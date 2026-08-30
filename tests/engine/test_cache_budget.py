@@ -112,6 +112,26 @@ def test_resolve_auto_applies_ratio_once_and_marlin_cap():
     assert size == 8 and pages == 40 and overlap is True
 
 
+def test_resolve_auto_reserves_usable_tokens_beyond_the_dummy_page():
+    size, pages, overlap = resolve_moe_cache_auto(
+        baseline_free=940,
+        weights_bytes=0,
+        memory_ratio=1.0,
+        cache_per_page=10,
+        fixed_cache_size=0,
+        per_expert_bytes=100,
+        num_experts=2,
+        total_experts=50,
+        prefill_overlap=False,
+        kv_reserve_tokens=256,
+        page_size=64,
+        quant_format="bf16",
+    )
+    assert overlap is False
+    assert (pages - 1) * 64 >= 256
+    assert size == 8 and pages == 14
+
+
 def test_resolve_auto_marlin_caps_slots():
     size, _, _ = resolve_moe_cache_auto(
         baseline_free=10_000_000, weights_bytes=0, memory_ratio=1.0,
@@ -295,6 +315,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         memory_ratio = 0.9
         moe_prefill_overlap = True
         kv_reserve_tokens = 0
+        max_seq_len = 64
         swa_full_tokens_ratio = 0.2
         swa_num_pages_override = None
         model_config = StubModelConfig()
@@ -331,7 +352,11 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         num_experts=4, total_experts=8, prefill_overlap=True,
         kv_reserve_tokens=0, page_size=16, quant_format="bf16",
     )
-    assert (size, pages, overlap) == expected
+    expected_size, expected_pages, expected_overlap = expected
+    # Auto sizing cannot allocate usable KV beyond the model context; one additional page is
+    # the pool's internal dummy/sentinel.
+    expected_pages = min(expected_pages, StubConfig.max_seq_len // StubConfig.page_size + 1)
+    assert (size, pages, overlap) == (expected_size, expected_pages, expected_overlap)
 
 
 # ---------------------------------------------------------------------------

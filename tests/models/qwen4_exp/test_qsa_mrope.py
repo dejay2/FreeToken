@@ -58,8 +58,10 @@ def _reference_norm_rope(
     rows, dim = x.shape
     rotary_half = cache.shape[1] // 2
     token = torch.arange(rows, device=x.device) // heads
-    pair = torch.arange(dim, device=x.device) % rotary_half
-    axis = torch.zeros(dim, dtype=torch.long, device=x.device)
+    rotary_dim = 2 * rotary_half
+    rotary_index = torch.arange(rotary_dim, device=x.device)
+    pair = rotary_index % rotary_half
+    axis = torch.zeros(rotary_dim, dtype=torch.long, device=x.device)
     axis[(pair % 3 == 1) & (pair < section[1] * 3)] = 1
     axis[(pair % 3 == 2) & (pair < section[2] * 3)] = 2
     selected = positions[axis, token[:, None]].squeeze(-1)
@@ -70,16 +72,48 @@ def _reference_norm_rope(
     normalized = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
     normalized = normalized * (weight.float() + 1)
     partner = torch.where(
-        torch.arange(dim, device=x.device) < rotary_half,
-        torch.arange(dim, device=x.device) + rotary_half,
-        torch.arange(dim, device=x.device) - rotary_half,
+        rotary_index < rotary_half,
+        rotary_index + rotary_half,
+        rotary_index - rotary_half,
     )
-    rotated = normalized * cos + torch.where(
-        torch.arange(dim, device=x.device) < rotary_half,
+    rotated = normalized.clone()
+    rotated[:, :rotary_dim] = normalized[:, :rotary_dim] * cos + torch.where(
+        rotary_index < rotary_half,
         -1.0,
         1.0,
     ) * normalized[:, partner] * sin
     return rotated.to(x.dtype)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_split_group_picture_positions_remain_private_until_each_qsa_layer_consumes_them():
+    from freetoken.kernel.triton.qsa import qsa_store_rows
+
+    device = torch.device("cuda")
+    md = SimpleNamespace(
+        positions=torch.tensor([2, 3, 4, 5], dtype=torch.int32, device=device),
+        rope_positions=torch.tensor(
+            [[20, 21, 22, 23], [30, 31, 32, 33], [40, 41, 42, 43]],
+            dtype=torch.int64,
+            device=device,
+        ),
+        token_to_req=torch.tensor([0, 0, 0, 0], dtype=torch.int32, device=device),
+        cu_seqlens=torch.tensor([0, 4], dtype=torch.int32, device=device),
+        ring_slots=torch.tensor([1], dtype=torch.int32, device=device),
+    )
+    rings = torch.zeros((2, 3, 4, 3), dtype=torch.int64, device=device)
+    prior = torch.tensor([5, 7, 9], dtype=torch.int64, device=device)
+    rings[:, 1, 0].copy_(prior)
+    ring_rows = torch.tensor([6, 7, 4, 5], dtype=torch.int32, device=device)
+
+    # Layer 0 completes compression, then writes this forward's last coordinates. Its ring
+    # wraps position 4 onto row 0, but layer 1 must still own the prior row 0.
+    qsa_store_rows(rings[0], ring_rows, md.rope_positions.transpose(0, 1).contiguous())
+    layer_zero = _first_mrope_positions(md, rings[0], compress_ratio=4)
+    layer_one = _first_mrope_positions(md, rings[1], compress_ratio=4)
+
+    assert not torch.equal(layer_zero[:, 1], prior)
+    assert torch.equal(layer_one[:, 1], prior)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

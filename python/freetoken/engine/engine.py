@@ -481,7 +481,7 @@ class Engine:
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
-        return resolve_moe_cache_auto(
+        moe_cache_size, num_pages, overlap = resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
             memory_ratio=config.memory_ratio,
@@ -495,6 +495,10 @@ class Engine:
             page_size=page_tokens,
             quant_format=banks.quant_format,
         )
+        # Page 0 is the pool's dummy. Additional pages beyond the model's usable context
+        # cannot serve a request, so do not spend residual auto-budget on unreachable KV.
+        max_context_pages = -(-config.max_seq_len // page_tokens) + 1
+        return moe_cache_size, min(num_pages, max_context_pages), overlap
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         # A model may fully own cache construction via make_offload_moe_cache.
