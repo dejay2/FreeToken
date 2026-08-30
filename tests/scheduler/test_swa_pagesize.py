@@ -120,6 +120,62 @@ def test_chunked_prefill_conserves_swa_slots(ps):
     cm.check_integrity()
 
 
+def test_private_chunked_swa_prefill_never_reuses_and_frees_both_pools():
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import ChunkedReq, PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    ps = 8
+    cm = _mgr(ps, num_pages=64)
+    tm = TableManager(max_running_reqs=4, page_table=cm.page_table)
+    pm = PrefillManager(cm, tm, DecodeManager(page_size=ps))
+    full_free_before = len(cm.free_slots)
+    swa_free_before = cm.swa_available_size
+    pm.pending_list = [
+        PendingReq(
+            uid=9,
+            input_ids=torch.arange(27, dtype=torch.int32),
+            sampling_params=SamplingParams(max_tokens=1),
+            mm_embeds=torch.ones(2, 8),
+            cache_private=True,
+        )
+    ]
+
+    final_req = None
+    while pm.runnable:
+        batch = pm.schedule_next_batch(10)
+        assert batch is not None
+        cm.free_swa_out_of_window_extend(batch.reqs)
+        cm.allocate_paged(batch.reqs)
+        for req in batch.reqs:
+            req.mm_embeds = None  # production gathering releases this step's reference
+            req.complete_one()
+            if not isinstance(req, ChunkedReq):
+                final_req = req
+
+    assert final_req is not None
+    unlocks = []
+    original_unlock = cm.unlock
+
+    def tracked_unlock(handle):
+        unlocks.append(handle)
+        return original_unlock(handle)
+
+    cm.unlock = tracked_unlock
+    cm.cache_req(final_req, finished=False)
+    assert unlocks == []
+    assert cm.prefix_cache.full_evictable_size == 0
+
+    cm.cache_req(final_req, finished=True)
+    assert unlocks == [final_req.cache_handle]
+    tm.free(final_req.table_idx)
+    cm.check_integrity()
+    assert len(cm.free_slots) == full_free_before
+    assert cm.swa_available_size == swa_free_before
+    assert cm.prefix_cache.full_evictable_size == 0
+
+
 @pytest.mark.parametrize("ps", [8])
 def test_hybrid_chunk_donate_skips_unaligned_boundary(ps):
     from freetoken.kvcache.linear_state_pool import LinearStatePool

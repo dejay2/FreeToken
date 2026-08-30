@@ -39,3 +39,22 @@ def test_scheduler_uses_mrope_delta_for_generated_tokens():
 def test_scheduler_skips_rope_tensor_for_text_only_batch():
     batch = SimpleNamespace(padded_reqs=[_req(3, 5)])
     assert _make_rope_positions(batch, torch.device("cpu")) is None
+
+
+def test_successive_picture_chunks_reconstruct_complete_mrope_table():
+    complete = torch.stack(
+        (
+            torch.arange(19, dtype=torch.int64),
+            torch.arange(19, dtype=torch.int64) + 100,
+            torch.arange(19, dtype=torch.int64) + 200,
+        )
+    )
+    ranges = ((0, 8), (8, 16), (16, 19))
+    chunks = [
+        _make_rope_positions(
+            SimpleNamespace(padded_reqs=[_req(start, end, complete, -3)]),
+            torch.device("cpu"),
+        )
+        for start, end in ranges
+    ]
+    assert torch.equal(torch.cat(chunks, dim=1), complete)

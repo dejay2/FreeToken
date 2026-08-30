@@ -80,16 +80,34 @@ def test_scheduler_rejects_feature_placeholder_mismatch_without_stopping_server(
     assert message.mm_token_type_ids is None
 
 
-def test_scheduler_rejects_picture_prompt_above_one_prefill_batch_before_encoding():
+def test_scheduler_admits_picture_prompt_above_one_prefill_batch():
     scheduler, calls, added, sent = _scheduler()
     message = _message(uid=3)
-    message.input_ids = torch.arange(8193, dtype=torch.int32)
+    message.input_ids = torch.full((8193,), 5, dtype=torch.int32)
+    message.input_ids[-4:] = IMAGE_TOKEN
+    message.mm_token_type_ids = torch.zeros(8193, dtype=torch.int64)
+    message.mm_token_type_ids[-4:] = 1
+
+    Scheduler._process_one_msg(scheduler, message)
+
+    assert len(calls) == 1 and added == [message] and sent == []
+    assert message.mm_embeds.shape == (4, 8)
+    assert message.mrope_position_ids.shape == (3, 8193)
+    assert message.mm_pixel_values is None
+    assert message.mm_image_grid_thw is None
+    assert message.mm_token_type_ids is None
+
+
+def test_scheduler_still_rejects_picture_prompt_at_combined_context_limit():
+    scheduler, calls, added, sent = _scheduler()
+    message = _message(uid=30)
+    message.input_ids = torch.full((262_144,), 5, dtype=torch.int32)
 
     Scheduler._process_one_msg(scheduler, message)
 
     assert calls == [] and added == []
     assert len(sent) == 1 and sent[0].code == "context_length_exceeded"
-    assert "must fit one prefill batch" in sent[0].error
+    assert "prompt is too long" in sent[0].error
     assert message.mm_pixel_values is None
     assert message.mm_image_grid_thw is None
     assert message.mm_token_type_ids is None
@@ -103,9 +121,18 @@ def test_prefill_marks_picture_request_private_then_releases_soft_embeddings_aft
     pending = manager.pending_list[0]
     assert pending.cache_private
 
-    request = SimpleNamespace(mm_embeds=pending.mm_embeds, cache_private=True)
+    request = SimpleNamespace(
+        input_ids=message.input_ids,
+        cached_len=0,
+        device_len=len(message.input_ids),
+        mm_embeds=pending.mm_embeds,
+        cache_private=True,
+    )
     batch = SimpleNamespace(reqs=[request], mm_embeds=None)
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SimpleNamespace(
+        model_config=SimpleNamespace(image_token_id=IMAGE_TOKEN)
+    )
     Scheduler._gather_multimodal(scheduler, batch)
 
     assert batch.mm_embeds.shape == (4, 8)

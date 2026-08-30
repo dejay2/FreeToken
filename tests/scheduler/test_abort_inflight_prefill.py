@@ -133,8 +133,14 @@ def test_abort_inflight_intermediate_chunk_marks_then_drains():
     pool, cm, tm, _dm, pm, sent, stub = _setup()
     prompt = torch.arange(1, 13, dtype=torch.int32)
     chunk = _launch_req(pool, cm, tm, prompt[:8], cls=ChunkedReq)
-    pending = PendingReq(uid=UID, input_ids=prompt,
-                         sampling_params=SamplingParams(max_tokens=4))
+    pending = PendingReq(
+        uid=UID,
+        input_ids=prompt,
+        sampling_params=SamplingParams(max_tokens=4),
+        mm_embeds=torch.ones(3, 8),
+        cache_private=True,
+        mrope_position_ids=torch.arange(3 * len(prompt)).view(3, -1),
+    )
     pending.chunked_req = chunk
     pm.pending_list = [pending]
     batch = Batch(reqs=[chunk], phase="prefill")
@@ -142,12 +148,30 @@ def test_abort_inflight_intermediate_chunk_marks_then_drains():
 
     Scheduler._process_one_msg(stub, AbortBackendMsg(uid=UID))
     assert pm.pending_list == []                # continuation gone: no next chunk
+    assert pending.mm_embeds is None and pending.mrope_position_ids is None
     assert chunk.aborted and chunk.table_idx != -1
 
     Scheduler._process_last_data(stub, stub._last_data)
     assert chunk.table_idx == -1
     assert sent == []                           # chunks never reply
     cm.check_integrity()
+
+
+def test_abort_before_first_picture_chunk_releases_pending_picture_state():
+    _pool_, _cm, _tm, _dm, pm, _sent, _stub = _setup()
+    pending = PendingReq(
+        uid=UID,
+        input_ids=torch.arange(12, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=4),
+        mm_embeds=torch.ones(3, 8),
+        cache_private=True,
+        mrope_position_ids=torch.arange(36).view(3, 12),
+    )
+    pm.pending_list = [pending]
+
+    assert pm.abort_req(UID) is None
+    assert pm.pending_list == []
+    assert pending.mm_embeds is None and pending.mrope_position_ids is None
 
 
 def test_abort_starved_decode_req_frees_immediately():

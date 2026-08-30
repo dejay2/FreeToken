@@ -578,24 +578,6 @@ class Scheduler(SchedulerIOMixin):
                     msg.mm_token_type_ids = None
                 return
             if has_raw_picture:
-                picture_limit = min(8192, getattr(self, "prefill_budget", 8192))
-                if input_len > picture_limit:
-                    msg.mm_pixel_values = None
-                    msg.mm_image_grid_thw = None
-                    msg.mm_token_type_ids = None
-                    self.send_result(
-                        [
-                            ErrorReplyMsg(
-                                uid=msg.uid,
-                                error=(
-                                    f"picture prompt has {input_len} tokens; picture prompts "
-                                    f"must fit one prefill batch of at most {picture_limit} tokens"
-                                ),
-                                code="context_length_exceeded",
-                            )
-                        ]
-                    )
-                    return
                 try:
                     self._prepare_multimodal_request(msg)
                 except Exception as exc:  # noqa: BLE001 - reject one request, keep serving
@@ -911,17 +893,37 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _gather_multimodal(self, batch: Batch) -> None:
-        """Concatenate per-request vision soft tokens (in request order) for a prefill
-        batch so the model can scatter them at image-token positions. ``req.mm_embeds``
-        is kept (not cleared) so the cache manager can recognize multimodal requests and
-        keep them out of the shared prefix cache (image placeholders share a token id but
-        carry per-image content)."""
-        parts = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
+        """Gather only the picture feature rows used by this prefill step.
+
+        ``PendingReq`` owns the complete feature tensor across continuation steps. Each
+        scheduled ``Req`` temporarily receives that tensor, then releases its reference
+        after this method copies the rows whose image placeholders fall in
+        ``[cached_len, device_len)``. ``cache_private`` remains authoritative after the
+        reference is cleared, so no picture KV can enter the shared prefix cache.
+        """
+        image_token_id = self.config.model_config.image_token_id
+        parts = []
+        for req in batch.reqs:
+            features = req.mm_embeds
+            if features is None:
+                continue
+            try:
+                if image_token_id is None:
+                    raise ValueError("picture features were supplied without a picture token id")
+                ids = req.input_ids
+                feature_start = int((ids[: req.cached_len] == image_token_id).sum().item())
+                feature_stop = int((ids[: req.device_len] == image_token_id).sum().item())
+                if feature_stop > features.shape[0]:
+                    raise ValueError(
+                        f"picture feature slice ends at {feature_stop}, but only "
+                        f"{features.shape[0]} rows exist"
+                    )
+                if feature_stop > feature_start:
+                    parts.append(features[feature_start:feature_stop])
+            finally:
+                req.mm_embeds = None
         if parts:
             batch.mm_embeds = torch.cat(parts, dim=0)
-            for req in batch.reqs:
-                if req.cache_private:
-                    req.mm_embeds = None
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first

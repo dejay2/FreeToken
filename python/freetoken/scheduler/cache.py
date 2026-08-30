@@ -307,12 +307,16 @@ class CacheManager:
         # ``match_req``). Their KV pages stay owned by the active request and are freed
         # on completion; nothing is exposed for cross-request reuse.
         if getattr(req, "cache_private", False) or req.mm_embeds is not None:
+            # A private request keeps its admission handle for its whole lifetime. The
+            # prefill-to-decode boundary is deliberately a no-op: no shared insert, no
+            # unlock, and no page donation. Completion/abort releases everything once.
+            if not finished:
+                return
             self.unlock(old_handle)
-            if finished:
-                tail = self._padded_tail(req, old_handle.cached_len)
-                if self.swa_paged:
-                    self._free_swa(tail)
-                self._free(tail)
+            tail = self._padded_tail(req, old_handle.cached_len)
+            if self.swa_paged:
+                self._free_swa(tail)
+            self._free(tail)
             return
         insert_ids = req.input_ids[: req.cached_len]
         cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
@@ -355,10 +359,11 @@ class CacheManager:
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
         if getattr(req, "cache_private", False) or req.mm_embeds is not None:
+            if not finished:
+                return
             self.unlock(old_handle)
-            if finished:
-                self._free(page_indices[old_handle.cached_len :])
-                self._free_req_slots(req)
+            self._free(page_indices[old_handle.cached_len :])
+            self._free_req_slots(req)
             return
 
         if finished:
@@ -449,11 +454,12 @@ class CacheManager:
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
         if getattr(req, "cache_private", False) or req.mm_embeds is not None:
+            if not finished:
+                return
             self.unlock(old_handle)
-            if finished:
-                tail = self._padded_tail(req, old_handle.cached_len)
-                self._free_swa(tail)
-                self._free(tail)
+            tail = self._padded_tail(req, old_handle.cached_len)
+            self._free_swa(tail)
+            self._free(tail)
             return
 
         insert_len = align_down(req.cached_len, self.page_size)

@@ -82,6 +82,48 @@ def test_hybrid_finish_donates_live_slot():
     assert mr2.cuda_handle.cached_len == 3 and mr2.mamba_value == live
 
 
+def test_private_hybrid_prefill_never_donates_and_unlocks_once_at_finish():
+    from freetoken.scheduler.prefill import PrefillAdder
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    pool = _pool()
+    page_table = torch.zeros(4, 64, dtype=torch.int32)
+    cm = CacheManager(64, 1, page_table, "hybrid_radix", linear_state_pool=pool)
+    tm = TableManager(max_running_reqs=4, page_table=page_table)
+    free_before = pool.num_free_slots
+    pending = PendingReq(
+        uid=8,
+        input_ids=torch.arange(12, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=1),
+        mm_embeds=torch.ones(2, 8),
+        cache_private=True,
+    )
+    req = PrefillAdder(12, 0, cm, tm).try_add_one(pending)
+    assert req is not None
+    cm.allocate_paged([req])
+    req.complete_one()
+
+    unlocks = []
+    original_unlock = cm.unlock
+
+    def tracked_unlock(handle):
+        unlocks.append(handle)
+        return original_unlock(handle)
+
+    cm.unlock = tracked_unlock
+    cm.cache_req(req, finished=False)
+    assert unlocks == []
+    assert cm.prefix_cache.full_evictable_size == 0
+
+    cm.cache_req(req, finished=True)
+    assert unlocks == [req.cache_handle]
+    tm.free(req.table_idx)
+    cm.check_integrity()
+    assert pool.num_free_slots == free_before
+    assert cm.prefix_cache.full_evictable_size == 0
+
+
 def test_free_req_slots_idempotent():
     """C2: a finish/abort double-free of the same request must NOT push its GDN slots twice."""
     pool = _pool()

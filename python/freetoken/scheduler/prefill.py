@@ -171,11 +171,6 @@ class PrefillAdder:
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
         device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
-        if is_chunked and pending_req.cache_private:
-            raise NotImplementedError(
-                "Multimodal prompts must fit in a single prefill chunk; increase "
-                "--max-extend-tokens or shrink the prompt."
-            )
         req = CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
@@ -316,7 +311,13 @@ class PrefillManager:
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
                 self.pending_list.pop(i)
-                return req.chunked_req
+                chunked_req = req.chunked_req
+                # A pending picture continuation owns the complete GPU feature tensor and
+                # CPU MRoPE table. Drop both deterministically on cancellation instead of
+                # waiting for the PendingReq object to be garbage-collected.
+                req.mm_embeds = None
+                req.mrope_position_ids = None
+                return chunked_req
         return None
 
     @property
