@@ -39,5 +39,7 @@ for them; other checkpoints of the same architectures work too.
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
 - Qwen3.8-Flash-Next supports `--ple-backend mmap` for demand-paging its PLE table
-  from the original safetensors while retaining decode CUDA graphs.
+  from the original safetensors while retaining decode CUDA graphs. An unofficial,
+  Desktop-assisted native-Windows setup and measured RTX 5090 results are in the
+  [Windows PLE mmap guide](windows-qwen38-flash-next-mmap.md).
 - Multimodal checkpoints are served text-only.
