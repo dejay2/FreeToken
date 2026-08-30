@@ -5,7 +5,11 @@ from types import SimpleNamespace
 import pytest
 
 from freetoken.attention import AttnType
-from freetoken.models.config import FullAttentionGroupConfig, LinearGatedDeltaGroupConfig
+from freetoken.models.config import (
+    FullAttentionGroupConfig,
+    LinearGatedDeltaGroupConfig,
+    vision_execution_mode,
+)
 from freetoken.models.qwen4_exp.config import parse_config
 
 
@@ -101,6 +105,23 @@ def _hf_config():
             ],
         },
     )
+
+
+def test_picture_execution_defaults_to_gpu(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_VISION_EXECUTION", raising=False)
+    assert vision_execution_mode() == "gpu"
+
+
+def test_picture_execution_accepts_gpu_and_layer_stream(monkeypatch):
+    for value, expected in (("gpu", "gpu"), ("LAYER-STREAM", "layer-stream")):
+        monkeypatch.setenv("FREETOKEN_VISION_EXECUTION", value)
+        assert vision_execution_mode() == expected
+
+
+def test_picture_execution_rejects_unknown_value(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_VISION_EXECUTION", "cpu")
+    with pytest.raises(ValueError, match="gpu.*layer-stream"):
+        vision_execution_mode()
 
 
 def test_picture_configuration_is_off_by_default(monkeypatch):

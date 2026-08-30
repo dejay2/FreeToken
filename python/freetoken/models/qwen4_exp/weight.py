@@ -13,6 +13,7 @@ is explicitly enabled.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import json
 import mmap
 import os
@@ -24,7 +25,7 @@ from typing import BinaryIO, Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
-from freetoken.models.config import vision_load_enabled
+from freetoken.models.config import vision_execution_mode, vision_load_enabled
 from freetoken.models.loader import drop_page_cache, iter_weight_files
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
@@ -172,17 +173,34 @@ def iter_weights(
 
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
     include_vision = vision_load_enabled()
+    stream_vision = include_vision and vision_execution_mode() == "layer-stream"
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
         disable=not get_tp_info().is_primary(),
     ):
-        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
-            for raw_name in f.keys():
+        with ExitStack() as stack:
+            engine_file = stack.enter_context(
+                safetensors.safe_open(file, framework="pt", device=str(device))
+            )
+            raw_names = engine_file.keys()
+            has_vision = stream_vision and any(
+                raw.startswith(("model.visual.", "visual.")) for raw in raw_names
+            )
+            vision_file = engine_file
+            if has_vision and device.type != "cpu":
+                # Read picture tensors directly into their persistent CPU home. Loading
+                # them on CUDA first would leave allocator reservations behind and make
+                # automatic expert sizing undercount the memory this mode is meant to free.
+                vision_file = stack.enter_context(
+                    safetensors.safe_open(file, framework="pt", device="cpu")
+                )
+            for raw_name in raw_names:
                 name = _rename(raw_name, include_vision=include_vision)
                 if name is None:
                     continue
-                tensor = f.get_tensor(raw_name)
+                source = vision_file if name.startswith("visual.") else engine_file
+                tensor = source.get_tensor(raw_name)
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete

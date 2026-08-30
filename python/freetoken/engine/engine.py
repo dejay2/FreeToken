@@ -4,7 +4,7 @@ import gc
 import math
 import os
 from datetime import timedelta
-from typing import Any, Dict, Iterable, NamedTuple, Tuple
+from typing import Any, Callable, Dict, Iterable, NamedTuple, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
@@ -267,14 +267,22 @@ def _materialize_loaded_weight_state_dict(
     weights: Iterable[Tuple[str, torch.Tensor]],
     *,
     device: torch.device,
+    device_for_key: Callable[[str, torch.device], torch.device] | None = None,
 ) -> Dict[str, torch.Tensor]:
+    """Materialize checkpoint values on their model-owned persistent devices.
+
+    Models without ``device_for_key`` retain the historical one-device behavior. The
+    callback is deliberately key-local so optional CPU-resident components do not leak
+    model-specific naming into the engine.
+    """
     state_dict: Dict[str, torch.Tensor] = {}
     for key, weight in weights:
         expected = model_state.get(key)
+        target = device_for_key(key, device) if device_for_key is not None else device
         if expected is None:
-            state_dict[key] = weight.to(device=device)
+            state_dict[key] = weight.to(device=target)
         else:
-            state_dict[key] = weight.to(device=device, dtype=expected.dtype)
+            state_dict[key] = weight.to(device=target, dtype=expected.dtype)
     return state_dict
 
 
@@ -317,6 +325,11 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        placement_report = getattr(self.model, "weight_placement_report", None)
+        if callable(placement_report):
+            report = placement_report()
+            if report:
+                logger.info_rank0(report)
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -467,6 +480,7 @@ class Engine:
                 include_moe_experts=not is_offload_moe_backend(config.moe_backend),
             ),
             device=self.device,
+            device_for_key=getattr(self.model, "weight_device_for_key", None),
         )
 
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks) -> tuple[int, int, bool]:

@@ -9,6 +9,22 @@ from freetoken.attention.base import AttnType
 # config (so the tower is never built) and to skip the matching tensors in the FTW reader.
 VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "visual.")
 _VISION_TRUE = {"1", "true", "yes", "on"}
+_VISION_EXECUTION_MODES = {"gpu", "layer-stream"}
+
+
+def vision_execution_mode() -> str:
+    """Return the selected picture-reader placement.
+
+    ``gpu`` preserves the existing behavior. ``layer-stream`` keeps persistent picture
+    weights on CPU and lets the model stage bounded components for each encode.
+    """
+    value = os.getenv("FREETOKEN_VISION_EXECUTION", "gpu").strip().lower()
+    if value not in _VISION_EXECUTION_MODES:
+        choices = ", ".join(sorted(_VISION_EXECUTION_MODES))
+        raise ValueError(
+            f"unsupported FREETOKEN_VISION_EXECUTION={value!r}; expected one of: {choices}"
+        )
+    return value
 
 
 def vision_load_enabled() -> bool:

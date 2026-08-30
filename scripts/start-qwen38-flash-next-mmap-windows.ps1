@@ -19,6 +19,9 @@ param(
 
     [switch]$EnableVision,
 
+    [ValidateSet('layer-stream', 'gpu')]
+    [string]$VisionExecution = 'layer-stream',
+
     [switch]$EnableCacheReport
 )
 
@@ -81,10 +84,12 @@ if ($EnableVision) {
     }
     $pathParts += $resolvedVisionPackages
     $env:FREETOKEN_LOAD_VISION = '1'
+    $env:FREETOKEN_VISION_EXECUTION = $VisionExecution
 }
 else {
     # Make the fallback deterministic even if the parent shell previously ran picture mode.
     $env:FREETOKEN_LOAD_VISION = '0'
+    $env:FREETOKEN_VISION_EXECUTION = 'gpu'
 }
 $pathParts += $sourceDir
 $env:PYTHONPATH = ($pathParts -join ';') + $(if ($env:PYTHONPATH) { ";$env:PYTHONPATH" } else { '' })
@@ -95,6 +100,7 @@ Write-Host "  API:    http://127.0.0.1:$Port/v1"
 Write-Host "  Context tokens: $ContextTokens"
 Write-Host "  Active requests: $MaxRunningRequests"
 Write-Host "  Picture input: $($EnableVision.IsPresent)"
+Write-Host "  Picture execution: $(if ($EnableVision) { $VisionExecution } else { 'disabled' })"
 Write-Host 'FreeToken Desktop supplies the Windows runtime but does not need to be open.'
 
 $serveArgs = @(

@@ -174,8 +174,11 @@ class Qwen4ExpModel(BaseOP):
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
+        from freetoken.models.config import vision_execution_mode
+
         self._config = config
         self._mmap_ple = False
+        self._vision_execution = vision_execution_mode() if config.is_multimodal else "gpu"
         self.model = Qwen4ExpModel(config)
         if getattr(config, "lm_head_quant", "none") == "nvfp4":
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
@@ -197,12 +200,38 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             self.visual = Qwen4VisionModel(config.vision_config)
         super().__init__()
 
+    def weight_device_for_key(
+        self, key: str, engine_device: torch.device
+    ) -> torch.device:
+        """Choose persistent storage without leaking Qwen key names into the engine."""
+        if self._vision_execution == "layer-stream" and key.startswith("visual."):
+            return torch.device("cpu")
+        return engine_device
+
+    def weight_placement_report(self) -> str:
+        if not hasattr(self, "visual"):
+            return ""
+        tensors = self.visual.state_dict().values()
+        count = 0
+        nbytes = 0
+        devices: set[str] = set()
+        for tensor in tensors:
+            count += 1
+            nbytes += tensor.numel() * tensor.element_size()
+            devices.add(tensor.device.type)
+        return (
+            f"Picture weights: mode={self._vision_execution}, tensors={count}, "
+            f"bytes={nbytes}, devices={','.join(sorted(devices))}"
+        )
+
     @torch.inference_mode()
     def encode_images(
         self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor
     ) -> torch.Tensor:
         if not hasattr(self, "visual"):
             raise RuntimeError("Qwen4-Exp picture weights are not loaded")
+        if self._vision_execution == "layer-stream":
+            raise RuntimeError("layer-stream picture execution is not initialized")
         return self.visual.forward(pixel_values, image_grid_thw)
 
     def prepare_cuda_graph_capture(self, batch: Batch) -> None:

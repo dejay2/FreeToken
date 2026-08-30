@@ -213,6 +213,31 @@ def test_picture_keys_are_retained_only_when_enabled():
     assert _rename("mtp.visual.weight", include_vision=True) is None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
+@pytest.mark.parametrize(
+    ("execution", "visual_device"), (("gpu", "cuda"), ("layer-stream", "cpu"))
+)
+def test_picture_weights_are_read_directly_on_their_persistent_device(
+    checkpoint, monkeypatch, execution, visual_device
+):
+    folder, _raw = checkpoint
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+    monkeypatch.setenv("FREETOKEN_VISION_EXECUTION", execution)
+
+    values = dict(
+        iter_weights(
+            folder,
+            torch.device("cuda"),
+            include_moe_experts=False,
+            include_non_moe=True,
+        )
+    )
+
+    assert values["visual.blocks.0.attn.qkv.weight"].device.type == visual_device
+    assert values["visual.merger.norm.weight"].device.type == visual_device
+    assert values["model.embed_tokens.weight"].device.type == "cuda"
+
+
 def test_key_map_is_exactly_the_model_state_dict(loaded):
     assert set(loaded) == _expected_names()
 
