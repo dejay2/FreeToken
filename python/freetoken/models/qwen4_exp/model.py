@@ -1,4 +1,4 @@
-"""Qwen3.8-Flash-Next decoder stack (text-only).
+"""Qwen3.8-Flash-Next decoder stack with optional still-picture embeddings.
 
 The residual state is ``R [T, hc_count*hidden]`` end to end: the embedding is repeated over the
 ``hc_count`` streams, every layer mixes them down to one ``[T, hidden]`` block input and injects
@@ -99,6 +99,7 @@ class Qwen4ExpModel(BaseOP):
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False)
         # plain tuple (not an OP child), so it never shows up in the state dict
         self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
+        self._image_token_id = config.image_token_id
 
     @property
     def ple_layers(self) -> List[PLELayer]:
@@ -127,8 +128,34 @@ class Qwen4ExpModel(BaseOP):
         for ple in self._ple:
             ple.ple_embedding.table.reset_cuda_graph()
 
+    def _merge_multimodal(
+        self,
+        input_ids: torch.Tensor,
+        hidden: torch.Tensor,
+        mm_embeds: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if mm_embeds is None:
+            return hidden
+        if self._image_token_id is None:
+            raise ValueError("picture features were supplied but the model has no picture token")
+        if mm_embeds.ndim != 2 or mm_embeds.shape[1] != hidden.shape[1]:
+            raise ValueError(
+                "picture features must be [picture_tokens, hidden_size], got "
+                f"{tuple(mm_embeds.shape)} for hidden size {hidden.shape[1]}"
+            )
+        mask = input_ids == self._image_token_id
+        slots = int(mask.sum().item())
+        if slots != mm_embeds.shape[0]:
+            raise ValueError(
+                f"picture-token slots ({slots}) do not match picture features "
+                f"({mm_embeds.shape[0]})"
+            )
+        return hidden.masked_scatter(mask.unsqueeze(-1), mm_embeds.to(hidden.dtype))
+
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
-        hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
+        hidden = self.embed_tokens.forward(input_ids)
+        hidden = self._merge_multimodal(input_ids, hidden, getattr(batch, "mm_embeds", None))
+        hidden = hidden.repeat(1, self.hc_count)
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
@@ -164,7 +191,19 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 tie_word_embeddings=config.tie_word_embeddings,
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
+        if config.is_multimodal:
+            from .vision import Qwen4VisionModel
+
+            self.visual = Qwen4VisionModel(config.vision_config)
         super().__init__()
+
+    @torch.inference_mode()
+    def encode_images(
+        self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        if not hasattr(self, "visual"):
+            raise RuntimeError("Qwen4-Exp picture weights are not loaded")
+        return self.visual.forward(pixel_values, image_grid_thw)
 
     def prepare_cuda_graph_capture(self, batch: Batch) -> None:
         if self._mmap_ple:

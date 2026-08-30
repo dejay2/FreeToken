@@ -1,4 +1,4 @@
-"""Qwen3.8-Flash-Next (model_type qwen4_exp), served text-only.
+"""Qwen3.8-Flash-Next (model_type qwen4_exp), with opt-in still-picture input.
 
 48 decoder layers on hc_count=4 hyper-connection residual streams R [T, 4*hidden]:
 embed -> repeat(1, 4) -> [PLE at zero-based layer 1] -> per layer attn_hc.mix -> (GDN | QSA) -> attn_hc.combine -> mlp_hc.mix -> MoE -> mlp_hc.combine -> top-level mixer.mix -> lm_head.

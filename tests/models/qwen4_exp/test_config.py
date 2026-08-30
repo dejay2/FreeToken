@@ -67,6 +67,20 @@ def _hf_config():
         architectures=["Qwen4ExpForConditionalGeneration"],
         image_token_id=248056,
         text_config=_text_config(),
+        vision_config=SimpleNamespace(
+            depth=27,
+            hidden_size=1152,
+            intermediate_size=4304,
+            num_heads=16,
+            num_position_embeddings=2304,
+            out_hidden_size=2560,
+            patch_size=16,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            in_channels=3,
+            hidden_act="gelu_pytorch_tanh",
+            deepstack_visual_indexes=[],
+        ),
         quantization_config={
             "quant_algo": "NVFP4",
             "quant_method": "modelopt",
@@ -87,6 +101,36 @@ def _hf_config():
             ],
         },
     )
+
+
+def test_picture_configuration_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_LOAD_VISION", raising=False)
+    cfg = parse_config(_hf_config())
+    assert cfg.vision_config is None
+    assert not cfg.is_multimodal
+
+
+def test_picture_configuration_is_loaded_only_when_enabled(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+    cfg = parse_config(_hf_config())
+    vision = cfg.vision_config
+    assert cfg.is_multimodal
+    assert (
+        vision.depth,
+        vision.hidden_size,
+        vision.intermediate_size,
+        vision.num_heads,
+    ) == (27, 1152, 4304, 16)
+    assert (
+        vision.num_position_embeddings,
+        vision.out_hidden_size,
+        vision.patch_size,
+        vision.spatial_merge_size,
+        vision.temporal_patch_size,
+        vision.in_channels,
+    ) == (2304, 2560, 16, 2, 2, 3)
+    assert vision.hidden_act == "gelu_pytorch_tanh"
+    assert vision.deepstack_visual_indexes == ()
 
 
 def test_groups_and_layer_split():

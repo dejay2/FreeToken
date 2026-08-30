@@ -12,7 +12,24 @@ from freetoken.models.config import (
     ModelConfig,
     RotaryConfig,
     SlotStateSpec,
+    vision_load_enabled,
 )
+
+
+@dataclass(frozen=True)
+class Qwen4VisionConfig:
+    depth: int
+    hidden_size: int
+    intermediate_size: int
+    num_heads: int
+    num_position_embeddings: int
+    out_hidden_size: int
+    patch_size: int
+    spatial_merge_size: int
+    temporal_patch_size: int
+    in_channels: int
+    hidden_act: str
+    deepstack_visual_indexes: Tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -102,6 +119,28 @@ def _quant_get(hf_config: Any):
 
 def _ignored(patterns, module_name: str) -> bool:
     return any(fnmatch(module_name, pat) for pat in patterns)
+
+
+def _parse_vision_config(hf_config: Any) -> Qwen4VisionConfig | None:
+    vision = getattr(hf_config, "vision_config", None)
+    if vision is None or not vision_load_enabled():
+        return None
+    return Qwen4VisionConfig(
+        depth=int(vision.depth),
+        hidden_size=int(vision.hidden_size),
+        intermediate_size=int(vision.intermediate_size),
+        num_heads=int(vision.num_heads),
+        num_position_embeddings=int(vision.num_position_embeddings),
+        out_hidden_size=int(vision.out_hidden_size),
+        patch_size=int(vision.patch_size),
+        spatial_merge_size=int(vision.spatial_merge_size),
+        temporal_patch_size=int(vision.temporal_patch_size),
+        in_channels=int(vision.in_channels),
+        hidden_act=str(vision.hidden_act),
+        deepstack_visual_indexes=tuple(
+            int(i) for i in (getattr(vision, "deepstack_visual_indexes", None) or ())
+        ),
+    )
 
 
 def _layer_types(text: Any) -> list[str]:
@@ -278,7 +317,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen4_exp"),
         architectures=getattr(hf_config, "architectures", ["Qwen4ExpForConditionalGeneration"]),
-        vision_config=None,  # served text-only
+        vision_config=_parse_vision_config(hf_config),
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
@@ -290,4 +329,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["PLE_CONV_STATE", "PLE_NGRAM_STATE", "Qwen4ExpArgs", "parse_config", "ple_slot_states"]
+__all__ = [
+    "PLE_CONV_STATE",
+    "PLE_NGRAM_STATE",
+    "Qwen4ExpArgs",
+    "Qwen4VisionConfig",
+    "parse_config",
+    "ple_slot_states",
+]

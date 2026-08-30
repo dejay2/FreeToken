@@ -17,6 +17,7 @@ from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
 from freetoken.models.qwen4_exp.weight import (
     _ZERO_CENTERED_NORM_SUFFIXES,
+    _rename,
     iter_weights,
     load_mmap_ple_table,
     load_ple_table,
@@ -196,6 +197,20 @@ def _expected_names() -> set[str]:
         "indexer.index_qk_proj.weight", "indexer.q_layernorm.weight",
         "indexer.k_layernorm.weight")}
     return names
+
+
+def test_picture_keys_are_retained_only_when_enabled():
+    assert _rename("model.visual.blocks.0.attn.qkv.weight", include_vision=False) is None
+    assert _rename("visual.merger.norm.weight", include_vision=False) is None
+    assert (
+        _rename("model.visual.blocks.0.attn.qkv.weight", include_vision=True)
+        == "visual.blocks.0.attn.qkv.weight"
+    )
+    assert (
+        _rename("visual.merger.norm.weight", include_vision=True)
+        == "visual.merger.norm.weight"
+    )
+    assert _rename("mtp.visual.weight", include_vision=True) is None
 
 
 def test_key_map_is_exactly_the_model_state_dict(loaded):
