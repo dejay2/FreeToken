@@ -7,8 +7,36 @@ import math
 import torch
 import torch.nn.functional as F
 from freetoken.layers import BaseOP, LinearReplicated, OPList
+from freetoken.utils.torch_utils import torch_dtype
 
 from .config import Qwen4VisionConfig
+
+
+def _copy_component_state_(target: BaseOP, source: BaseOP) -> None:
+    """Copy one CPU component into an existing GPU workspace in place."""
+    target_state = target.state_dict()
+    source_state = source.state_dict()
+    if target_state.keys() != source_state.keys():
+        missing = sorted(source_state.keys() - target_state.keys())
+        extra = sorted(target_state.keys() - source_state.keys())
+        raise ValueError(
+            f"picture component state names differ: missing={missing}, extra={extra}"
+        )
+    for key, source_tensor in source_state.items():
+        target_tensor = target_state[key]
+        if target_tensor.shape != source_tensor.shape:
+            raise ValueError(
+                f"picture component {key} shape differs: "
+                f"target={tuple(target_tensor.shape)}, source={tuple(source_tensor.shape)}"
+            )
+        if target_tensor.dtype != source_tensor.dtype:
+            raise ValueError(
+                f"picture component {key} dtype differs: "
+                f"target={target_tensor.dtype}, source={source_tensor.dtype}"
+            )
+    with torch.no_grad():
+        for key, source_tensor in source_state.items():
+            target_state[key].copy_(source_tensor, non_blocking=False)
 
 
 class _LayerNorm(BaseOP):
@@ -170,6 +198,8 @@ class Qwen4VisionPatchMerger(BaseOP):
 
 class Qwen4VisionModel(BaseOP):
     def __init__(self, config: Qwen4VisionConfig):
+        self._config = config
+        self._active_stream_workspace: dict[str, BaseOP] | None = None
         self.patch_embed = Qwen4VisionPatchEmbed(config)
         self.pos_embed = _Embedding(config.num_position_embeddings, config.hidden_size)
         self.blocks = OPList([Qwen4VisionBlock(config) for _ in range(config.depth)])
@@ -236,6 +266,93 @@ class Qwen4VisionModel(BaseOP):
                 deepstack.append(self.deepstack_merger_list.op_list[slot].forward(hidden))
         merged = self.merger.forward(hidden)
         return torch.cat((merged, *deepstack), dim=-1) if deepstack else merged
+
+    def forward_layer_streamed(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Run a CPU-resident picture reader through one bounded GPU component."""
+        if self.deepstack_visual_indexes:
+            raise ValueError(
+                "layer-stream does not support non-empty deepstack_visual_indexes"
+            )
+        if device.type != "cuda":
+            raise ValueError("layer-stream picture execution requires a CUDA device")
+        if self._active_stream_workspace is not None:
+            raise RuntimeError("layer-stream picture execution is already active")
+        source_devices = {tensor.device.type for tensor in self.state_dict().values()}
+        if source_devices != {"cpu"}:
+            raise RuntimeError(
+                "layer-stream picture weights must all be CPU-resident, got "
+                f"{sorted(source_devices)}"
+            )
+
+        workspace: dict[str, BaseOP] = {}
+        self._active_stream_workspace = workspace
+        try:
+            return self._forward_layer_streamed_impl(
+                pixel_values,
+                grid_thw,
+                device=device,
+                workspace=workspace,
+            )
+        finally:
+            # The implementation has its own frame so every patch/block/merger and hidden
+            # tensor is unreachable before empty_cache runs. Measurements on the live server
+            # showed that retaining this ~631 MiB allocator segment reduced subsequent text
+            # throughput below the acceptance threshold.
+            workspace.clear()
+            self._active_stream_workspace = None
+            torch.cuda.empty_cache()
+
+    def _forward_layer_streamed_impl(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        *,
+        device: torch.device,
+        workspace: dict[str, BaseOP],
+    ) -> torch.Tensor:
+        dtype = self.patch_embed.proj.weight.dtype
+        grid_cpu = grid_thw.to(device="cpu", dtype=torch.long)
+        segment_lengths = tuple(
+            int(h) * int(w)
+            for temporal, h, w in grid_cpu.tolist()
+            for _ in range(int(temporal))
+        )
+
+        with torch.device(device), torch_dtype(dtype):
+            patch = Qwen4VisionPatchEmbed(self._config)
+        workspace["patch"] = patch
+        _copy_component_state_(patch, self.patch_embed)
+        hidden = patch.forward(pixel_values.to(device=device, dtype=dtype))
+        workspace.clear()
+        del patch
+
+        pos, cos, sin = self._position_data(grid_cpu, hidden.dtype)
+        hidden = hidden + pos.to(device=device, dtype=hidden.dtype)
+        cos = cos.to(device=device, dtype=hidden.dtype)
+        sin = sin.to(device=device, dtype=hidden.dtype)
+
+        with torch.device(device), torch_dtype(dtype):
+            block_workspace = Qwen4VisionBlock(self._config)
+        workspace["block"] = block_workspace
+        for source_block in self.blocks.op_list:
+            _copy_component_state_(block_workspace, source_block)
+            hidden = block_workspace.forward(hidden, segment_lengths, cos, sin)
+        workspace.clear()
+        del block_workspace
+
+        with torch.device(device), torch_dtype(dtype):
+            merger = Qwen4VisionPatchMerger(self._config)
+        workspace["merger"] = merger
+        _copy_component_state_(merger, self.merger)
+        merged = merger.forward(hidden)
+        torch.cuda.synchronize(device)
+        return merged
 
 
 __all__ = ["Qwen4VisionModel"]

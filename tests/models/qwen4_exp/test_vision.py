@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from freetoken.models.qwen4_exp.config import Qwen4VisionConfig
-from freetoken.models.qwen4_exp.model import Qwen4ExpModel
-from freetoken.models.qwen4_exp.vision import Qwen4VisionModel
+from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM, Qwen4ExpModel
+from freetoken.models.qwen4_exp.vision import (
+    Qwen4VisionBlock,
+    Qwen4VisionModel,
+    Qwen4VisionPatchEmbed,
+    _copy_component_state_,
+)
+from freetoken.utils.torch_utils import torch_dtype
 
 
 def _config() -> Qwen4VisionConfig:
@@ -96,6 +104,191 @@ def test_qwen_picture_reader_derived_rope_survives_meta_construction():
         expected = reference.forward(pixels, grid)
         actual = model.forward(pixels, grid)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_stream_component_copy_is_in_place_and_validates_shape_and_dtype():
+    config = _config()
+    with torch.device("cpu"):
+        source = Qwen4VisionPatchEmbed(config)
+        target = Qwen4VisionPatchEmbed(config)
+    with torch.no_grad():
+        for tensor in source.state_dict().values():
+            tensor.fill_(3.25)
+    addresses = {key: value.data_ptr() for key, value in target.state_dict().items()}
+
+    _copy_component_state_(target, source)
+
+    assert {key: value.data_ptr() for key, value in target.state_dict().items()} == addresses
+    assert all(torch.all(value == 3.25) for value in target.state_dict().values())
+
+    target.proj.weight = target.proj.weight[:, :, :, :, :-1]
+    with pytest.raises(ValueError, match="shape"):
+        _copy_component_state_(target, source)
+
+    with torch.device("cpu"), torch_dtype(torch.float64):
+        wrong_dtype = Qwen4VisionPatchEmbed(config)
+    with pytest.raises(ValueError, match="dtype"):
+        _copy_component_state_(wrong_dtype, source)
+
+
+def _stream_config(
+    *, depth: int = 27, deepstack_visual_indexes: tuple[int, ...] = ()
+) -> Qwen4VisionConfig:
+    return Qwen4VisionConfig(
+        depth=depth,
+        hidden_size=8,
+        intermediate_size=16,
+        num_heads=2,
+        num_position_embeddings=16,
+        out_hidden_size=8,
+        patch_size=2,
+        spatial_merge_size=2,
+        temporal_patch_size=2,
+        in_channels=3,
+        hidden_act="gelu_pytorch_tanh",
+        deepstack_visual_indexes=deepstack_visual_indexes,
+    )
+
+
+def _cpu_stream_source(config: Qwen4VisionConfig) -> Qwen4VisionModel:
+    with torch.device("cpu"), torch_dtype(torch.bfloat16):
+        model = Qwen4VisionModel(config)
+    with torch.no_grad():
+        for tensor in model.state_dict().values():
+            tensor.uniform_(-0.02, 0.02)
+        for layer_id, block in enumerate(model.blocks.op_list):
+            for tensor in block.state_dict().values():
+                tensor.fill_((layer_id + 1) / 4096)
+    return model
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
+def test_layer_stream_matches_gpu_reference_uses_all_blocks_once_and_cleans_up(monkeypatch):
+    from freetoken.models.qwen4_exp import vision as vision_module
+
+    torch.manual_seed(29)
+    config = _stream_config()
+    source = _cpu_stream_source(config)
+    with torch.device("cuda"), torch_dtype(torch.bfloat16):
+        reference = Qwen4VisionModel(config)
+    reference.load_state_dict(
+        {key: value.to("cuda") for key, value in source.state_dict().items()}
+    )
+    grid = torch.tensor([[1, 4, 4]], dtype=torch.long)
+    pixels = torch.randn(16, 24, dtype=torch.bfloat16)
+    source_layers = {id(block): layer_id for layer_id, block in enumerate(source.blocks.op_list)}
+    copied_blocks = []
+    empty_cache_calls = []
+    original_copy = vision_module._copy_component_state_
+    original_empty_cache = torch.cuda.empty_cache
+
+    def record_copy(target, origin):
+        if id(origin) in source_layers:
+            copied_blocks.append((source_layers[id(origin)], id(target)))
+        return original_copy(target, origin)
+
+    def record_empty_cache():
+        empty_cache_calls.append(True)
+        original_empty_cache()
+
+    monkeypatch.setattr(vision_module, "_copy_component_state_", record_copy)
+    monkeypatch.setattr(torch.cuda, "empty_cache", record_empty_cache)
+    with torch.inference_mode():
+        expected = reference.forward(pixels.to("cuda"), grid.to("cuda"))
+        first = source.forward_layer_streamed(pixels, grid, device=torch.device("cuda"))
+        second = source.forward_layer_streamed(pixels, grid, device=torch.device("cuda"))
+
+    torch.testing.assert_close(first, expected, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(second, expected, rtol=2e-3, atol=2e-3)
+    assert [layer for layer, _target in copied_blocks] == list(range(27)) * 2
+    assert len({target for _layer, target in copied_blocks[:27]}) == 1
+    assert len({target for _layer, target in copied_blocks[27:]}) == 1
+    assert source._active_stream_workspace is None
+    assert len(empty_cache_calls) == 2
+    assert first.device.type == "cuda"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
+@pytest.mark.parametrize("failure_stage", ("patch", "block", "merger"))
+def test_layer_stream_failure_cleans_workspace_and_next_encode_succeeds(
+    monkeypatch, failure_stage
+):
+    from freetoken.models.qwen4_exp import vision as vision_module
+
+    config = _stream_config(depth=3)
+    source = _cpu_stream_source(config)
+    grid = torch.tensor([[1, 4, 4]], dtype=torch.long)
+    pixels = torch.randn(16, 24, dtype=torch.bfloat16)
+    original_copy = vision_module._copy_component_state_
+    original_block_forward = Qwen4VisionBlock.forward
+
+    if failure_stage == "block":
+        def fail_block(*_args, **_kwargs):
+            raise RuntimeError("injected block failure")
+
+        monkeypatch.setattr(Qwen4VisionBlock, "forward", fail_block)
+    else:
+        failed_source = source.patch_embed if failure_stage == "patch" else source.merger
+
+        def fail_component(target, origin):
+            if origin is failed_source:
+                raise RuntimeError(f"injected {failure_stage} failure")
+            return original_copy(target, origin)
+
+        monkeypatch.setattr(vision_module, "_copy_component_state_", fail_component)
+
+    with pytest.raises(RuntimeError, match=f"injected {failure_stage} failure"):
+        source.forward_layer_streamed(pixels, grid, device=torch.device("cuda"))
+    assert source._active_stream_workspace is None
+
+    monkeypatch.setattr(vision_module, "_copy_component_state_", original_copy)
+    monkeypatch.setattr(Qwen4VisionBlock, "forward", original_block_forward)
+    recovered = source.forward_layer_streamed(pixels, grid, device=torch.device("cuda"))
+    assert recovered.shape == (4, config.out_hidden_size)
+    assert source._active_stream_workspace is None
+
+
+def test_layer_stream_rejects_deepstack_before_allocating_workspace():
+    source = _cpu_stream_source(_stream_config(depth=2, deepstack_visual_indexes=(0,)))
+    with pytest.raises(ValueError, match="deepstack_visual_indexes"):
+        source.forward_layer_streamed(
+            torch.randn(16, 24),
+            torch.tensor([[1, 4, 4]], dtype=torch.long),
+            device=torch.device("cpu"),
+        )
+    assert source._active_stream_workspace is None
+
+
+def test_qwen_picture_encoding_owns_input_and_output_placement():
+    calls = []
+
+    class Visual:
+        def forward(self, pixels, grid):
+            calls.append(("gpu", pixels.device, grid.device))
+            return torch.ones(4, 8, device=pixels.device)
+
+        def forward_layer_streamed(self, pixels, grid, *, device):
+            calls.append(("layer-stream", pixels.device, grid.device, device))
+            return torch.ones(4, 8, device=device)
+
+    model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    model.visual = Visual()
+    model.model = SimpleNamespace(
+        embed_tokens=SimpleNamespace(weight=torch.empty(2, 8, device="cpu"))
+    )
+    pixels = torch.randn(16, 24)
+    grid = torch.tensor([[1, 4, 4]], dtype=torch.long)
+
+    model._vision_execution = "gpu"
+    gpu_result = model.encode_images(pixels, grid)
+    model._vision_execution = "layer-stream"
+    stream_result = model.encode_images(pixels, grid)
+
+    assert calls == [
+        ("gpu", torch.device("cpu"), torch.device("cpu")),
+        ("layer-stream", torch.device("cpu"), torch.device("cpu"), torch.device("cpu")),
+    ]
+    assert gpu_result.device.type == stream_result.device.type == "cpu"
 
 
 def _model_shell(image_token_id: int = 99) -> Qwen4ExpModel:

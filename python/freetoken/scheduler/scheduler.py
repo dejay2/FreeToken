@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -501,10 +502,19 @@ class Scheduler(SchedulerIOMixin):
                 grid,
                 int(vision_config.spatial_merge_size),
             )
-            features = model.encode_images(
-                pixels.to(self.device),
-                grid.to(self.device),
-            )
+            encode_started = time.perf_counter()
+            try:
+                # The model owns placement: layer-stream keeps these transport tensors on
+                # CPU, while the backward-compatible GPU path moves them inside encode_images.
+                features = model.encode_images(pixels, grid)
+                if features.device.type == "cuda":
+                    torch.cuda.synchronize(features.device)
+            finally:
+                logger.info_rank0(
+                    "Picture encoder request %d: %.3f seconds",
+                    msg.uid,
+                    time.perf_counter() - encode_started,
+                )
             image_token_id = self.config.model_config.image_token_id
             if image_token_id is None:
                 raise ValueError("model configuration has no picture token id")

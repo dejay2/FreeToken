@@ -230,9 +230,17 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     ) -> torch.Tensor:
         if not hasattr(self, "visual"):
             raise RuntimeError("Qwen4-Exp picture weights are not loaded")
+        language_device = self.model.embed_tokens.weight.device
         if self._vision_execution == "layer-stream":
-            raise RuntimeError("layer-stream picture execution is not initialized")
-        return self.visual.forward(pixel_values, image_grid_thw)
+            return self.visual.forward_layer_streamed(
+                pixel_values,
+                image_grid_thw,
+                device=language_device,
+            )
+        return self.visual.forward(
+            pixel_values.to(device=language_device),
+            image_grid_thw.to(device=language_device),
+        )
 
     def prepare_cuda_graph_capture(self, batch: Batch) -> None:
         if self._mmap_ple:

@@ -6,6 +6,7 @@ import torch
 
 from freetoken.core import SamplingParams
 from freetoken.message import ErrorReplyMsg, UserMsg
+from freetoken.scheduler import scheduler as scheduler_module
 from freetoken.scheduler.cache import CacheManager
 from freetoken.scheduler.prefill import PrefillManager
 from freetoken.scheduler.scheduler import Scheduler
@@ -26,18 +27,22 @@ def _message(uid: int = 1) -> UserMsg:
     )
 
 
-def _scheduler(feature_rows: int = 4):
+def _scheduler(feature_rows: int = 4, encode_error: Exception | None = None):
     calls = []
 
     class Model:
         def encode_images(self, pixels, grid):
-            calls.append((pixels.clone(), grid.clone()))
+            calls.append((pixels.device, grid.device, tuple(pixels.shape), grid.tolist()))
+            if encode_error is not None:
+                raise encode_error
             return torch.arange(feature_rows * 8, dtype=torch.float32).view(feature_rows, 8)
 
     added = []
     sent = []
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler.device = torch.device("cpu")
+    # A non-CPU engine device proves that the scheduler leaves transport tensors on
+    # the CPU and lets the model own placement.
+    scheduler.device = torch.device("meta")
     scheduler.prefill_budget = 8192
     scheduler.engine = SimpleNamespace(max_seq_len=262_144, model=Model())
     scheduler.config = SimpleNamespace(
@@ -57,10 +62,45 @@ def test_scheduler_encodes_picture_builds_mrope_and_releases_raw_tensors():
 
     Scheduler._process_one_msg(scheduler, message)
 
-    assert len(calls) == 1 and sent == [] and added == [message]
+    assert calls == [
+        (torch.device("cpu"), torch.device("cpu"), (16, 24), [[1, 4, 4]])
+    ]
+    assert sent == [] and added == [message]
     assert message.mm_embeds.shape == (4, 8)
     assert message.mrope_position_ids.shape == (3, 6)
     assert isinstance(message.mrope_position_delta, int)
+    assert message.mm_pixel_values is None
+    assert message.mm_image_grid_thw is None
+    assert message.mm_token_type_ids is None
+
+
+def test_scheduler_logs_encoder_time_without_changing_admission(monkeypatch):
+    scheduler, _calls, added, sent = _scheduler()
+    message = _message(uid=77)
+    logs = []
+    ticks = iter((100.0, 104.25))
+    monkeypatch.setattr(scheduler_module.time, "perf_counter", lambda: next(ticks))
+    monkeypatch.setattr(
+        scheduler_module.logger, "info_rank0", lambda *args: logs.append(args)
+    )
+
+    Scheduler._process_one_msg(scheduler, message)
+
+    assert added == [message] and sent == []
+    assert logs == [("Picture encoder request %d: %.3f seconds", 77, 4.25)]
+
+
+def test_scheduler_releases_raw_tensors_when_streamed_encoding_fails():
+    scheduler, calls, added, sent = _scheduler(
+        encode_error=RuntimeError("injected streamed failure")
+    )
+    message = _message(uid=78)
+
+    Scheduler._process_one_msg(scheduler, message)
+
+    assert len(calls) == 1 and added == []
+    assert len(sent) == 1 and isinstance(sent[0], ErrorReplyMsg)
+    assert "injected streamed failure" in sent[0].error
     assert message.mm_pixel_values is None
     assert message.mm_image_grid_thw is None
     assert message.mm_token_type_ids is None
