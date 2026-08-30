@@ -7,6 +7,8 @@ wire with its fields intact; these pin the ones carrying state a later consumer 
 
 from __future__ import annotations
 
+import torch
+
 from freetoken.message import (
     BaseBackendMsg,
     DetokenizeMsg,
@@ -18,6 +20,7 @@ from freetoken.message import (
     CacheRebuildResultMsg,
     PromptAdmittedMsg,
     TokenizeMsg,
+    UserMsg,
     UserReply,
 )
 from freetoken.core import SamplingParams
@@ -99,6 +102,42 @@ def test_detokenize_msg_carries_kv_usage_round_trip():
     assert (decoded.kv_used_pages, decoded.kv_total_pages, decoded.gpu_mem_bytes) == (10, 256, 1 << 30)
     assert (decoded.mamba_used_slots, decoded.mamba_total_slots) == (7, 64)
     assert (decoded.swa_used_tokens, decoded.swa_total_tokens) == (8448, 76800)
+
+
+def test_multidimensional_bfloat16_picture_tensors_survive_backend_wire():
+    pixels = torch.arange(24, dtype=torch.float32).reshape(3, 8).to(torch.bfloat16)
+    msg = UserMsg(
+        uid=9,
+        input_ids=torch.tensor([1, 2, 3], dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=4),
+        mm_pixel_values=pixels,
+        mm_image_grid_thw=torch.tensor([[1, 2, 4]], dtype=torch.int64),
+        mm_token_type_ids=torch.tensor([0, 1, 1], dtype=torch.int32),
+    )
+
+    out = BaseBackendMsg.decoder(msg.encoder())
+
+    assert isinstance(out, UserMsg)
+    assert out.mm_pixel_values.dtype == torch.bfloat16
+    assert out.mm_pixel_values.shape == (3, 8)
+    assert torch.equal(out.mm_pixel_values, pixels)
+    assert torch.equal(out.mm_image_grid_thw, msg.mm_image_grid_thw)
+    assert torch.equal(out.mm_token_type_ids, msg.mm_token_type_ids)
+
+
+def test_old_shape_less_one_dimensional_tensor_record_still_decodes():
+    original = torch.tensor([7, 8, 9], dtype=torch.int32)
+    wire = {
+        "__type__": "Tensor",
+        "buffer": original.numpy().tobytes(),
+        "dtype": "torch.int32",
+    }
+
+    from freetoken.message.utils import deserialize_type
+
+    out = deserialize_type({}, wire)
+    assert out.shape == (3,)
+    assert torch.equal(out, original)
 
 
 def test_client_dicts_with_the_wire_tag_key_survive_intact():

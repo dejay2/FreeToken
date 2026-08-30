@@ -71,6 +71,9 @@ ft = "freetoken.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=6.0"]
+# Still-picture preprocessing. Qwen picture serving remains opt-in at runtime through
+# FREETOKEN_LOAD_VISION=1; these packages are not needed by text-only serving.
+vision = ["pillow>=11,<13", "torchvision>=0.26,<0.27"]
 # Native fused-kernel packages. Without them the runtime falls back to the pure-Triton
 # kernels in freetoken.kernel.triton (and the 'triton' attention backend). Install
 # `freetoken[accel]` for the full native fast path.
@@ -91,6 +94,7 @@ accel = ["freetoken[fi,sgl]"]
 # which would otherwise shadow PyPI under uv's first-index strategy).
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
 sglang-kernel = { index = "sglang-cu130" }
 
 [[tool.uv.index]]

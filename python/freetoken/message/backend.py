@@ -34,9 +34,14 @@ class UserMsg(BaseBackendMsg):
     uid: int
     input_ids: torch.Tensor  # CPU 1D int32 tensor
     sampling_params: SamplingParams
-    # Optional precomputed multimodal soft-token embeddings (GPU tensor). Only used by
-    # the in-process offline path; remains None for the (serialized) online path.
+    # Optional precomputed multimodal soft-token embeddings (GPU tensor). The offline
+    # path can provide these directly; online requests carry the processor outputs below.
     mm_embeds: torch.Tensor | None = None
+    # CPU picture tensors prepared by the tokenizer worker. Pixel rows travel as BF16
+    # because Qwen's first picture projection immediately casts to its BF16 weights.
+    mm_pixel_values: torch.Tensor | None = None
+    mm_image_grid_thw: torch.Tensor | None = None
+    mm_token_type_ids: torch.Tensor | None = None
 
 
 @dataclass

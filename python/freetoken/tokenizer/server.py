@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import base64
+import io
 import multiprocessing as mp
+import re
+from pathlib import Path
 from typing import Any, List
+from urllib.error import HTTPError, URLError
+from urllib.parse import unquote_to_bytes, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener, url2pathname
 
 import torch
 from freetoken.message import (
@@ -82,9 +89,15 @@ def _send_generation_replies(
 
 def _tokenize_requests(
     tokenize_manager: Any,
+    multimodal_processor: Any,
     messages: List[TokenizeMsg],
     logger: Any,
-) -> tuple[List[TokenizeMsg], List[torch.Tensor], List[UserReply]]:
+) -> tuple[
+    List[TokenizeMsg],
+    List[torch.Tensor],
+    List[dict[str, torch.Tensor] | None],
+    List[UserReply],
+]:
     """Tokenize independently, returning backend work plus terminal frontend errors.
 
     Successful tokenization deliberately emits no prompt-token reply: accounting starts
@@ -92,10 +105,11 @@ def _tokenize_requests(
     """
     ok_msgs: List[TokenizeMsg] = []
     ok_tensors: List[torch.Tensor] = []
+    ok_multimodal: List[dict[str, torch.Tensor] | None] = []
     errors: List[UserReply] = []
     for msg in messages:
         try:
-            tokens = tokenize_manager.tokenize([msg])[0]
+            tokens, multimodal = multimodal_processor.encode(msg, tokenize_manager)
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
             logger.warning(f"tokenization failed for request {msg.uid}: {exc!r}")
             errors.append(
@@ -121,7 +135,204 @@ def _tokenize_requests(
             continue
         ok_msgs.append(msg)
         ok_tensors.append(tokens)
-    return ok_msgs, ok_tensors, errors
+        ok_multimodal.append(multimodal)
+    return ok_msgs, ok_tensors, ok_multimodal, errors
+
+
+_MAX_IMAGE_BYTES = 64 * 1024 * 1024
+_IMAGE_TIMEOUT_SECONDS = 30
+_MAX_IMAGE_REDIRECTS = 5
+_WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+class _BoundedRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, max_redirects: int):
+        super().__init__()
+        self.max_redirects = max_redirects
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirects = int(getattr(req, "_freetoken_redirects", 0)) + 1
+        if redirects > self.max_redirects:
+            raise HTTPError(
+                req.full_url,
+                code,
+                f"image redirect limit exceeded ({self.max_redirects})",
+                headers,
+                fp,
+            )
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            redirected._freetoken_redirects = redirects
+        return redirected
+
+
+def _image_source(part: dict[str, Any]) -> str:
+    value = part.get("image_url", part.get("image"))
+    if isinstance(value, dict):
+        value = value.get("url")
+    if not isinstance(value, str) or not value:
+        raise ValueError("picture content part needs a non-empty source")
+    return value
+
+
+def _message_image_sources(text: str | List[dict[str, Any]]) -> list[str]:
+    if not isinstance(text, list):
+        return []
+    sources: list[str] = []
+    for message in text:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in {"image", "image_url"} or "image" in part or "image_url" in part:
+                sources.append(_image_source(part))
+    return sources
+
+
+def _read_limited(stream, *, expected_size: int | None = None) -> bytes:
+    if expected_size is not None and expected_size > _MAX_IMAGE_BYTES:
+        raise ValueError("picture exceeds the 64 MiB input limit")
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = stream.read(min(1 << 20, _MAX_IMAGE_BYTES + 1 - total))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > _MAX_IMAGE_BYTES:
+            raise ValueError("picture exceeds the 64 MiB input limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _file_url_path(source: str) -> Path:
+    parsed = urlsplit(source)
+    path = url2pathname(parsed.path)
+    if parsed.netloc and parsed.netloc.lower() != "localhost":
+        path = f"//{parsed.netloc}{path}"
+    return Path(path)
+
+
+def _read_image_source(source: str) -> bytes:
+    """Read one approved local-only picture source under strict byte/network bounds."""
+    if not source:
+        raise ValueError("picture source must not be empty")
+    if source.startswith("data:"):
+        header, separator, payload = source.partition(",")
+        if not separator:
+            raise ValueError("invalid picture data URL")
+        try:
+            data = (
+                base64.b64decode(payload, validate=True)
+                if ";base64" in header.lower()
+                else unquote_to_bytes(payload)
+            )
+        except Exception as exc:
+            raise ValueError("invalid picture data URL") from exc
+        if len(data) > _MAX_IMAGE_BYTES:
+            raise ValueError("picture exceeds the 64 MiB input limit")
+        return data
+
+    parsed = urlsplit(source)
+    if parsed.scheme.lower() in {"http", "https"}:
+        request = Request(source, headers={"User-Agent": "FreeToken/vision"})
+        opener = build_opener(_BoundedRedirectHandler(_MAX_IMAGE_REDIRECTS))
+        try:
+            with opener.open(request, timeout=_IMAGE_TIMEOUT_SECONDS) as response:  # noqa: S310
+                length = response.headers.get("Content-Length")
+                expected = int(length) if length and length.isdigit() else None
+                return _read_limited(response, expected_size=expected)
+        except HTTPError as exc:
+            if "redirect limit" in str(exc):
+                raise ValueError(str(exc)) from exc
+            raise ValueError(f"could not download picture: HTTP {exc.code}") from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise ValueError(f"could not download picture: {exc}") from exc
+
+    if parsed.scheme.lower() == "file":
+        path = _file_url_path(source)
+    elif _WINDOWS_DRIVE_PATH.match(source) or source.startswith(("\\\\", "//")):
+        path = Path(source)
+    elif not parsed.scheme:
+        path = Path(source)
+    else:
+        raise ValueError("picture source must use data, http, https, file, or a local path")
+
+    try:
+        size = path.stat().st_size
+        if size > _MAX_IMAGE_BYTES:
+            raise ValueError("picture exceeds the 64 MiB input limit")
+        with path.open("rb") as stream:
+            return _read_limited(stream, expected_size=size)
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"could not read picture file {path}: {exc}") from exc
+
+
+def _load_rgb_image(data: bytes):
+    from PIL import Image, UnidentifiedImageError
+
+    try:
+        with Image.open(io.BytesIO(data)) as opened:
+            opened.seek(0)
+            image = opened.convert("RGB")
+            image.load()
+            return image
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ValueError(f"invalid picture: {exc}") from exc
+
+
+class _MultimodalProcessor:
+    def __init__(self, model_path: str):
+        self.model_path = model_path
+        self.processor = None
+
+    def encode(
+        self, msg: TokenizeMsg, tokenize_manager: Any
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+        sources = _message_image_sources(msg.text)
+        if not sources:
+            return tokenize_manager.tokenize([msg])[0], None
+
+        if self.processor is None:
+            from transformers import AutoProcessor
+
+            self.processor = AutoProcessor.from_pretrained(self.model_path)
+        prompt = tokenize_manager.render_prompt(msg)
+        images = []
+        try:
+            images = [_load_rgb_image(_read_image_source(source)) for source in sources]
+            encoded = self.processor(text=[prompt], images=images, return_tensors="pt")
+        finally:
+            for image in images:
+                image.close()
+
+        required = {"input_ids", "pixel_values", "image_grid_thw", "mm_token_type_ids"}
+        missing = sorted(required.difference(encoded))
+        if missing:
+            raise ValueError(f"model picture processor did not return: {', '.join(missing)}")
+        input_ids = encoded["input_ids"]
+        pixels = encoded["pixel_values"]
+        grid = encoded["image_grid_thw"]
+        token_types = encoded["mm_token_type_ids"]
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError(f"picture processor input_ids must be [1,tokens], got {input_ids.shape}")
+        if pixels.ndim != 2:
+            raise ValueError(f"picture processor pixel_values must be [patches,width], got {pixels.shape}")
+        if grid.ndim != 2 or grid.shape[1] != 3:
+            raise ValueError(f"picture processor image_grid_thw must be [pictures,3], got {grid.shape}")
+        if token_types.ndim == 2 and token_types.shape[0] == 1:
+            token_types = token_types[0]
+        if token_types.ndim != 1 or token_types.numel() != input_ids.shape[1]:
+            raise ValueError("picture processor token markers must match input_ids")
+        return input_ids[0].to(device="cpu", dtype=torch.int32), {
+            "pixel_values": pixels.to(device="cpu", dtype=torch.bfloat16),
+            "image_grid_thw": grid.to(device="cpu", dtype=torch.int64),
+            "mm_token_type_ids": token_types.to(device="cpu", dtype=torch.int32),
+        }
 
 
 @torch.inference_mode()
@@ -148,6 +359,7 @@ def tokenize_worker(
     from .tokenize import TokenizeManager
 
     tokenize_manager = TokenizeManager(tokenizer)
+    multimodal_processor = _MultimodalProcessor(tokenizer_path)
     detokenize_manager = DetokenizeManager(
         tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
     )
@@ -245,19 +457,31 @@ def tokenize_worker(
                 # Tokenize per-message so a single un-renderable request (e.g. a chat template
                 # that rejects the message layout) becomes a terminal error reply for THAT uid
                 # instead of an uncaught exception that kills the worker and bricks the server.
-                ok_msgs, ok_tensors, errors = _tokenize_requests(
-                    tokenize_manager, tokenize_msg, logger
+                ok_msgs, ok_tensors, ok_multimodal, errors = _tokenize_requests(
+                    tokenize_manager, multimodal_processor, tokenize_msg, logger
                 )
                 if errors:
                     send_frontend.put(
                         errors[0] if len(errors) == 1 else BatchFrontendMsg(data=errors)
                     )
                 if ok_msgs:
-                    backend = [
-                        UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params)
-                        for msg, t in zip(ok_msgs, ok_tensors, strict=True)
-                    ]
-                    send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
+                    backend = []
+                    for msg, tokens, mm in zip(
+                        ok_msgs, ok_tensors, ok_multimodal, strict=True
+                    ):
+                        backend.append(
+                            UserMsg(
+                                uid=msg.uid,
+                                input_ids=tokens,
+                                sampling_params=msg.sampling_params,
+                                mm_pixel_values=(mm or {}).get("pixel_values"),
+                                mm_image_grid_thw=(mm or {}).get("image_grid_thw"),
+                                mm_token_type_ids=(mm or {}).get("mm_token_type_ids"),
+                            )
+                        )
+                    send_backend.put(
+                        backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend)
+                    )
             if len(abort_msg) > 0:
                 batch_output = BatchBackendMsg(
                     data=[AbortBackendMsg(uid=msg.uid) for msg in abort_msg]

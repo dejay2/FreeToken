@@ -13,7 +13,13 @@ param(
     [ValidateRange(1, 16)]
     [int]$MaxRunningRequests = 1,
 
-    [string]$DesktopPython = (Join-Path $env:LOCALAPPDATA 'FreeToken\venv\Scripts\python.exe')
+    [string]$DesktopPython = (Join-Path $env:LOCALAPPDATA 'FreeToken\venv\Scripts\python.exe'),
+
+    [string]$VisionPackagesPath,
+
+    [switch]$EnableVision,
+
+    [switch]$EnableCacheReport
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,6 +27,9 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $sourceDir = Join-Path $repoRoot 'python'
 $shimDir = Join-Path $PSScriptRoot 'windows-ple-mmap'
+if (-not $VisionPackagesPath) {
+    $VisionPackagesPath = Join-Path $repoRoot '.local\vision-packages'
+}
 
 if (-not (Test-Path -LiteralPath $ModelPath -PathType Container)) {
     throw "Model directory does not exist: $ModelPath"
@@ -52,13 +61,40 @@ if (-not $cudaRoot -or -not (Test-Path -LiteralPath (Join-Path $cudaRoot 'bin\nv
 $resolvedModel = (Resolve-Path -LiteralPath $ModelPath).Path
 $resolvedPython = (Resolve-Path -LiteralPath $DesktopPython).Path
 $env:CUDA_PATH = (Resolve-Path -LiteralPath $cudaRoot).Path
-$env:PYTHONPATH = "$shimDir;$sourceDir" + $(if ($env:PYTHONPATH) { ";$env:PYTHONPATH" } else { '' })
+
+$pathParts = @($shimDir)
+if ($EnableVision) {
+    if (-not (Test-Path -LiteralPath $VisionPackagesPath -PathType Container)) {
+        throw "Local picture packages do not exist: $VisionPackagesPath. Run install-qwen38-vision-deps-windows.ps1 first."
+    }
+    $resolvedVisionPackages = (Resolve-Path -LiteralPath $VisionPackagesPath).Path
+    $priorPythonPath = $env:PYTHONPATH
+    try {
+        $env:PYTHONPATH = $resolvedVisionPackages + $(if ($priorPythonPath) { ";$priorPythonPath" } else { '' })
+        & $resolvedPython -c "import PIL, torch, torchvision; assert torch.__version__.startswith('2.11.'); assert torch.version.cuda and torch.version.cuda.startswith('13.'); assert torchvision.__version__.startswith('0.26.'); assert torchvision.extension._has_ops()"
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Local picture packages are missing or incompatible with Desktop Torch.'
+        }
+    }
+    finally {
+        $env:PYTHONPATH = $priorPythonPath
+    }
+    $pathParts += $resolvedVisionPackages
+    $env:FREETOKEN_LOAD_VISION = '1'
+}
+else {
+    # Make the fallback deterministic even if the parent shell previously ran picture mode.
+    $env:FREETOKEN_LOAD_VISION = '0'
+}
+$pathParts += $sourceDir
+$env:PYTHONPATH = ($pathParts -join ';') + $(if ($env:PYTHONPATH) { ";$env:PYTHONPATH" } else { '' })
 
 Write-Host "Starting the unofficial Desktop-assisted Windows server"
 Write-Host "  Model:  $resolvedModel"
 Write-Host "  API:    http://127.0.0.1:$Port/v1"
 Write-Host "  Context tokens: $ContextTokens"
 Write-Host "  Active requests: $MaxRunningRequests"
+Write-Host "  Picture input: $($EnableVision.IsPresent)"
 Write-Host 'FreeToken Desktop supplies the Windows runtime but does not need to be open.'
 
 $serveArgs = @(
@@ -73,6 +109,9 @@ $serveArgs = @(
     '--kv-reserve-tokens', "$ContextTokens",
     '--expert-load', 'serial'
 )
+if ($EnableCacheReport) {
+    $serveArgs += '--enable-cache-report'
+}
 
 & $resolvedPython @serveArgs
 exit $LASTEXITCODE

@@ -161,6 +161,46 @@ def test_chat_request_reasoning_replay_field_aliases():
         assert asst["thinking"] == "prior thought", field
 
 
+def test_chat_picture_parts_stay_structured_for_the_tokenizer():
+    source = "data:image/png;base64,AA=="
+    req = ChatCompletionRequest(
+        model="client-model",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": source}},
+                    {"type": "text", "text": "describe"},
+                ],
+            }
+        ],
+    )
+
+    content = chat_request_to_genspec(req, {}).messages[0]["content"]
+
+    assert content == [
+        {"type": "image_url", "image_url": {"url": source}},
+        {"type": "text", "text": "describe"},
+    ]
+
+
+def test_chat_text_part_lists_still_flatten_to_a_string():
+    req = ChatCompletionRequest(
+        model="client-model",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello "},
+                    {"type": "text", "text": "world"},
+                ],
+            }
+        ],
+    )
+
+    assert chat_request_to_genspec(req, {}).messages[0]["content"] == "hello world"
+
+
 def test_chat_reasoning_effort_enables_thinking():
     spec = chat_request_to_genspec(chat_request(reasoning_effort="high"), {})
     assert spec.chat_template_kwargs == {
