@@ -7,11 +7,14 @@ page at consecutive slots, which makes that division well-defined: the compresse
 1/ratio shadow of the K/V pages and follow page sharing and eviction for free -- no
 allocator, no free, no clear (SGLang qsa_kv_pool / vLLM compressed-region precedent).
 
-Two tiers ride alongside the shadow slab and are NOT per-token:
+Three tiers ride alongside the shadow slab and are NOT per-token:
 - ``pending_ring``: the last ``ring_capacity`` pre-RoPE index keys of each running request (sized by ``ring_capacity_for``), indexed by ``Req.table_idx``. A group that straddles two forwards (chunked prefill, and
   every decode step) reads its already-consumed members from here. Never cleared: a new
   tenant of a table_idx starts at a group boundary (cached_len is 0 or a page multiple), so
   its first closing group takes every member from its own forward.
+- ``pending_position_ring``: the matching three-axis int64 picture coordinates, private to
+  each sparse layer so an early QSA layer cannot overwrite coordinates before a later layer
+  consumes its straddling group.
 - scratch rows at ``cmp_scratch_base``: one row per request slot, the write target for rows
   whose group does not close in this forward, so the compress kernel scatters unconditionally
   with no negative index and no cross-row conflict (DSV4 precedent).
@@ -128,6 +131,14 @@ class QSAKVCache(MHAKVCache):
             dtype=self._index_dtype,
             device=self._device,
         )
+        self._pending_position_ring = torch.zeros(
+            self._num_req_slots,
+            self._num_index_layers,
+            self._ring_capacity,
+            3,
+            dtype=torch.int64,
+            device=self._device,
+        )
 
     def rebuild(self, num_pages: int) -> None:
         # Free the index tiers BEFORE the K/V realloc (super().rebuild frees + syncs +
@@ -137,6 +148,7 @@ class QSAKVCache(MHAKVCache):
         # cannot drop a live request's pending members.
         self._cmp_k_buffer = None
         self._pending_ring = None
+        self._pending_position_ring = None
         super().rebuild(num_pages)
         self._zero_kv_slabs()
         try:
@@ -162,7 +174,15 @@ class QSAKVCache(MHAKVCache):
             if spec.attn_type is AttnType.QSA:
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
-                fixed += num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio) + 1)
+                ring_capacity = cls.ring_capacity_for(spec.index_ratio)
+                fixed += num_req_slots * row * (ring_capacity + 1)
+                fixed += (
+                    num_req_slots
+                    * spec.num_index_layers
+                    * ring_capacity
+                    * 3
+                    * torch.int64.itemsize
+                )
         return per_token * config.page_size, fixed, config.page_size, 0
 
     def unit_bytes(self) -> tuple[int, int]:
@@ -185,6 +205,10 @@ class QSAKVCache(MHAKVCache):
     def pending_ring(self, slot: int) -> torch.Tensor:
         """One sparse layer's pending ring: ``[num_req_slots, ring_capacity, index_head_dim]``."""
         return self._pending_ring[:, slot]
+
+    def pending_position_ring(self, slot: int) -> torch.Tensor:
+        """One sparse layer's picture positions: ``[num_req_slots, ring_capacity, 3]``."""
+        return self._pending_position_ring[:, slot]
 
     @property
     def cmp_scratch_base(self) -> int:

@@ -55,6 +55,41 @@ _LOGITS_WORKSPACE_BYTES = 128 << 20
 TORCH_TOPK_ENV = "FREETOKEN_QSA_TORCH_TOPK"
 
 
+def _first_mrope_positions(
+    md: "QSASparseMetadata",
+    position_ring: torch.Tensor,
+    *,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Return each row's closing-group first Qwen coordinate as ``[3, tokens]``.
+
+    A group can begin in the per-layer pending ring and finish in this forward. Logical
+    scalar positions decide membership; only the rotary coordinates are gathered here.
+    """
+    logical = md.positions.to(torch.int64)
+    rows = torch.arange(logical.numel(), dtype=torch.int64, device=logical.device)
+    request = md.token_to_req.to(torch.int64)
+    starts = md.cu_seqlens.to(torch.int64).index_select(0, request)
+    chunk_start = logical - (rows - starts)
+    first_logical = logical - compress_ratio + 1
+    use_current = first_logical >= chunk_start
+
+    raw_row = starts + first_logical - chunk_start
+    safe_raw = raw_row.clamp(0, max(logical.numel() - 1, 0))
+    current = md.rope_positions.index_select(1, safe_raw).transpose(0, 1)
+
+    slots = md.ring_slots.to(torch.int64).index_select(0, request)
+    safe_slots = slots.clamp(0, max(position_ring.shape[0] - 1, 0))
+    ring_row = first_logical.remainder(position_ring.shape[1])
+    previous = position_ring[safe_slots, ring_row]
+
+    valid = (first_logical >= 0) & (slots >= 0) & (slots < position_ring.shape[0])
+    selected = torch.where(use_current.unsqueeze(1), current, previous)
+    return torch.where(valid.unsqueeze(1), selected, torch.zeros_like(selected)).transpose(
+        0, 1
+    ).contiguous()
+
+
 def _resolve_block_topk() -> Callable | None:
     """The in-repo Triton block top-k, or None to fall back on torch.topk."""
     if os.getenv(TORCH_TOPK_ENV, "0") == "1":
@@ -88,6 +123,7 @@ class QSASparseMetadata(BaseAttnMetadata):
     cmp_rows:         torch.Tensor | None = None  # [T] int32, compressed slab destination
     ring_rows:        torch.Tensor | None = None  # [T] int32, flat ring row or -1
     positions:        torch.Tensor | None = None  # [T] int32, logical query positions
+    rope_positions:   torch.Tensor | None = None  # [3, T] int64, picture rotary coordinates
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -128,6 +164,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         group = self._qsa_group(config)
         self._idx_slot = {lid: i for i, lid in enumerate(group.layer_ids)}
         self.rotary_config = group.rotary_config
+        self.mrope_section = tuple(args.mrope_section)
         self._index_cos_sin: torch.Tensor | None = None
 
         self._block_topk_kernel = _resolve_block_topk()
@@ -296,6 +333,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
         (it is layer-invariant). Pure device arithmetic: no host sync, graph-capturable."""
         md.positions = batch.positions
+        md.rope_positions = getattr(batch, "rope_positions", None)
         out_loc = batch.out_loc.to(torch.int64)
         positions = batch.positions.to(torch.int64)
         rows = torch.arange(out_loc.numel(), device=self.device)
@@ -338,18 +376,32 @@ class QSASparseAttnBackend(BaseAttnBackend):
             pooled,
             first,
         )
+        rope_positions = first
+        position_ring = None
+        if md.rope_positions is not None:
+            position_ring = self.kvcache.pending_position_ring(slot)
+            rope_positions = _first_mrope_positions(
+                md,
+                position_ring,
+                compress_ratio=self.ratio,
+            )
         qsa_index_norm_rope(
             pooled,
-            first,
+            rope_positions,
             self._index_rope_cache(),
             index.k_norm_weight,
             index.eps,
             self.kvcache.cmp_k_cache(slot),
             dest_rows=md.cmp_rows,
+            mrope_section=self.mrope_section if md.rope_positions is not None else None,
         )
-        # After the compression read: the ring rows this forward overwrites are exactly the
-        # ones a straddling group just consumed.
+        # After the compression read: each layer updates only its own key and coordinate rings,
+        # so a later QSA layer still sees the prior forward's straddling-group members.
         qsa_store_rows(ring, md.ring_rows, index.k)
+        if position_ring is not None:
+            position_rows = self._scratch("ring_positions", rows, 3, dtype=torch.int64)
+            position_rows.copy_(md.rope_positions.transpose(0, 1))
+            qsa_store_rows(position_ring, md.ring_rows, position_rows)
 
     def _select(self, index, md: QSASparseMetadata, slot: int) -> torch.Tensor:
         """Score complete visible blocks, take the top-k, expand them to token indices."""
@@ -361,17 +413,19 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
         rows = index.q.shape[0]
         positions = md.positions
+        index_positions = md.rope_positions if md.rope_positions is not None else positions
         q_index = self._scratch(
             "q_index", rows, self.index_heads, self.index_head_dim, dtype=self.dtype
         )
         qsa_index_norm_rope(
             index.q.view(-1, self.index_head_dim),
-            positions,
+            index_positions,
             self._index_rope_cache(),
             index.q_norm_weight,
             index.eps,
             q_index.view(-1, self.index_head_dim),
             heads=self.index_heads,
+            mrope_section=self.mrope_section if md.rope_positions is not None else None,
         )
         cmp_pages = self._cmp_pages(slot)
         columns = md.block_table.shape[1] * self.cmp_page_size
@@ -479,6 +533,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             "pooled": empty(max_bs, self.index_head_dim, dtype=self.dtype),
             "first_pos": empty(max_bs, dtype=torch.int32),
             "q_index": empty(max_bs, self.index_heads, self.index_head_dim, dtype=self.dtype),
+            "ring_positions": empty(max_bs, 3, dtype=torch.int64),
         }
         if topk_scratch:
             self._graph["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)

@@ -92,6 +92,11 @@ def test_slab_ring_and_scratch_shapes():
     assert pool.cmp_k_cache(0).shape == (64 + 4, 32)
     assert pool.cmp_k_cache(3).shape == (64 + 4, 32)
     assert pool.pending_ring(0).shape == (4, QSAKVCache.ring_capacity_for(4), 32)
+    assert pool.pending_position_ring(0).shape == (
+        4,
+        QSAKVCache.ring_capacity_for(4),
+        3,
+    )
     assert pool.cmp_k_cache(0).abs().sum().item() == 0.0
     assert pool.k_cache(1).shape == (4, 64, 2, 64)
 
@@ -105,11 +110,22 @@ def test_kv_slabs_cover_sparse_layers_only():
         pool.k_cache(0)
 
 
+def test_picture_position_rings_are_private_to_each_qsa_layer():
+    pool = _pool()
+    position = torch.tensor([7, 11, 13], dtype=torch.int64)
+    pool.pending_position_ring(0)[2, 3].copy_(position)
+    assert torch.equal(pool.pending_position_ring(0)[2, 3], position)
+    assert pool.pending_position_ring(1)[2, 3].count_nonzero().item() == 0
+    pool.pending_position_ring(0)[2, 3].copy_(position + 20)
+    assert torch.equal(pool.pending_position_ring(0)[2, 3], position + 20)
+
+
 def test_ring_capacity_and_ratio_are_parameters():
     pool = _pool(num_pages=8, index_ratio=2, num_req_slots=3, ring_capacity=6)
     assert pool.index_ratio == 2 and pool.ring_capacity == 6
     assert pool.cmp_scratch_base == 8 * 64 // 2
     assert pool.pending_ring(0).shape == (3, 6, 32)
+    assert pool.pending_position_ring(0).shape == (3, 6, 3)
 
 
 def test_ring_capacity_formula_and_floor():
@@ -155,6 +171,7 @@ def test_rebuild_resizes_every_tier_and_keeps_identity():
     assert pool.cmp_scratch_base == 16 * 64 // 4
     assert pool.cmp_k_cache(0).shape == (16 * 64 // 4 + 4, 32)
     assert pool.pending_ring(3).shape == (4, pool.ring_capacity, 32)
+    assert pool.pending_position_ring(3).shape == (4, pool.ring_capacity, 3)
     assert pool._kv_buffer.shape[1] == 4  # sparse-layer slabs survive the resize
     pool.k_cache(7)
 
@@ -182,7 +199,9 @@ def test_kv_cost_prices_ring_and_scratch_as_fixed():
     assert per_page == spec_kv_bytes_per_token(spec, config) * 64
     assert page_tokens == 64 and min_reserve == 0
     row = 32 * 4 * 2
-    assert fixed == 4 * row * (QSAKVCache.ring_capacity_for(4) + 1)
+    ring_capacity = QSAKVCache.ring_capacity_for(4)
+    picture_positions = 4 * 4 * ring_capacity * 3 * torch.int64.itemsize
+    assert fixed == 4 * row * (ring_capacity + 1) + picture_positions
 
 
 def test_unit_bytes_matches_the_cost_model():

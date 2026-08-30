@@ -114,6 +114,8 @@ def _index_norm_rope_kernel(
     stride_x_row,
     stride_out_row,
     stride_cos_sin_row,
+    stride_positions_axis,
+    stride_positions_token,
     num_rows,
     eps,
     HEADS: tl.constexpr,
@@ -122,6 +124,9 @@ def _index_norm_rope_kernel(
     BLOCK_R: tl.constexpr,
     BLOCK_D: tl.constexpr,
     HAS_DEST_ROWS: tl.constexpr,
+    HAS_MROPE: tl.constexpr,
+    H_SPAN: tl.constexpr,
+    W_SPAN: tl.constexpr,
 ) -> None:
     rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     live = rows < num_rows
@@ -146,8 +151,25 @@ def _index_norm_rope_kernel(
     y = x * rrms[:, None] * weight[None, :]
     y_partner = x_partner * rrms[:, None] * weight_partner[None, :]
 
-    position = tl.load(positions_ptr + rows // HEADS, mask=live, other=0).to(tl.int64)
-    cos_base = cos_sin_ptr + position[:, None] * stride_cos_sin_row
+    token = rows // HEADS
+    if HAS_MROPE:
+        axis = tl.zeros((BLOCK_D,), dtype=tl.int32)
+        axis = tl.where((pair % 3 == 1) & (pair < H_SPAN), 1, axis)
+        axis = tl.where((pair % 3 == 2) & (pair < W_SPAN), 2, axis)
+        position = tl.load(
+            positions_ptr
+            + axis[None, :] * stride_positions_axis
+            + token[:, None] * stride_positions_token,
+            mask=live[:, None] & in_dim[None, :],
+            other=0,
+        ).to(tl.int64)
+    else:
+        position = tl.load(
+            positions_ptr + token * stride_positions_token,
+            mask=live,
+            other=0,
+        ).to(tl.int64)[:, None]
+    cos_base = cos_sin_ptr + position * stride_cos_sin_row
     rotary_mask = live[:, None] & in_rotary[None, :]
     cos = tl.load(cos_base + pair[None, :], mask=rotary_mask, other=1.0)
     sin = tl.load(cos_base + ROTARY_HALF + pair[None, :], mask=rotary_mask, other=0.0)
@@ -259,6 +281,7 @@ def qsa_index_norm_rope(
     out: torch.Tensor,
     heads: int = 1,
     dest_rows: torch.Tensor | None = None,
+    mrope_section: tuple[int, int, int] | None = None,
 ) -> torch.Tensor:
     """Zero-centered RMSNorm then partial NeoX rope on [rows, head_dim] indexer rows."""
 
@@ -270,6 +293,25 @@ def qsa_index_norm_rope(
         raise ValueError("QSA indexer norm+rope needs unit-stride rows")
     if rows % heads:
         raise ValueError("QSA indexer rows must be a whole number of head groups")
+    has_mrope = positions.ndim == 2
+    if has_mrope:
+        if positions.shape != (3, rows // heads):
+            raise ValueError(
+                "QSA MRoPE positions must be [3, token_rows], got "
+                f"{tuple(positions.shape)} for {rows // heads} token rows"
+            )
+        if mrope_section is None or sum(mrope_section) != rotary_dim // 2:
+            raise ValueError(
+                f"QSA MRoPE sections must sum to {rotary_dim // 2}, got {mrope_section}"
+            )
+        stride_positions_axis, stride_positions_token = positions.stride()
+    elif positions.ndim == 1:
+        if positions.numel() != rows // heads:
+            raise ValueError("QSA scalar position count must match token rows")
+        stride_positions_axis = 0
+        stride_positions_token = positions.stride(0)
+    else:
+        raise ValueError("QSA positions must be [token_rows] or [3, token_rows]")
     if not rows:
         return out
     block_r = 8 if head_dim >= 128 else 16
@@ -283,6 +325,8 @@ def qsa_index_norm_rope(
         x.stride(0),
         out.stride(0),
         cos_sin_cache.stride(0),
+        stride_positions_axis,
+        stride_positions_token,
         rows,
         eps,
         HEADS=heads,
@@ -291,6 +335,9 @@ def qsa_index_norm_rope(
         BLOCK_R=block_r,
         BLOCK_D=triton.next_power_of_2(head_dim),
         HAS_DEST_ROWS=dest_rows is not None,
+        HAS_MROPE=has_mrope,
+        H_SPAN=0 if mrope_section is None else int(mrope_section[1]) * 3,
+        W_SPAN=0 if mrope_section is None else int(mrope_section[2]) * 3,
         num_warps=4,
     )
     return out
