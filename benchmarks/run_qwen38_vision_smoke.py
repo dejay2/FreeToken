@@ -316,6 +316,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         evidence["two_picture"] = {"answer": answer, "usage": body.get("usage")}
         print("PASS two-picture order")
 
+        if not args.skip_long_picture:
+            long_picture_prompt = (
+                "Read every filler word, then inspect the picture and reply with only its "
+                "large numeric code. "
+                + " token" * 32_768
+                + "\nNow inspect the picture and reply with only its large numeric code."
+            )
+            long_picture = _assert_picture(
+                chat_url,
+                args.model,
+                first.as_posix(),
+                "424242",
+                prompt=long_picture_prompt,
+            )
+            assert (long_picture.get("usage") or {}).get("prompt_tokens", 0) > 32_768, (
+                long_picture
+            )
+            evidence["long_picture"] = long_picture
+            print("PASS 32K picture-bearing chunking")
+
         evidence["errors"]["malformed_base64"] = _assert_error(
             chat_url, args.model, "data:image/png;base64,%%%", "invalid picture data url"
         )
@@ -417,6 +437,7 @@ def main() -> int:
         / "qwen38-vision-acceptance.json",
     )
     parser.add_argument("--skip-long-text", action="store_true")
+    parser.add_argument("--skip-long-picture", action="store_true")
     args = parser.parse_args()
     try:
         evidence = run(args)
