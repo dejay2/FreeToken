@@ -42,6 +42,9 @@ class UserMsg(BaseBackendMsg):
     mm_pixel_values: torch.Tensor | None = None
     mm_image_grid_thw: torch.Tensor | None = None
     mm_token_type_ids: torch.Tensor | None = None
+    # Scheduler-derived Qwen three-axis positions; normally absent on the tokenizer wire.
+    mrope_position_ids: torch.Tensor | None = None
+    mrope_position_delta: int = 0
 
 
 @dataclass

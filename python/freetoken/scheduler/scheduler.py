@@ -474,6 +474,56 @@ class Scheduler(SchedulerIOMixin):
             return 0
         return torch.cuda.memory_reserved(self.device)
 
+    @torch.inference_mode()
+    def _prepare_multimodal_request(self, msg: UserMsg) -> None:
+        """Encode one tokenizer-prepared still picture and derive Qwen rotary positions."""
+        pixels = msg.mm_pixel_values
+        grid = msg.mm_image_grid_thw
+        token_types = msg.mm_token_type_ids
+        try:
+            if pixels is None or grid is None or token_types is None:
+                raise ValueError(
+                    "Qwen picture input needs pixel_values, image_grid_thw, and "
+                    "mm_token_type_ids"
+                )
+            model = self.engine.model
+            if not hasattr(model, "encode_images"):
+                raise ValueError(f"{type(model).__name__} does not support picture inputs")
+            vision_config = self.config.model_config.vision_config
+            if vision_config is None:
+                raise ValueError("model picture configuration is not loaded")
+
+            from freetoken.models.qwen4_exp.mrope import build_mrope_positions
+
+            positions, delta = build_mrope_positions(
+                msg.input_ids,
+                token_types,
+                grid,
+                int(vision_config.spatial_merge_size),
+            )
+            features = model.encode_images(
+                pixels.to(self.device),
+                grid.to(self.device),
+            )
+            image_token_id = self.config.model_config.image_token_id
+            if image_token_id is None:
+                raise ValueError("model configuration has no picture token id")
+            placeholders = int((msg.input_ids == image_token_id).sum().item())
+            if features.ndim != 2 or features.shape[0] != placeholders:
+                raise ValueError(
+                    f"picture-token slots ({placeholders}) do not match picture features "
+                    f"({features.shape[0] if features.ndim else 0})"
+                )
+            msg.mm_embeds = features
+            msg.mrope_position_ids = positions
+            msg.mrope_position_delta = delta
+        finally:
+            # These CPU tensors dominate request transport memory and are never needed after
+            # the picture reader has produced soft tokens (including on a rejected request).
+            msg.mm_pixel_values = None
+            msg.mm_image_grid_thw = None
+            msg.mm_token_type_ids = None
+
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
             for msg in msg.data:
@@ -489,6 +539,14 @@ class Scheduler(SchedulerIOMixin):
                     "Dropping request %d because its abort arrived before admission", msg.uid
                 )
                 return
+            has_raw_picture = any(
+                value is not None
+                for value in (
+                    msg.mm_pixel_values,
+                    msg.mm_image_grid_thw,
+                    msg.mm_token_type_ids,
+                )
+            )
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:
@@ -514,7 +572,40 @@ class Scheduler(SchedulerIOMixin):
                         )
                     ]
                 )
+                if has_raw_picture:
+                    msg.mm_pixel_values = None
+                    msg.mm_image_grid_thw = None
+                    msg.mm_token_type_ids = None
                 return
+            if has_raw_picture:
+                picture_limit = min(8192, getattr(self, "prefill_budget", 8192))
+                if input_len > picture_limit:
+                    msg.mm_pixel_values = None
+                    msg.mm_image_grid_thw = None
+                    msg.mm_token_type_ids = None
+                    self.send_result(
+                        [
+                            ErrorReplyMsg(
+                                uid=msg.uid,
+                                error=(
+                                    f"picture prompt has {input_len} tokens; picture prompts "
+                                    f"must fit one prefill batch of at most {picture_limit} tokens"
+                                ),
+                                code="context_length_exceeded",
+                            )
+                        ]
+                    )
+                    return
+                try:
+                    self._prepare_multimodal_request(msg)
+                except Exception as exc:  # noqa: BLE001 - reject one request, keep serving
+                    logger.warning_rank0(
+                        "Picture processing failed for request %d: %s", msg.uid, exc
+                    )
+                    self.send_result(
+                        [ErrorReplyMsg(uid=msg.uid, error=f"could not encode picture: {exc}")]
+                    )
+                    return
             if msg.sampling_params.max_tokens > max_output_len:
                 msg.sampling_params.max_tokens = max_output_len
                 logger.warning_rank0(
@@ -828,6 +919,9 @@ class Scheduler(SchedulerIOMixin):
         parts = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
         if parts:
             batch.mm_embeds = torch.cat(parts, dim=0)
+            for req in batch.reqs:
+                if req.cache_private:
+                    req.mm_embeds = None
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first

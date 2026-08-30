@@ -43,6 +43,8 @@ class Req:
     # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
     # hidden]) scattered at image-token positions during this request's prefill.
     mm_embeds: torch.Tensor | None = None
+    # Picture requests remain private after the one-shot soft embeddings are released.
+    cache_private: bool = False
     # Full-prompt three-axis Qwen rotary coordinates plus the generated-token offset.
     # Logical/cache addressing continues to use the scalar lengths above.
     mrope_position_ids: torch.Tensor | None = None

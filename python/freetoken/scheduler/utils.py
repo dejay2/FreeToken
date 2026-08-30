@@ -18,6 +18,7 @@ class PendingReq:
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
     mm_embeds: torch.Tensor | None = None
+    cache_private: bool = False
     mrope_position_ids: torch.Tensor | None = None
     mrope_position_delta: int = 0
 

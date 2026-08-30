@@ -171,7 +171,7 @@ class PrefillAdder:
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
         device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
-        if is_chunked and pending_req.mm_embeds is not None:
+        if is_chunked and pending_req.cache_private:
             raise NotImplementedError(
                 "Multimodal prompts must fit in a single prefill chunk; increase "
                 "--max-extend-tokens or shrink the prompt."
@@ -185,6 +185,7 @@ class PrefillAdder:
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
             mm_embeds=pending_req.mm_embeds,
+            cache_private=pending_req.cache_private,
             mrope_position_ids=pending_req.mrope_position_ids,
             mrope_position_delta=pending_req.mrope_position_delta,
         )
@@ -252,7 +253,13 @@ class PrefillManager:
                 req.input_ids,
                 req.sampling_params,
                 mm_embeds=req.mm_embeds,
-                mrope_position_ids=getattr(req, "mrope_position_ids", None),
+                cache_private=(
+                    req.mm_embeds is not None
+                    or req.mm_pixel_values is not None
+                    or req.mm_image_grid_thw is not None
+                    or req.mm_token_type_ids is not None
+                ),
+                mrope_position_ids=req.mrope_position_ids,
                 mrope_position_delta=getattr(req, "mrope_position_delta", 0),
             )
         )

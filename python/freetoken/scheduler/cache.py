@@ -96,7 +96,11 @@ class CacheManager:
         # Multimodal requests must not reuse a shared prefix: image-placeholder tokens
         # have identical ids across images but carry different content (and KV), so a
         # match would serve the wrong image's KV. Match against the empty prefix.
-        ids = req.input_ids[:0] if req.mm_embeds is not None else req.input_ids[: input_len - 1]
+        ids = (
+            req.input_ids[:0]
+            if getattr(req, "cache_private", False) or req.mm_embeds is not None
+            else req.input_ids[: input_len - 1]
+        )
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
             m = self.prefix_cache.match_prefix(ids)
@@ -302,7 +306,7 @@ class CacheManager:
         # Multimodal requests are never inserted into the shared prefix cache (see
         # ``match_req``). Their KV pages stay owned by the active request and are freed
         # on completion; nothing is exposed for cross-request reuse.
-        if req.mm_embeds is not None:
+        if getattr(req, "cache_private", False) or req.mm_embeds is not None:
             self.unlock(old_handle)
             if finished:
                 tail = self._padded_tail(req, old_handle.cached_len)
@@ -350,7 +354,7 @@ class CacheManager:
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
-        if req.mm_embeds is not None:
+        if getattr(req, "cache_private", False) or req.mm_embeds is not None:
             self.unlock(old_handle)
             if finished:
                 self._free(page_indices[old_handle.cached_len :])
@@ -444,7 +448,7 @@ class CacheManager:
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
-        if req.mm_embeds is not None:
+        if getattr(req, "cache_private", False) or req.mm_embeds is not None:
             self.unlock(old_handle)
             if finished:
                 tail = self._padded_tail(req, old_handle.cached_len)
