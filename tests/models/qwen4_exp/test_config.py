@@ -187,6 +187,8 @@ def test_qwen4_args_payload():
     assert args.ple_conv_state_len == 9
     assert args.ple_state_width == 10240
     assert args.ngram_boundary_token_id == 248044
+    assert args.mrope_section == (11, 11, 10)
+    assert args.mrope_interleaved is True
 
 
 def test_ple_on_full_attention_layer_rejected():

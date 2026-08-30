@@ -781,6 +781,7 @@ class Scheduler(SchedulerIOMixin):
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
+        batch.rope_positions = _make_rope_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
@@ -888,6 +889,38 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
         )
         offset += length
     return indices_host.to(device, non_blocking=True)
+
+
+def _make_rope_positions(batch: Batch, device: torch.device) -> torch.Tensor | None:
+    """Build packed three-axis rotary positions when a batch contains Qwen picture input."""
+    if not any(req.mrope_position_ids is not None for req in batch.padded_reqs):
+        return None
+    needed_size = sum(req.extend_len for req in batch.padded_reqs)
+    host = torch.empty(
+        (3, needed_size),
+        dtype=torch.int64,
+        pin_memory=device.type == "cuda",
+    )
+    offset = 0
+    for req in batch.padded_reqs:
+        start, end = int(req.cached_len), int(req.device_len)
+        length = end - start
+        if not length:
+            continue
+        prompt_positions = req.mrope_position_ids
+        prompt_len = 0 if prompt_positions is None else int(prompt_positions.shape[1])
+        prompt_stop = min(end, prompt_len)
+        copied = max(prompt_stop - start, 0)
+        if copied:
+            host[:, offset : offset + copied].copy_(prompt_positions[:, start:prompt_stop])
+        generated_start = start + copied
+        if generated_start < end:
+            generated = torch.arange(generated_start, end, dtype=torch.int64).add_(
+                int(req.mrope_position_delta)
+            )
+            host[:, offset + copied : offset + length].copy_(generated.expand(3, -1))
+        offset += length
+    return host.to(device, non_blocking=True)
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:

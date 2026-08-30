@@ -43,6 +43,10 @@ class Req:
     # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
     # hidden]) scattered at image-token positions during this request's prefill.
     mm_embeds: torch.Tensor | None = None
+    # Full-prompt three-axis Qwen rotary coordinates plus the generated-token offset.
+    # Logical/cache addressing continues to use the scalar lengths above.
+    mrope_position_ids: torch.Tensor | None = None
+    mrope_position_delta: int = 0
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
@@ -116,6 +120,9 @@ class Batch:
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)
+    # Optional Qwen temporal/height/width positions [3, padded_tokens]. Scalar
+    # ``positions`` remains authoritative for causal masks, cache writes, and QSA rows.
+    rope_positions: torch.Tensor | None = field(default=None, init=False)
     out_loc: torch.Tensor | None = field(init=False)
     # Per-(padded-)request table_idx as a GPU int64 tensor, used by GatedDeltaNet
     # decode to gather/scatter recurrent+conv state without host-side loops (so the

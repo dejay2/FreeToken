@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Protocol
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearReplicated
-from freetoken.layers.rotary import get_rope
+from freetoken.models.qwen4_exp.mrope import Qwen4MRoPE
 from freetoken.utils import nvtx_annotate
 
 if TYPE_CHECKING:
@@ -127,14 +127,7 @@ class Qwen4ExpAttention(BaseOP):
         self.o_proj = LinearReplicated(self.qo_attn_dim, config.hidden_size, has_bias=False)
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        rotary = config.rotary_config
-        self.rotary = get_rope(
-            head_dim=self.head_dim,
-            rotary_dim=rotary.rotary_dim,
-            max_position=rotary.max_position,
-            base=rotary.base,
-            rope_scaling=tuple(rotary.scaling.items()) if rotary.scaling else None,
-        )
+        self.rotary = Qwen4MRoPE(config)
         self.indexer = Qwen4ExpIndexer(config, layer_id)
 
     @nvtx_annotate("QSA")
@@ -147,8 +140,11 @@ class Qwen4ExpAttention(BaseOP):
         v = v.contiguous()
         self.q_norm.forward_inplace(q)
         self.k_norm.forward_inplace(k)
+        rope_positions = getattr(batch, "rope_positions", None)
         q, k = self.rotary.forward(
-            batch.positions, q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
+            batch.positions if rope_positions is None else rope_positions,
+            q.view(-1, self.qo_attn_dim),
+            k.view(-1, self.kv_attn_dim),
         )
         index = self.indexer.forward(x)
         o = get_global_ctx().attn_backend.qsa_forward(

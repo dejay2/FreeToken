@@ -51,6 +51,9 @@ class Qwen4ExpArgs:
     split_ngram_parts: int
     # n-gram hash windows never cross this token (the eos id); they restart after it.
     ngram_boundary_token_id: int
+    # Qwen multimodal rotary axis widths and layout.
+    mrope_section: Tuple[int, int, int]
+    mrope_interleaved: bool
     # QSA indexer scoring geometry (the slab/ratio geometry lives on the attention group).
     index_n_heads: int
     index_kv_heads: int
@@ -178,9 +181,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # int(), not round(): HF configuration_qwen4_exp truncates head_dim * partial.
     rotary_dim = int(head_dim * partial)
 
-    # Text-only serving with the default rope type: the mRoPE sections reduce to standard
-    # partial rope, and the unhashable ``mrope_section`` list must not reach get_rope's
-    # cache key.
+    # The three-axis MRoPE wrapper owns mrope_section/interleaving. The scalar rotary
+    # cache still receives only hashable scalar scaling parameters.
     rope_type = rope_params.get("rope_type", "default")
     rope_scaling = (
         None
@@ -272,6 +274,12 @@ def parse_config(hf_config: Any) -> ModelConfig:
     if isinstance(eos_token_id, (list, tuple)):
         eos_token_id = eos_token_id[0]
 
+    mrope_half = rotary_dim // 2
+    mrope_section = rope_params.get("mrope_section") or (
+        (mrope_half + 2) // 3,
+        (mrope_half + 1) // 3,
+        mrope_half // 3,
+    )
     qwen4_args = Qwen4ExpArgs(
         hidden_size=text.hidden_size,
         hc_count=int(text.hc_count),
@@ -285,6 +293,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         make_ngram_vocab_size_divisible_by=int(text.make_ngram_vocab_size_divisible_by),
         split_ngram_parts=int(text.split_ngram_parts),
         ngram_boundary_token_id=int(eos_token_id),
+        mrope_section=tuple(int(value) for value in mrope_section),
+        mrope_interleaved=bool(rope_params.get("mrope_interleaved", True)),
         index_n_heads=int(text.indexer_n_heads),
         index_kv_heads=int(text.indexer_kv_heads),
         index_head_dim=int(text.indexer_head_dim),
