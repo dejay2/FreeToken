@@ -1,3 +1,5 @@
+import atexit
+import json
 import os
 from typing import TYPE_CHECKING, Tuple
 
@@ -24,6 +26,66 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+
+# ----------------------------------------------------------------------
+# Throwaway routing diagnostics (expert-prefetch feasibility study).
+# Enabled only when FREETOKEN_MOE_ROUTE_LOG names a directory; the single
+# cached module-level check below is the entire cost when it is unset.
+# ----------------------------------------------------------------------
+_ROUTE_LOG_DIR = os.getenv("FREETOKEN_MOE_ROUTE_LOG") or None
+_route_log_records: list = []
+_ROUTE_LOG_FLUSH_EVERY = 200
+_route_log_path: str | None = None
+
+
+def _route_log_flush() -> None:
+    global _route_log_path
+    if not _route_log_records:
+        return
+    if _route_log_path is None:
+        assert _ROUTE_LOG_DIR is not None
+        os.makedirs(_ROUTE_LOG_DIR, exist_ok=True)
+        _route_log_path = os.path.join(_ROUTE_LOG_DIR, f"route-log-{os.getpid()}.jsonl")
+    batch, _route_log_records[:] = list(_route_log_records), []
+    with open(_route_log_path, "a", encoding="utf-8") as fh:
+        for rec in batch:
+            fh.write(json.dumps(rec) + "\n")
+
+
+def _route_log(layer_id, topk_ids: torch.Tensor) -> None:
+    """Record one MoE forward's routing decision. Best-effort: never raises."""
+    try:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+        batch = get_global_ctx().batch
+        experts = topk_ids.detach().reshape(topk_ids.shape[0], -1).cpu().tolist()
+        tokens = batch.input_ids.detach().reshape(-1).cpu().tolist()
+        positions = getattr(batch, "positions", None)
+        pos = [] if positions is None else positions.detach().reshape(-1).cpu().tolist()
+        _route_log_records.append(
+            {
+                "layer": layer_id,
+                "phase": batch.phase,
+                "tokens": tokens,
+                "positions": pos,
+                "experts": experts,
+            }
+        )
+        if len(_route_log_records) >= _ROUTE_LOG_FLUSH_EVERY:
+            _route_log_flush()
+    except Exception:  # diagnostics must never break a forward
+        pass
+
+
+def _route_log_flush_atexit() -> None:
+    try:
+        _route_log_flush()
+    except Exception:
+        pass
+
+
+if _ROUTE_LOG_DIR is not None:
+    atexit.register(_route_log_flush_atexit)
 
 
 class MoELayer(BaseOP):
@@ -259,6 +321,8 @@ class OffloadMoELayer(MoELayer):
         past the router. ``topk_ids`` must be safe to mutate in place (decode
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
         """
+        if _ROUTE_LOG_DIR is not None:
+            _route_log(self.layer_id, topk_ids)  # before ensure_experts' in-place rewrite
         if self._use_decode_movement(hidden_states):
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
         else:
@@ -276,6 +340,8 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        if _ROUTE_LOG_DIR is not None:
+            _route_log(self.layer_id, topk_ids)  # before ensure_experts' in-place rewrite
         return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
     def prefill_forward(
@@ -289,6 +355,8 @@ class OffloadMoELayer(MoELayer):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        if _ROUTE_LOG_DIR is not None:
+            _route_log(self.layer_id, topk_ids)
         return self._prefill_routed(hidden_states, topk_weights, topk_ids)
 
     # ------------------------------------------------------------------
