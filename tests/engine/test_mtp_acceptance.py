@@ -380,16 +380,19 @@ def test_batched_acceptance_is_deterministic_and_greedy_matches_reference():
 
 
 def test_batched_acceptance_requires_bounded_matching_shapes():
-    with pytest.raises(ValueError, match="one to three"):
-        batched_speculative_accept(
-            proposals=[],
-            draft_logits=torch.empty(0, 4),
-            target_logits=torch.empty(1, 4),
-            temperature=1.0,
-            top_k=-1,
-            top_p=1.0,
-            generator=torch.Generator().manual_seed(1),
-        )
+    # the bound is 1..5 now (the integrated path's depth ceiling); an empty chain and a chain
+    # past the ceiling are both refused
+    for proposals in ([], [1, 2, 3, 4, 5, 6]):
+        with pytest.raises(ValueError, match=r"1\.\.5 proposals"):
+            batched_speculative_accept(
+                proposals=proposals,
+                draft_logits=torch.empty(len(proposals), 4),
+                target_logits=torch.empty(len(proposals) + 1, 4),
+                temperature=1.0,
+                top_k=-1,
+                top_p=1.0,
+                generator=torch.Generator().manual_seed(1),
+            )
     with pytest.raises(ValueError, match=r"depth\+1"):
         batched_speculative_accept(
             proposals=[1, 2],

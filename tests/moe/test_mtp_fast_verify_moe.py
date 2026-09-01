@@ -127,7 +127,7 @@ def test_private_verify_marker_is_disabled_by_default(monkeypatch):
 
 @pytest.mark.parametrize(
     ("rows", "phase", "requests"),
-    [(1, "prefill", 1), (5, "prefill", 1), (2, "prefill", 2), (2, "decode", 1)],
+    [(1, "prefill", 1), (7, "prefill", 1), (2, "prefill", 2), (2, "decode", 1)],
 )
 def test_private_verify_rejects_invalid_public_batch_before_movement(
     monkeypatch, rows, phase, requests
@@ -147,9 +147,47 @@ def test_private_verify_rejects_invalid_public_batch_before_movement(
     with _active_batch(monkeypatch, batch):
         with pytest.raises(
             ValueError,
-            match="private MTP verification requires one prefill request and 2 to 4 rows",
+            match="private MTP verification requires one prefill request and 2 to 6 rows",
         ):
             layer.routed_forward(hidden, weights, ids)
+
+
+# ------------------------------------------------------- the depth-5 ceiling's verify widths
+
+
+def test_the_row_guard_admits_every_width_a_configured_depth_can_emit(monkeypatch):
+    """``w = 1 + depth`` rows arrive in ONE forward, so the guard has to admit the whole
+    range the depth ceiling allows -- 5 and 6 rows included, which are depth 4 and 5."""
+    for rows in range(2, 7):
+        layer = _layer()
+        hidden = torch.randn(rows, 32)
+        weights = torch.full((rows, 10), 0.1)
+        ids = torch.arange(10, dtype=torch.int32).repeat(rows, 1)
+        calls: list[str] = []
+        monkeypatch.setattr(
+            layer, "_decode_routed", lambda h, w, i: calls.append("decode") or h
+        )
+        monkeypatch.setattr(
+            layer,
+            "_prefill_routed",
+            lambda *args: (_ for _ in ()).throw(
+                AssertionError("a verify batch must take the decode-movement path")
+            ),
+        )
+        batch = _batch(rows=rows, marked=True)
+        with _active_batch(monkeypatch, batch):
+            layer.routed_forward(hidden, weights, ids.clone())
+        assert calls == ["decode"], rows
+
+
+def test_the_moe_row_cap_is_the_engine_configs_widest_verify_block():
+    """``layers/moe.py`` deliberately mirrors the ceiling rather than importing the engine
+    config (which would pull the model registry into every MoE layer). Pin them equal, or the
+    mirror rots the day the ceiling moves and a depth-5 boot dies mid-forward."""
+    from freetoken.engine.config import _MAX_SPEC_DEPTH
+    from freetoken.layers.moe import _MAX_MTP_VERIFY_ROWS
+
+    assert _MAX_MTP_VERIFY_ROWS == 1 + _MAX_SPEC_DEPTH
 
 
 def _movement_cache(*, decode_target="gpu"):

@@ -480,6 +480,91 @@ def test_a_cut_short_proposal_round_trips_the_whole_cycle(k):
     assert req.spec_inflight is None
 
 
+# ------------------------------------------------------ the raised depth ceiling (4 and 5)
+#
+# Nothing in the cycle is written per width: the batch builder derives ``w = 1 + k`` from the
+# proposal, the write mapping walks ``emit_width``, the ladder's arena is sized from the config
+# and acceptance is a cumprod over however many rows arrived. These run the WHOLE cycle at the
+# new ceiling, because a width bound that only bites in one of those seams would otherwise show
+# up first on a live boot.
+
+
+@pytest.mark.parametrize("depth", [4, 5])
+def test_a_full_width_cycle_at_the_raised_ceiling_round_trips(depth):
+    target = _FakeTarget()
+    ladder = _RecordingLadder()
+    stub = _scheduler(target, _FakeDraft(target), depth=depth, ladder=ladder)
+    req = _decode_req(stub, prompt_len=8)
+
+    stub._speculative_decode_step(req)
+
+    assert target.forwards == [1 + depth]  # k drafts -> one w-row forward
+    assert ladder.calls[0] == ("begin", 8, 1 + depth)
+    (msg,) = stub.sent[-1]
+    assert len(msg.next_tokens) == depth + 1  # every draft accepted, plus the bonus
+    assert (req.cached_len, req.device_len) == (9 + depth, 10 + depth)
+    assert req.input_ids.numel() == req.device_len
+    assert req.spec_inflight is None
+    # the run lands at its own positions, one row per emitted token
+    assert stub.token_pool[0, 9 : 10 + depth].tolist() == list(msg.next_tokens)
+    assert ladder.calls[1] == ("rollback", 9 + depth, 10 + depth, depth + 1)
+
+
+@pytest.mark.parametrize("depth", [4, 5])
+@pytest.mark.parametrize("policy", ["perfect", "garbage", "first-only"])
+def test_a_deep_cycle_emits_exactly_what_plain_decode_would_have(depth, policy):
+    """The gate that matters: a deeper chain is a COST choice, so the emitted stream, the
+    finish reason and the settled lengths must all be the plain decode's, whatever the draft
+    guessed."""
+    target = _FakeTarget()
+    plain_stub, plain_req, plain = _plain_decode(target, prompt_len=8, output_len=20)
+
+    spec_target = _FakeTarget()
+    stub = _scheduler(spec_target, _FakeDraft(spec_target, policy=policy), depth=depth)
+    req = _decode_req(stub, prompt_len=8, output_len=20)
+    msgs = _run_spec(stub, req)
+
+    assert _tokens(msgs) == _tokens(plain)[1:]
+    assert msgs[-1].finished and msgs[-1].finish_reason == plain[-1].finish_reason
+    assert req.input_ids.tolist() == plain_req.input_ids.tolist()
+    assert (req.cached_len, req.device_len) == (plain_req.cached_len, plain_req.device_len)
+    assert torch.equal(stub.cache_manager.free_slots, plain_stub.cache_manager.free_slots)
+
+
+@pytest.mark.parametrize("depth", [4, 5])
+def test_a_deep_cycle_near_the_budget_narrows_instead_of_overrunning(depth):
+    """``depth = min(configured, remain_len)``: with fewer tokens of budget left than the
+    ceiling, the cycle drafts narrower rather than forwarding rows whose sampled tokens would
+    take the write mapping's -1 discard slot."""
+    target = _FakeTarget()
+    _, plain_req, plain = _plain_decode(target, prompt_len=8, output_len=4)
+
+    spec_target = _FakeTarget()
+    stub = _scheduler(spec_target, _FakeDraft(spec_target), depth=depth)
+    req = _decode_req(stub, prompt_len=8, output_len=4)
+    msgs = _run_spec(stub, req)
+
+    assert max(spec_target.forwards) <= 1 + req.output_len
+    assert _tokens(msgs) == _tokens(plain)[1:]
+    assert msgs[-1].finish_reason == "length"
+
+
+def test_a_deep_cut_short_proposal_still_verifies_only_what_was_drafted():
+    """The confidence cut and the raised ceiling meet here: a depth-5 configuration whose cut
+    left 2 drafts must forward 3 rows, not 6."""
+    target = _FakeTarget()
+    ladder = _RecordingLadder()
+    stub = _scheduler(target, _FakeDraft(target, cut_to=2), depth=5, ladder=ladder)
+    req = _decode_req(stub, prompt_len=8)
+
+    stub._speculative_decode_step(req)
+
+    assert target.forwards == [3]
+    assert ladder.calls[0] == ("begin", 8, 3)
+    (msg,) = stub.sent[-1]
+    assert len(msg.next_tokens) == 3
+
+
 def test_a_cut_short_cycle_emits_what_plain_decode_would_have():
     """The cut is a COST policy, never a correctness one: the target still decides every
     token, so a one-draft cycle's output is the plain decode's, token for token."""

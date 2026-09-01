@@ -22,6 +22,12 @@ if TYPE_CHECKING:
 # generic softmax+top-k path.
 TopK = Tuple[torch.Tensor, torch.Tensor]
 
+# The widest MTP verification block one forward may carry: ``w = 1 + depth`` rows. A MIRROR of
+# ``1 + freetoken.engine.config._MAX_SPEC_DEPTH``, which is the source of truth; importing the
+# engine config here would drag the model registry and the HF config loader into every MoE
+# layer. ``tests/moe/test_mtp_fast_verify_moe.py`` imports both and pins them equal.
+_MAX_MTP_VERIFY_ROWS = 6
+
 # Hybrid decode overlaps the CPU overflow GEMV behind the GPU PCIe fetch + GEMM by
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
@@ -290,10 +296,11 @@ class OffloadMoELayer(MoELayer):
         if (
             not batch.is_prefill
             or len(batch.reqs) != 1
-            or hidden_states.shape[0] not in (2, 3, 4)
+            or not 2 <= hidden_states.shape[0] <= _MAX_MTP_VERIFY_ROWS
         ):
             raise ValueError(
-                "private MTP verification requires one prefill request and 2 to 4 rows"
+                "private MTP verification requires one prefill request and 2 to "
+                f"{_MAX_MTP_VERIFY_ROWS} rows"
             )
         return True
 

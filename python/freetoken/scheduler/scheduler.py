@@ -1084,7 +1084,7 @@ class Scheduler(SchedulerIOMixin):
             )
             # No track checkpoint can ride a speculative step, whatever cached_len is: the
             # hybrid-radix snapshot is scheduled per FORWARD, at c = (extend_len - 1) // 64
-            # chunks into it (attention/linear.py:123-127), so a w <= 4 row batch gives c == 0
+            # chunks into it (attention/linear.py:123-127), so a w <= 6 row batch gives c == 0
             # and is skipped -- absolute x64 alignment never enters it. Were one scheduled it
             # would freeze rejected rows into a donatable prefix-cache slot.
             batch.fla_metadata = build_fla_metadata(batch, self.device)

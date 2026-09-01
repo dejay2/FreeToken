@@ -14,8 +14,24 @@ from freetoken.utils import cached_load_hf_config
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
 
-# w = 1 + depth must stay a capturable MTP verify width (mtp_fast_verify captures 2, 3, 4).
-_MAX_SPEC_DEPTH = 3
+# The deepest chain an operator may ask for. ``w = 1 + depth`` is the verify width, and every
+# width 2..6 is capturable by the width-generic ``SpecVerifyGraphRunner``: ``graph_widths``
+# below derives 1..batch_width and ``engine/spec_graph.py`` builds one fixed-width graph per
+# entry, with no per-width table anywhere. (The legacy ``mtp_fast_verify`` observer keeps its
+# own 2..4 cap; it lives behind FREETOKEN_MTP_SHADOW, which ``resolve_spec_decode`` refuses to
+# run alongside speculation, so the two ceilings never meet.)
+#
+# 5 rather than 3 is measured. With the confidence cut armed (``conf_cut``, default 0.8) only
+# a confident chain ever reaches the deep rows: 40% of live cycles have every draft at >= 0.9
+# confidence and 93% of those accept in full. An extra verified row costs ~6.5 ms (~5 unique
+# experts per layer marginal, measured window-union cost) and pays for itself once the extra
+# draft's acceptance clears ~0.63 -- against 0.73-0.77 measured in exactly those confident
+# cycles. So the CEILING is 5; the DEFAULT stays 3 until a live sweep moves it.
+_MAX_SPEC_DEPTH = 5
+
+# What an unset ``FREETOKEN_MTP_SPEC_DEPTH`` means. Deliberately below the ceiling: depth 3 is
+# the only width live-swept end to end (slice 34), and 4/5 are opt-in until one says otherwise.
+_DEFAULT_SPEC_DEPTH = 3
 
 # A cold request probes at least once every ``cooldown_cap`` plain steps. 4x rather than 8x
 # because a re-cool now takes TWO consecutive failed probes, so each rung of the ladder is
@@ -34,7 +50,7 @@ class SpecDecodeConfig:
     """
 
     enabled: bool = False
-    depth: int = _MAX_SPEC_DEPTH
+    depth: int = _DEFAULT_SPEC_DEPTH
     graph: bool = False
     # --- the confidence cut (see ``SpecDraftHead.propose``) ---
     # Stop the draft chain before the first token whose RAW softmax top-1 probability falls
@@ -126,7 +142,7 @@ def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfi
     graph_raw = env.get("FREETOKEN_MTP_SPEC_GRAPH", "0").strip()
     if graph_raw not in ("0", "1"):
         raise ValueError("FREETOKEN_MTP_SPEC_GRAPH must be 0 or 1")
-    depth_raw = env.get("FREETOKEN_MTP_SPEC_DEPTH", str(_MAX_SPEC_DEPTH)).strip()
+    depth_raw = env.get("FREETOKEN_MTP_SPEC_DEPTH", str(_DEFAULT_SPEC_DEPTH)).strip()
     try:
         depth = int(depth_raw)
     except ValueError:

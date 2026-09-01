@@ -144,13 +144,25 @@ def test_the_batch_has_one_row_per_speculative_token():
     assert batch.positions.tolist() == [64, 65, 66, 67]
 
 
-@pytest.mark.parametrize("drafts,width", [([11], 2), ([11, 12], 3), ([11, 12, 13], 4)])
+@pytest.mark.parametrize(
+    "drafts,width",
+    [
+        ([11], 2),
+        ([11, 12], 3),
+        ([11, 12, 13], 4),
+        ([11, 12, 13, 14], 5),
+        ([11, 12, 13, 14, 15], 6),
+    ],
+)
 def test_every_configured_depth_produces_a_capturable_verify_width(drafts, width):
     stub = _scheduler(depth=len(drafts))
     req = _decode_req(stub)
     batch = stub._prepare_spec_batch(req, drafts).batch
     assert batch.emit_width == width and req.extend_len == width
-    assert width in (2, 3, 4)
+    # the width-generic SpecVerifyGraphRunner captures 2..6 = 1 + the depth ceiling
+    assert 2 <= width <= 6
+    assert batch.positions.tolist() == list(range(64, 64 + width))
+    assert stub.token_pool[batch.reqs[0].table_idx, 65 : 64 + width].tolist() == drafts
 
 
 def test_the_rows_read_the_last_accepted_token_then_the_drafts():

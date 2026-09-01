@@ -38,14 +38,26 @@ def test_the_flag_turns_it_on_at_the_default_depth():
     assert spec.batch_width == 4
 
 
-@pytest.mark.parametrize("depth", [1, 2, 3])
+@pytest.mark.parametrize("depth", [1, 2, 3, 4, 5])
 def test_depth_is_honoured_over_its_whole_range(depth):
     spec = resolve_spec_decode(
         {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_DEPTH": str(depth)}
     )
     assert spec.num_speculative_tokens == depth
-    # w = 1 + k must stay a capturable MTP verify width (2..4).
-    assert spec.batch_width in (2, 3, 4)
+    # w = 1 + k must stay a capturable MTP verify width; the width-generic
+    # SpecVerifyGraphRunner captures 2..6, so the whole range is emittable.
+    assert 2 <= spec.batch_width <= 6
+
+
+def test_the_ceiling_is_five_and_the_default_stays_three():
+    """Raising the CAP is not raising the default. The confidence cut is what makes a deep
+    chain safe (only confident cycles get there), and depth 3 is the width the live sweep
+    actually measured, so 4 and 5 are opt-in until another sweep moves the default."""
+    from freetoken.engine.config import _DEFAULT_SPEC_DEPTH, _MAX_SPEC_DEPTH
+
+    assert (_MAX_SPEC_DEPTH, _DEFAULT_SPEC_DEPTH) == (5, 3)
+    assert resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"}).depth == 3
+    assert SpecDecodeConfig().depth == 3
 
 
 def test_depth_alone_reserves_nothing_while_speculation_is_off():
@@ -54,8 +66,8 @@ def test_depth_alone_reserves_nothing_while_speculation_is_off():
     assert spec.num_speculative_tokens == 0
 
 
-@pytest.mark.parametrize("raw", ["0", "4", "-1", "x", ""])
-def test_a_depth_outside_one_to_three_is_rejected(raw):
+@pytest.mark.parametrize("raw", ["0", "6", "7", "-1", "x", ""])
+def test_a_depth_outside_one_to_five_is_rejected(raw):
     with pytest.raises(ValueError, match="FREETOKEN_MTP_SPEC_DEPTH"):
         resolve_spec_decode({"FREETOKEN_MTP_SPEC_DEPTH": raw})
 
@@ -245,7 +257,7 @@ def test_the_cpu_moe_executor_is_sized_for_the_speculative_verify_width():
     ) == 4
 
 
-@pytest.mark.parametrize("depth,tokens", [(1, 2), (2, 3), (3, 4)])
+@pytest.mark.parametrize("depth,tokens", [(1, 2), (2, 3), (3, 4), (4, 5), (5, 6)])
 def test_the_sizing_follows_the_configured_depth(depth, tokens):
     from freetoken.engine.engine import _cpu_moe_executor_tokens
 
@@ -296,7 +308,16 @@ def test_the_verify_graph_flag_turns_capture_on():
     assert spec.graph_widths == (1, 2, 3, 4)
 
 
-@pytest.mark.parametrize("depth,widths", [(1, (1, 2)), (2, (1, 2, 3)), (3, (1, 2, 3, 4))])
+@pytest.mark.parametrize(
+    "depth,widths",
+    [
+        (1, (1, 2)),
+        (2, (1, 2, 3)),
+        (3, (1, 2, 3, 4)),
+        (4, (1, 2, 3, 4, 5)),
+        (5, (1, 2, 3, 4, 5, 6)),
+    ],
+)
 def test_only_the_widths_the_depth_can_actually_produce_are_captured(depth, widths):
     """A graph costs a warm-up forward and a slab of pinned buffers; capturing a width the
     configured depth can never emit would spend both for nothing."""
@@ -482,6 +503,66 @@ def test_the_cut_aware_default_still_clamps_to_the_full_width_ceiling():
         {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_DEPTH": "1"}
     )
     assert spec.min_emitted == pytest.approx(2.0)
+
+
+# ------------------------------------------------ the raised ceiling: depths 4 and 5
+#
+# Every bound in ``resolve_spec_decode`` is written against ``1 + depth`` rather than a literal,
+# so the deep depths should need no code of their own. These pin that -- a hard 4 anywhere would
+# either reject a legal configuration at boot or, worse, accept an illegal one.
+
+
+@pytest.mark.parametrize("depth,width", [(4, 5), (5, 6)])
+def test_the_deep_depths_resolve_to_their_full_verify_width(depth, width):
+    spec = resolve_spec_decode(
+        {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_DEPTH": str(depth)}
+    )
+    assert (spec.depth, spec.num_speculative_tokens, spec.batch_width) == (
+        depth,
+        depth,
+        width,
+    )
+    # the EMA seed is one full cycle's emission, whatever the width
+    assert spec.ema_seed == pytest.approx(float(width))
+
+
+@pytest.mark.parametrize("depth", [4, 5])
+def test_the_unset_emission_bar_stops_clamping_once_the_width_clears_it(depth):
+    """At depth 1-2 the ``1 + depth`` ceiling binds below the cut-armed 2.4; from depth 3 up
+    the breakeven itself is the bar, and a deeper cycle does not raise it -- what a cycle
+    costs is set by the rows the CUT lets it verify, not by the depth it was allowed."""
+    spec = resolve_spec_decode(
+        {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_DEPTH": str(depth)}
+    )
+    assert spec.min_emitted == pytest.approx(2.4)
+    uncut = resolve_spec_decode(
+        {
+            "FREETOKEN_MTP_SPECULATE": "1",
+            "FREETOKEN_MTP_SPEC_DEPTH": str(depth),
+            "FREETOKEN_MTP_SPEC_CONF_CUT": "0",
+        }
+    )
+    assert uncut.min_emitted == pytest.approx(3.6)
+
+
+@pytest.mark.parametrize("depth,width", [(4, 5), (5, 6)])
+def test_the_emission_and_probe_bounds_open_up_with_the_deeper_width(depth, width):
+    """``0..1 + depth`` and ``(0, 1 + depth]``: exactly the full width is legal at the deeper
+    depths (it was not at depth 3), and one step past it is still refused."""
+    env = {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_DEPTH": str(depth)}
+    at_ceiling = resolve_spec_decode(
+        {
+            **env,
+            "FREETOKEN_MTP_SPEC_MIN_EMITTED": str(float(width)),
+            "FREETOKEN_MTP_SPEC_PROBE_RESUME": str(float(width)),
+        }
+    )
+    assert at_ceiling.min_emitted == pytest.approx(float(width))
+    assert at_ceiling.probe_resume == pytest.approx(float(width))
+    with pytest.raises(ValueError, match="FREETOKEN_MTP_SPEC_MIN_EMITTED"):
+        resolve_spec_decode({**env, "FREETOKEN_MTP_SPEC_MIN_EMITTED": str(width + 0.1)})
+    with pytest.raises(ValueError, match="FREETOKEN_MTP_SPEC_PROBE_RESUME"):
+        resolve_spec_decode({**env, "FREETOKEN_MTP_SPEC_PROBE_RESUME": str(width + 0.1)})
 
 
 @pytest.mark.parametrize("cut", ["0", "0.8"])

@@ -82,7 +82,7 @@ def test_the_widened_capacity_is_eight_for_ratio_four_at_depth_three():
 
 
 @pytest.mark.parametrize("ratio", [2, 4, 8, 16])
-@pytest.mark.parametrize("depth", [0, 1, 2, 3])
+@pytest.mark.parametrize("depth", [0, 1, 2, 3, 4, 5])
 def test_the_capacity_always_covers_a_whole_group_plus_the_drafts(ratio, depth):
     # The invariant the compressor needs: a closing group reads up to ratio - 1 past members,
     # and a w = 1 + depth row step writes depth more rows on top of them.
@@ -143,6 +143,32 @@ def test_the_budget_and_the_pool_agree_on_the_same_config():
     )
     scratch_bytes = 4 * 4 * 32 * 2  # one scratch slab row per request slot, all index layers
     assert fixed == ring_bytes + position_bytes + scratch_bytes
+
+
+def test_the_target_pool_covers_the_deepest_configurable_chain():
+    """THE silent-corruption bound at the raised ceiling. A depth-5 step writes 5 pending rows
+    on top of an open ratio-4 group's members, so the ring needs >= 9 rows; the ratio-multiple
+    rounding gives 12. At depth 3 the shipped 8 was already 7-covering, which is why depth 4
+    (4 + 4 = 8) still fits it exactly and only depth 5 forces the next multiple -- an arithmetic
+    step nothing in the code special-cases, and everything downstream reads off the pool."""
+    from freetoken.engine.config import _MAX_SPEC_DEPTH
+
+    ratio = 4
+    for depth in range(0, _MAX_SPEC_DEPTH + 1):
+        config = _config(_spec(ratio), num_speculative_tokens=depth)
+        pool = create_kv_pool(config, num_pages=4, device=DEV, dtype=torch.bfloat16)
+        assert pool.ring_capacity >= ratio + depth, depth
+        assert pool.ring_capacity == QSAKVCache.ring_capacity_for(ratio, depth)
+        # and the boot budget prices exactly what was allocated
+        ring_bytes = pool._pending_ring.numel() * pool._pending_ring.element_size()
+        position_bytes = (
+            pool._pending_position_ring.numel() * pool._pending_position_ring.element_size()
+        )
+        scratch_bytes = 4 * 4 * 32 * 2
+        assert QSAKVCache.kv_cost(config)[1] == ring_bytes + position_bytes + scratch_bytes
+
+    assert QSAKVCache.ring_capacity_for(ratio, 4) == 8
+    assert QSAKVCache.ring_capacity_for(ratio, 5) == 12
 
 
 def test_the_shipping_geometry_widens_from_four_to_eight():

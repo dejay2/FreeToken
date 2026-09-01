@@ -85,7 +85,7 @@ def _verify_batch(width: int, value: int) -> Batch:
     return batch
 
 
-def test_private_qsa_graph_accepts_one_request_with_two_to_four_verify_tokens():
+def test_private_qsa_graph_accepts_one_request_with_two_to_six_verify_tokens():
     backend = object.__new__(QSASparseAttnBackend)
     backend.device = torch.device("cpu")
     backend._mtp_verify_graph = {}
@@ -93,7 +93,9 @@ def test_private_qsa_graph_accepts_one_request_with_two_to_four_verify_tokens():
     backend._mtp_verify_active_width = None
     backend._ensure_mtp_verify_scratch = lambda width: None
 
-    for width in (2, 3, 4):
+    # 2..6 = w for depth 1..5, the whole range FREETOKEN_MTP_SPEC_DEPTH admits. Each width
+    # gets its own static metadata and its own scratch dict; nothing is special-cased.
+    for width in (2, 3, 4, 5, 6):
         captured = _verify_batch(width, 10 + width)
         assert captured.size == captured.padded_size == 1
         assert captured.reqs[0].extend_len == width
@@ -108,6 +110,57 @@ def test_private_qsa_graph_accepts_one_request_with_two_to_four_verify_tokens():
         backend.stage_mtp_verify_graph(runtime, captured)
         assert captured.attn_metadata.seq_lens.tolist() == [90 + width]
         backend.finish_mtp_verify_graph_capture(width)
+
+
+def test_private_qsa_graph_rejects_a_width_past_the_depth_ceiling():
+    """One past the widest verify block any configuration can produce. The bound exists to
+    catch a shape bug (a padded request count used as a token width, slice-27's live failure),
+    so it must stay tight to the ceiling rather than being dropped."""
+    backend = object.__new__(QSASparseAttnBackend)
+    backend.device = torch.device("cpu")
+    backend._mtp_verify_graph = {}
+    backend._mtp_verify_scratch = {}
+    backend._mtp_verify_active_width = None
+    backend._ensure_mtp_verify_scratch = lambda width: None
+
+    with pytest.raises(ValueError, match="width must be 2..6"):
+        backend.prepare_mtp_verify_graph(_verify_batch(7, 70))
+    with pytest.raises(ValueError, match="width must be 2..6"):
+        backend.prepare_mtp_verify_graph(_verify_batch(1, 71))
+
+
+def test_the_qsa_verify_width_cap_mirrors_the_engine_configs_depth_ceiling():
+    """The attention backend must not import the engine config, so it mirrors the ceiling.
+    Pinned here: a mirror that rots would refuse a legal depth-5 boot's graph capture."""
+    from freetoken.attention.qsa_sparse import _MAX_MTP_VERIFY_WIDTH
+    from freetoken.engine.config import _MAX_SPEC_DEPTH
+
+    assert _MAX_MTP_VERIFY_WIDTH == 1 + _MAX_SPEC_DEPTH
+
+
+def test_private_qsa_ring_widens_with_a_deeper_draft_chain():
+    """The draft head sizes its OWN pool from the configured depth (spec_draft passes
+    ``num_speculative_tokens=self.depth``). At depth 5 the ring must cover a whole
+    index_ratio-token group plus the 5 recursive rows -- 4 + 5 = 9, so ratio-4 rounding gives
+    12. A narrower ring aliases a draft row onto the open group's still-needed members and is
+    silently wrong, never a crash."""
+    config = derive_mtp_model_config(parsed_config())
+    ratio = config.kv_cache_group_specs()[0].index_ratio
+    for depth, expected in ((3, 8), (4, 8), (5, 12)):
+        pool = create_kvcache_pool(
+            model_config=config,
+            num_pages=4,
+            page_size=64,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+            num_req_slots=2,
+            num_speculative_tokens=depth,
+        )
+        assert pool.ring_capacity == expected
+        assert pool.ring_capacity >= ratio + depth
+        assert pool.ring_capacity % ratio == 0
+        assert pool._pending_ring.shape[2] == expected
+        assert pool._pending_position_ring.shape[2] == expected
 
 
 def test_private_qsa_graph_rejects_non_prefill_or_multi_request_shapes():

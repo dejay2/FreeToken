@@ -50,6 +50,11 @@ _CPU_PINNED = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
 # Block-score transient budget (vLLM's number): the fp32 [rows, n_blocks] logits tile is
 # 256 KB per row at a 1M-token context, so a long prefill must be scored in row chunks.
 _LOGITS_WORKSPACE_BYTES = 128 << 20
+# Widest MTP verify block a graph may bind: ``w = 1 + depth`` at the deepest configurable
+# chain. A MIRROR of ``1 + freetoken.engine.config._MAX_SPEC_DEPTH`` (the source of truth) --
+# an attention backend must not import the engine config; the two are pinned equal in
+# tests/kvcache/test_mtp_qsa_shadow.py.
+_MAX_MTP_VERIFY_WIDTH = 6
 
 
 TORCH_TOPK_ENV = "FREETOKEN_QSA_TORCH_TOPK"
@@ -634,10 +639,21 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._mtp_verify_scratch[width] = scratch
 
     def prepare_mtp_verify_graph(self, batch: Batch) -> None:
-        """Bind one private 2--4-token prefill request to persistent QSA buffers."""
+        """Bind one private 2..6-token prefill request to persistent QSA buffers.
+
+        The upper bound is the widest verify block speculation can ask for, ``1 +
+        engine.config._MAX_SPEC_DEPTH``; ``_MAX_MTP_VERIFY_WIDTH`` mirrors it (the attention
+        backend must not import the engine config), and
+        ``tests/kvcache/test_mtp_qsa_shadow.py`` pins the two equal. Every width in the range
+        gets its own scratch dict and its own static metadata, so nothing here is per-width
+        special-cased -- the bound only refuses a shape no configuration could emit.
+        """
         width = int(batch.input_ids.shape[0])
-        if width not in (2, 3, 4):
-            raise ValueError("MTP QSA graph width must be exactly 2, 3, or 4 token rows")
+        if not 2 <= width <= _MAX_MTP_VERIFY_WIDTH:
+            raise ValueError(
+                f"MTP QSA graph width must be 2..{_MAX_MTP_VERIFY_WIDTH} token rows, got "
+                f"{width}"
+            )
         if not batch.is_prefill or batch.size != 1 or batch.padded_size != 1:
             raise ValueError("MTP QSA graph requires one prefill request")
         if not getattr(batch, "mtp_verify", False):

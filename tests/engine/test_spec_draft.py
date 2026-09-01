@@ -530,6 +530,41 @@ def test_an_unprimed_head_refuses_to_propose():
         head.propose(_req(), 3)
 
 
+@pytest.mark.parametrize("depth", [1, 3, 4, 5])
+def test_the_private_qsa_ring_is_sized_from_the_configured_depth(monkeypatch, depth):
+    """The draft's OWN pending ring has to cover ``index_ratio + depth`` rows, exactly as the
+    target's does: a proposal writes ``depth - 1`` recursive rows on top of an open compression
+    group, and a ring narrower than that aliases them onto the group's still-needed members --
+    wrong keys, no crash. It is sized off ``self.depth``, so the ceiling moving does not need a
+    second edit here; this is the pin that says so."""
+    import freetoken.attention.qsa_sparse as qsa
+    from freetoken.models.qwen4_exp.mtp_spike import derive_mtp_model_config
+    from tests.models.qwen4_exp.common import parsed_config
+
+    import freetoken.core as core
+
+    core._GLOBAL_CTX = None
+    ctx = Context(page_size=PAGE_SIZE)
+    set_global_ctx(ctx)
+
+    head = object.__new__(SpecDraftHead)
+    head.device = CPU
+    head.depth = depth
+    head.num_pages = PAGES
+    head.target_ctx = ctx
+    head.mtp_config = derive_mtp_model_config(parsed_config())
+    # the real pool, the real arithmetic; only the attention backend (which wants a device) is
+    # stood in for
+    monkeypatch.setattr(qsa, "QSASparseAttnBackend", lambda config: SimpleNamespace())
+
+    head._init_private_state(PAGE_SIZE)
+
+    ratio = head.mtp_config.kv_cache_group_specs()[0].index_ratio
+    assert head.kv_cache.ring_capacity >= ratio + depth
+    assert head.kv_cache._pending_ring.shape[2] == head.kv_cache.ring_capacity
+    assert head.kv_cache._pending_position_ring.shape[2] == head.kv_cache.ring_capacity
+
+
 # ------------------------------------------------------------------------ the confidence cut
 #
 # The head's own raw top-1 confidence predicts the target's verdict, and a verify row is the

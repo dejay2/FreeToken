@@ -58,6 +58,12 @@ if TYPE_CHECKING:
 
 # Shared with the shadow observer's draft/acceptance streams (mtp_shadow.MTPShadowConfig.seed).
 DEFAULT_SPEC_SEED = 1729
+# The deepest proposal chain acceptance will decide. A MIRROR of
+# ``freetoken.engine.config._MAX_SPEC_DEPTH``, which is the source of truth: this module is
+# torch-only at module scope (see the docstring) and importing config here would pull the model
+# registry and the HF config loader into the decode path. ``tests/engine/test_spec_sampler.py``
+# imports both and pins them equal, so the two cannot drift.
+_MAX_ACCEPT_DEPTH = 5
 # purpose tags keep the acceptance stream disjoint from the draft head's, per request
 _ACCEPTANCE_PURPOSE = 2
 
@@ -199,8 +205,10 @@ def batched_speculative_accept(
     generator: torch.Generator,
 ) -> MTPAcceptanceResult:
     depth = len(proposals)
-    if depth not in (1, 2, 3):
-        raise ValueError("batched MTP acceptance requires one to three proposals")
+    if not 1 <= depth <= _MAX_ACCEPT_DEPTH:
+        raise ValueError(
+            f"batched MTP acceptance requires 1..{_MAX_ACCEPT_DEPTH} proposals, got {depth}"
+        )
     if draft_logits.ndim != 2 or draft_logits.shape[0] != depth:
         raise ValueError("draft logits must have one row per proposal")
     if target_logits.ndim != 2 or target_logits.shape[0] != depth + 1:

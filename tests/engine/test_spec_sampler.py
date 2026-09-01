@@ -631,3 +631,116 @@ def test_the_decision_carries_the_split_through_a_truncation():
     truncated = decision.truncated(2)
     assert (truncated.filter_ms, truncated.decide_ms, truncated.sync_ms) == split
     assert truncated.acceptance_ms == decision.acceptance_ms
+
+
+# ------------------------------------------------------------- the depth 4 / 5 acceptance
+#
+# The tensor core is written against ``depth`` throughout (cumprod over the whole row block,
+# ``target_logits[depth:depth + 1]`` for the bonus), so the deeper chains need no new maths --
+# only the module's own guard had a literal in it. These pin the arithmetic at the widths the
+# raised ceiling admits, in all three shapes a cycle can end in.
+
+
+@pytest.mark.parametrize("depth", [4, 5])
+def test_a_deep_chain_the_target_agrees_with_is_accepted_whole(depth):
+    drafts = list(range(1, depth + 1))
+    decision = _sampler(depth=depth).step(
+        uid=1,
+        draft_tokens=drafts,
+        draft_logits=_peaked(drafts),
+        target_logits=_peaked(drafts + [7]),
+        args=_args(temperature=None),
+    )
+    assert decision.accepted_drafts == depth
+    assert decision.tokens == tuple(drafts) + (7,)
+    assert decision.accepted_rows == depth + 1 == len(decision.tokens)
+    assert decision.rejected_at is None
+
+
+@pytest.mark.parametrize("depth", [4, 5])
+@pytest.mark.parametrize("accepted", [1, 2, 3])
+def test_a_deep_chain_accepts_the_prefix_and_stops_at_the_first_miss(depth, accepted):
+    """Acceptance is a PREFIX: a later row whose guess happens to be right is unreachable,
+    because the target row it would be judged against was conditioned on a token the request
+    never emits."""
+    drafts = list(range(1, depth + 1))
+    # the target agrees up to `accepted`, then wants 7 -- while the drafts past the miss keep
+    # guessing what the target would have said had the chain survived
+    winners = drafts[:accepted] + [7] * (depth + 1 - accepted)
+    decision = _sampler(depth=depth).step(
+        uid=1,
+        draft_tokens=drafts,
+        draft_logits=_peaked(drafts),
+        target_logits=_peaked(winners),
+        args=_args(temperature=None),
+    )
+    assert decision.accepted_drafts == accepted
+    assert decision.rejected_at == accepted
+    assert decision.tokens == tuple(drafts[:accepted]) + (7,)
+    assert decision.accepted_rows == accepted + 1 == len(decision.tokens)
+
+
+@pytest.mark.parametrize("depth", [4, 5])
+def test_a_wholly_rejected_deep_chain_still_emits_exactly_one_token(depth):
+    drafts = list(range(1, depth + 1))
+    decision = _sampler(depth=depth).step(
+        uid=1,
+        draft_tokens=drafts,
+        draft_logits=_peaked(drafts),
+        target_logits=_peaked([6] * (depth + 1)),
+        args=_args(temperature=None),
+    )
+    assert (decision.accepted_drafts, decision.accepted_rows) == (0, 1)
+    assert decision.tokens == (6,)
+    # a deep cycle that accepts nothing costs w rows and emits one token: that is exactly the
+    # loss the adaptive fallback's bar is there to notice
+    assert decision.rejected_at == 0
+
+
+@pytest.mark.parametrize("depth", [4, 5])
+def test_a_deep_stochastic_chain_accepts_a_draft_the_target_agrees_with(depth):
+    """Not greedy: the rejection-sampling arm draws ``depth`` uniforms and compares them to
+    ``min(1, p/q)``. With p == q on every drafted token the ratio is 1 and every draw accepts,
+    whatever the stream -- so the whole chain lands without pinning any particular RNG."""
+    drafts = list(range(1, depth + 1))
+    row = [0.7, 0.1, 0.1, 0.1, 0.0, 0.0, 0.0, 0.0]
+    rows = [row[-index:] + row[:-index] for index in range(1, depth + 2)]
+    decision = _sampler(depth=depth, seed=4242).step(
+        uid=1,
+        draft_tokens=drafts,
+        draft_logits=_rows(rows[:depth]),
+        target_logits=_rows(rows),
+        args=_args(temperature=1.0),
+    )
+    assert decision.greedy is False
+    assert decision.acceptance_probabilities == pytest.approx((1.0,) * depth)
+    assert decision.accepted_drafts == depth
+    assert decision.tokens[:depth] == tuple(drafts)
+
+
+@pytest.mark.parametrize("depth", [4, 5])
+def test_a_deep_sampler_owns_one_rng_stream_per_depth(depth):
+    sampler = _sampler(depth=depth)
+    assert sorted(sampler._generators) == list(range(1, depth + 1))
+    assert len(sampler.stats["acceptance_histogram"]) == depth + 1
+
+
+def test_the_acceptance_core_admits_the_whole_configurable_depth_range():
+    for depth in range(1, 6):
+        assert _accept(depth=depth).accepted_prefix == depth
+
+
+def test_the_acceptance_core_refuses_a_chain_past_the_ceiling():
+    with pytest.raises(ValueError, match="1\\.\\.5 proposals"):
+        _accept(depth=6)
+
+
+def test_the_acceptance_ceiling_mirrors_the_engine_configs():
+    """``spec_sample`` is torch-only at module scope (its docstring is the contract), so it
+    cannot import the engine config for the ceiling and keeps a mirror instead. The test is
+    where the two meet: if they ever disagree, a depth the config admits would be refused by
+    acceptance in the middle of a live cycle."""
+    from freetoken.engine.config import _MAX_SPEC_DEPTH
+    from freetoken.engine.spec_sample import _MAX_ACCEPT_DEPTH
+
+    assert _MAX_ACCEPT_DEPTH == _MAX_SPEC_DEPTH
