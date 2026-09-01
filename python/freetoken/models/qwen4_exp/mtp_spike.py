@@ -377,6 +377,14 @@ class MTPExpertStats:
     explicit_pcie_bytes: int = 0
 
 
+@dataclass(frozen=True)
+class _MTPBankGeometry:
+    num_experts: int
+    hidden_size: int
+    intermediate_size: int
+    bytes_per_expert: int
+
+
 class MTPCPUExpertRunner:
     """Bounded MTP routed experts through FreeToken's existing CPU worker."""
 
@@ -524,7 +532,6 @@ class MTPGPUExpertRunner:
         device = torch.device(device)
         if device.type == "cuda" and device.index is None:
             device = torch.device("cuda", torch.cuda.current_device())
-        self.banks = banks
         self.top_k = int(top_k)
         self.renormalize = bool(renormalize)
         self.max_tokens = int(max_tokens)
@@ -532,6 +539,14 @@ class MTPGPUExpertRunner:
         self.stats = MTPExpertStats()
         self.gate_up = banks.gate_up.to(device)
         self.down = banks.down.to(device)
+        # Only the geometry outlives the host banks: holding the banks object here would
+        # keep ~5 GB of committed CPU RAM alive for a handful of scalar reads.
+        self.banks = _MTPBankGeometry(
+            num_experts=int(banks.num_experts),
+            hidden_size=int(banks.hidden_size),
+            intermediate_size=int(banks.intermediate_size),
+            bytes_per_expert=int(banks.bytes_per_expert),
+        )
         self.resident_bytes = sum(
             tensor.numel() * tensor.element_size()
             for tensor in (self.gate_up, self.down)

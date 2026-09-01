@@ -453,6 +453,10 @@ class MTPShadowObserver:
             num_threads=self.config.cpu_threads,
             device=self.device,
         )
+        if self.config.resident:
+            # The runner copied the banks to the device and kept only their geometry;
+            # this reference is the last thing pinning the ~5 GB host copy.
+            self._expert_banks = None
 
     @contextmanager
     def _private_context_fields(self):
