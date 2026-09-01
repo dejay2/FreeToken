@@ -87,6 +87,25 @@ def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memo
     return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
 
 
+def _cpu_moe_executor_tokens(config) -> int:
+    """Rows one CPU MoE submit may carry -- the executor's ``max_tokens`` sizing.
+
+    Decode batches never exceed ``max_running_req``, but CUDA-graph padding can round a
+    batch up to the largest captured size, so both bound it. A speculative verify step
+    adds a third: it submits the WHOLE ``w = 1 + depth`` row block in one forward, and
+    speculation pins ``max_running_req`` to 1 (``require_speculation_supported``), so
+    neither of the other two covers it. The C++ scratch and the pinned IO buffers are
+    cut to ``max_tokens`` once, ahead of graph capture -- a wider submit would run past
+    them. ``batch_width`` is 1 while speculation is off, so this is inert then.
+    """
+    return max(
+        config.max_running_req,
+        config.cuda_graph_max_bs or 0,
+        config.spec_decode.batch_width,
+        1,
+    )
+
+
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
     """Column count for the page table. ``_write_page_table`` writes WHOLE trailing pages, so the
     highest column touched is ``align_ceil(max_seq_len, page_size) - 1`` -- which the 32-alignment
@@ -797,9 +816,7 @@ class Engine:
                 "CPU MoE backend is not yet supported for this model architecture "
                 f"(MoE layer {type(sample).__name__} is missing {required})."
             )
-        # Decode batches never exceed max_running_req, but CUDA-graph padding can
-        # round a batch up to the largest captured size; cover both.
-        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        max_tokens = _cpu_moe_executor_tokens(config)
         # gpt-oss mxfp4 carries clamped-swiglu scalars; other formats use the defaults.
         executor = CpuMoeExecutor(
             cache,
