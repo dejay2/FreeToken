@@ -17,8 +17,10 @@ if TYPE_CHECKING:
 # w = 1 + depth must stay a capturable MTP verify width (mtp_fast_verify captures 2, 3, 4).
 _MAX_SPEC_DEPTH = 3
 
-# A cold request probes at least once every ``cooldown_cap`` plain steps.
-_COOLDOWN_BACKOFF_CAP = 8
+# A cold request probes at least once every ``cooldown_cap`` plain steps. 4x rather than 8x
+# because a re-cool now takes TWO consecutive failed probes, so each rung of the ladder is
+# already twice the evidence it used to be.
+_COOLDOWN_BACKOFF_CAP = 4
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,10 @@ class SpecDecodeConfig:
     # --- the adaptive fallback (see ``adaptive``) ---
     ema_alpha: float = 0.3
     min_emitted: float = 2.0
+    # A probe is ONE integer sample from the distribution ``min_emitted`` bounds the mean of,
+    # so it is judged against its own -- lower -- bar. Holding a single sample to the mean's
+    # threshold rejects roughly half of content that is comfortably worth speculating on.
+    probe_resume: float = 2.0
     cooldown: int = 16
 
     @property
@@ -63,16 +69,21 @@ class SpecDecodeConfig:
 
     @property
     def graph_widths(self) -> tuple[int, ...]:
-        """The verify widths worth capturing: ``2 .. batch_width``, or nothing when off.
+        """The widths worth capturing: ``1 .. batch_width``, or nothing when off.
 
         A step drafts ``min(depth, remain_len)`` tokens, so near a request's budget end it can
         narrow below the full width -- but never below 2, and never above ``1 + depth``. Each
-        graph costs a warm-up forward and its own buffers, so capturing outside that range
-        would spend both on a width the configuration can never emit.
+        graph costs a warm-up forward and its own buffers, so capturing above that range would
+        spend both on a width the configuration can never emit.
+
+        Width 1 is not a verify width at all: it is the ORDINARY decode forward, recorded with
+        the same fixed output slots. A spec-enabled boot cannot use the plain decode graph
+        (logits only, and the draft head needs hidden + embeddings), so without this every
+        fallback decode step ran eager at roughly half the graphed rate.
         """
         if not (self.enabled and self.graph):
             return ()
-        return tuple(range(2, self.batch_width + 1))
+        return tuple(range(1, self.batch_width + 1))
 
     @property
     def num_speculative_tokens(self) -> int:
@@ -89,7 +100,7 @@ class SpecDecodeConfig:
 def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfig:
     """Read ``FREETOKEN_MTP_SPECULATE`` / ``FREETOKEN_MTP_SPEC_DEPTH`` / ``..._SPEC_GRAPH``,
     plus the adaptive fallback's ``..._SPEC_EMA_ALPHA`` / ``..._SPEC_MIN_EMITTED`` /
-    ``..._SPEC_COOLDOWN``."""
+    ``..._SPEC_PROBE_RESUME`` / ``..._SPEC_COOLDOWN``."""
     env = os.environ if env is None else env
     raw = env.get("FREETOKEN_MTP_SPECULATE", "0").strip()
     if raw not in ("0", "1"):
@@ -125,6 +136,14 @@ def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfi
         raise ValueError(
             f"FREETOKEN_MTP_SPEC_MIN_EMITTED must be 0..{1 + depth}, got {min_emitted!r}"
         )
+    probe_resume = _float_env(env, "FREETOKEN_MTP_SPEC_PROBE_RESUME", "2.0")
+    if not 0.0 < probe_resume <= 1 + depth:
+        # Zero would resume on any emission at all, which is not a probe; above the full width
+        # no probe could ever clear the bar and a cold request would never come back.
+        raise ValueError(
+            f"FREETOKEN_MTP_SPEC_PROBE_RESUME must be in (0, {1 + depth}], got "
+            f"{probe_resume!r}"
+        )
     cooldown_raw = env.get("FREETOKEN_MTP_SPEC_COOLDOWN", "16").strip()
     try:
         cooldown = int(cooldown_raw)
@@ -140,6 +159,7 @@ def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfi
         graph=graph_raw == "1",
         ema_alpha=alpha,
         min_emitted=min_emitted,
+        probe_resume=probe_resume,
         cooldown=cooldown,
     )
 

@@ -34,6 +34,7 @@ runs after the lengths are final, because a stop condition can still shrink the 
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
@@ -166,6 +167,29 @@ class SpecStateLadder:
             )
             self._ngram_hist[self._ngram_len : self._ngram_len + width].copy_(ids)
         batch.spec_capture = self
+
+    @contextmanager
+    def borrow_snapshot(self, req: "Req"):
+        """Snapshot ``req``'s slot for a capture that is NOT a speculative step, and yield the
+        wind-back.
+
+        ``begin`` is the speculative step's snapshot and also arms the per-layer stash, sized
+        to that step's width. The width-1 capture-decode graph needs only the undo: its warm-up
+        pass advances the slot by one row, and the recorded pass -- which is where the step's
+        real values come from -- must start where the warm-up did. Nothing is stashed and no
+        rollback follows, so the borrow ends when the capture does.
+        """
+        if self._live is not None:
+            raise RuntimeError("a speculative step is already in flight on this ladder")
+        slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
+        self.pool.copy_from(slot, self.slot)
+        self._live = slot
+        self._width = 0
+        try:
+            yield self.restore_snapshot
+        finally:
+            self._live = None
+            self._width = 0
 
     # ------------------------------------------------------------------ during the forward
 

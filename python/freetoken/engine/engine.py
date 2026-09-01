@@ -515,8 +515,8 @@ class Engine:
                 guard_bytes=_SPEC_GRAPH_GUARD_BYTES,
             )
             logger.info_rank0(
-                "Integrated MTP verify graphs armed for widths "
-                f"{config.spec_decode.graph_widths}"
+                "Integrated MTP graphs armed for widths "
+                f"{config.spec_decode.graph_widths} (1 = the capture-decode step)"
             )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
@@ -1038,24 +1038,52 @@ class Engine:
                 guard_bytes=_SPEC_GRAPH_GUARD_BYTES,
             )
 
+    def _capture_decode_graph(self, batch: Batch):
+        """Replay the width-1 spec graph for an ordinary decode step, or None to run eagerly.
+
+        Eligibility is deliberately "a batch the plain path would have graphed": that shape is
+        the only one whose attention addressing the backend stages into the persistent decode
+        buffers a capture can bake (``init_capture_graph``), and it is exactly the step the
+        acceptance fallback made slow.
+        """
+        runner = self.spec_graph_runner
+        if (
+            runner is None
+            or self.spec_draft is None
+            or not batch.is_decode
+            or batch.size != 1
+            or batch.padded_size != 1
+            or not self.graph_runner.can_use_cuda_graph(batch)
+        ):
+            return None
+        ladder = self.spec_state_ladder
+        if ladder is None or not runner.capture_pending(1):
+            return runner.forward_decode(batch)
+        # capture's warm-up EXECUTES this decode and advances the request's GDN slot; a plain
+        # decode step takes no ladder snapshot of its own, so one is borrowed for the capture.
+        with ladder.borrow_snapshot(batch.reqs[0]) as restore_state:
+            return runner.forward_decode(batch, restore_state=restore_state)
+
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
-        mtp_capture = None
         # Integrated speculation feeds its draft head the same (hidden, embeddings) pair the
-        # observer captures, so a spec-enabled boot takes the eager capture path too -- but
-        # only for the ordinary forwards it still runs (prefill, and the decode fallback);
-        # the speculative step itself goes through speculative_decode_batch.
+        # observer captures, so a spec-enabled boot takes the capture path too -- but only for
+        # the ordinary forwards it still runs (prefill, and the decode fallback); the
+        # speculative step itself goes through speculative_decode_batch.
         wants_capture = self.mtp_shadow_observer is not None or self.spec_draft is not None
-        with self.ctx.forward_batch(batch):
-            if wants_capture:
-                # Capture is private/eager; normal serving keeps its original graph path.
-                captured = self.model.forward_mtp_capture(all_row_logits=False)
-                logits, mtp_hidden, mtp_embeddings = captured
-                mtp_capture = (logits, mtp_hidden, mtp_embeddings)
-            elif self.graph_runner.can_use_cuda_graph(batch):
-                logits = self.graph_runner.replay(batch)
-            else:
-                logits = self.model.forward()
+        mtp_capture = self._capture_decode_graph(batch) if wants_capture else None
+        if mtp_capture is not None:
+            logits = mtp_capture[0]
+        else:
+            with self.ctx.forward_batch(batch):
+                if wants_capture:
+                    # Capture is private; normal serving keeps its original graph path.
+                    mtp_capture = self.model.forward_mtp_capture(all_row_logits=False)
+                    logits = mtp_capture[0]
+                elif self.graph_runner.can_use_cuda_graph(batch):
+                    logits = self.graph_runner.replay(batch)
+                else:
+                    logits = self.model.forward()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.

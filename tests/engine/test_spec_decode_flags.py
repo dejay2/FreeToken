@@ -133,6 +133,8 @@ def _forward_engine(*, spec_draft=None):
     engine.mtp_shadow_observer = None
     engine.spec_draft = spec_draft
     engine.spec_sampler = None
+    engine.spec_state_ladder = None
+    engine.spec_graph_runner = None  # FREETOKEN_MTP_SPEC_GRAPH off: the eager capture path
     engine.cpu_moe_executor = None
     engine.sampler = Sampler(device=device, vocab_size=4)
     engine.graph_runner = SimpleNamespace(can_use_cuda_graph=lambda batch: False)
@@ -227,10 +229,12 @@ def test_the_verify_graph_flag_turns_capture_on():
         {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_GRAPH": "1"}
     )
     assert spec.graph is True
-    assert spec.graph_widths == (2, 3, 4)
+    # width 1 is the graphed capture-decode: the ordinary forward a spec-enabled boot still
+    # runs, which without a graph of its own falls back to eager at half the decode rate.
+    assert spec.graph_widths == (1, 2, 3, 4)
 
 
-@pytest.mark.parametrize("depth,widths", [(1, (2,)), (2, (2, 3)), (3, (2, 3, 4))])
+@pytest.mark.parametrize("depth,widths", [(1, (1, 2)), (2, (1, 2, 3)), (3, (1, 2, 3, 4))])
 def test_only_the_widths_the_depth_can_actually_produce_are_captured(depth, widths):
     """A graph costs a warm-up forward and a slab of pinned buffers; capturing a width the
     configured depth can never emit would spend both for nothing."""
@@ -310,11 +314,31 @@ def test_a_fresh_request_is_seeded_at_a_full_cycles_emission():
 
 def test_the_cooldown_backoff_is_bounded():
     """A cold request must keep probing: content changes mid-stream, and a permanently
-    cold request would never discover that its draft went hot again."""
+    cold request would never discover that its draft went hot again. The cap is 4x rather
+    than 8x now that two consecutive probes, not one, are what re-cools."""
     spec = resolve_spec_decode(
         {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_COOLDOWN": "16"}
     )
-    assert spec.cooldown_cap == 128
+    assert spec.cooldown_cap == 64
+
+
+def test_the_probe_is_judged_on_its_own_threshold_not_the_averages():
+    """``min_emitted`` is a bar for a MEAN; a probe is one integer sample from the
+    distribution that mean describes, so it gets its own -- lower -- bar."""
+    spec = resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"})
+    assert spec.probe_resume == pytest.approx(2.0)
+    tuned = resolve_spec_decode(
+        {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_PROBE_RESUME": "1.5"}
+    )
+    assert tuned.probe_resume == pytest.approx(1.5)
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "x", "", "nan", "4.5"])
+def test_a_probe_resume_outside_the_emittable_range_is_rejected(raw):
+    """Zero is rejected too: a probe that resumes on any emission is not a probe. Turning
+    the fallback off is still ``FREETOKEN_MTP_SPEC_MIN_EMITTED=0``."""
+    with pytest.raises(ValueError, match="FREETOKEN_MTP_SPEC_PROBE_RESUME"):
+        resolve_spec_decode({"FREETOKEN_MTP_SPEC_PROBE_RESUME": raw})
 
 
 @pytest.mark.parametrize("raw", ["0", "-0.1", "1.1", "x", "", "nan"])

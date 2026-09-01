@@ -1489,17 +1489,29 @@ class _SpecAcceptance:
     built while the draft was useless would veto a probe that just emitted a full run. So a
     good probe replaces the EMA outright -- the pre-cold history describes content that has
     since changed.
+
+    AND IT IS JUDGED TWICE, AGAINST ITS OWN THRESHOLD. ``min_emitted`` bounds a MEAN; a probe
+    is one integer sample from the distribution that mean describes. Content whose cycles
+    alternate a full run with a single token sits comfortably above the bar on average while
+    every other sample lands below it, so a single-sample verdict re-cooled roughly half the
+    time -- with doubling backoff behind it, that is how a request that should speculate
+    throughout ended up decoding 16, then 32, then 64 steps plainly. Hence ``probe_resume``
+    (a sample's bar, not a mean's) and a pair of consecutive probes before any re-cool.
     """
+
+    #: consecutive failing probes before the request cools down again
+    PROBE_CYCLES = 2
 
     def __init__(self, spec) -> None:  # SpecDecodeConfig
         self.ema = spec.ema_seed
         self.alpha = spec.ema_alpha
         self.min_emitted = spec.min_emitted
+        self.probe_resume = spec.probe_resume
         self.base_cooldown = spec.cooldown
         self.cooldown_cap = spec.cooldown_cap
         self.next_cooldown = spec.cooldown
         self.remaining = 0        # plain steps still owed before the next probe
-        self.probing = False      # the next cycle is a probe, judged on its own emission
+        self.probes_left = 0      # probe cycles still owed before a re-cool
         self.cycles = 0
         self.plain_steps = 0
 
@@ -1512,21 +1524,23 @@ class _SpecAcceptance:
 
     def record(self, emitted: int) -> None:
         self.cycles += 1
-        if self.probing:
-            self.probing = False
-            if emitted >= self.min_emitted:
+        if self.probes_left:
+            self.probes_left -= 1
+            if emitted >= self.probe_resume:
+                self.probes_left = 0
                 self.ema = float(emitted)
                 self.next_cooldown = self.base_cooldown
-                return
-        else:
-            self.ema += self.alpha * (emitted - self.ema)
-            if self.ema >= self.min_emitted:
-                return
-        self._cool_down()
+            elif not self.probes_left:
+                self._cool_down()
+            # else: the next iteration is the second probe, with no cooldown between them
+            return
+        self.ema += self.alpha * (emitted - self.ema)
+        if self.ema < self.min_emitted:
+            self._cool_down()
 
     def _cool_down(self) -> None:
         self.remaining = self.next_cooldown
-        self.probing = True
+        self.probes_left = self.PROBE_CYCLES
         self.next_cooldown = min(2 * self.next_cooldown, self.cooldown_cap)
 
 

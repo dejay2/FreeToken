@@ -34,6 +34,18 @@ also starts from the right state. Everything else the step writes is position-ad
 idempotent: the KV store, the compressed slab, and the pending rings all re-derive from the
 same inputs.
 
+**WIDTH 1: THE CAPTURE-DECODE GRAPH.** A spec-enabled boot cannot serve its ORDINARY forwards
+from the plain decode graph, which returns logits and nothing else while the draft head needs
+the hidden rows and the input embeddings too -- so every one of them ran eager, and once the
+adaptive policy falls back to plain decode that is every step, at roughly half the graphed
+rate. Width 1 records exactly the forward the eager path runs
+(``forward_mtp_capture(all_row_logits=False)``) into fixed logit, hidden and embedding slots.
+
+It is DECODE-shaped, not a one-row verify batch: same phase, same kernels and same numbers as
+plain decode, which is what the draft head has always been fed. Its restore seam is the same
+one, but an ordinary decode step takes no ladder snapshot of its own, so the engine borrows one
+around the capture (``SpecStateLadder.borrow_snapshot``).
+
 Sampling stays outside: the graph's outputs are fixed buffers the caller reads.
 """
 
@@ -84,6 +96,10 @@ class _GraphInputBuffer:
     (the step may have straddled a page boundary), and ``linear_table_idx`` is whatever slot
     the request holds now.
     """
+
+    #: whether this shape drives the CHUNKED GDN kernel, and so needs the fla chunk-index
+    #: cache primed before capture. Decode does not: it runs the fused recurrent path.
+    primes_chunk_indices = True
 
     def __init__(self, width: int, device: torch.device) -> None:
         self.input_ids = torch.empty(width, dtype=torch.int32, device=device)
@@ -208,6 +224,93 @@ class _SpecVerifyGraphBuffer(_GraphInputBuffer):
         self.hidden.copy_(hidden)
 
 
+class _SpecDecodeGraphBuffer(_GraphInputBuffer):
+    """The width-1 buffer: one ORDINARY decode row in, all three capture outputs out.
+
+    Decode-shaped, deliberately. A one-row verify batch would be prefill-phase and take the
+    chunked GDN kernel and the ragged QSA path; the draft head has been fed from the
+    decode-phase forward since it existed, and a graph that swapped the kernels underneath it
+    would silently change what a fallback step computes. So this mirrors
+    ``graph.GraphCaptureBuffer`` at ``bs = 1`` -- the same int32 arange indptr, the same
+    state-slot map -- and adds the hidden and embedding slots the draft head consumes.
+    """
+
+    primes_chunk_indices = False
+
+    def __init__(self, device: torch.device) -> None:
+        super().__init__(1, device)
+        # decode GDN metadata is the plain runner's: an int32 arange indptr and no
+        # continuation flag, because a decode step always continues its sequence
+        self.fla_cu_seqlens = torch.arange(2, dtype=torch.int32, device=device)
+        del self.fla_has_initial_state
+        self.logits: torch.Tensor | None = None
+        self.hidden: torch.Tensor | None = None
+        self.embeddings: torch.Tensor | None = None
+
+    @classmethod
+    def init(cls, device: torch.device) -> _SpecDecodeGraphBuffer:
+        return cls(device)
+
+    def copy_from(self, batch) -> None:
+        if int(batch.input_ids.shape[0]) != 1:
+            raise ValueError("the width-1 spec graph replays exactly one token row")
+        _check_decode_batch(batch)
+        self.input_ids.copy_(batch.input_ids)
+        self.positions.copy_(batch.positions)
+        self.out_loc.copy_(batch.out_loc)
+        rope_positions = getattr(batch, "rope_positions", None)
+        if rope_positions is None:
+            self.rope_positions.copy_(batch.positions.to(torch.int64).expand(3, -1))
+        else:
+            self.rope_positions.copy_(rope_positions)
+        if batch.linear_table_idx is not None:
+            self.linear_table_idx.copy_(batch.linear_table_idx[:1])
+
+    def bind(self, batch) -> None:
+        from freetoken.attention.linear import FLAMetadata
+
+        batch.input_ids = self.input_ids
+        batch.positions = self.positions
+        batch.out_loc = self.out_loc
+        batch.rope_positions = self.rope_positions
+        if batch.linear_table_idx is not None:
+            batch.linear_table_idx = self.linear_table_idx
+            batch.fla_metadata = FLAMetadata(
+                cu_seqlens=self.fla_cu_seqlens, cache_indices=self.linear_table_idx
+            )
+
+    def alloc_outputs(self, logits, hidden, embeddings) -> None:
+        rows = {"logits": logits, "hidden": hidden, "embeddings": embeddings}
+        for name, tensor in rows.items():
+            if tensor.ndim != 2 or int(tensor.shape[0]) != 1:
+                raise RuntimeError(
+                    f"a one-row capture-decode forward returned {name} {tuple(tensor.shape)}"
+                )
+        if self.logits is None:
+            self.logits = torch.empty_like(logits)
+            self.hidden = torch.empty_like(hidden)
+            self.embeddings = torch.empty_like(embeddings)
+        elif any(
+            getattr(self, name).shape != tensor.shape for name, tensor in rows.items()
+        ):
+            raise RuntimeError("the capture-decode forward changed its output shapes")
+
+    def store_outputs(self, logits, hidden, embeddings) -> None:
+        assert self.logits is not None
+        self.logits.copy_(logits)
+        self.hidden.copy_(hidden)
+        self.embeddings.copy_(embeddings)
+
+
+def _check_decode_batch(batch) -> None:
+    if not batch.is_decode or batch.size != 1 or batch.padded_size != 1:
+        raise ValueError("the width-1 spec graph requires one decode request")
+    if getattr(batch, "mtp_verify", False):
+        raise ValueError(
+            "the width-1 spec graph records the ordinary decode forward, not a verify step"
+        )
+
+
 class _FixedWidthGraphRunner:
     """Survivable per-width capture, shared by the observer and the integrated step."""
 
@@ -227,8 +330,8 @@ class _FixedWidthGraphRunner:
         self.device = torch.device(device)
         self.guard_bytes = int(guard_bytes)
         self.widths = tuple(int(width) for width in widths)
-        if not self.widths or min(self.widths) < 2:
-            raise ValueError(f"graph widths must all be >= 2, got {self.widths}")
+        if not self.widths or min(self.widths) < 1:
+            raise ValueError(f"graph widths must all be >= 1, got {self.widths}")
         if self.guard_bytes < 0:
             raise ValueError("MTP graph guard bytes must be non-negative")
         self._stream = (
@@ -259,6 +362,33 @@ class _FixedWidthGraphRunner:
     def _estimated_buffer_bytes(self, width: int) -> int:
         raise NotImplementedError
 
+    def _check_batch(self, batch, width: int) -> None:
+        """The shape contract this width's graph replays against. Verify-shaped by default;
+        width 1 of the integrated runner overrides it with the decode shape."""
+        if not batch.is_prefill or batch.size != 1 or batch.padded_size != 1:
+            raise ValueError("MTP graph requires one prefill request")
+        if not getattr(batch, "mtp_verify", False):
+            raise ValueError("MTP graph requires the private verification marker")
+
+    # Attention staging, as three seams rather than three inline getattrs: the verify widths
+    # bind private QSA metadata, and the decode width goes through the backend's ordinary
+    # decode-graph buffers instead.
+
+    def _prepare_attention(self, batch, width: int) -> None:
+        prepare = getattr(self.attn_backend, "prepare_mtp_verify_graph", None)
+        if prepare is not None:
+            prepare(batch)
+
+    def _finish_attention(self, width: int) -> None:
+        finish = getattr(self.attn_backend, "finish_mtp_verify_graph_capture", None)
+        if finish is not None:
+            finish(width)
+
+    def _stage_attention(self, batch, static_batch, width: int) -> None:
+        stage = getattr(self.attn_backend, "stage_mtp_verify_graph", None)
+        if stage is not None:
+            stage(batch, static_batch)
+
     # ------------------------------------------------------------------------ inspection
 
     @property
@@ -284,6 +414,22 @@ class _FixedWidthGraphRunner:
     def last_attempt(self, width: int) -> MTPGraphCaptureResult | None:
         return self._last_attempt.get(width)
 
+    def capture_pending(self, width: int) -> bool:
+        """Whether the NEXT live step at this width would attempt a capture.
+
+        The caller needs this before the step, not after: capture's warm-up executes the
+        forward, so the state it advances has to be snapshotted first -- and an ordinary decode
+        step, unlike a speculative one, has no snapshot of its own to reuse.
+        """
+        if self._destroyed or self.device.type != "cuda" or width not in self.widths:
+            return False
+        if width in self._graphs:
+            return False
+        support = self._support.get(width)
+        if support is not None and support.status == "permanently-unsupported":
+            return False
+        return self._attempts.get(width, 0) < _MAX_RETRYABLE_ATTEMPTS
+
     # -------------------------------------------------------------------------- internals
 
     def _validate_width(self, batch) -> int:
@@ -294,16 +440,13 @@ class _FixedWidthGraphRunner:
             raise ValueError(
                 f"MTP graph width must be exactly {_render_widths(self.widths)} token rows"
             )
-        if not batch.is_prefill or batch.size != 1 or batch.padded_size != 1:
-            raise ValueError("MTP graph requires one prefill request")
+        self._check_batch(batch, width)
         # the graph's fla_cu_seqlens is a fixed [0, width]; a request whose extend_len says
         # otherwise would replay against metadata that does not describe it
         if int(batch.reqs[0].extend_len) != width:
             raise ValueError(
                 f"MTP graph request extend_len {batch.reqs[0].extend_len} != {width} token rows"
             )
-        if not getattr(batch, "mtp_verify", False):
-            raise ValueError("MTP graph requires the private verification marker")
         return width
 
     def _discard_attention_width(self, width: int) -> None:
@@ -423,16 +566,13 @@ class _FixedWidthGraphRunner:
             # entries: prime it so capture takes no miss, and hold the tensors so a later
             # prefill cannot evict and free what this graph is about to bake an address for
             # (imported lazily: fla.utils initializes CUDA at import, before Engine allows it)
-            from freetoken.kernel.fla.index import prime_chunk_index_cache
+            if buffer.primes_chunk_indices:
+                from freetoken.kernel.fla.index import prime_chunk_index_cache
 
-            self._fla_index_pins[width] = prime_chunk_index_cache(
-                buffer.fla_cu_seqlens, width
-            )
-            prepare_attention = getattr(
-                self.attn_backend, "prepare_mtp_verify_graph", None
-            )
-            if prepare_attention is not None:
-                prepare_attention(batch)
+                self._fla_index_pins[width] = prime_chunk_index_cache(
+                    buffer.fla_cu_seqlens, width
+                )
+            self._prepare_attention(batch, width)
             prepare_model = getattr(
                 self.target_model, "prepare_cuda_graph_capture", None
             )
@@ -478,11 +618,7 @@ class _FixedWidthGraphRunner:
                         # capture_end raises next and would otherwise mask the real cause
                         body_error = exc
                         raise
-            finish_attention = getattr(
-                self.attn_backend, "finish_mtp_verify_graph_capture", None
-            )
-            if finish_attention is not None:
-                finish_attention(width)
+            self._finish_attention(width)
             captured_pool = graph.pool() if self._pool is None else self._pool
             torch.cuda.synchronize(self.device)
             synchronizations += 1
@@ -584,9 +720,7 @@ class _FixedWidthGraphRunner:
             raise RuntimeError(f"MTP graph width {width} is unavailable: {reason}")
         buffer = self._buffers[width]
         buffer.copy_from(batch)
-        stage_attention = getattr(self.attn_backend, "stage_mtp_verify_graph", None)
-        if stage_attention is not None:
-            stage_attention(batch, self._batches[width])
+        self._stage_attention(batch, self._batches[width], width)
         prepare_model = getattr(self.target_model, "prepare_cuda_graph_replay", None)
         if prepare_model is not None:
             prepare_model(batch)
@@ -613,9 +747,20 @@ class _FixedWidthGraphRunner:
 
 
 class SpecVerifyGraphRunner(_FixedWidthGraphRunner):
-    """The integrated step's graph: real addresses in, logits AND hidden rows out."""
+    """The integrated step's graphs: the ``w``-row verify forward, and the 1-row decode one.
 
-    def _new_buffer(self, width: int) -> _SpecVerifyGraphBuffer:
+    Two shapes, one runner -- one graph pool, one memory guard, one survivable-capture
+    classifier, and one object for the engine to hold and tear down. Width 1 is never a verify
+    batch (a step drafts at least one token, so ``w >= 2`` always), which is what lets the
+    width alone select the shape.
+    """
+
+    def _is_decode_width(self, width: int) -> bool:
+        return width == 1
+
+    def _new_buffer(self, width: int) -> _GraphInputBuffer:
+        if self._is_decode_width(width):
+            return _SpecDecodeGraphBuffer.init(self.device)
         return _SpecVerifyGraphBuffer.init(width, self.device)
 
     def _estimated_buffer_bytes(self, width: int) -> int:
@@ -623,7 +768,47 @@ class SpecVerifyGraphRunner(_FixedWidthGraphRunner):
         # the post-warm-up guard below is what actually protects the capture.
         return width * (3 * torch.int32.itemsize + 3 * torch.int64.itemsize) + 64
 
+    def _check_batch(self, batch, width: int) -> None:
+        if self._is_decode_width(width):
+            _check_decode_batch(batch)
+            return
+        super()._check_batch(batch, width)
+
+    def _prepare_attention(self, batch, width: int) -> None:
+        if not self._is_decode_width(width):
+            return super()._prepare_attention(batch, width)
+        # the ordinary decode-graph seam: it stages this step's block table, lengths and ring
+        # slots into the backend's persistent buffers, which is what the capture bakes
+        prepare = getattr(self.attn_backend, "prepare_for_capture", None)
+        if prepare is not None:
+            prepare(batch)
+
+    def _finish_attention(self, width: int) -> None:
+        if not self._is_decode_width(width):
+            super()._finish_attention(width)
+
+    def _discard_attention_width(self, width: int) -> None:
+        # the decode width owns no private QSA metadata; its addressing lives in the backend's
+        # ordinary decode-graph buffers, which this runner must never drop
+        if not self._is_decode_width(width):
+            super()._discard_attention_width(width)
+
+    def _stage_attention(self, batch, static_batch, width: int) -> None:
+        if not self._is_decode_width(width):
+            return super()._stage_attention(batch, static_batch, width)
+        stage = getattr(self.attn_backend, "prepare_for_replay", None)
+        if stage is not None:
+            stage(batch)
+
     def _run(self, batch, buffer, *, allocate: bool) -> None:
+        if isinstance(buffer, _SpecDecodeGraphBuffer):
+            # all_row_logits=False: the same call Engine.forward_batch runs eagerly, so the
+            # graphed step's logits, hidden rows and embeddings are the eager ones exactly
+            outputs = self.target_model.forward_mtp_capture(all_row_logits=False)
+            if allocate:
+                buffer.alloc_outputs(*outputs)
+            buffer.store_outputs(*outputs)
+            return
         logits, hidden, _ = self.target_model.forward_mtp_capture(all_row_logits=True)
         if allocate:
             buffer.alloc_outputs(logits, hidden)
@@ -647,27 +832,41 @@ class SpecVerifyGraphRunner(_FixedWidthGraphRunner):
         Returns ``None`` when the width has no graph and cannot get one, which is the caller's
         signal to run the step eagerly -- so a capture failure costs correctness nothing.
         """
-        if self._destroyed or self.device.type != "cuda":
-            return None
         width = int(batch.input_ids.shape[0])
-        if width not in self.widths:
+        if width in self._graphs:
+            return self.replay(batch)
+        if not self.capture_pending(width):
             return None
-        if width not in self._graphs:
-            support = self._support.get(width)
-            if support is not None and support.status == "permanently-unsupported":
-                return None
-            if self._attempts.get(width, 0) >= _MAX_RETRYABLE_ATTEMPTS:
+        if self.capture(batch, restore_state=restore_state).status != "captured":
+            return None
+        # capture's own warm-up produced values from a state the restore has since wound
+        # back, and the recorded pass ran nothing at all: this replay is the step.
+        return self.replay(batch)
+
+    def forward_decode(
+        self, batch, *, restore_state: Callable[[], None] | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """One graphed capture-decode step: logits, hidden rows and input embeddings.
+
+        ``None`` means "run this decode eagerly" -- no width-1 graph, and none to be had. The
+        three tensors are OWNED copies, because the buffers they came from belong to the next
+        step's replay while ``observe_forward`` still holds these.
+        """
+        if not self._is_decode_width(int(batch.input_ids.shape[0])):
+            return None
+        if 1 not in self._graphs:
+            if not self.capture_pending(1):
                 return None
             if self.capture(batch, restore_state=restore_state).status != "captured":
                 return None
-            # capture's own warm-up produced values from a state the restore has since wound
-            # back, and the recorded pass ran nothing at all: this replay is the step.
-        return self.replay(batch)
+        buffer = self._replay_into_buffers(batch)
+        return buffer.logits.clone(), buffer.hidden.clone(), buffer.embeddings.clone()
 
 
 __all__ = [
     "MTPGraphCaptureResult",
     "SpecVerifyGraphRunner",
     "_MTPVerifyGraphBuffer",
+    "_SpecDecodeGraphBuffer",
     "_SpecVerifyGraphBuffer",
 ]

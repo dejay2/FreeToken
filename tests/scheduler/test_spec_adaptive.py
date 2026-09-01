@@ -26,13 +26,16 @@ from freetoken.scheduler.scheduler import Scheduler, _SpecTimingProbe
 CPU = torch.device("cpu")
 
 
-def _stub(*, depth=3, min_emitted=2.0, cooldown=4, ema_alpha=0.5, ready=True):
+def _stub(
+    *, depth=3, min_emitted=2.0, probe_resume=2.0, cooldown=4, ema_alpha=0.5, ready=True
+):
     stub = Scheduler.__new__(Scheduler)
     stub.config = SimpleNamespace(
         spec_decode=SpecDecodeConfig(
             enabled=True,
             depth=depth,
             min_emitted=min_emitted,
+            probe_resume=probe_resume,
             cooldown=cooldown,
             ema_alpha=ema_alpha,
         )
@@ -66,6 +69,19 @@ def _plain_steps_until_probe(stub, req, *, limit=64) -> int:
         plain += 1
         assert plain <= limit, "the cooldown never allowed another probe"
     return plain
+
+
+def _fail_a_probe_pair(stub, req) -> int:
+    """Wait out the cooldown, then fail BOTH probes -- what it now takes to re-cool.
+
+    Returns the plain steps waited before the first of them, and asserts on the way through
+    that one bad probe alone did not re-cool.
+    """
+    gap = _plain_steps_until_probe(stub, req)
+    stub._spec_record(req, 1)
+    assert stub._spec_candidate() is req, "one bad probe must not re-cool on its own"
+    stub._spec_record(req, 1)
+    return gap
 
 
 def _dispatches(stub, req, emissions):
@@ -158,17 +174,65 @@ def test_the_threshold_is_the_ema_not_a_single_bad_cycle():
     assert stub._spec_candidate() is req
 
 
-def test_the_cooldown_counts_plain_steps_then_allows_exactly_one_probe():
+def test_the_cooldown_counts_plain_steps_then_allows_a_probe_pair():
     stub = _stub(cooldown=4, ema_alpha=0.5)
     req = _req(stub)
     stub._spec_record(req, 1)
     stub._spec_record(req, 1)  # cold
 
     assert [stub._spec_candidate() is req for _ in range(4)] == [False] * 4
-    assert stub._spec_candidate() is req  # the probe
-    # the probe is one cycle, not a resumption: a bad one cools down again
+    assert stub._spec_candidate() is req  # the first probe
+    stub._spec_record(req, 1)
+    # one unlucky probe is a single integer sample, not a verdict: the second follows
+    # immediately rather than doubling the cooldown behind it
+    assert stub._spec_candidate() is req
     stub._spec_record(req, 1)
     assert stub._spec_candidate() is None
+
+
+def test_the_probe_resumes_on_its_own_threshold_not_the_averages():
+    """``min_emitted`` is a bar for a MEAN. Judging one sample from that distribution by the
+    mean's bar rejects roughly half of content that is comfortably worth speculating on."""
+    stub = _stub(cooldown=2, min_emitted=3.0, probe_resume=2.0, ema_alpha=0.5)
+    req = _req(stub)
+    stub._spec_record(req, 1)  # 4.0 -> 2.5, below min_emitted
+    _plain_steps_until_probe(stub, req)
+
+    stub._spec_record(req, 2)  # below min_emitted, at probe_resume
+
+    assert stub._spec_candidate() is req
+    assert stub._spec_policy(req).ema == pytest.approx(2.0)
+
+
+def test_the_second_probe_rescues_a_run_the_first_probe_missed():
+    stub = _stub(cooldown=2, ema_alpha=0.5)
+    req = _req(stub)
+    stub._spec_record(req, 1)
+    stub._spec_record(req, 1)
+    _plain_steps_until_probe(stub, req)
+
+    stub._spec_record(req, 1)  # first probe: unlucky
+    assert stub._spec_candidate() is req
+    stub._spec_record(req, 4)  # second probe: the content was fine all along
+
+    assert stub._spec_candidate() is req
+    assert stub._spec_policy(req).ema == pytest.approx(4.0)
+
+
+def test_alternating_full_and_single_token_cycles_keep_speculating():
+    """The live failure, encoded. Cycles that alternate a full run with a single token have a
+    mean well clear of the bar, but every other probe sample lands under it -- and a
+    single-sample verdict with doubling backoff turned that into 16 + 32 + 64 plain-step
+    stretches on content that should have been speculating throughout."""
+    stub = _stub(cooldown=4, ema_alpha=0.3, min_emitted=2.0)
+    req = _req(stub)
+    script = [1, 1, 1, 1] + [1, 4] * 10  # go cold, then alternate around a mean of 2.5
+
+    decisions = _dispatches(stub, req, script)
+
+    # one cooldown, then the probe pair resumes; no backoff ladder
+    assert decisions.count(False) == 4
+    assert stub._spec_policy(req).ema > 2.0
 
 
 def test_a_good_probe_resumes_speculation():
@@ -194,12 +258,10 @@ def test_a_bad_probe_backs_off_within_a_bounded_cooldown():
     stub._spec_record(req, 1)
     stub._spec_record(req, 1)
 
-    gaps = []
-    for _ in range(6):
-        gaps.append(_plain_steps_until_probe(stub, req))
-        stub._spec_record(req, 1)  # every probe fails
-    # doubling, capped at cooldown_cap (8 * 2) -- a cold request never stops probing
-    assert gaps == [2, 4, 8, 16, 16, 16]
+    gaps = [_fail_a_probe_pair(stub, req) for _ in range(6)]
+
+    # doubling, capped at cooldown_cap (4 * 2) -- a cold request never stops probing
+    assert gaps == [2, 4, 8, 8, 8, 8]
 
 
 def test_a_resumption_clears_the_backoff():
@@ -207,9 +269,8 @@ def test_a_resumption_clears_the_backoff():
     req = _req(stub)
     stub._spec_record(req, 1)
     stub._spec_record(req, 1)
-    for _ in range(3):  # failed probes push the cooldown out to 16
-        _plain_steps_until_probe(stub, req)
-        stub._spec_record(req, 1)
+    for _ in range(3):  # failed probe pairs push the cooldown out to the cap
+        _fail_a_probe_pair(stub, req)
     _plain_steps_until_probe(stub, req)
     stub._spec_record(req, 4)  # a good probe
 

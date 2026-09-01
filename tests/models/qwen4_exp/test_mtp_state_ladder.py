@@ -550,3 +550,51 @@ def test_restore_snapshot_rewinds_the_slot_without_ending_the_step():
     assert not torch.equal(advanced["recurrent"], before["recurrent"])
     ladder.rollback(req, 0)  # the step was still in flight and settles normally
     _assert_bitwise(before, world.families(SLOT))
+
+
+# ------------------------------------------------- the borrowed snapshot (capture-decode)
+#
+# The width-1 capture-decode graph runs its decode forward TWICE: an executing warm-up pass
+# and then the replay that produces the step's real values. It is triggered from an ORDINARY
+# decode step, which takes no ladder snapshot of its own -- so the engine borrows one around
+# the capture. Only the wind-back is borrowed; nothing arms the per-layer stash.
+
+
+def test_a_borrowed_snapshot_makes_a_capture_warm_up_invisible_to_the_slot():
+    ids = _token_ids(64 + WIDTH + 4)
+    plain = _World()
+    hidden, ple_in = _inputs(1, plain.config.hidden_size, plain.args.ple_state_width, 3)
+    _warm(plain, 64, ids)
+    want = _plain_decode_families(plain, 64, ids, hidden, ple_in, 1)
+
+    graphed = _World()
+    _warm(graphed, 64, ids)
+    ladder = SpecStateLadder(graphed.pool, WIDTH)
+    with ladder.borrow_snapshot(graphed._req(64, 1, ids=ids)) as restore:
+        _, warm_batch = graphed.decode(hidden, ple_in, ids, cached_len=64)
+        restore()
+    _, replay_batch = graphed.decode(hidden, ple_in, ids, cached_len=64)
+
+    _assert_bitwise(want, graphed.families(SLOT))
+    assert warm_batch.spec_capture is None and replay_batch.spec_capture is None
+
+    # discriminating: without the wind-back the slot would hold both passes' rows
+    doubled = _World()
+    _warm(doubled, 64, ids)
+    for _ in range(2):
+        doubled.decode(hidden, ple_in, ids, cached_len=64)
+    assert not torch.equal(doubled.families(SLOT)["recurrent"], want["recurrent"])
+
+
+def test_a_borrowed_snapshot_is_released_and_refuses_to_nest():
+    ids = _token_ids(8)
+    world = _World()
+    ladder = SpecStateLadder(world.pool, WIDTH)
+
+    with ladder.borrow_snapshot(world._req(0, 1, ids=ids)):
+        with pytest.raises(RuntimeError, match="already in flight"):
+            with ladder.borrow_snapshot(world._req(0, 1, ids=ids)):
+                pass
+
+    with pytest.raises(RuntimeError, match="no speculative"):
+        ladder.restore_snapshot()
