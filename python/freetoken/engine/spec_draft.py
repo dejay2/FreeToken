@@ -58,8 +58,9 @@ of kernels, 843 launches). ``_chain_graph_body`` and ``_commit_graph_body`` are 
 sequences written into fixed buffers; ``spec_draft_graph`` holds the capture discipline and the
 table of what moves per cycle and how each moving value became a device input -- of which
 ``_graph_base``, the int32 cell every graphed position, ``out_loc`` gather and QSA context
-length is derived from, is the load-bearing one. Greedy proposals only (the private draft RNG
-is rebuilt per request and cannot be baked into a record); off with
+length is derived from, is the load-bearing one. Every request is graphed, greedy or sampled:
+the filter is three device cells ``_stage_chain_inputs`` writes and the head's single private
+generator is registered with the graph, so a replay draws what an eager chain would. Off with
 ``FREETOKEN_MTP_SPEC_DRAFT_GRAPH=0``, which restores exactly the eager chain and commit below.
 
 THE DISTRIBUTION CONTRACT
@@ -261,7 +262,6 @@ class SpecDraftHead:
     _graph_runner = None
     _graph_buffers_ready = False
     _graph_disabled_reason: str | None = None
-    _sampled_chain_logged = False
     _device_base_offset: int | None = None
     #: the MTP head is one QSA layer, so its block-selection capture has exactly one slot
     _graph_qsa_slot = 0
@@ -280,6 +280,7 @@ class SpecDraftHead:
         )
         from freetoken.engine.spec_sample import resolve_spec_seed
         from freetoken.models.qwen4_exp.mtp_spike import (
+            MTPDraftSampler,
             Qwen4ExpMTPModel,
             derive_mtp_model_config,
         )
@@ -337,7 +338,11 @@ class SpecDraftHead:
         self._recursive: torch.Tensor | None = None
         self._saved_blocks: dict[int, torch.Tensor] | None = None
         self._buffered: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = []
-        self._sampler = None
+        # ONE generator for the head's life, not one per request -- see ``reset_request`` for
+        # why the per-request stream was dropped and what it did (and did not) guarantee. It is
+        # built here rather than lazily because a chain graph registers this exact object's
+        # state, so it has to outlive every request the graph serves.
+        self._sampler = MTPDraftSampler(seed=self.seed, device=self.device)
         # ------------------------------------------------------------------ graph state
         # ``None`` -- the default -- means every ``_batch`` derives its positions from the
         # host ``committed_len``, which is what the eager chain has always done. A graph body
@@ -349,7 +354,6 @@ class SpecDraftHead:
         self._graph_runner = None
         self._graph_buffers_ready = False
         self._graph_disabled_reason: str | None = None
-        self._sampled_chain_logged = False
         self._init_graph_runner()
 
     # ------------------------------------------------------------------------ construction
@@ -730,14 +734,19 @@ class SpecDraftHead:
         return f"chain:mrope={int(mrope)}"
 
     def _chain_graph_body(self, *, mrope: bool) -> None:
-        """The whole depth-``self.depth`` greedy chain, into the fixed output slots.
+        """The whole depth-``self.depth`` chain, into the fixed output slots.
 
-        Step by step this is ``propose``'s loop with three substitutions and no other change:
-        the seed rows come from the input buffers, the sampler's greedy arm is inlined (see
-        ``MTPDraftSampler.sample_device``: ``temperature == 0 or top_k == 1`` IS
-        ``torch.argmax``), and each row's logits/id/confidence are written to a slot instead of
-        appended to a Python list. Every step's confidence is recorded whether or not a cut is
-        armed -- inside the graph it is free, and it makes one recorded chain serve both.
+        Step by step this is ``propose``'s loop with two substitutions and no other change: the
+        seed rows come from the input buffers, and each row's logits/id/confidence are written
+        to a slot instead of appended to a Python list. Every step's confidence is recorded
+        whether or not a cut is armed -- inside the graph it is free, and it makes one recorded
+        chain serve both.
+
+        GREEDY AND SAMPLED ALIKE. ``MTPDraftSampler.draw`` executes one fixed sequence of
+        kernels over three device cells, so the request's temperature / top-k / top-p are
+        replay inputs rather than things the record decided; the private generator's philox
+        state is registered with the graph so it advances across replays exactly as it would
+        across eager chains.
         """
         base = self.committed_len
         depth = self.depth
@@ -745,7 +754,10 @@ class SpecDraftHead:
         saved = {self._graph_qsa_slot: self._graph_in_blocks}
         for index in range(depth):
             logits = self.draft_lm_head.forward_all(sample)[0]
-            token = torch.argmax(logits)
+            # ``draw``, not ``sample_device``: the controls were staged before the replay (or
+            # before the capture), and ``draw`` is the half of the sampler that is the same
+            # sequence of kernels whatever they say.
+            token = self._sampler.draw(logits)
             self._graph_out_logits[index].copy_(logits)
             self._graph_out_tokens[index].copy_(token)
             _record_row_top1(logits, self._graph_out_conf, index)
@@ -803,10 +815,22 @@ class SpecDraftHead:
             key,
             lambda: self._chain_graph_body(mrope=mrope),
             restore=lambda: self._graph_restore(base),
+            # the chain DRAWS: without this the recorded philox offset would be frozen and
+            # every replay of a sampled request would propose the same tokens forever
+            generators=(self._sampler.generator,),
         )
         return key if result.status == "captured" else None
 
-    def _stage_chain_inputs(self, *, base: int, mrope: bool, delta: int) -> None:
+    def _stage_chain_inputs(
+        self,
+        *,
+        base: int,
+        mrope: bool,
+        delta: int,
+        temperature: float,
+        top_k,
+        top_p,
+    ) -> None:
         """Write this cycle's moving inputs into the addresses the chain graph baked."""
         assert self._sample is not None and self._recursive is not None
         assert self._saved_blocks is not None
@@ -816,6 +840,10 @@ class SpecDraftHead:
         self._graph_base.fill_(base)
         if mrope:
             self._graph_rope_base.fill_(base + delta)
+        # THIS request's filter, into the sampler's three cells -- the reason one recorded
+        # chain serves a greedy request and a sampled one alike. Validation happens here, on
+        # the host, where a bad ``SamplingParams`` still raises before any kernel runs.
+        self._sampler.stage(temperature=temperature, top_k=top_k, top_p=top_p)
         self._backup_rings()
 
     # ------------------------------------------------------------------ the commit forward
@@ -907,28 +935,37 @@ class SpecDraftHead:
         # warm-ups leave in the private KV and rings is wiped by the first ``reset_request``.
         self._graph_base.fill_(0)
         self._graph_rope_base.fill_(0)
-        plans: list[tuple[str, Callable[[], None]]] = []
+        # The chain DRAWS and the commit does not, so only the chain's record needs the
+        # generator registered -- a graph that recorded a draw without it would replay the
+        # capture's philox offset for ever, which is a sampled request proposing one fixed
+        # chain until it is restarted.
+        plans: list[tuple[str, Callable[[], None], tuple]] = []
         for rows in range(self.depth + 1, 0, -1):
             plans.append(
                 (
                     self._commit_graph_key(rows, mrope=False),
                     (lambda n: lambda: self._commit_graph_body(n, mrope=False))(rows),
+                    (),
                 )
             )
         plans.append(
             (
                 self._chain_graph_key(mrope=False),
                 lambda: self._chain_graph_body(mrope=False),
+                (self._sampler.generator,),
             )
         )
-        for key, body in plans:
+        for key, body, generators in plans:
             if not runner.capture_pending(key):
                 continue
             base = self.committed_len
             self._backup_rings()
             try:
                 result = runner.capture(
-                    key, body, restore=lambda: self._graph_restore(base)
+                    key,
+                    body,
+                    restore=lambda: self._graph_restore(base),
+                    generators=generators,
                 )
             except Exception as exc:  # noqa: BLE001 -- a bonus capture, never a boot gate
                 logger.warning_rank0(
@@ -948,8 +985,27 @@ class SpecDraftHead:
     # ---------------------------------------------------------------------- request lifecycle
 
     def reset_request(self, uid: int) -> None:
-        from freetoken.models.qwen4_exp.mtp_spike import MTPDraftSampler
+        """Point the head at a new request. THE DRAFT STREAM IS NOT RESEEDED.
 
+        It used to be: one generator per request, seeded ``_draft_seed(seed, uid)``, so two
+        identical requests drafted identically. That contract is deliberately gone, for two
+        reasons that point the same way.
+
+        It was never a CORRECTNESS contract. Speculative sampling is exact for ANY draft
+        distribution -- acceptance divides by the ``q`` the draft was drawn from and resamples
+        the residual, so the served distribution is the target's whatever the draft's stream
+        did. The server itself offers no reproducibility either (``SamplingParams`` carries no
+        seed, and the triton sampler draws from a module-global generator).
+
+        And it is incompatible with graphing the chain, which is where the 11 ms of per-cycle
+        host time lives. ``torch.cuda.CUDAGraph.register_generator_state`` bakes a generator's
+        state tensors into the record; a graph registered against one request's generator would
+        keep drawing from an object no live request owns. One head-wide generator, seeded once
+        from ``FREETOKEN_MTP_DRAFT_SEED`` at construction, is what a graph can hold.
+
+        ``MTPDraftSampler.reseed`` remains for tests, which are the only caller that needs a
+        known starting point.
+        """
         self._uid = int(uid)
         self.committed_len = 0
         self._pending_hidden = None
@@ -962,9 +1018,6 @@ class SpecDraftHead:
         self.kv_cache._cmp_k_buffer.zero_()
         self.kv_cache._pending_ring.zero_()
         self.kv_cache._pending_position_ring.zero_()
-        self._sampler = MTPDraftSampler(
-            seed=_draft_seed(self.seed, self._uid), device=self.device
-        )
 
     def is_ready(self, req: "Req") -> bool:
         """True once the head has consumed every token the request has emitted.
@@ -1214,12 +1267,18 @@ class SpecDraftHead:
         mrope = getattr(req, "mrope_position_ids", None) is not None
         delta = int(getattr(req, "mrope_position_delta", 0))
 
-        if self._chain_graphable(temperature, top_k, top_p):
+        if self._chain_graphable():
             # Staged BEFORE the graph is asked for, because asking may capture it and capture's
-            # warm-up executes the chain: it has to be this cycle's chain, at this cycle's base.
+            # warm-up executes the chain: it has to be this cycle's chain, at this cycle's base,
+            # under this cycle's filter.
             self._ensure_graph_buffers()
             self._stage_chain_inputs(
-                base=self.committed_len, mrope=mrope, delta=delta
+                base=self.committed_len,
+                mrope=mrope,
+                delta=delta,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
             )
             key = self._chain_graph(mrope=mrope)
             if key is not None:
@@ -1297,33 +1356,21 @@ class SpecDraftHead:
             draft_top1_gap=gap,
         )
 
-    def _chain_graphable(self, temperature: float, top_k, top_p) -> bool:
-        """Whether this request's chain may be replayed from a graph at all.
+    def _chain_graphable(self) -> bool:
+        """Whether the chain may be replayed from a graph at all.
 
-        GREEDY ONLY, and the test is ``MTPDraftSampler.sample_device``'s own first branch, so
-        the graphed chain draws exactly what the eager one would. A sampled request's chain
-        divides by a HOST temperature, slices a HOST ``top_k`` and draws through a generator
-        that ``reset_request`` rebuilds per request -- three host values a record would bake --
-        so it keeps the chain it has today and says so once (see spec_draft_graph's module
-        docstring for why registering the generator is not the answer).
+        THE REQUEST'S SAMPLING PARAMETERS ARE NOT PART OF THIS. They used to be -- a record of
+        a host-branching sampler is a record of one request's controls, so only greedy chains
+        could be graphed -- and both halves of that are gone: ``MTPDraftSampler.draw`` runs one
+        fixed sequence of kernels over three device cells, and the head owns a single generator
+        whose philox state the graph registers. What remains is whether there is a graph runner
+        and a primed context to draft from.
         """
         if self._graph_runner is None:
             return False
         if self._sample is None or self._recursive is None or self._saved_blocks is None:
             return False
-        if self._graph_qsa_slot not in self._saved_blocks:
-            return False
-        if not (temperature == 0 or top_k == 1):
-            if not self._sampled_chain_logged:
-                self._sampled_chain_logged = True
-                logger.info_rank0(
-                    "MTP draft chain stays eager for sampled requests (temperature "
-                    f"{temperature}, top_k {top_k}, top_p {top_p}): the draft's private "
-                    "generator is rebuilt per request, so its state cannot be baked into a "
-                    "graph. Greedy requests are graphed."
-                )
-            return False
-        return True
+        return self._graph_qsa_slot in self._saved_blocks
 
     def _propose_graphed(self, key: str, depth: int, *, probe=None) -> DraftProposal:
         """``propose``, as one launch: write the inputs, replay, take the single readback.

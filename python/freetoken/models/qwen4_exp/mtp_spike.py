@@ -1272,12 +1272,133 @@ class Qwen4ExpMTPModel(BaseOP):
 
 
 class MTPDraftSampler:
-    """Private sampler with its own generator; it never consumes target/global RNG state."""
+    """Private sampler with its own generator; it never consumes target/global RNG state.
+
+    BRANCH-FREE ON THE HOST, because the draft chain is a CUDA graph.
+
+    The shipped sampler read ``temperature`` / ``top_k`` / ``top_p`` as HOST values and took a
+    different path for each: ``argmax`` when greedy, a ``topk`` slice only when a ``top_k`` was
+    asked for, a sort only when ``top_p < 1``. A record of that is a record of ONE request's
+    parameters -- so a graphed chain could only ever have served greedy requests, which on this
+    operator's traffic is the wrong half. Here the three controls are device cells written
+    before the replay and the kernel sequence is fixed: the scale, the sort, the top-k threshold
+    mask, the top-p cumulative mask and the draw all execute every time, and which of the two
+    candidate ids comes out is a ``torch.where`` on ``temperature == 0 | top_k == 1``.
+
+    WHAT THAT COSTS AND WHAT IT KEEPS
+    ---------------------------------
+    A greedy step now pays the full-vocabulary sort it used to skip: measured on the RTX 5090
+    at the shipping geometry (248,320 tokens) a captured depth-5 chain's five draws come to
+    0.86 ms of GPU against a bare ``argmax``'s 0.06 ms, so the branch-free draw costs ~0.8 ms
+    of DEVICE time per cycle to buy ~11 ms of HOST time -- and it buys it for the sampled
+    traffic that is most of what the box serves. (If a greedy-only deployment ever wants that
+    0.8 ms back, the answer is a second graph key, not a host branch in here.) What it keeps is
+    exact: the greedy id is still ``torch.argmax(logits)`` BIT FOR BIT, and the sampled
+    distribution is still ``_sampling_probabilities_batch``'s -- the same scale, the same
+    ``filtered < k-th largest`` THRESHOLD mask (so ties keep more than ``k``, as before), the
+    same ``cumsum - p >= top_p`` mask and the same renormalization.
+
+    THE DRAW ITSELF CHANGED. ``torch.multinomial`` is replaced by an inverse-CDF draw --
+    ``searchsorted`` over the cumulative sorted probabilities at ``u * total``, ``u`` from
+    ``torch.rand`` on this generator. The two are the same distribution and not the same
+    sequence of ids from a given seed; ``multinomial`` was never capturable at a fixed address
+    anyway. Equivalence is pinned at the distribution level
+    (``tests/models/qwen4_exp/test_mtp_spike_proposal.py``), which is the level the
+    speculative-sampling theorem needs: acceptance divides by ``filtered_probs``, and this
+    draws from exactly that.
+    """
 
     def __init__(self, *, seed: int, device: torch.device) -> None:
         self.device = torch.device(device)
         self.generator = torch.Generator(device=self.device)
         self.generator.manual_seed(int(seed))
+        # The three controls, at addresses a graph bakes once. Defaults are "no filter at
+        # temperature 1", so a sampler that is drawn from before anything is staged behaves
+        # like an unfiltered draw rather than like whatever the last request asked for.
+        self.temperature_cell = torch.ones(1, dtype=torch.float32, device=self.device)
+        self.top_k_cell = torch.full((1,), -1, dtype=torch.int32, device=self.device)
+        self.top_p_cell = torch.ones(1, dtype=torch.float32, device=self.device)
+
+    def reseed(self, seed: int) -> None:
+        """Put the private stream back to a known point. TESTS, and nothing else.
+
+        Serving deliberately does not reseed per request (see ``SpecDraftHead.reset_request``):
+        speculative sampling is exact for any draft distribution, so the stream carries no
+        correctness weight, and a generator whose state a graph has baked cannot be swapped out
+        underneath it.
+        """
+        self.generator.manual_seed(int(seed))
+
+    def stage(
+        self,
+        *,
+        temperature: float,
+        top_k: int | None = None,
+        top_p: float | None = None,
+    ) -> None:
+        """Validate one request's controls on the host and write them into the cells.
+
+        Every rejection the shipped sampler made is made here, at the same moment (before any
+        kernel runs) and with the same message -- the validation is host-side by nature and
+        costs a graphed chain nothing, because a replay never re-runs it.
+        """
+        if temperature < 0:
+            raise ValueError(f"MTP draft temperature cannot be negative, got {temperature}")
+        if top_p is not None and not 0 < top_p <= 1:
+            raise ValueError(f"MTP draft top_p must be in (0,1], got {top_p}")
+        if top_k is not None and top_k != -1 and top_k < 1:
+            raise ValueError(f"MTP draft top_k must be -1 or positive, got {top_k}")
+        self.temperature_cell.fill_(float(temperature))
+        self.top_k_cell.fill_(-1 if top_k is None else int(top_k))
+        self.top_p_cell.fill_(1.0 if top_p is None else float(top_p))
+
+    def draw(self, logits: torch.Tensor) -> torch.Tensor:
+        """One id from ``logits`` under the STAGED controls, as a device scalar.
+
+        The whole point of this method is that it is the same sequence of kernels over the same
+        addresses whatever the controls say, so it is what the chain graph records.
+        """
+        if logits.ndim != 1:
+            raise ValueError(f"MTP draft logits must be one-dimensional, got {tuple(logits.shape)}")
+        if logits.device != self.device:
+            raise ValueError(f"MTP draft logits must be on {self.device}, got {logits.device}")
+        vocab = logits.numel()
+        temperature, top_k, top_p = (
+            self.temperature_cell,
+            self.top_k_cell,
+            self.top_p_cell,
+        )
+        # the two spellings of "argmax" the shipped sampler took as its first branch
+        greedy = (temperature <= 0) | (top_k == 1)
+        greedy_id = torch.argmax(logits)
+        # a greedy request's temperature is 0 and would divide to inf/nan; the result is
+        # discarded by the ``where`` below, but it still has to be finite to sort
+        safe = torch.where(greedy, torch.ones_like(temperature), temperature)
+        scaled = logits.float() / safe
+        # ONE stable descending sort serves both filters: the top-k threshold is its k-th
+        # element and the top-p bar is a prefix sum of its softmax. Stable so that ties resolve
+        # by token id, which is what makes a replay reproducible.
+        ordered, order = torch.sort(scaled, descending=True, stable=True)
+        # top_k <= 0 (absent, -1) or >= vocab means "the whole vocabulary": the threshold is
+        # then the SMALLEST scaled logit, which masks nothing -- the branchless twin of the
+        # shipped ``if 1 <= top_k < vocab``.
+        limit = torch.full_like(top_k, vocab)
+        rank = torch.where((top_k < 1) | (top_k >= vocab), limit, top_k)
+        threshold = ordered.index_select(0, (rank - 1).to(torch.int64))
+        ordered = ordered.masked_fill(ordered < threshold, -float("inf"))
+        probabilities = torch.softmax(ordered, dim=-1)
+        # ...and top_p >= 1 means "keep everything": a bar above 1 can never be reached by an
+        # exclusive prefix sum of a distribution, so nothing is removed.
+        bar = torch.where(top_p >= 1.0, torch.full_like(top_p, 2.0), top_p)
+        cumulative = probabilities.cumsum(0)
+        probabilities = probabilities.masked_fill(cumulative - probabilities >= bar, 0.0)
+        # the inverse-CDF draw, over the SORTED order (a permutation of the same distribution)
+        cdf = probabilities.cumsum(0)
+        uniform = torch.rand(1, device=self.device, generator=self.generator)
+        position = torch.searchsorted(cdf, uniform * cdf[-1:], right=True)
+        position = position.clamp_(max=vocab - 1)
+        drawn = order.index_select(0, position.reshape(1)).reshape(())
+        return torch.where(greedy.reshape(()), greedy_id, drawn)
 
     def sample(
         self,
@@ -1303,38 +1424,12 @@ class MTPDraftSampler:
     ) -> torch.Tensor:
         """``sample`` without the device->host sync: the selected id stays on device.
 
-        Callers that draft a chain use this so no step blocks on a readback; the ops and
-        their order are identical to ``sample``'s, so the generator advances the same way.
+        Callers that draft a chain use this so no step blocks on a readback. It is ``stage``
+        followed by ``draw``, which is exactly what a graphed cycle does across the capture
+        boundary -- so the eager and the graphed chain cannot diverge.
         """
-        if logits.ndim != 1:
-            raise ValueError(f"MTP draft logits must be one-dimensional, got {tuple(logits.shape)}")
-        if logits.device != self.device:
-            raise ValueError(f"MTP draft logits must be on {self.device}, got {logits.device}")
-        if temperature < 0:
-            raise ValueError(f"MTP draft temperature cannot be negative, got {temperature}")
-        if top_p is not None and not 0 < top_p <= 1:
-            raise ValueError(f"MTP draft top_p must be in (0,1], got {top_p}")
-        vocab = logits.numel()
-        if top_k is not None and top_k != -1 and top_k < 1:
-            raise ValueError(f"MTP draft top_k must be -1 or positive, got {top_k}")
-        if temperature == 0 or top_k == 1:
-            return torch.argmax(logits)
-
-        filtered = logits.float() / float(temperature)
-        if top_k not in (None, -1) and top_k < vocab:
-            keep = int(top_k)
-            threshold = torch.topk(filtered, keep).values[-1]
-            filtered = filtered.masked_fill(filtered < threshold, -float("inf"))
-        probabilities = torch.softmax(filtered, dim=-1)
-        if top_p is not None and top_p < 1:
-            sorted_probabilities, order = torch.sort(probabilities, descending=True)
-            remove = sorted_probabilities.cumsum(-1) - sorted_probabilities >= float(top_p)
-            sorted_probabilities = sorted_probabilities.masked_fill(remove, 0.0)
-            probabilities = torch.zeros_like(probabilities).scatter(
-                0, order, sorted_probabilities
-            )
-            probabilities /= probabilities.sum()
-        return torch.multinomial(probabilities, 1, generator=self.generator)
+        self.stage(temperature=temperature, top_k=top_k, top_p=top_p)
+        return self.draw(logits)
 
 
 @dataclass(frozen=True)

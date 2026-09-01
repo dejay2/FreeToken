@@ -201,7 +201,15 @@ def test_complete_private_draft_rng_replay_is_deterministic_across_fresh_observe
     )
 
 
-def test_private_draft_and_acceptance_rng_streams_are_distinct_and_greedy_is_stable():
+def test_private_draft_and_acceptance_rng_streams_are_distinct_and_greedy_is_exact():
+    """A greedy draft still returns the argmax exactly -- and now costs one draw doing it.
+
+    ``MTPDraftSampler`` is branch-free on the host so the integrated draft CHAIN can be a CUDA
+    graph, which means the greedy id is selected out of the same fixed sequence of kernels the
+    sampled draw runs, and that sequence contains the uniform. What the observer still owns is
+    that the draft's stream and the acceptance streams are disjoint, and that a draft never
+    touches the acceptance one.
+    """
     observer = _draft_rng_observer()
     draft_before = observer._rng_stream_snapshot("draft")
     acceptance_before = observer._rng_stream_snapshot("acceptance", depth=1)
@@ -215,8 +223,10 @@ def test_private_draft_and_acceptance_rng_streams_are_distinct_and_greedy_is_sta
     )
 
     assert token == 1
-    assert transition["draw_count_before"] == transition["draw_count_after"] == 0
-    assert transition["state_sha256_before"] == transition["state_sha256_after"]
+    assert transition["greedy"] is True
+    assert transition["draw_count_before"] == 0
+    assert transition["draw_count_after"] == 1
+    assert transition["state_sha256_before"] != transition["state_sha256_after"]
     assert observer._rng_stream_snapshot("acceptance", depth=1) == acceptance_before
 
 

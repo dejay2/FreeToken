@@ -684,19 +684,24 @@ class MTPShadowObserver:
             self._draft_sampler.generator.set_state(private_state_before)
             self._assert_default_rng_unchanged(default_before)
             raise
-        draws = 0 if temperature == 0 or top_k == 1 else 1
-        self._draft_draw_count += draws
+        # EVERY draft costs exactly one uniform now, greedy included. ``MTPDraftSampler`` is
+        # branch-free on the host so the draft chain can be a CUDA graph (see its docstring):
+        # the greedy id is still bit-exact ``argmax``, but it is SELECTED from the same fixed
+        # sequence of kernels the sampled draw runs, and that sequence contains the draw. The
+        # accounting therefore counts calls rather than kinds, and the invariant this observer
+        # enforces is the one that survived: a draft always advances its private stream, and
+        # never the default one.
+        greedy = temperature == 0 or top_k == 1
+        self._draft_draw_count += 1
         after = self._rng_stream_snapshot("draft")
-        if draws == 0 and before["state_sha256"] != after["state_sha256"]:
-            raise RuntimeError("greedy MTP draft advanced its private RNG")
-        if draws and before["state_sha256"] == after["state_sha256"]:
-            raise RuntimeError("sampled MTP draft did not advance its private RNG")
+        if before["state_sha256"] == after["state_sha256"]:
+            raise RuntimeError("MTP draft did not advance its private RNG")
         transition = self._rng_transition(
             before,
             after,
             default_rng=default_rng,
         )
-        transition["greedy"] = draws == 0
+        transition["greedy"] = greedy
         instrumentation_wall_ms += (
             time.perf_counter() - instrumentation_started
         ) * 1000.0

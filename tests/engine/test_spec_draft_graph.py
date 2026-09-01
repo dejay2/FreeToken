@@ -6,12 +6,14 @@ cycle's wall clock is the host pushing launch packets for a fixed sequence. Reco
 only legal once every value that MOVES between cycles is a device input rather than a host
 scalar baked into the record, and that is what this file pins:
 
-* the CPU half -- the keying (greedy only, mrope in the key, row count in the commit key), the
-  device-position staging arithmetic, and every arm of the fallback, which must leave the
-  eager chain byte for byte what it was;
+* the CPU half -- the keying (mrope in the key, row count in the commit key, and NOTHING about
+  the request's sampling parameters), the device-position staging arithmetic, the request
+  filter's landing in the sampler's three cells, and every arm of the fallback, which must
+  leave the eager chain byte for byte what it was;
 * the GPU half -- capture and replay against a toy MTP head, where the graphed chain and the
   graphed commit must equal the eager ones BIT for BIT, including after ``committed_len``
-  moves (which is the whole point of the ``_graph_base`` cell).
+  moves (which is the whole point of the ``_graph_base`` cell) and including a SAMPLED
+  request, whose N replays must draw what N eager chains from the same seed draw.
 
 The toy head is the ``tests/engine/test_spec_draft.py`` fixture moved onto the device: the
 same hand-built ``SpecDraftHead`` with a fake staged model, a fake LM head and a fake
@@ -201,7 +203,8 @@ def _head(device, *, depth=3, graphs=True, conf_cut=0.0, cut_mode="chain") -> Sp
     head._recursive = None
     head._saved_blocks = None
     head._buffered = []
-    head._sampler = None
+    # one generator for the head's life, as ``SpecDraftHead.__init__`` builds it
+    head._sampler = _sampler(device)
     if graphs and device.type == "cuda":
         head._graph_runner = SpecDraftGraphRunner(device=device)
     return head
@@ -216,19 +219,21 @@ def _prime(head, *, base: int) -> None:
     head._saved_blocks = {
         0: torch.tensor([[3, 5]], dtype=torch.int32, device=device)
     }
-    head._sampler = _greedy_sampler(device)
+    head._sampler.reseed(7)
 
 
-def _greedy_sampler(device):
+def _sampler(device):
     from freetoken.models.qwen4_exp.mtp_spike import MTPDraftSampler
 
     return MTPDraftSampler(seed=7, device=device)
 
 
-def _req(*, mrope=False, temperature=0.0):
+def _req(*, mrope=False, temperature=0.0, top_k=-1, top_p=1.0):
     req = SimpleNamespace(
         uid=1,
-        sampling_params=SamplingParams(temperature=temperature),
+        sampling_params=SamplingParams(
+            temperature=temperature, top_k=top_k, top_p=top_p
+        ),
         mrope_position_ids=torch.zeros(3, 1) if mrope else None,
         mrope_position_delta=11 if mrope else 0,
     )
@@ -282,37 +287,27 @@ def test_an_ungraphed_head_takes_the_eager_chain_and_commit():
     """Every fallback arm must be the pre-graph path exactly: no key, no buffers, no runner."""
     head = _head(CPU, graphs=False)
     _prime(head, base=4)
-    assert not head._chain_graphable(0.0, None, None)
+    assert not head._chain_graphable()
     assert not head._commit_graphable(2)
     assert head._commit_graph(2, mrope=False) is None
     assert not head._graph_buffers_ready
 
 
-def test_a_sampled_request_keeps_the_eager_chain_and_says_so_once(caplog):
-    """The draft's private generator is rebuilt per request, so its state cannot be baked."""
+def test_a_sampled_request_is_graphable_like_any_other():
+    """The key carries nothing about the request. ``MTPDraftSampler.draw`` runs one fixed
+    sequence of kernels over three device cells, so temperature / top-k / top-p are replay
+    inputs, and the head's single generator is registered with the graph."""
     head = _head(CPU, graphs=False)
     head._graph_runner = object()  # armed as far as the key is concerned
     _prime(head, base=4)
-    with caplog.at_level("INFO"):
-        assert not head._chain_graphable(0.7, 40, 0.9)
-        assert not head._chain_graphable(0.7, 40, 0.9)
-    assert sum("stays eager for sampled" in r.getMessage() for r in caplog.records) == 1
-
-
-@pytest.mark.parametrize("temperature,top_k", [(0.0, None), (1.0, 1)])
-def test_both_greedy_spellings_are_graphable(temperature, top_k):
-    """The test is ``MTPDraftSampler.sample_device``'s own first branch, so the graphed chain
-    draws exactly what the eager one would."""
-    head = _head(CPU, graphs=False)
-    head._graph_runner = object()
-    _prime(head, base=4)
-    assert head._chain_graphable(temperature, top_k, None)
+    assert head._chain_graphable()
+    assert head._chain_graph_key(mrope=False) == "chain:mrope=0"
 
 
 def test_a_head_without_a_primed_context_is_not_graphable():
     head = _head(CPU, graphs=False)
     head._graph_runner = object()
-    assert not head._chain_graphable(0.0, None, None)
+    assert not head._chain_graphable()
 
 
 def test_the_keys_separate_the_shapes_that_change_the_kernels():
@@ -387,6 +382,71 @@ def test_the_device_position_staging_reproduces_the_host_arithmetic():
     head._graph_base.fill_(0)
     head._stage_device_positions(3, 2, positions, out_loc)
     assert positions.tolist() == [2, 3, 4]
+
+
+# ------------------------------------------------- the request's filter, as device cells
+#
+# The chain graph carries no sampling parameters in its key, because it carries none in its
+# record either: ``request_filter_params`` decides the triple on the host and
+# ``MTPDraftSampler.stage`` writes it into three cells the replay reads.
+
+
+@pytest.mark.parametrize(
+    "params,expected",
+    [
+        (SamplingParams(temperature=0.0), (0.0, -1, 1.0)),
+        (SamplingParams(temperature=0.9), (0.9, -1, 1.0)),
+        # top_k == 1 IS greedy to the server (SamplingParams.is_greedy), so it lands on the
+        # argmax cell rather than on a one-wide filter
+        (SamplingParams(temperature=0.9, top_k=1), (0.0, -1, 1.0)),
+        (SamplingParams(temperature=0.9, top_k=0), (0.9, -1, 1.0)),
+        (SamplingParams(temperature=0.9, top_k=40, top_p=0.95), (0.9, 40, 0.95)),
+        # temperature 0 with a top_p is SAMPLED by the server (Sampler.prepare floors it)
+        (SamplingParams(temperature=0.0, top_p=0.8), (1e-6, -1, 0.8)),
+    ],
+)
+def test_the_request_filter_lands_in_the_samplers_three_cells(params, expected):
+    from freetoken.engine.spec_sample import request_filter_params
+
+    sampler = _sampler(CPU)
+    triple = request_filter_params(params)
+    assert triple == pytest.approx(expected)
+
+    sampler.stage(temperature=triple[0], top_k=triple[1], top_p=triple[2])
+    assert float(sampler.temperature_cell[0]) == pytest.approx(expected[0])
+    assert int(sampler.top_k_cell[0]) == expected[1]
+    assert float(sampler.top_p_cell[0]) == pytest.approx(expected[2])
+
+
+def test_a_zero_temperature_cell_draws_the_argmax_bit_for_bit():
+    """The greedy id is still ``torch.argmax(logits)`` -- selected by a ``where`` on the cell
+    rather than by a host branch, which is what let the record cover both kinds of request."""
+    sampler = _sampler(CPU)
+    generator = torch.Generator().manual_seed(5)
+    for _ in range(16):
+        logits = torch.randn(VOCAB, generator=generator) * 3
+        sampler.stage(temperature=0.0, top_k=-1, top_p=1.0)
+        assert torch.equal(sampler.draw(logits), torch.argmax(logits))
+        sampler.stage(temperature=0.9, top_k=1, top_p=1.0)
+        assert torch.equal(sampler.draw(logits), torch.argmax(logits))
+
+
+def test_an_absent_top_k_or_top_p_masks_nothing():
+    """``top_k <= 0`` and ``top_p >= 1`` are the "whole vocabulary" spellings, and branchless
+    they have to reach every token the unfiltered softmax gives mass to."""
+    sampler = _sampler(CPU)
+    logits = torch.zeros(VOCAB)  # a uniform distribution: every token must be reachable
+    sampler.stage(temperature=1.0, top_k=None, top_p=None)
+    seen = {int(sampler.draw(logits)) for _ in range(4000)}
+    assert seen == set(range(VOCAB))
+
+    sampler.stage(temperature=1.0, top_k=-1, top_p=1.0)
+    assert {int(sampler.draw(logits)) for _ in range(4000)} == set(range(VOCAB))
+
+    # ...and a real top_k does bite
+    sampler.stage(temperature=1.0, top_k=2, top_p=1.0)
+    ordered = torch.arange(VOCAB, dtype=torch.float32)
+    assert {int(sampler.draw(ordered)) for _ in range(400)} == {VOCAB - 1, VOCAB - 2}
 
 
 def test_a_batch_outside_a_graph_body_stages_from_the_host_length():
@@ -528,6 +588,102 @@ def test_every_accepted_run_width_replays_like_eager(rows):
 
     assert torch.equal(head._sample, eager._sample)
     assert head.committed_len == 9 + rows
+
+
+@requires_cuda
+def test_a_sampled_chain_replays_exactly_what_the_eager_chain_would_draw():
+    """THE point of registering the generator: N replays draw what N eager chains draw.
+
+    The state is matched by reseeding both heads AFTER the graph is captured -- capture's
+    warm-up draws too, and a graph is recorded once while the stream goes on advancing.
+    """
+    device = _cuda()
+    req = _req(temperature=0.9, top_k=8, top_p=0.95)
+
+    head = _head(device, graphs=True, depth=3)
+    head.capture_graphs_at_boot()
+    _prime(head, base=12)
+    head._sampler.reseed(31)
+    graphed = [head.propose(req, 3).tokens for _ in range(6)]
+
+    eager = _head(device, graphs=False, depth=3)
+    _prime(eager, base=12)
+    eager._sampler.reseed(31)
+    expected = [eager.propose(req, 3).tokens for _ in range(6)]
+
+    assert graphed == expected
+    # ...and the philox offset really is advancing: a frozen one would repeat the first chain
+    assert len(set(graphed)) > 1
+
+
+@requires_cuda
+def test_a_registered_generator_still_draws_outside_the_graph():
+    """Registration must not strand the eager path. Every fallback the head has -- a buffered
+    flush, a width the graph does not cover, a capture that never succeeded -- runs the eager
+    chain through the SAME generator the record holds."""
+    device = _cuda()
+    head = _head(device, graphs=True, depth=3)
+    head.capture_graphs_at_boot()
+    logits = torch.randn(VOCAB, device=device)
+
+    drawn = [int(head._sampler.sample(logits, temperature=0.8)) for _ in range(8)]
+
+    assert len(drawn) == 8
+    assert all(0 <= token < VOCAB for token in drawn)
+    # ...and an eager proposal on the graphed head still works after a replay
+    _prime(head, base=12)
+    head.propose(_req(temperature=0.8), 3)
+    head._graph_runner = None
+    assert len(head.propose(_req(temperature=0.8), 3).tokens) == 3
+
+
+@requires_cuda
+def test_a_sampled_chain_and_a_greedy_one_share_one_recorded_graph():
+    """The key carries no sampling parameters, so the same record serves both -- and the greedy
+    replay is still bit-for-bit the eager argmax chain."""
+    device = _cuda()
+    head = _head(device, graphs=True, depth=3)
+    head.capture_graphs_at_boot()
+    _prime(head, base=12)
+
+    sampled = head.propose(_req(temperature=0.9, top_k=8), 3)
+    greedy = head.propose(_req(), 3)
+
+    chains = [k for k in head._graph_runner.keys if k.startswith("chain:")]
+    assert chains == [head._chain_graph_key(mrope=False)]
+    eager = _head(device, graphs=False, depth=3)
+    _prime(eager, base=12)
+    assert greedy.tokens == eager.propose(_req(), 3).tokens
+    # both chains start from the same seed row, so row 0's logits are the same tensor of
+    # numbers; from row 1 they diverge, because the sampled draw fed a different token back in
+    assert torch.equal(greedy.logits[0], sampled.logits[0])
+    assert greedy.tokens != sampled.tokens
+
+
+@requires_cuda
+def test_a_graphed_sampled_proposal_is_drawn_from_the_q_acceptance_divides_by():
+    """The speculative-sampling theorem's precondition: every proposed token has to carry mass
+    under ``filtered_probs`` of the row it was drawn from, or acceptance divides by zero."""
+    from freetoken.engine.sample import BatchSamplingArgs
+    from freetoken.engine.spec_sample import filtered_probs
+
+    device = _cuda()
+    temperature, top_k, top_p = 0.9, 6, 0.9
+    req = _req(temperature=temperature, top_k=top_k, top_p=top_p)
+    head = _head(device, graphs=True, depth=3)
+    head.capture_graphs_at_boot()
+    _prime(head, base=12)
+
+    args = BatchSamplingArgs(
+        temperatures=torch.tensor([temperature], device=device),
+        top_k=torch.tensor([top_k], device=device),
+        top_p=torch.tensor([top_p], device=device),
+    )
+    for _ in range(8):
+        proposal = head.propose(req, 3)
+        q = filtered_probs(proposal.logits, args)
+        for row, token in enumerate(proposal.tokens):
+            assert float(q[row, token]) > 0.0
 
 
 @requires_cuda

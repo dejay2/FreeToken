@@ -209,3 +209,92 @@ def test_proposal_depth_and_callback_contract_are_bounded():
             lm_head=lambda hidden: hidden,
             temperature=0.0,
         )
+
+
+# ------------------------------------------------- the branch-free, graph-capturable draw
+#
+# The chain is a CUDA graph, so the sampler cannot branch on host values: temperature, top-k
+# and top-p are device cells and one fixed sequence of kernels runs whatever they say. Greedy
+# stays bit-exact argmax; the sampled DRAW method changed (inverse CDF over the sorted
+# probabilities, in place of ``torch.multinomial``), so its equivalence to the server's filter
+# is pinned as a distribution rather than as a sequence of ids.
+
+_FILTERS = [
+    (0.0, -1, 1.0),
+    (1.0, 1, 1.0),
+    (0.8, -1, 1.0),
+    (0.8, 4, 1.0),
+    (0.8, -1, 0.9),
+    (0.8, 5, 0.85),
+    (1.3, -1, 1.0),
+]
+
+
+@pytest.mark.parametrize("temperature,top_k,top_p", _FILTERS)
+def test_the_branch_free_draw_is_the_servers_own_filter(temperature, top_k, top_p):
+    """The speculative-sampling theorem's precondition: the proposal is drawn from exactly the
+    ``q`` acceptance divides by. Chi-square over the supported cells plus total variation, at
+    40k draws on a 16-token vocabulary."""
+    from freetoken.engine.spec_sample import _sampling_probabilities_batch
+
+    vocab = 16
+    logits = torch.randn(vocab, generator=torch.Generator().manual_seed(3)) * 3
+    expected = _sampling_probabilities_batch(
+        logits.unsqueeze(0), temperature=temperature, top_k=top_k, top_p=top_p
+    )[0]
+
+    sampler = MTPDraftSampler(seed=11, device=torch.device("cpu"))
+    sampler.stage(temperature=temperature, top_k=top_k, top_p=top_p)
+    draws = 40_000
+    counts = torch.zeros(vocab)
+    for _ in range(draws):
+        counts[int(sampler.draw(logits))] += 1
+
+    # never proposes a token the filter zeroed -- acceptance would divide by q = 0 there
+    assert not bool(((counts > 0) & (expected == 0)).any())
+    supported = expected > 0
+    assert float((counts / draws - expected).abs().sum()) < 0.02
+    chi_square = float(
+        (
+            (counts[supported] - draws * expected[supported]) ** 2
+            / (draws * expected[supported])
+        ).sum()
+    )
+    # 15 dof at p = 0.001 is 37.7; the widest case here has 15 dof, so one bar covers all
+    assert chi_square < 37.7
+
+
+def test_staging_and_drawing_is_exactly_what_sample_device_does():
+    """``sample_device`` is ``stage`` then ``draw``. The chain graph splits them across the
+    capture boundary, so a difference between the two forms would be a difference between the
+    eager chain and the graphed one."""
+    logits = torch.tensor([0.2, 0.7, -0.1, 1.1, 0.3])
+    split = MTPDraftSampler(seed=5, device=torch.device("cpu"))
+    joined = MTPDraftSampler(seed=5, device=torch.device("cpu"))
+    split.stage(temperature=0.8, top_k=4, top_p=0.9)
+    for _ in range(24):
+        picked = split.draw(logits)
+        assert torch.equal(
+            picked,
+            joined.sample_device(logits, temperature=0.8, top_k=4, top_p=0.9),
+        )
+
+
+def test_the_cells_default_to_an_unfiltered_draw():
+    """A sampler that has not been staged must not inherit whatever the last request asked
+    for -- the cells are addresses a graph bakes, so their resting value is part of the API."""
+    sampler = MTPDraftSampler(seed=5, device=torch.device("cpu"))
+    assert float(sampler.temperature_cell[0]) == 1.0
+    assert int(sampler.top_k_cell[0]) == -1
+    assert float(sampler.top_p_cell[0]) == 1.0
+
+
+def test_reseed_puts_the_private_stream_back():
+    """The head no longer reseeds per request (``SpecDraftHead.reset_request``); this is what
+    tests use instead, and the only caller that should."""
+    logits = torch.tensor([0.2, 0.7, -0.1, 1.1, 0.3])
+    sampler = MTPDraftSampler(seed=1, device=torch.device("cpu"))
+    sampler.reseed(99)
+    first = [sampler.sample(logits, temperature=0.8) for _ in range(16)]
+    sampler.reseed(99)
+    assert [sampler.sample(logits, temperature=0.8) for _ in range(16)] == first

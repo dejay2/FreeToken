@@ -36,11 +36,15 @@ RNG
 The server has no reproducibility contract to preserve: ``SamplingParams`` carries no seed, the
 triton sampler draws from a module-global generator that falls back to the default generator
 under graph capture, and the default is seeded once at engine start. So the speculative path
-owns its own stream instead -- one generator per (request, depth), seeded from
-``FREETOKEN_MTP_DRAFT_SEED``, the shape the shadow observer already uses. Identical requests
-therefore reproduce with speculation on, while the number of draws per emitted token differs
-from plain decode (inherent: a cycle emits 1..k+1 tokens for a fixed 2k+1 draws). Nothing here
-advances the default stream; ``guard_default_rng=True`` asserts it.
+owns its own stream instead -- ACCEPTANCE keeps one generator per (request, depth), seeded from
+``FREETOKEN_MTP_DRAFT_SEED``, the shape the shadow observer already uses. Nothing here advances
+the default stream; ``guard_default_rng=True`` asserts it.
+
+The DRAFT half no longer matches that shape. Its chain is a CUDA graph, and a graph registers
+one generator's philox state for the life of the record, so ``SpecDraftHead`` owns a single
+head-wide generator seeded once instead of one per request (see ``SpecDraftHead.reset_request``
+for why dropping per-request draft reproducibility costs nothing: acceptance is exact for any
+draft distribution).
 """
 
 from __future__ import annotations

@@ -135,7 +135,8 @@ def _head(
     head._recursive = None
     head._saved_blocks = None
     head._buffered = []
-    head._sampler = None
+    # one generator for the head's life, built in __init__ and never rebuilt per request
+    head._sampler = MTPDraftSampler(seed=seed, device=CPU)
     return head
 
 
@@ -1058,14 +1059,32 @@ def test_the_draft_samples_from_the_same_filtered_distribution_acceptance_divide
     assert float((empirical - expected).abs().max()) < 0.05
 
 
-def test_the_draft_stream_is_per_request_and_replays():
+def test_the_draft_stream_belongs_to_the_head_and_survives_a_reset():
+    """The per-request stream is DELIBERATELY gone (``SpecDraftHead.reset_request``).
+
+    It was never a correctness contract -- speculative sampling is exact for any draft
+    distribution -- and one generator per request cannot be registered with a chain graph,
+    which is where the cycle's 11 ms of host time is. What a reset must not do is swap the
+    object out from under a graph that baked its state, or wind it back to a point the graph
+    has already drawn from.
+    """
     head = _head()
+    sampler = head._sampler
+    logits = torch.randn(VOCAB, generator=torch.Generator().manual_seed(2))
+    sampler.sample(logits, temperature=0.8)
+    advanced = sampler.generator.get_state().clone()
+
     head.reset_request(5)
-    first = head._sampler.generator.get_state().clone()
-    head.reset_request(5)
-    assert torch.equal(head._sampler.generator.get_state(), first)
+    assert head._sampler is sampler
+    assert torch.equal(sampler.generator.get_state(), advanced)
     head.reset_request(6)
-    assert not torch.equal(head._sampler.generator.get_state(), first)
+    assert head._sampler is sampler
+
+    # ...and tests (only tests) can still put the stream back to a known point
+    sampler.reseed(11)
+    first = [sampler.sample(logits, temperature=0.8) for _ in range(8)]
+    sampler.reseed(11)
+    assert [sampler.sample(logits, temperature=0.8) for _ in range(8)] == first
 
 
 def test_the_draft_seed_keeps_the_observers_private_stream_shape():

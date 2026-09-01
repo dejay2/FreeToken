@@ -30,23 +30,31 @@ the commit's hidden/embeds    ``_commit_in_*`` -- copied in before the replay
 the QSA context length        ``QSASparseAttnBackend.step_seq_len_source``: the
                               backend's ``fill_`` bakes a host scalar, so an armed
                               chain hands it a cell to copy from instead
+the request's temperature,    ``MTPDraftSampler``'s three cells, staged by
+top-k and top-p               ``_stage_chain_inputs`` -- see below
+the draft RNG's philox state  registered on the graph, so the replay bumps it
 the private KV / ring         already at fixed addresses (the head owns its pool)
-the sampling parameters       NOT device inputs -- see below
 ===========================  =====================================================
 
-WHY GREEDY ONLY
----------------
-``MTPDraftSampler.sample_device`` branches on HOST values: ``temperature == 0 or top_k == 1``
-takes ``argmax``, and every other arm divides by the host temperature, slices a host ``top_k``
-and draws through ``torch.multinomial(..., generator=...)``. Baking one request's temperature
-into a graph would silently serve it to the next request, so a sampled chain would need one
-graph per distinct parameter triple AND a generator whose state advances inside the replay.
-The second half is what settles it: the draft's private RNG is a fresh ``torch.Generator``
-built per request in ``reset_request``, so a graph that registered one request's generator
-state (``CUDAGraph.register_generator_state``) would keep drawing from a generator no live
-request owns. Greedy chains -- ``temperature == 0`` or ``top_k == 1``, which is what a
-benchmark and most agentic traffic run -- are graphed and bit-exact; a sampled request logs
-once and keeps the eager chain, which is exactly the chain it has today.
+SAMPLED REQUESTS ARE GRAPHED TOO
+--------------------------------
+This chain first shipped greedy-only, because ``MTPDraftSampler`` branched on HOST values
+(``temperature == 0 or top_k == 1`` took ``argmax``; the other arms divided by a host
+temperature and sliced a host ``top_k``) and because the draft's generator was rebuilt per
+request, so a record could hold neither. The operator's real traffic runs at the model's
+temperature, which is exactly where the 11 ms was being left on the table. Both blockers are
+gone:
+
+* ``MTPDraftSampler.draw`` is branch-free -- one scale, one stable sort, a top-k THRESHOLD
+  mask, a top-p prefix-sum mask and an inverse-CDF draw, always, with the greedy id selected
+  by a ``torch.where`` on the temperature cell. Greedy stays bit-exact ``argmax``; the sampled
+  distribution stays ``filtered_probs``, pinned by a chi-square/total-variation test rather
+  than by matching ``multinomial``'s draw sequence;
+* the head owns ONE generator for its life (``SpecDraftHead.reset_request`` explains what the
+  per-request stream did and did not guarantee), and ``capture(..., generators=...)`` registers
+  its state so replays advance the philox offset exactly as eager chains would.
+
+So the key is ``chain:mrope={0,1}`` and nothing about the request enters it.
 
 THE CAPTURE DISCIPLINE
 ----------------------
@@ -80,7 +88,7 @@ from __future__ import annotations
 import gc
 import os
 from dataclasses import dataclass
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 
 import torch
 
@@ -239,12 +247,20 @@ class SpecDraftGraphRunner:
         run: Callable[[], None],
         *,
         restore: Callable[[], None] | None = None,
+        generators: "Sequence[torch.Generator]" = (),
     ) -> DraftGraphCaptureResult:
         """Record ``run`` under ``key``, winding the head back with ``restore`` around it.
 
         ``run`` is called twice: once as an executing warm-up (on the capture stream, so the
         per-stream lazy resources it needs exist before recording) and once under capture,
         where it executes nothing. ``restore`` follows each call and every failure.
+
+        ``generators`` are the RNG streams the body draws from. Each is registered on the graph
+        before recording (``CUDAGraph.register_generator_state``, torch 2.11) so that its philox
+        seed and offset are read from device tensors the replay bumps, rather than baked as the
+        constants they were at capture. Without it a sampled draft chain would propose the
+        capture's tokens on every replay for ever; with it, N replays draw exactly what N eager
+        chains from the same state draw.
         """
         previous = self._support.get(key)
         if previous is not None:
@@ -274,6 +290,10 @@ class SpecDraftGraphRunner:
         # a raising capture_end skips torch's own stream restore, so own the restore here
         entry_stream = torch.cuda.current_stream(self.device)
         try:
+            for generator in generators:
+                # before the warm-up, so a torch that refuses the registration fails on the
+                # cheap side of the attempt rather than half-way through a recording
+                graph.register_generator_state(generator)
             self._stream.wait_stream(entry_stream)
             warmed = True
             with torch.cuda.stream(self._stream):
