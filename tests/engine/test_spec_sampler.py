@@ -744,3 +744,45 @@ def test_the_acceptance_ceiling_mirrors_the_engine_configs():
     from freetoken.engine.spec_sample import _MAX_ACCEPT_DEPTH
 
     assert _MAX_ACCEPT_DEPTH == _MAX_SPEC_DEPTH
+
+
+# -------------------------------------------------- the device run the decision carries
+
+
+def test_the_decision_carries_acceptances_device_run_and_truncates_it_too():
+    """``tokens_gpu`` is ``tokens`` in the shape the token-pool write wants; a stop condition
+    that shortens the run has to shorten both, or the pool takes rows the host never emitted."""
+    decision = _sampler().step(
+        uid=1,
+        draft_tokens=[1, 2, 3],
+        draft_logits=_peaked([1, 2, 3]),
+        target_logits=_peaked([1, 2, 3, 4]),
+        args=_args(temperature=None),
+    )
+    assert decision.tokens_gpu is not None
+    assert decision.tokens_gpu.dtype is torch.int32
+    assert tuple(decision.tokens_gpu.tolist()) == decision.tokens
+
+    truncated = decision.truncated(2)
+    assert tuple(truncated.tokens_gpu.tolist()) == truncated.tokens == decision.tokens[:2]
+
+
+def test_the_device_run_stays_out_of_the_verdicts_identity():
+    """Two runs of the same step are the same verdict; a tensor field would make them differ
+    (and ``Tensor.__eq__`` would not even return a bool)."""
+    first = _sampler().step(
+        uid=1,
+        draft_tokens=[1, 2],
+        draft_logits=_peaked([1, 2]),
+        target_logits=_peaked([1, 2, 3]),
+        args=_args(temperature=None),
+    )
+    second = _sampler().step(
+        uid=1,
+        draft_tokens=[1, 2],
+        draft_logits=_peaked([1, 2]),
+        target_logits=_peaked([1, 2, 3]),
+        args=_args(temperature=None),
+    )
+    assert first.tokens_gpu is not second.tokens_gpu
+    assert first == second

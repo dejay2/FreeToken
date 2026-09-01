@@ -7,6 +7,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, NamedTuple, Sequence, Tuple
 
 import torch
+from freetoken import diag
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
@@ -1380,23 +1381,25 @@ class Engine:
         captured = None
         graph_runner = self.spec_graph_runner
         armed = probe is not None and graph_runner is not None
-        if graph_runner is not None:
-            if armed:
-                # the runner's own split of the replay, which the probe's marks cannot see:
-                # its host-side staging costs versus the graph's device duration
-                graph_runner.replay_timings = {}
-            ladder = self.spec_state_ladder
-            captured = graph_runner.forward(
-                batch,
-                # capture's warm-up EXECUTES this forward against the live GDN slot; the
-                # ladder's own pre-step snapshot is the wind-back (spec_graph, spec_state_ladder)
-                restore_state=None if ladder is None else ladder.restore_snapshot,
-            )
-        if captured is None:
-            with self.ctx.forward_batch(batch):
-                logits, hidden, _ = self.model.forward_mtp_capture(all_row_logits=True)
-        else:
-            logits, hidden = captured
+        with diag.region("diag.spec_verify_replay"):
+            if graph_runner is not None:
+                if armed:
+                    # the runner's own split of the replay, which the probe's marks cannot see:
+                    # its host-side staging costs versus the graph's device duration
+                    graph_runner.replay_timings = {}
+                ladder = self.spec_state_ladder
+                captured = graph_runner.forward(
+                    batch,
+                    # capture's warm-up EXECUTES this forward against the live GDN slot; the
+                    # ladder's own pre-step snapshot is the wind-back (spec_graph,
+                    # spec_state_ladder)
+                    restore_state=None if ladder is None else ladder.restore_snapshot,
+                )
+            if captured is None:
+                with self.ctx.forward_batch(batch):
+                    logits, hidden, _ = self.model.forward_mtp_capture(all_row_logits=True)
+            else:
+                logits, hidden = captured
         probe and probe.mark("verify.forward")
         if armed:
             timings = graph_runner.replay_timings or {}
@@ -1410,17 +1413,24 @@ class Engine:
                         add_ms(name, value)
         if self.cpu_moe_executor is not None:
             self.cpu_moe_executor.raise_if_unhealthy()
-        decision = self.spec_sampler.step(
-            uid=batch.reqs[0].uid,
-            draft_tokens=draft_tokens,
-            draft_logits=draft_logits,
-            target_logits=logits[: batch.emit_width],
-            args=args,
-        )
+        with diag.region("diag.spec_accept"):
+            decision = self.spec_sampler.step(
+                uid=batch.reqs[0].uid,
+                draft_tokens=draft_tokens,
+                draft_logits=draft_logits,
+                target_logits=logits[: batch.emit_width],
+                args=args,
+            )
         probe and probe.mark("verify.accept")
-        next_tokens_gpu = torch.tensor(
-            decision.tokens, dtype=torch.int32, device=logits.device
-        )
+        # Acceptance already cut the run out of tensors it held on the device, so the ids that
+        # were produced there never leave and come back: the H2D this used to pay is a cat of
+        # device slices instead. ``tokens_gpu`` is None only for a decision acceptance did not
+        # build (a stubbed sampler in a test), and then the H2D is still the right answer.
+        next_tokens_gpu = getattr(decision, "tokens_gpu", None)
+        if next_tokens_gpu is None or next_tokens_gpu.device != logits.device:
+            next_tokens_gpu = torch.tensor(
+                decision.tokens, dtype=torch.int32, device=logits.device
+            )
         probe and probe.mark("verify.pack")
         return SpecForwardOutput(decision, next_tokens_gpu, hidden)
 

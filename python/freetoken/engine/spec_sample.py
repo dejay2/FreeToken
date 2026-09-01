@@ -180,6 +180,11 @@ class MTPAcceptanceResult:
     filter_wall_ms: float = field(default=0.0, compare=False)
     decide_wall_ms: float = field(default=0.0, compare=False)
     sync_wall_ms: float = field(default=0.0, compare=False)
+    # The emitted run (``proposals[:accepted_prefix]`` + the corrected token) as an int32 DEVICE
+    # tensor, cut from the tensors acceptance already had there. It exists so the caller never
+    # has to ship the same ids BACK with ``torch.tensor(..., device=cuda)``; it is a second
+    # shape of the decision the tuple fields already carry, so it stays out of equality.
+    emitted_tokens_device: torch.Tensor | None = field(default=None, compare=False)
 
     @property
     def acceptance_ms(self) -> float:
@@ -270,23 +275,52 @@ def batched_speculative_accept(
 
     decide_done = time.perf_counter()
 
+    # ONE transfer for the whole verdict. Read row by row this is six device round trips (a
+    # ``synchronize``, two ``int()`` reads and four ``.tolist()``), each of which stalls the
+    # host on its own D2H; packed, it is a single cat and a single blocking copy, and that copy
+    # IS the synchronization the old ``torch.cuda.synchronize`` was -- so the accounting below
+    # is unchanged (1 on cuda, 0 elsewhere). float64 carries the two integer blocks losslessly:
+    # token ids and counts are exact in a double well past any vocabulary, and float32 ->
+    # float64 -> float is exact for the three probability blocks.
+    packed = torch.cat(
+        (
+            torch.stack(
+                (
+                    accepted_prefix_device.reshape(()).to(torch.float64),
+                    corrected_device.reshape(()).to(torch.float64),
+                )
+            ),
+            target_tokens_device.to(torch.float64),
+            torch.cat((ratios, q_selected, p_selected)).to(torch.float64),
+        )
+    )
     required_synchronizations = 0
     if device.type == "cuda":
-        torch.cuda.synchronize(device)
+        host = packed.to("cpu")
         required_synchronizations = 1
+    else:
+        host = packed
     sync_done = time.perf_counter()
     required_wall_ms = (sync_done - started) * 1000.0
     filter_wall_ms = (filter_done - started) * 1000.0
     decide_wall_ms = (decide_done - filter_done) * 1000.0
     sync_wall_ms = (sync_done - decide_done) * 1000.0
 
+    # Everything below reads the HOST copy; not one of these lines touches the device again.
+    accepted_prefix = int(host[0])
+    corrected_token = int(host[1])
+    # The emitted run without a round trip: the proposals and the correction are both already
+    # on the device, so the caller's ``next_tokens_gpu`` is a cat of device slices instead of a
+    # pageable H2D of the host tuple we just decoded.
+    emitted_tokens_device = torch.cat(
+        (proposal_ids[:accepted_prefix], corrected_device.reshape(1))
+    ).to(torch.int32)
+
     instrumentation_started = time.perf_counter()
-    accepted_prefix = int(accepted_prefix_device)
-    corrected_token = int(corrected_device)
-    target_tokens = _tensor_to_tuple(target_tokens_device, int)
-    acceptance_probabilities = _tensor_to_tuple(ratios, float)
-    draft_probabilities = _tensor_to_tuple(q_selected, float)
-    target_probabilities = _tensor_to_tuple(p_selected, float)
+    target_tokens = _tensor_to_tuple(host[2 : 2 + depth], int)
+    acceptance_probabilities = _tensor_to_tuple(host[2 + depth : 2 + 2 * depth], float)
+    draft_probabilities = _tensor_to_tuple(host[2 + 2 * depth : 2 + 3 * depth], float)
+    target_probabilities = _tensor_to_tuple(host[2 + 3 * depth :], float)
     instrumentation_wall_ms = (
         time.perf_counter() - instrumentation_started
     ) * 1000.0
@@ -305,6 +339,7 @@ def batched_speculative_accept(
         filter_wall_ms=filter_wall_ms,
         decide_wall_ms=decide_wall_ms,
         sync_wall_ms=sync_wall_ms,
+        emitted_tokens_device=emitted_tokens_device,
     )
     return result
 
@@ -360,6 +395,11 @@ class SpecDecision:
     filter_ms: float = field(default=0.0, compare=False)
     decide_ms: float = field(default=0.0, compare=False)
     sync_ms: float = field(default=0.0, compare=False)
+    # ``tokens`` as an int32 DEVICE tensor, produced by acceptance itself so the token-pool
+    # write needs no H2D of ids the device already held. None whenever acceptance did not
+    # build one (a hand-made decision in a test, a decision reconstructed off the wire), and
+    # every consumer must keep its own fallback for that. Out of equality: it is ``tokens``.
+    tokens_gpu: torch.Tensor | None = field(default=None, compare=False)
 
     @property
     def bonus_token(self) -> int:
@@ -389,6 +429,7 @@ class SpecDecision:
             filter_ms=self.filter_ms,
             decide_ms=self.decide_ms,
             sync_ms=self.sync_ms,
+            tokens_gpu=None if self.tokens_gpu is None else self.tokens_gpu[:keep],
         )
 
 
@@ -527,6 +568,12 @@ class SpecSampler:
         tokens = tuple(int(t) for t in draft_tokens[:accepted]) + (
             acceptance.corrected_token,
         )
+        # numel is host-side metadata, so this costs no device traffic: the device run and the
+        # host run are the same decision cut two ways and must not drift in length.
+        assert (
+            acceptance.emitted_tokens_device is None
+            or acceptance.emitted_tokens_device.numel() == len(tokens)
+        ), "acceptance's device run and host run disagree on length"
         self._steps += 1
         self._drafts_proposed += k
         self._drafts_accepted += accepted
@@ -545,6 +592,7 @@ class SpecSampler:
             filter_ms=acceptance.filter_wall_ms,
             decide_ms=acceptance.decide_wall_ms,
             sync_ms=acceptance.sync_wall_ms,
+            tokens_gpu=acceptance.emitted_tokens_device,
         )
 
     def _accept(

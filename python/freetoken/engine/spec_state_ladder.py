@@ -30,18 +30,48 @@ different ladder from plain decode and spend the greedy-equivalence gate for ~0.
 
 ``rollback`` is the ``state_rollback`` callable ``Scheduler._rollback_spec_tokens`` takes; it
 runs after the lengths are final, because a stop condition can still shrink the accepted run.
+
+THE SETTLE IS LAUNCH-BOUND, NOT BANDWIDTH-BOUND. Every tensor it touches is a few hundred KB;
+what it costs is HOST LAUNCHES, one per GDN layer in the recurrent replay (36 on Qwen3.8) plus
+the whole-slot copies around them. Two things cut that:
+
+  * the replay's inputs all live at addresses the ladder allocated once and never moves (the
+    stash arena, the state pool, the layer's own ``A_log``/``dt_bias``), and the only per-step
+    variable is WHICH slot to advance -- so the ``steps``-row replay records into a CUDA graph
+    keyed on ``steps`` alone, and a settle issues one replay instead of 36 launches. Off with
+    ``FREETOKEN_MTP_SPEC_LADDER_GRAPH=0``, which restores the eager per-layer loop exactly;
+  * a settle that accepts anything REWRITES the conv and PLE shift registers whole, so
+    restoring their snapshot first is three strided copies whose every byte is overwritten a
+    moment later. ``rollback`` restores only the recurrent state (the replay's own starting
+    point) and reads the shift registers' pre-step halves straight out of the snapshot slot.
 """
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Mapping
 
 import torch
+
+from freetoken.utils import init_logger
 
 if TYPE_CHECKING:
     from freetoken.core import Batch, Req
     from freetoken.kvcache.linear_state_pool import LinearStatePool
+
+logger = init_logger(__name__)
+
+LADDER_GRAPH_ENV = "FREETOKEN_MTP_SPEC_LADDER_GRAPH"
+
+
+def ladder_graph_enabled(env: "Mapping[str, str] | None" = None) -> bool:
+    """Whether the recurrent replay may be recorded into a CUDA graph (default: yes)."""
+    env = os.environ if env is None else env
+    raw = (env.get(LADDER_GRAPH_ENV, "1") or "1").strip()
+    if raw not in {"0", "1"}:
+        raise ValueError(f"{LADDER_GRAPH_ENV} must be 0 or 1, got {raw!r}")
+    return raw == "1"
 
 
 class SpecStateLadder:
@@ -105,6 +135,16 @@ class SpecStateLadder:
             ]
         )
         self._slot_ids = torch.arange(num_slots, dtype=torch.int32, device=device)
+        # The graphed replay's ONE moving input. A graph bakes the address of its index tensor,
+        # not the slot id inside it, so the replay reads this fixed cell and a settle refills it
+        # with a single-element device copy off ``_slot_ids``.
+        self._graph_slot = torch.empty(1, dtype=torch.int32, device=device)
+        self._graph_enabled = device.type == "cuda" and ladder_graph_enabled()
+        self._graphs: dict[int, "torch.cuda.CUDAGraph"] = {}
+        # the kernel's per-call output tensor is allocated from the graph's private pool and
+        # written on every replay, so the capture's copy has to stay alive with the graph
+        self._graph_outputs: dict[int, list[torch.Tensor]] = {}
+        self._graph_stream = None
 
         self._ple_rows: dict[int, int] = {}
         self._ple_hist = None
@@ -138,6 +178,9 @@ class SpecStateLadder:
         self._slot_ids = torch.arange(
             self.pool.num_slots, dtype=torch.int32, device=self.pool.device
         )
+        # ``rebuild`` REPLACED the pool's state tensors, so every recorded replay is pointing at
+        # freed storage. Drop them; the next settle re-records against the new addresses.
+        self._drop_graphs()
         self.slot = self.pool.alloc(1)[0]
         self._live = None
         self._width = 0
@@ -244,6 +287,15 @@ class SpecStateLadder:
             raise RuntimeError("no speculative step is in flight on this ladder")
         self.pool.copy_from(self.slot, self._live)
 
+    def _restore_recurrent(self) -> None:
+        """The recurrent half of ``restore_snapshot`` -- the replay's starting state, and the
+        only half a settle that accepts anything has to put back (see the module docstring)."""
+        if self._live is None:
+            raise RuntimeError("no speculative step is in flight on this ladder")
+        self.pool.recurrent_states[:, self._live].copy_(
+            self.pool.recurrent_states[:, self.slot]
+        )
+
     def rollback(self, req: "Req", accepted: int) -> None:
         """Leave the slot holding exactly ``accepted`` of the step's rows.
 
@@ -258,59 +310,148 @@ class SpecStateLadder:
         if not 0 <= accepted <= self._width:
             raise ValueError(f"accepted must be 0..{self._width} rows, got {accepted}")
         slot = self._live
-        self.restore_snapshot()
         if accepted:
+            # Only the recurrent state is restored: ``_replay_conv`` / ``_replay_ple`` rewrite
+            # the conv and PLE shift registers WHOLE out of the snapshot slot, so restoring
+            # those first would be three strided copies nothing ever reads.
+            self._restore_recurrent()
             self._replay_recurrent(slot, accepted)
             self._replay_conv(slot, accepted)
             self._replay_ple(slot, accepted)
+        else:
+            # The full undo keeps ``copy_from``'s exact semantics -- boot capture's
+            # ``rollback(req, 0)`` is the wind-back for a pass that produced nothing.
+            self.restore_snapshot()
         self._live = None
         self._width = 0
 
-    def _replay_recurrent(self, slot: int, steps: int) -> None:
+    # -------------------------------------------------------------- the recurrent replay
+
+    def _launch_recurrent(
+        self, indices: torch.Tensor, steps: int
+    ) -> list[torch.Tensor]:
+        """One ``fused_sigmoid_gating_delta_rule_update`` per GDN layer, advancing ``steps``
+        rows of the slot named by ``indices``. Every other input is at a fixed address, which
+        is what makes the whole loop capturable."""
         from freetoken.kernel.fla import fused_sigmoid_gating_delta_rule_update
 
-        indices = self._slot_ids[slot : slot + 1]
         cu_seqlens = self._cu[steps]
         q_end, k_end = self._splits
+        outputs = []
         for li, params in enumerate(self._params):
             assert params is not None, (
                 f"GDN layer index {li} never stashed; the capture hook did not run"
             )
             A_log, dt_bias, scale = params
             mixed = self._mixed[li, :steps]
-            fused_sigmoid_gating_delta_rule_update(
-                A_log=A_log,
-                a=self._a[li, :steps],
-                dt_bias=dt_bias,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-                q=mixed[:, :q_end].view(1, steps, self._k_heads, self._key_dim),
-                k=mixed[:, q_end:k_end].view(1, steps, self._k_heads, self._key_dim),
-                v=mixed[:, k_end:].view(1, steps, self._v_heads, self._value_dim),
-                b=self._b[li, :steps],
-                initial_state_source=self.pool.recurrent_states[li],
-                initial_state_indices=indices,
-                scale=scale,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
+            outputs.append(
+                fused_sigmoid_gating_delta_rule_update(
+                    A_log=A_log,
+                    a=self._a[li, :steps],
+                    dt_bias=dt_bias,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    q=mixed[:, :q_end].view(1, steps, self._k_heads, self._key_dim),
+                    k=mixed[:, q_end:k_end].view(1, steps, self._k_heads, self._key_dim),
+                    v=mixed[:, k_end:].view(1, steps, self._v_heads, self._value_dim),
+                    b=self._b[li, :steps],
+                    initial_state_source=self.pool.recurrent_states[li],
+                    initial_state_indices=indices,
+                    scale=scale,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=cu_seqlens,
+                )
             )
+        return outputs
+
+    def _replay_recurrent(self, slot: int, steps: int) -> None:
+        graph = self._graphs.get(steps)
+        if graph is None and self._graph_enabled:
+            graph = self._capture_replay(steps)
+        if graph is None:
+            self._launch_recurrent(self._slot_ids[slot : slot + 1], steps)
+            return
+        self._graph_slot.copy_(self._slot_ids[slot : slot + 1])
+        graph.replay()
+
+    def _drop_graphs(self) -> None:
+        self._graphs.clear()
+        self._graph_outputs.clear()
+
+    def _capture_replay(self, steps: int):
+        """Record the ``steps``-row replay once, or fall back to the eager loop for good.
+
+        Capture's warm-up EXECUTES the replay against the live slot, so the recurrent state is
+        wound back to the snapshot between the two passes -- exactly where ``rollback`` handed
+        it over -- and the recorded pass runs nothing. An in-capture failure poisons the CUDA
+        context for retries, so nothing is retried: graphing switches off and the ladder is the
+        pre-graph ladder, which is also what ``FREETOKEN_MTP_SPEC_LADDER_GRAPH=0`` selects.
+        """
+        device = self.pool.device
+        if torch.cuda.is_current_stream_capturing():
+            # a capture is already recording (the verify graph); nesting is illegal
+            return None
+        entry_stream = torch.cuda.current_stream(device)
+        if self._graph_stream is None:
+            self._graph_stream = torch.cuda.Stream(device=device)
+        graph = torch.cuda.CUDAGraph()
+        warmed = False
+        try:
+            self._graph_slot.copy_(self._slot_ids[self._live : self._live + 1])
+            # warm up ON the stream that gets captured, so its lazy per-stream resources
+            # (the triton module, its launch metadata) exist before recording
+            self._graph_stream.wait_stream(entry_stream)
+            warmed = True
+            with torch.cuda.stream(self._graph_stream):
+                self._launch_recurrent(self._graph_slot, steps)
+            entry_stream.wait_stream(self._graph_stream)
+            torch.cuda.synchronize(device)
+            self._restore_recurrent()
+            # a private pool per graph: these replay in whatever order acceptance dictates,
+            # which is exactly what a shared pool does not allow
+            with torch.cuda.graph(
+                graph,
+                stream=self._graph_stream,
+                # background threads (ple-mmap staging, the CPU-MoE watchdog) must not
+                # invalidate this capture from outside
+                capture_error_mode="thread_local",
+            ):
+                outputs = self._launch_recurrent(self._graph_slot, steps)
+            torch.cuda.synchronize(device)
+        except Exception as exc:  # pragma: no cover - needs a live CUDA context
+            torch.cuda.set_stream(entry_stream)
+            self._graph_enabled = False
+            self._drop_graphs()
+            if warmed:
+                # the warm-up may have advanced the live state before it fell over
+                self._restore_recurrent()
+            logger.warning(
+                "spec ladder replay capture failed at %d step(s) (%s: %s); "
+                "falling back to the eager per-layer replay",
+                steps, type(exc).__name__, " ".join(str(exc).split())[:200],
+            )
+            return None
+        self._graphs[steps] = graph
+        self._graph_outputs[steps] = outputs
+        return graph
 
     def _replay_conv(self, slot: int, steps: int) -> None:
         km1 = self._km1
-        self._conv_hist[:, :, :km1].copy_(self.pool.conv_states[:, slot])
+        # the pre-step window comes from the SNAPSHOT, so the live slot needs no restore first
+        self._conv_hist[:, :, :km1].copy_(self.pool.conv_states[:, self.slot])
         self.pool.conv_states[:, slot].copy_(self._conv_hist[:, :, steps : steps + km1])
 
     def _replay_ple(self, slot: int, steps: int) -> None:
         if self._ple_hist is not None:
             state_len = self._ple_state_len
             states = self.pool.slot_states[self._ple_conv_name]
-            self._ple_hist[:, :, :state_len].copy_(states[:, slot])
+            self._ple_hist[:, :, :state_len].copy_(states[:, self.slot])
             states[:, slot].copy_(self._ple_hist[:, :, steps : steps + state_len])
         if self._ngram_hist is not None:
             ctx_len = self._ngram_len
             states = self.pool.slot_states[self._ngram_name]
-            self._ngram_hist[:ctx_len].copy_(states[0, slot])
+            self._ngram_hist[:ctx_len].copy_(states[0, self.slot])
             states[0, slot].copy_(self._ngram_hist[steps : steps + ctx_len])
 
 
-__all__ = ["SpecStateLadder"]
+__all__ = ["LADDER_GRAPH_ENV", "SpecStateLadder", "ladder_graph_enabled"]

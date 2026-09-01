@@ -14,6 +14,7 @@ from typing import (
 )
 
 import torch
+from freetoken import diag
 from freetoken.attention.linear import build_fla_metadata
 from freetoken.core import Batch, Req, SpecInflight
 from freetoken.env import ENV
@@ -150,6 +151,7 @@ class Scheduler(SchedulerIOMixin):
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
+            debug_log=logger.debug_rank0,
         )
 
         # Initialize the I/O mixin
@@ -323,16 +325,24 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
+        # ``diag.profile_step`` is the kernel profiler's iteration boundary (default-off; see
+        # freetoken/diag.py). It sits HERE and not inside the two loops because this is the one
+        # point both of them pass through exactly once per iteration -- and because boot-time
+        # graph capture is finished by construction: it ran in the Engine constructor, long
+        # before run_forever, so the recorder can never catch a capture.
+        diag.profile_loop_begin()
         if ENV.DISABLE_OVERLAP_SCHEDULING:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
                     self.normal_loop()
+                    diag.profile_step()
         else:
             assert torch.cuda.current_stream() == self.stream
             data = None
             while True:
                 data = self.overlap_loop(data)
+                diag.profile_step()
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
@@ -1141,6 +1151,13 @@ class Scheduler(SchedulerIOMixin):
         keep = max(0, min(div_ceil(req.cached_len, page_size), spec.last_page) - spec.first_page)
         returned = spec.pages[keep:]
         if returned.numel():
+            # NOT per-cycle churn, despite the fresh free-list tensor: ``spec.pages`` spans
+            # only [first_page, last_page), and a w <= 6 row step straddles a page boundary
+            # rarely (never, at page_size 64, unless cached_len lands within w of one) and
+            # LOSES that page rarer still -- it must also have rejected back across it. The
+            # free list is a suffix VIEW consumed from the front and appended at the back, and
+            # ``_allocate`` hands its callers views of the very prefix an in-place prepend
+            # would overwrite, so making this in-place is a free-list refactor, not a patch.
             self.cache_manager.free_slots = torch.cat(
                 [returned, self.cache_manager.free_slots]
             )
@@ -1335,7 +1352,8 @@ class Scheduler(SchedulerIOMixin):
         # the context length the drafts were made AT
         cached_len = int(req.cached_len) if conf_log is not None else 0
         depth = min(self.config.spec_decode.depth, req.remain_len)
-        proposal = engine.spec_draft.propose(req, depth)
+        with diag.region("diag.spec_draft"):
+            proposal = engine.spec_draft.propose(req, depth)
         probe and probe.mark("draft")
 
         forward_input = self._prepare_spec_batch(req, proposal.tokens)
@@ -1354,21 +1372,30 @@ class Scheduler(SchedulerIOMixin):
         )
         probe and probe.mark("verify+accept")
 
-        msg = self._emit_step_tokens(
-            req, torch.tensor(output.decision.tokens, dtype=torch.int32), settled=True
-        )
-        emitted = len(msg.next_tokens)
-        decision = output.decision.truncated(emitted)
-        # Only the emitted run reaches the token pool; a rejected row's sampled token would
-        # become the next step's row 0.
-        self.token_pool[write_mapping[0][:emitted], write_mapping[1][:emitted]] = (
-            output.next_tokens_gpu[:emitted]
-        )
-        self._rollback_spec_tokens(
-            req,
-            decision.accepted_rows,
-            state_rollback=None if ladder is None else ladder.rollback,
-        )
+        with diag.region("diag.spec_emit"):
+            msg = self._emit_step_tokens(
+                req, torch.tensor(output.decision.tokens, dtype=torch.int32), settled=True
+            )
+            emitted = len(msg.next_tokens)
+            decision = output.decision.truncated(emitted)
+            # Only the emitted run reaches the token pool; a rejected row's sampled token would
+            # become the next step's row 0.
+            self.token_pool[write_mapping[0][:emitted], write_mapping[1][:emitted]] = (
+                output.next_tokens_gpu[:emitted]
+            )
+        # The tail's three sub-stages, in the same dotted shape the engine subdivides
+        # "verify+accept" with: each is timed against the previous sub-mark, so the coarse
+        # stages they sit inside keep spanning exactly what they spanned before. They mirror
+        # the diag regions above one for one, so a probe run and a diag trace name the same
+        # spans. "tail.commit" is the draft head's forward -- measured here, owned elsewhere.
+        probe and probe.mark("tail.emit")
+        with diag.region("diag.spec_rollback"):
+            self._rollback_spec_tokens(
+                req,
+                decision.accepted_rows,
+                state_rollback=None if ladder is None else ladder.rollback,
+            )
+        probe and probe.mark("tail.rollback")
         probe and probe.mark("emit+rollback")
 
         if msg.finished:
@@ -1376,9 +1403,11 @@ class Scheduler(SchedulerIOMixin):
         else:
             # The draft's context is the shifted pairs (target hidden i, embedding of token
             # i+1); this cycle contributed exactly `emitted` of them.
-            engine.spec_draft.commit(
-                req, hidden=output.hidden, token_ids=msg.next_tokens
-            )
+            with diag.region("diag.spec_commit"):
+                engine.spec_draft.commit(
+                    req, hidden=output.hidden, token_ids=msg.next_tokens
+                )
+        probe and probe.mark("tail.commit")
         self._spec_record(req, emitted)
         probe and probe.finish_cycle(
             emitted=emitted,
@@ -1487,7 +1516,12 @@ class Scheduler(SchedulerIOMixin):
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
-        forward_output = self.engine.forward_batch(batch, sample_args)
+        # The whole non-speculative forward: a prefill batch, or a plain decode step
+        # (graph replay including its PLE staging, or the width-1 spec-graph fallback).
+        with diag.region(
+            "diag.prefill_forward" if batch.is_prefill else "diag.plain_decode_step"
+        ):
+            forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output

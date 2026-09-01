@@ -403,3 +403,111 @@ def test_batched_acceptance_requires_bounded_matching_shapes():
             top_p=1.0,
             generator=torch.Generator().manual_seed(1),
         )
+
+
+# -------------------------------------------------------- one transfer for the whole verdict
+
+
+def test_the_verdict_leaves_the_device_in_a_single_transfer(monkeypatch):
+    """Read row by row the verdict was six device round trips (a synchronize, two ``int()``
+    reads and four ``.tolist()``). Packed it is one blocking copy, and that copy IS the
+    synchronization -- so ``required_synchronizations`` still counts exactly one on cuda."""
+    import freetoken.engine.spec_sample as spec_sample
+
+    transfers: list[tuple] = []
+    original = torch.Tensor.to
+
+    def counting_to(self, *args, **kwargs):
+        if args and args[0] in ("cpu", torch.device("cpu")):
+            transfers.append(tuple(self.shape))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", counting_to)
+    result = spec_sample.batched_speculative_accept(
+        proposals=[1, 2, 3],
+        draft_logits=_logits([1, 2, 3]),
+        target_logits=_logits([1, 2, 5, 6]),
+        temperature=0.0,
+        top_k=-1,
+        top_p=1.0,
+        generator=torch.Generator().manual_seed(44),
+    )
+
+    # a CPU run makes no transfer at all; what is pinned is that nothing walks the tensors
+    # one by one -- the whole verdict is read off a single packed host buffer
+    assert transfers == []
+    assert result.accepted_prefix == 2
+    assert result.target_tokens == (1, 2, 5)
+
+
+def test_the_packed_verdict_carries_the_same_numbers_the_row_reads_did():
+    """The pack round-trips through float64; token ids and counts are exact in a double, and
+    float32 -> float64 -> float is exact for the probabilities."""
+    proposals = [1, 2, 3]
+    target_logits = _logits([1, 7, 3, 6])
+    draft_logits = _logits(proposals)
+    result = batched_speculative_accept(
+        proposals=proposals,
+        draft_logits=draft_logits,
+        target_logits=target_logits,
+        temperature=0.8,
+        top_k=-1,
+        top_p=0.95,
+        generator=torch.Generator().manual_seed(773),
+    )
+
+    from freetoken.engine.spec_sample import _sampling_probabilities_batch
+
+    q_rows = _sampling_probabilities_batch(
+        draft_logits, temperature=0.8, top_k=-1, top_p=0.95
+    )
+    p_rows = _sampling_probabilities_batch(
+        target_logits, temperature=0.8, top_k=-1, top_p=0.95
+    )
+    for row, token in enumerate(proposals):
+        assert result.draft_probabilities[row] == float(q_rows[row][token])
+        assert result.target_probabilities[row] == float(p_rows[row][token])
+    assert result.target_tokens == tuple(
+        int(v) for v in torch.argmax(target_logits[:3], dim=-1)
+    )
+
+
+def test_acceptance_hands_back_the_emitted_run_on_the_device():
+    """The caller's ``next_tokens_gpu`` used to be an H2D of ids the device had just produced.
+    Acceptance cuts the run out of the tensors it already held instead."""
+    result = batched_speculative_accept(
+        proposals=[1, 2, 3],
+        draft_logits=_logits([1, 2, 3]),
+        target_logits=_logits([1, 2, 5, 6]),
+        temperature=0.0,
+        top_k=-1,
+        top_p=1.0,
+        generator=torch.Generator().manual_seed(44),
+    )
+
+    run = result.emitted_tokens_device
+    assert run is not None
+    assert run.dtype is torch.int32
+    assert run.tolist() == [1, 2, result.corrected_token]
+    assert len(run) == result.accepted_prefix + 1
+
+
+def test_the_device_run_is_evidence_not_identity():
+    """``emitted_tokens_device`` is a second shape of the same decision, so two results that
+    agree on the decision must still compare equal."""
+    kwargs = dict(
+        proposals=[1, 2],
+        draft_logits=_logits([1, 2]),
+        target_logits=_logits([1, 2, 5]),
+        temperature=0.0,
+        top_k=-1,
+        top_p=1.0,
+    )
+    first = batched_speculative_accept(
+        generator=torch.Generator().manual_seed(3), **kwargs
+    )
+    second = batched_speculative_accept(
+        generator=torch.Generator().manual_seed(3), **kwargs
+    )
+    assert first.emitted_tokens_device is not second.emitted_tokens_device
+    assert first == second

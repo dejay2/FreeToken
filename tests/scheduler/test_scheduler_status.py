@@ -159,3 +159,73 @@ def test_usage_ratio_guard():
     assert _usage_ratio(0, 0) == 0.0
     assert _usage_ratio(5, 0) == 0.0
     assert _usage_ratio(5, 10) == 0.5
+
+
+# ------------------------------------------------------------- the speculative verify batch
+
+
+def _spec_verify_batch(width=4):
+    """What ``_prepare_spec_batch`` builds: prefill PHASE (so the w rows are causal) with
+    nothing prefilled -- ``log_new_tokens``/``log_cached_tokens`` are both 0, which is what
+    made its INFO line read "#new-token: 0, #cached-token: 0" once per speculative cycle."""
+    return SimpleNamespace(
+        is_prefill=True, is_decode=False, reqs=[_req(extend=width, cached=100)],
+        log_new_tokens=0, log_cached_tokens=0, mtp_verify=True, emit_width=width,
+    )
+
+
+def _debug_reporter():
+    logs: list[str] = []
+    debug: list[str] = []
+    clock = {"t": 0.0}
+    rep = SchedulerStatusReporter(
+        log=logs.append, clock=lambda: clock["t"], decode_log_interval=40,
+        debug_log=debug.append,
+    )
+    return rep, logs, debug, clock
+
+
+def test_a_spec_verify_batch_never_reaches_the_prefill_line():
+    rep, logs, debug, clock = _debug_reporter()
+    clock["t"] = 1.0
+    rep.report_batch(
+        _spec_verify_batch(), running_reqs=1, queue_reqs=0,
+        kv_used_pages=50, kv_total_pages=200, page_size=16,
+    )
+    assert logs == []
+    assert len(debug) == 1
+    assert debug[0].startswith("Spec verify batch, #row: 4")
+    assert "token usage: 0.25" in debug[0]
+    assert "#new-token" not in debug[0]
+
+
+def test_a_spec_verify_batch_is_dropped_when_there_is_no_debug_sink():
+    rep, logs, clock = _reporter()
+    rep.report_batch(
+        _spec_verify_batch(), running_reqs=1, queue_reqs=0,
+        kv_used_pages=1, kv_total_pages=2, page_size=16,
+    )
+    assert logs == []
+
+
+def test_a_spec_verify_batch_does_not_consume_the_real_prefills_throughput_gap():
+    """The next REAL prefill's rate is measured from the last real prefill. A speculative
+    cycle in between must not reset that clock, or every prefill after one reads as a
+    microsecond apart."""
+    rep, logs, debug, clock = _debug_reporter()
+    clock["t"] = 0.5
+    rep.report_batch(
+        _prefill_batch(new_tokens=30, cached_tokens=0, n_seqs=1),
+        running_reqs=1, queue_reqs=0, kv_used_pages=1, kv_total_pages=4, page_size=16,
+    )
+    clock["t"] = 0.9
+    rep.report_batch(
+        _spec_verify_batch(), running_reqs=1, queue_reqs=0,
+        kv_used_pages=1, kv_total_pages=4, page_size=16,
+    )
+    clock["t"] = 1.5  # 30 new tokens over (1.5 - 0.5) = 1.0s -> 30 tok/s
+    rep.report_batch(
+        _prefill_batch(new_tokens=30, cached_tokens=0, n_seqs=1),
+        running_reqs=1, queue_reqs=0, kv_used_pages=1, kv_total_pages=4, page_size=16,
+    )
+    assert "input throughput (token/s): 30.00" in logs[-1]

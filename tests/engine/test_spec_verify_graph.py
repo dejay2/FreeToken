@@ -530,3 +530,44 @@ def test_without_a_graph_runner_the_step_is_the_eager_forward_it_always_was():
     output = _step(_engine(None, None, sampler, ctx, model), batch)
 
     assert torch.equal(output.hidden, _outputs(_batch(4, 8, device))[1])
+
+
+# ------------------------------------------------------- the emitted run stays on the device
+
+
+class _DeviceRunSampler:
+    """A sampler whose verdict carries the run acceptance already built on the device."""
+
+    def __init__(self, run):
+        self.run = run
+
+    def step(self, *, uid, draft_tokens, draft_logits, target_logits, args):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(tokens=tuple(self.run.tolist()), tokens_gpu=self.run)
+
+
+def test_the_step_ships_acceptances_own_device_run_rather_than_copying_it_back():
+    ctx = _Context()
+    model = _Model(ctx)
+    batch = _batch(2, 4, torch.device("cpu"))
+    run = torch.tensor([3, 7], dtype=torch.int32)
+
+    output = _step(_engine(None, None, _DeviceRunSampler(run), ctx, model), batch)
+
+    # the SAME tensor, not a copy: the pack stage does no work at all when acceptance has
+    # already cut the run out of the tensors it held
+    assert output.next_tokens_gpu is run
+
+
+def test_a_verdict_without_a_device_run_still_gets_one():
+    """A decision acceptance did not build (a stubbed sampler, a replayed verdict) keeps the
+    H2D fallback -- the engine's contract is a device tensor either way."""
+    ctx = _Context()
+    model = _Model(ctx)
+    batch = _batch(2, 4, torch.device("cpu"))
+
+    output = _step(_engine(None, None, _Sampler(), ctx, model), batch)
+
+    assert output.next_tokens_gpu.dtype is torch.int32
+    assert output.next_tokens_gpu.tolist() == [7]

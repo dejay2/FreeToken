@@ -12,6 +12,11 @@ class SchedulerStatusReporter:
     log: Callable[[str], None]
     clock: Callable[[], float] = time.perf_counter
     decode_log_interval: int = 40
+    #: Where a speculative verify batch's line goes. It is prefill-PHASE only so its ``w`` rows
+    #: get causal semantics -- it admits no sequence and prefills no token, so on the INFO line
+    #: it reads "#new-token: 0, #cached-token: 0" once per cycle, tens of times a second.
+    #: Unset, those lines are dropped entirely.
+    debug_log: Callable[[str], None] | None = None
     _last_prefill_time: float = field(init=False)
     _last_decode_time: float = field(init=False)
     _decode_forward_count: int = field(default=0, init=False)
@@ -37,6 +42,21 @@ class SchedulerStatusReporter:
         generated_tokens: int | None = None,
     ) -> None:
         if batch.is_prefill:
+            # A speculative verify batch is prefill-phase without being a prefill: it emits
+            # tokens, so its line belongs at DEBUG, and it must not consume the prefill
+            # throughput gap either -- the next REAL prefill's rate is measured from the last
+            # real prefill, not from whatever speculative cycle ran in between.
+            if getattr(batch, "mtp_verify", False):
+                if self.debug_log is not None:
+                    self.debug_log(
+                        f"Spec verify batch, #row: {batch.emit_width}, "
+                        f"token usage: {_usage_ratio(kv_used_pages, kv_total_pages):.2f}, "
+                        f"{_swa_msg(swa_tokens)}"
+                        f"{_mamba_msg(mamba_slots)}"
+                        f"#running-req: {running_reqs}, "
+                        f"#queue-req: {queue_reqs}"
+                    )
+                return
             self._report_prefill(
                 batch,
                 running_reqs=running_reqs,

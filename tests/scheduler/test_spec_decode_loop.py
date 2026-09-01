@@ -1142,7 +1142,12 @@ def test_the_cycle_subdivides_its_verify_stage_when_a_probe_is_armed():
         # the coarse stage still closes AFTER the engine returns, so it still spans the whole
         # verify -- the sub-marks only subdivide it
         "verify+accept",
+        # the tail subdivides the same way: emit / rollback close before the coarse stage,
+        # commit after it, and none of them moves what the coarse stages span
+        "tail.emit",
+        "tail.rollback",
         "emit+rollback",
+        "tail.commit",
     ]
 
 
