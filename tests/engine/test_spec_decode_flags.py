@@ -271,7 +271,7 @@ def test_the_graph_flag_alone_captures_nothing_while_speculation_is_off():
 def test_the_fallback_defaults_are_the_measured_breakeven():
     spec = resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"})
     assert spec.ema_alpha == pytest.approx(0.3)
-    assert spec.min_emitted == pytest.approx(3.2)
+    assert spec.min_emitted == pytest.approx(3.6)
     assert spec.cooldown == 16
     assert spec.adaptive is True
 
@@ -279,7 +279,7 @@ def test_the_fallback_defaults_are_the_measured_breakeven():
 def test_the_fallback_is_inert_while_speculation_is_off():
     spec = resolve_spec_decode({})
     assert spec.adaptive is False
-    assert spec.min_emitted == pytest.approx(3.2)  # parsed, but nothing consults it
+    assert spec.min_emitted == pytest.approx(3.6)  # parsed, but nothing consults it
 
 
 def test_a_zero_threshold_restores_always_speculate():

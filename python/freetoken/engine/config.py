@@ -129,10 +129,13 @@ def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfi
         raise ValueError(
             f"FREETOKEN_MTP_SPEC_EMA_ALPHA must be in (0, 1], got {alpha!r}"
         )
-    # 3.2 is the live graphs-on breakeven (cycle ~74 ms vs 22 ms plain steps); at shallow
-    # depths the ceiling below binds first, so the unset default clamps to it.
+    # 3.6 is the measured end-to-end breakeven: a graphed depth-3 cycle costs ~3.7 plain
+    # steps (verify replay is PCIe expert-fetch bound at w rows), and same-boot profiles
+    # show prose LOSES at a 3.2 bar and recovers monotonically toward plain parity as the
+    # bar rises to it. At shallow depths the ceiling below binds first, so the unset
+    # default clamps to it.
     min_emitted = _float_env(
-        env, "FREETOKEN_MTP_SPEC_MIN_EMITTED", str(min(3.2, float(1 + depth)))
+        env, "FREETOKEN_MTP_SPEC_MIN_EMITTED", str(min(3.6, float(1 + depth)))
     )
     if not 0.0 <= min_emitted <= 1 + depth:
         # Above the full width no cycle could ever clear the bar, so speculation would go
