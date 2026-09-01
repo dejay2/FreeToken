@@ -220,6 +220,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             self.lm_head = Nvfp4LMHead(
                 num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
             )
+        elif getattr(config, "lm_head_quant", "none") == "int8":
+            from freetoken.kernel.triton.int8_linear import Int8LMHead
+
+            # parse_config only reaches int8 for an UNTIED head (a tied one is the embedding).
+            assert not config.tie_word_embeddings, "int8 lm_head assumes untied embeddings"
+            self.lm_head = Int8LMHead(
+                num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
+            )
         else:
             self.lm_head = ParallelLMHead(
                 num_embeddings=config.vocab_size,

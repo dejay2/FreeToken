@@ -9,7 +9,7 @@ from freetoken.layers import BaseOP, LinearColParallelMerged
 from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
 from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
 from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
-from freetoken.models.quant_linear import make_replicated_quant
+from freetoken.models.quant_linear import make_dense_col_merged, make_replicated_quant
 
 
 _GATE_ACTIVATIONS = ("silu", "swish", "sigmoid")
@@ -97,8 +97,12 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                 hidden_size, [num_v_heads, num_v_heads], has_bias=False
             )
         else:
-            # Fused input projection (one GEMM instead of four): qkv | z | b | a.
-            self.in_proj = LinearColParallelMerged(hidden_size, self._in_proj_split, has_bias=False)
+            # Fused input projection (one GEMM instead of four): qkv | z | b | a. Always bf16
+            # in the checkpoint, so only the load-time int8 conversion applies here (and it is
+            # the single largest dense read of a GDN layer: [16480, 2560]).
+            self.in_proj = make_dense_col_merged(
+                attn_quant, hidden_size, self._in_proj_split, has_bias=False
+            )
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a

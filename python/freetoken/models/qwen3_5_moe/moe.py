@@ -36,6 +36,15 @@ class _SharedExpert(BaseOP):
                 hidden_size, [intermediate_size, intermediate_size], has_bias=False
             )
             self.down_proj = Nvfp4DenseLinear(intermediate_size, hidden_size, has_bias=False)
+        elif getattr(config, "dense_quant", "none") == "int8":
+            # FREETOKEN_DENSE_QUANT=int8: the checkpoint ships these bf16 (Qwen3.8's ignore
+            # list excludes ``*.mlp.shared_expert.*``); convert them at load to W8A16.
+            from freetoken.kernel.triton.int8_linear import Int8DenseColMerged, Int8DenseRowParallel
+
+            self.gate_up_proj = Int8DenseColMerged(
+                hidden_size, [intermediate_size, intermediate_size], has_bias=False
+            )
+            self.down_proj = Int8DenseRowParallel(intermediate_size, hidden_size, has_bias=False)
         else:
             self.gate_up_proj = LinearColParallelMerged(
                 hidden_size, [intermediate_size, intermediate_size], has_bias=False

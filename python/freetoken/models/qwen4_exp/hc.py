@@ -20,7 +20,8 @@ from freetoken.kernel.triton.hc import (
     hc_gate_mix,
     hc_silu,
 )
-from freetoken.layers import BaseOP, LinearReplicated
+from freetoken.layers import BaseOP
+from freetoken.models.quant_linear import make_dense_replicated
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -93,16 +94,25 @@ class GatedResidual(BaseOP):
         self.use_combine = use_combine
         width = args.ple_state_width
         self.hc_norm = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
+        # ``*hyper_connection*`` sits in the checkpoint's modelopt ignore list, so these are
+        # bf16 on disk in every build and follow ``dense_quant`` (the load-time int8
+        # conversion). There are two per layer plus the top-level mixer -- 96 blocks on
+        # Qwen3.8 -- so the pair is a real slice of both the decode read and the residency.
+        dense_quant = getattr(config, "dense_quant", "none")
         if use_combine:
             # 16-row alignment for the merged skinny GEMM (vLLM hyperconnection.py:98)
             self.pad_size = (-(self.lowrank + self.hc_count)) % 16
-            self.input_mix_weight_down_block_inject = LinearReplicated(
-                width, self.lowrank + self.hc_count + self.pad_size, has_bias=False
+            self.input_mix_weight_down_block_inject = make_dense_replicated(
+                dense_quant, width, self.lowrank + self.hc_count + self.pad_size, has_bias=False
             )
         else:
             self.pad_size = 0
-            self.input_mix_weight_down = LinearReplicated(width, self.lowrank, has_bias=False)
-        self.input_mix_weight_up = LinearReplicated(self.lowrank, width, has_bias=False)
+            self.input_mix_weight_down = make_dense_replicated(
+                dense_quant, width, self.lowrank, has_bias=False
+            )
+        self.input_mix_weight_up = make_dense_replicated(
+            dense_quant, self.lowrank, width, has_bias=False
+        )
 
     def _down(self, rn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
         """Run the down GEMM and split off the raw inject logits; the pad columns are dropped."""

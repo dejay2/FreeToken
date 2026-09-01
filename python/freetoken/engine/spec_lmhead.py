@@ -15,11 +15,17 @@ distribution stays bit-for-bit what it was.
 WHAT THE COPY IS
 ----------------
 Weight-only int8 (A16W8), one symmetric scale per output row, run through
-``torch._weight_int8pack_mm`` -- ATen's gpt-fast decode GEMV, which takes a bf16 activation
-and an int8 [N, K] weight and needs no activation quantization, no M >= 17 padding (the
-``torch._int_mm`` IMMA path does), no rescale epilogue and no new kernel. Halves the traffic
-(1.27 GB -> 0.64 GB, ~0.4 ms/step, ~2 ms off a depth-5 chain), fixed shapes and no host sync
-so it stays graph-legal.
+``kernel/triton/int8_linear.int8_linear`` -- the repo's W8A16 GEMV/GEMM, which takes a bf16
+activation and an int8 [N, K] weight and needs no activation quantization, no M >= 17 padding
+(the ``torch._int_mm`` IMMA path does) and no rescale epilogue. Halves the traffic
+(1.27 GB -> 0.64 GB) and, at 0.41 ms against the bf16 GEMV's 0.83 ms on this box, halves the
+time too: ~2 ms off a depth-5 chain. Fixed shapes, no host sync, so it stays graph-legal.
+
+This used to call ``torch._weight_int8pack_mm``, and that is why the flag defaulted to bf16:
+ATen's CUDA path for it is a naive kernel, measured here at 1.56 ms for one
+[1, 2560] x [248320, 2560] call -- nearly 2x the bf16 cuBLAS GEMV it was meant to replace, and
+linear in M (4.6 ms at the verify's 6 rows). The traffic was always halved; only the kernel
+was missing.
 
 WHY NOT NVFP4
 -------------
@@ -50,11 +56,15 @@ from typing import Mapping
 
 import torch
 
+# The quantizer moved to the kernel that consumes it (``FREETOKEN_DENSE_QUANT=int8`` runs the
+# whole dense path through it, not just this head). Re-exported so the historical import site
+# ``freetoken.engine.spec_lmhead.quantize_int8_rows`` keeps working.
+from freetoken.kernel.triton.int8_linear import int8_linear, quantize_int8_rows
+
 _DRAFT_LMHEAD_ENV = "FREETOKEN_MTP_SPEC_DRAFT_LMHEAD"
 _PLACEMENTS = ("bf16", "int8", "nvfp4")
-# Output rows quantized per pass. The fp32 working copy of the shipping head would be 2.5 GB
-# in one go; at this chunk it is 84 MB, which fits beside a card that is already nearly full.
-_QUANT_CHUNK_ROWS = 8192
+# Heads that are already quantized: copying them would cost VRAM to lose accuracy.
+_QUANTIZED_HEADS = ("Nvfp4LMHead", "Int8LMHead")
 
 
 def resolve_draft_lmhead_placement(environ: Mapping[str, str] | None = None) -> str:
@@ -63,12 +73,13 @@ def resolve_draft_lmhead_placement(environ: Mapping[str, str] | None = None) -> 
     Parsed here rather than on ``EngineConfig`` for the same reason the expert placement is:
     it is a private weight layout of this head, not a serving flag.
 
-    The default is ``bf16`` (the shared target head, byte for byte). ``int8`` halves the bytes
-    but LOSES time on this box: ``torch._weight_int8pack_mm``'s CUDA path is a naive kernel,
-    measured 2026-09-02 on the RTX 5090 at 1.56 ms per [1, 2560] x [248320, 2560] call against
-    0.81 ms for the bf16 cuBLAS GEMV, and it scales linearly with rows (4.6 ms at M=6). It
-    stays selectable for a box with a real W8A16 GEMV (or once one is written); fp8 row-wise
-    ``_scaled_mm`` is not supported on this device by torch 2.11, so it is not an alternative.
+    The default stays ``bf16`` (the shared target head, byte for byte) because the copy costs
+    0.64 GB of a card the operator has already filled -- not because it costs time: since the
+    W8A16 triton kernel landed, ``int8`` measures 0.41 ms per [1, 2560] x [248320, 2560] call
+    against 0.83 ms for the bf16 cuBLAS GEMV on the RTX 5090, and 0.42 ms at the verify's 6
+    rows. fp8 row-wise ``_scaled_mm`` is not supported on this device by torch 2.11, so it is
+    not an alternative. Under ``FREETOKEN_DENSE_QUANT=int8`` the TARGET's head is already int8
+    and every placement collapses to sharing it (no copy, no extra VRAM).
     """
     env = os.environ if environ is None else environ
     placement = (env.get(_DRAFT_LMHEAD_ENV, "") or "bf16").strip().lower() or "bf16"
@@ -77,43 +88,6 @@ def resolve_draft_lmhead_placement(environ: Mapping[str, str] | None = None) -> 
             f"{_DRAFT_LMHEAD_ENV} must be one of {'|'.join(_PLACEMENTS)}, got {placement!r}"
         )
     return placement
-
-
-def quantize_int8_rows(
-    weight: torch.Tensor,
-    *,
-    dtype: torch.dtype | None = None,
-    chunk_rows: int = _QUANT_CHUNK_ROWS,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-output-row symmetric int8 for a ``[N, K]`` weight: ``(codes int8, scales)``.
-
-    The scale is stored in the COMPUTE dtype and the codes are then rounded against that
-    stored value, not against the fp32 scale it came from. ``_weight_int8pack_mm`` multiplies
-    by what is stored, so folding the scale's own rounding in here leaves quantization as the
-    only error; leaving it out would add a per-row gain error of up to one bf16 ulp (~0.4%)
-    that moves an entire row's logits together -- which is exactly the error argmax notices.
-
-    Chunked over output rows so the fp32 intermediate stays bounded regardless of vocabulary.
-    """
-    if weight.ndim != 2:
-        raise ValueError(f"an int8 LM head weight must be [N, K], got {tuple(weight.shape)}")
-    if chunk_rows < 1:
-        raise ValueError(f"chunk_rows must be positive, got {chunk_rows}")
-    dtype = weight.dtype if dtype is None else dtype
-    rows, width = weight.shape
-    codes = torch.empty((rows, width), dtype=torch.int8, device=weight.device)
-    scales = torch.empty(rows, dtype=dtype, device=weight.device)
-    # An all-zero output row has no scale of its own; any positive one reproduces it exactly
-    # (0 / s = 0), and the smallest normal keeps the stored value representable in bf16.
-    floor = torch.finfo(torch.float32).tiny
-    for lo in range(0, rows, chunk_rows):
-        hi = min(lo + chunk_rows, rows)
-        block = weight[lo:hi].float()
-        scale = (block.abs().amax(dim=1) / 127.0).clamp_min(floor).to(dtype)
-        block /= scale.float().unsqueeze(1)
-        codes[lo:hi] = block.round_().clamp_(-127.0, 127.0).to(torch.int8)
-        scales[lo:hi] = scale
-    return codes, scales
 
 
 def _same_device(wanted: torch.device, actual: torch.device) -> bool:
@@ -166,7 +140,7 @@ class Int8DraftLMHead:
         rows = x.reshape(-1, self.embedding_dim)
         if rows.dtype is not self.scales.dtype:
             rows = rows.to(self.scales.dtype)
-        return torch._weight_int8pack_mm(rows.contiguous(), self.weight, self.scales)
+        return int8_linear(rows.contiguous(), self.weight, self.scales)
 
 
 def target_lm_head_weight(lm_head) -> torch.Tensor:
@@ -189,10 +163,10 @@ def build_draft_lm_head(lm_head, *, placement: str, device: torch.device | None 
     """The object ``SpecDraftHead.propose`` projects through, for one resolved placement."""
     if placement == "bf16":
         return lm_head
-    already_quantized = type(lm_head).__name__ == "Nvfp4LMHead"
+    already_quantized = type(lm_head).__name__ in _QUANTIZED_HEADS
     if placement == "nvfp4":
         if already_quantized:
-            # The checkpoint's own 4-bit head: no copy, no extra VRAM, and exactly the logits
+            # The target's own quantized head: no copy, no extra VRAM, and exactly the logits
             # the target computes -- there is nothing to trade.
             return lm_head
         raise ValueError(
@@ -201,8 +175,9 @@ def build_draft_lm_head(lm_head, *, placement: str, device: torch.device | None 
             f"for int8 (see this module's docstring); use {_DRAFT_LMHEAD_ENV}=int8"
         )
     if already_quantized:
-        # A 4-bit head is already cheaper than the int8 copy would be; quantizing it again
-        # would cost VRAM to lose accuracy.
+        # An NVFP4 head is already cheaper than this copy would be, and an int8 target head
+        # (FREETOKEN_DENSE_QUANT=int8) already IS this copy -- with a real W8A16 kernel behind
+        # it. Either way, quantizing again would only cost VRAM.
         return lm_head
     return Int8DraftLMHead.from_weight(target_lm_head_weight(lm_head), device=device)
 

@@ -26,6 +26,10 @@ def make_col_merged_quant(expert_quant: str, attn_quant: str, in_f: int,
         from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged
 
         return Nvfp4DenseColMerged(in_f, output_sizes, has_bias)
+    if attn_quant == "int8":  # FREETOKEN_DENSE_QUANT=int8: W8A16, quantized at load
+        from freetoken.kernel.triton.int8_linear import Int8DenseColMerged
+
+        return Int8DenseColMerged(in_f, output_sizes, has_bias)
     from freetoken.layers import LinearColParallelMerged
 
     return LinearColParallelMerged(in_f, output_sizes, has_bias=has_bias)
@@ -46,6 +50,10 @@ def make_replicated_quant(expert_quant: str, attn_quant: str, in_f: int, out_f: 
         from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseLinear
 
         return Nvfp4DenseLinear(in_f, out_f, has_bias)
+    if attn_quant == "int8":  # FREETOKEN_DENSE_QUANT=int8: W8A16, quantized at load
+        from freetoken.kernel.triton.int8_linear import Int8DenseLinear
+
+        return Int8DenseLinear(in_f, out_f, has_bias)
     from freetoken.layers import LinearReplicated
 
     return LinearReplicated(in_f, out_f, has_bias=has_bias)
@@ -70,8 +78,43 @@ def make_col_merged(config, in_f: int, output_sizes: list[int], has_bias: bool =
     )
 
 
+# --------------------------------------------------------------------------------------
+# Projections the CHECKPOINT always ships bf16.
+#
+# The factories above map a STORAGE format ("this weight arrived as block-fp8 / per-tensor
+# fp8 / NVFP4") onto the kernel that reads it. Some projections were never stored that way
+# by any build -- Qwen3.8-Flash-Next's modelopt ignore list excludes ``*.self_attn.*``,
+# ``*.linear_attn.*``, ``*hyper_connection*`` -- so routing them through the factories would
+# be wrong the moment a checkpoint sets ``attn_quant`` for a sibling weight that IS packed.
+# What CAN apply to them is a load-time conversion, which is what these two select.
+# --------------------------------------------------------------------------------------
+def make_dense_replicated(dense_quant: str, in_f: int, out_f: int, has_bias: bool = False):
+    """Replicated linear for a bf16-in-the-checkpoint projection: int8 (W8A16) or bf16."""
+    if dense_quant == "int8":
+        from freetoken.kernel.triton.int8_linear import Int8DenseLinear
+
+        return Int8DenseLinear(in_f, out_f, has_bias)
+    from freetoken.layers import LinearReplicated
+
+    return LinearReplicated(in_f, out_f, has_bias=has_bias)
+
+
+def make_dense_col_merged(dense_quant: str, in_f: int, output_sizes: list[int],
+                          has_bias: bool = False):
+    """Column-merged linear for a bf16-in-the-checkpoint projection: int8 (W8A16) or bf16."""
+    if dense_quant == "int8":
+        from freetoken.kernel.triton.int8_linear import Int8DenseColMerged
+
+        return Int8DenseColMerged(in_f, output_sizes, has_bias)
+    from freetoken.layers import LinearColParallelMerged
+
+    return LinearColParallelMerged(in_f, output_sizes, has_bias=has_bias)
+
+
 __all__ = [
     "make_col_merged_quant",
+    "make_dense_col_merged",
+    "make_dense_replicated",
     "make_replicated_quant",
     "make_replicated",
     "make_col_merged",

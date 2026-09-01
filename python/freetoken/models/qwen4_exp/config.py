@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from fnmatch import fnmatch
-from typing import Any, Tuple
+from typing import Any, Mapping, Tuple
 
 import torch
 
@@ -113,6 +114,35 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
     )
 
 
+_DENSE_QUANT_ENV = "FREETOKEN_DENSE_QUANT"
+_DENSE_QUANT_MODES = ("int8",)
+
+
+def resolve_dense_quant(environ: Mapping[str, str] | None = None) -> str:
+    """Load-time quantization for the dense projections (``FREETOKEN_DENSE_QUANT``).
+
+    The shipping NVFP4 build quantizes only the routed experts: attention, GDN, the
+    hyper-connections, the shared expert and ``lm_head`` are all in the modelopt ignore list
+    and arrive bf16, which is ~8 GB of weight read per decode token and 6.2 GiB resident.
+    ``int8`` converts them at load to weight-only int8 with one scale per output channel --
+    half the bytes, half the decode time on those GEMMs, and near-lossless (see
+    ``kernel/triton/int8_linear``). Unset (the default) keeps every one of them bf16, byte
+    for byte: this flag never changes what a weight the checkpoint ALREADY quantized does.
+
+    An env flag rather than a serving option because it is a private weight layout, exactly
+    like the draft head's ``FREETOKEN_MTP_SPEC_DRAFT_LMHEAD``.
+    """
+    env = os.environ if environ is None else environ
+    mode = (env.get(_DENSE_QUANT_ENV, "") or "none").strip().lower() or "none"
+    if mode == "none":
+        return "none"
+    if mode not in _DENSE_QUANT_MODES:
+        raise ValueError(
+            f"{_DENSE_QUANT_ENV} must be none|{'|'.join(_DENSE_QUANT_MODES)}, got {mode!r}"
+        )
+    return mode
+
+
 def _quant_get(hf_config: Any):
     quant = getattr(hf_config, "quantization_config", None)
     if quant is None:
@@ -220,6 +250,19 @@ def parse_config(hf_config: Any) -> ModelConfig:
             attn_quant = _quant(f"{prefix}.self_attn.q_proj")
             lm_head_quant = _quant("lm_head")
 
+    # FREETOKEN_DENSE_QUANT=int8 converts the projections this checkpoint left bf16. It only
+    # ever upgrades a "none": a component the checkpoint already ships packed keeps its own
+    # (cheaper, exact) format. A tied lm_head is the token embedding under another name --
+    # quantizing it would either corrupt the embedding or duplicate 1.27 GB -- so it is left
+    # alone; on this checkpoint the head is untied.
+    tie_word_embeddings = bool(getattr(text, "tie_word_embeddings", False))
+    dense_override = resolve_dense_quant()
+    if dense_override != "none":
+        attn_quant = dense_override if attn_quant == "none" else attn_quant
+        dense_quant = dense_override if dense_quant == "none" else dense_quant
+        if lm_head_quant == "none" and not tie_word_embeddings:
+            lm_head_quant = dense_override
+
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
@@ -312,7 +355,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         intermediate_size=getattr(text, "intermediate_size", 0) or 0,
         hidden_act=text.hidden_act,
         rms_norm_eps=text.rms_norm_eps,
-        tie_word_embeddings=bool(getattr(text, "tie_word_embeddings", False)),
+        tie_word_embeddings=tie_word_embeddings,
         rotary_config=full_rotary,
         num_experts=num_experts,
         num_experts_per_tok=int(getattr(text, "num_experts_per_tok", 0) or 0),
@@ -346,4 +389,5 @@ __all__ = [
     "Qwen4VisionConfig",
     "parse_config",
     "ple_slot_states",
+    "resolve_dense_quant",
 ]

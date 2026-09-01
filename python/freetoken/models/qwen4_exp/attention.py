@@ -19,8 +19,9 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm
 from freetoken.models.qwen4_exp.mrope import Qwen4MRoPE
+from freetoken.models.quant_linear import make_dense_col_merged, make_dense_replicated
 from freetoken.utils import nvtx_annotate
 
 if TYPE_CHECKING:
@@ -84,7 +85,10 @@ class Qwen4ExpIndexer(BaseOP):
         self.head_dim = args.index_head_dim
         self.eps = config.rms_norm_eps
         self._split = [self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim]
-        self.index_qk_proj = LinearReplicated(args.hidden_size, sum(self._split), has_bias=False)
+        self.index_qk_proj = make_dense_replicated(
+            getattr(config, "dense_quant", "none"), args.hidden_size, sum(self._split),
+            has_bias=False,
+        )
         self.q_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
         self.k_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
 
@@ -121,10 +125,15 @@ class Qwen4ExpAttention(BaseOP):
         self.qo_attn_dim = self.num_q * self.head_dim
         self.kv_attn_dim = self.num_kv * self.head_dim
         self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
-        self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_split, has_bias=False
+        # The modelopt ignore list keeps every ``self_attn`` weight bf16 in the checkpoint,
+        # so these follow ``dense_quant`` (the load-time int8 conversion), not a storage format.
+        dense_quant = getattr(config, "dense_quant", "none")
+        self.qkv_proj = make_dense_col_merged(
+            dense_quant, config.hidden_size, self._qkv_split, has_bias=False
         )
-        self.o_proj = LinearReplicated(self.qo_attn_dim, config.hidden_size, has_bias=False)
+        self.o_proj = make_dense_replicated(
+            dense_quant, self.qo_attn_dim, config.hidden_size, has_bias=False
+        )
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.rotary = Qwen4MRoPE(config)
