@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import freetoken.models.qwen4_exp.ple as ple_module
+from freetoken.core import Batch, Req, SamplingParams
 from freetoken.models.config import ModelConfig
 from freetoken.models.qwen4_exp.config import parse_config
 from freetoken.models.qwen4_exp.model import Qwen4ExpModel
@@ -89,6 +90,68 @@ def test_mmap_graph_hooks_stage_every_ple_layer(monkeypatch):
         ("replay", "b", 22),
         ("reset", "a"),
         ("reset", "b"),
+    ]
+
+
+def test_mtp_verify_graph_capture_sizes_mmap_ple_by_token_width(monkeypatch):
+    events = []
+    meta = object()
+
+    class Table:
+        def __init__(self, name):
+            self.name = name
+
+        def prepare_cuda_graph_capture(self, rows):
+            events.append(("capture", self.name, rows))
+
+        def prefetch(self, row_ids):
+            events.append(("prefetch", self.name, row_ids.numel()))
+
+        def prepare_cuda_graph_replay(self, row_ids):
+            events.append(("replay", self.name, row_ids.numel()))
+
+    def ple(name):
+        table = Table(name)
+        embedding = SimpleNamespace(
+            num_heads=4,
+            table=table,
+            row_ids=lambda got_meta: (
+                torch.arange(12, dtype=torch.int64).view(3, 4)
+                if got_meta is meta
+                else None
+            ),
+        )
+        return SimpleNamespace(args=object(), ple_embedding=embedding)
+
+    model = object.__new__(Qwen4ExpModel)
+    model._ple = (ple("a"), ple("b"))
+    req = Req(
+        input_ids=torch.arange(8, dtype=torch.int32),
+        table_idx=2,
+        cached_len=5,
+        output_len=0,
+        uid=17,
+        sampling_params=SamplingParams(),
+        cache_handle=None,
+    )
+    batch = Batch(reqs=[req], phase="prefill")
+    batch.padded_reqs = batch.reqs
+    batch.input_ids = torch.tensor([101, 102, 103], dtype=torch.int32)
+    batch.mtp_verify = True
+    monkeypatch.setattr(ple_module, "build_ple_metadata", lambda *args: meta)
+
+    assert batch.size == batch.padded_size == 1
+    assert req.extend_len == batch.input_ids.shape[0] == 3
+    model.prepare_mmap_ple_graph_capture(batch)
+    model.prepare_mmap_ple_graph_replay(batch)
+
+    assert events == [
+        ("capture", "a", 12),
+        ("capture", "b", 12),
+        ("prefetch", "a", 12),
+        ("prefetch", "b", 12),
+        ("replay", "a", 12),
+        ("replay", "b", 12),
     ]
 
 
@@ -747,3 +810,118 @@ def test_decode_graph_replay_matches_eager():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(static_out, replayed)
+
+
+# --------------------------------------------------------------------------------------
+# prefill index cache (CUDA-graph capture safety)
+# --------------------------------------------------------------------------------------
+
+def test_prefill_indices_memoizes_one_tensor_per_shape():
+    layer = _make_layer(_config())
+    device = torch.device("cpu")
+
+    first = layer._prefill_indices([3, 2], device)
+    again = layer._prefill_indices([3, 2], device)
+    other = layer._prefill_indices([2, 3], device)
+
+    assert all(a is b for a, b in zip(first, again))
+    assert first[0] is not other[0]
+    assert first[0].tolist() == again[0].tolist()
+    assert first[0].device == device
+
+
+@requires_cuda
+def test_prefill_indices_refuses_a_cache_miss_under_stream_capture():
+    layer = _make_layer(_config())
+    device = torch.device("cuda:0")
+    primed = layer._prefill_indices([4, 1], device)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    hit = None
+    with pytest.raises(NotImplementedError, match="capture"):
+        with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
+            hit = layer._prefill_indices([4, 1], device)
+            layer._prefill_indices([5, 1], device)
+
+    assert all(a is b for a, b in zip(hit, primed))
+    # the guard raised before any illegal op, so the context still accepts work
+    torch.zeros(1, device=device)
+    torch.cuda.synchronize()
+
+
+def test_prefill_indices_cache_is_bounded():
+    layer = _make_layer(_config())
+    device = torch.device("cpu")
+    for length in range(200):
+        layer._prefill_indices([length + 1], device)
+
+    assert len(layer._prefill_index_cache) == ple_module._PREFILL_INDEX_CACHE_SIZE
+
+
+@requires_cuda
+def test_prefill_graph_replay_matches_eager():
+    """The MTP verifier captures a prefill PLE forward; the primed index cache keeps it legal."""
+    from freetoken.attention.linear import FLAMetadata
+
+    torch.manual_seed(23)
+    config = _config()
+    args = config.qwen4_args
+    lens = [3, 2]
+    total = sum(lens)
+    layer = _make_layer(config, device="cuda", dtype=torch.bfloat16, rows=4096)
+
+    ctxp = torch.full((3, 2), EOS, dtype=torch.int32, device="cuda")
+    ctxp[1:] = torch.randint(0, VOCAB, (2, 2), device="cuda", dtype=torch.int32)
+    slots = torch.tensor([1, 2], dtype=torch.int32, device="cuda")
+    batch = SimpleNamespace(
+        padded_reqs=[SimpleNamespace(extend_len=n) for n in lens],
+        is_decode=False,
+        is_prefill=True,
+        input_ids=torch.randint(0, VOCAB, (total,), device="cuda", dtype=torch.int32),
+        linear_table_idx=slots,
+        fla_metadata=FLAMetadata(
+            cu_seqlens=torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda"),
+            cache_indices=slots,
+            has_initial_state=torch.tensor([True, True], device="cuda"),
+        ),
+    )
+    R = torch.randn(total, args.ple_state_width, device="cuda", dtype=torch.bfloat16)
+    states0 = torch.randn(
+        3, args.ple_state_width, args.ple_conv_state_len, device="cuda", dtype=torch.bfloat16
+    ) * 0.1
+    states = states0.clone()
+
+    def step():
+        return layer.forward(
+            R, batch, build_ple_metadata(batch, args, R.device, context_pool=ctxp), states
+        )
+
+    eager = step().clone()
+    eager_states = states.clone()
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        states.copy_(states0)
+        step()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    states.copy_(states0)
+    with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
+        static_out = step()
+    # free and refill same-size pinned host blocks between capture and replay: the memoized device
+    # tensor makes the replay independent of the staging buffer the indices were built through
+    packed_numel = total + 2 * len(lens) * args.ple_conv_state_len
+    for _ in range(8):
+        torch.full((packed_numel,), -1, dtype=torch.int64).pin_memory()
+
+    states.copy_(states0)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.equal(static_out, eager)
+    assert torch.equal(states, eager_states)

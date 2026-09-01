@@ -42,6 +42,7 @@ _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
+_PREFILL_INDEX_CACHE_SIZE = 64
 
 
 class PLETableBackend(Protocol):
@@ -722,6 +723,7 @@ class PLELayer(BaseOP):
             f"PLE conv history {self.state_len} exceeds CHUNK_SIZE {CHUNK_SIZE}"
         )
         self._pending: Tuple[PLEMetadata, torch.Tensor | None] | None = None
+        self._prefill_index_cache: dict[tuple, Tuple[torch.Tensor, ...]] = {}
 
     def start_prefetch(self, batch: Batch, meta: PLEMetadata | None = None) -> None:
         """Hash this forward's n-grams and start the table gather on the side stream."""
@@ -855,8 +857,24 @@ class PLELayer(BaseOP):
         return F.silu(out.index_select(1, out_index).transpose(0, 1))
 
     def _prefill_indices(self, lens: List[int], device: torch.device):
-        """Columns of the packed history: this forward's outputs, the state block, the next state block."""
+        """Columns of the packed history: this forward's outputs, the state block, the next state block.
+
+        Memoized per ``(lens, state_len, device)`` -- the whole result is a function of those -- so a
+        CUDA graph replays against a stable address instead of a freed pinned staging buffer.
+        Building an entry needs a host allocation (``torch.cuda.graph`` empties the pinned cache on
+        entry, so the block is always fresh) plus an H2D copy of host-computed values, neither of
+        which belongs inside a capture region; the warm-up pass primes every captured shape.
+        """
         state_len = self.state_len
+        key = (tuple(lens), state_len, str(device))
+        cached = self._prefill_index_cache.get(key)
+        if cached is not None:
+            return cached
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise NotImplementedError(
+                f"PLE prefill indices for lens={list(lens)} were not primed before CUDA graph "
+                "capture; building them needs a pinned-host staging buffer"
+            )
         counts = torch.tensor(lens, dtype=torch.int64)
         cu = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
         pad = torch.arange(len(lens), dtype=torch.int64) * state_len
@@ -874,7 +892,11 @@ class PLELayer(BaseOP):
             packed = packed.pin_memory()
         packed = packed.to(device, non_blocking=True)
         n_out, n_state = out_index.numel(), len(lens) * state_len
-        return packed[:n_out], packed[n_out : n_out + n_state], packed[n_out + n_state :]
+        views = (packed[:n_out], packed[n_out : n_out + n_state], packed[n_out + n_state :])
+        if len(self._prefill_index_cache) >= _PREFILL_INDEX_CACHE_SIZE:
+            self._prefill_index_cache.pop(next(iter(self._prefill_index_cache)))
+        self._prefill_index_cache[key] = views
+        return views
 
 
 __all__ = [
