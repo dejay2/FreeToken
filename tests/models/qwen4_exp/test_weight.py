@@ -6,6 +6,7 @@ The tensors are tiny but the key names, dtypes and the fusion geometry that matt
 
 from __future__ import annotations
 
+import ctypes
 import random
 from types import SimpleNamespace
 
@@ -15,8 +16,10 @@ from safetensors.torch import save_file
 
 from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
+from freetoken.models.qwen4_exp import weight as weight_mod
 from freetoken.models.qwen4_exp.weight import (
     _ZERO_CENTERED_NORM_SUFFIXES,
+    _PleRowCache,
     _rename,
     iter_weights,
     load_mmap_ple_table,
@@ -594,6 +597,264 @@ def test_gather_runs_under_inference_mode_like_the_staged_table(checkpoint, monk
             assert torch.equal(_gather(table.storage, ids), want)
     finally:
         table.storage.close()
+
+
+# ======================================================================================
+# The Windows PrefetchVirtualMemory fast path
+# ======================================================================================
+
+
+@pytest.fixture
+def prefetch_enabled(monkeypatch):
+    """Force the fast path on with a stub that records calls and reports success.
+
+    The stub does not really prefetch; the copy that follows faults the pages itself, so a
+    gather behind it must still return exactly the same bytes.
+    """
+    calls: list[tuple[int, int]] = []
+
+    def fake(handle, entries, pointer, flags):
+        calls.append((int(entries), int(flags)))
+        return 1
+
+    monkeypatch.setattr(weight_mod, "_prefetch_virtual_memory", fake)
+    monkeypatch.setattr(weight_mod, "_current_process", -1)
+    monkeypatch.setattr(weight_mod, "_prefetch_failed", False)
+    return calls
+
+
+def test_range_entries_are_16_byte_address_length_pairs(checkpoint):
+    """One WIN32_MEMORY_RANGE_ENTRY per row: {PVOID VirtualAddress; SIZE_T NumberOfBytes;}."""
+    folder, raw = checkpoint
+    table = _open_mmap_ple(folder)
+    storage = table.storage
+    try:
+        ids = torch.tensor(
+            [0, NGRAM_ROWS - 1, NGRAM_ROWS, 2 * NGRAM_ROWS + 3, ALL_ROWS - 1, 5, 5],
+            dtype=torch.int64,
+        )
+        entries = storage._range_entries(ids)
+        assert entries.dtype == torch.int64
+        assert entries.is_contiguous()
+        assert tuple(entries.shape) == (ids.numel(), 2)
+        assert entries.element_size() * entries.shape[1] == 16
+        want = [
+            [
+                storage._shards[row // NGRAM_ROWS].data_ptr() + (row % NGRAM_ROWS) * NGRAM_DIM,
+                NGRAM_DIM,
+            ]
+            for row in ids.tolist()
+        ]
+        assert entries.tolist() == want
+        # and the addresses really name those rows in the mapping
+        reference = _ngram_reference(raw)
+        for row, (address, length) in zip(ids.tolist(), entries.tolist()):
+            assert bytes(ctypes.string_at(address, length)) == bytes(reference[row].tolist())
+    finally:
+        table.storage.close()
+
+
+def test_range_entries_of_an_empty_id_set_is_empty(checkpoint):
+    folder, _raw = checkpoint
+    table = _open_mmap_ple(folder)
+    try:
+        entries = table.storage._range_entries(torch.empty(0, dtype=torch.int64))
+        assert tuple(entries.shape) == (0, 2)
+    finally:
+        table.storage.close()
+
+
+@pytest.mark.parametrize("cache", ["0", "1048576"])
+def test_prefetched_gather_matches_the_serial_reference(
+    checkpoint, monkeypatch, prefetch_enabled, cache
+):
+    folder, raw = checkpoint
+    monkeypatch.setenv("FREETOKEN_PLE_ROW_CACHE", cache)
+    table = _open_mmap_ple(folder)
+    ids = [r % ALL_ROWS for r in range(0, 3 * ALL_ROWS, 3)] + [-1, ALL_ROWS + 4]
+    try:
+        assert torch.equal(_gather(table.storage, ids), _serial_gather(_ngram_reference(raw), ids))
+        assert prefetch_enabled  # the fast path really ran
+        assert all(flags == 0 for _entries, flags in prefetch_enabled)  # Flags is reserved
+    finally:
+        table.storage.close()
+
+
+def test_prefetch_covers_every_missing_row_in_one_call(checkpoint, monkeypatch, prefetch_enabled):
+    folder, _raw = checkpoint
+    monkeypatch.setenv("FREETOKEN_PLE_ROW_CACHE", "1048576")
+    table = _open_mmap_ple(folder)
+    try:
+        _gather(table.storage, [3, 10, 17, 24, -1, ALL_ROWS])  # 4 valid rows, all missing
+        assert prefetch_enabled == [(4, 0)]
+        _gather(table.storage, [3, 10, 17, 24, 9, 16])  # 4 cached, 2 new
+        assert prefetch_enabled == [(4, 0), (2, 0)]
+        _gather(table.storage, [3, 10, 17, 24])  # every row cached: no syscall at all
+        assert prefetch_enabled == [(4, 0), (2, 0)]
+    finally:
+        table.storage.close()
+
+
+def test_a_single_missing_row_skips_the_syscall(checkpoint, monkeypatch, prefetch_enabled):
+    """One row is cheaper to just fault (0.15 ms) than to prefetch and fault (0.17 ms)."""
+    folder, raw = checkpoint
+    monkeypatch.setenv("FREETOKEN_PLE_ROW_CACHE", "0")
+    table = _open_mmap_ple(folder)
+    try:
+        assert torch.equal(_gather(table.storage, [11]), _serial_gather(_ngram_reference(raw), [11]))
+        assert prefetch_enabled == []
+    finally:
+        table.storage.close()
+
+
+def test_gather_falls_back_when_the_api_is_unavailable(checkpoint, monkeypatch):
+    """No PrefetchVirtualMemory (non-Windows, or a kernel without the symbol)."""
+    folder, raw = checkpoint
+    monkeypatch.setattr(weight_mod, "_prefetch_virtual_memory", None)
+    monkeypatch.setattr(weight_mod, "_prefetch_failed", False)
+    monkeypatch.setenv("FREETOKEN_PLE_ROW_CACHE", "0")
+    table = _open_mmap_ple(folder)
+    ids = list(range(ALL_ROWS))
+    try:
+        assert not table.storage._prefetch_rows(torch.tensor(ids, dtype=torch.int64))
+        assert torch.equal(_gather(table.storage, ids), _serial_gather(_ngram_reference(raw), ids))
+    finally:
+        table.storage.close()
+
+
+def test_a_false_return_warns_once_and_disables_the_path(checkpoint, monkeypatch):
+    folder, raw = checkpoint
+    calls: list[int] = []
+    warnings: list[tuple] = []
+
+    def failing(handle, entries, pointer, flags):
+        calls.append(int(entries))
+        return 0
+
+    monkeypatch.setattr(weight_mod, "_prefetch_virtual_memory", failing)
+    monkeypatch.setattr(weight_mod, "_current_process", -1)
+    monkeypatch.setattr(weight_mod, "_prefetch_failed", False)
+    monkeypatch.setattr(
+        weight_mod.logger,
+        "warning",
+        lambda msg, *args: warnings.append((msg, args)),
+        raising=False,
+    )
+    monkeypatch.setenv("FREETOKEN_PLE_ROW_CACHE", "0")
+    table = _open_mmap_ple(folder)
+    ids = [1, 8, 15, 22, -3]
+    want = _serial_gather(_ngram_reference(raw), ids)
+    try:
+        assert torch.equal(_gather(table.storage, ids), want)  # falls back, still correct
+        assert torch.equal(_gather(table.storage, ids), want)
+        assert torch.equal(_gather(table.storage, ids), want)
+        assert calls == [4]  # tried once, never again for the process
+        assert weight_mod._prefetch_failed is True
+        assert len(warnings) == 1
+    finally:
+        table.storage.close()
+
+
+# ======================================================================================
+# _PleRowCache: the slab-backed bounded row cache
+# ======================================================================================
+
+
+def _rows(n: int, start: int = 0) -> torch.Tensor:
+    return (torch.arange(start, start + n * NGRAM_DIM) % 251).to(torch.uint8).reshape(n, NGRAM_DIM)
+
+
+def test_row_cache_default_capacity_is_a_mebirow():
+    assert weight_mod._PLE_ROW_CACHE_DEFAULT == 1_048_576
+
+
+def test_row_cache_splits_hits_from_misses_and_serves_the_hits():
+    cache = _PleRowCache(8, NGRAM_DIM)
+    src = _rows(3)
+    assert cache.take_hits([5, 6, 7], [0, 1, 2], src.clone()) == ([5, 6, 7], [0, 1, 2])
+    cache.insert([5, 6, 7], [0, 1, 2], src)
+    out = torch.zeros(4, NGRAM_DIM, dtype=torch.uint8)
+    # positions deliberately unsorted and one id still absent
+    assert cache.take_hits([7, 99, 5], [3, 1, 0], out) == ([99], [1])
+    assert torch.equal(out[3], src[2])
+    assert torch.equal(out[0], src[0])
+    assert torch.equal(out[1], torch.zeros(NGRAM_DIM, dtype=torch.uint8))
+
+
+def test_row_cache_holds_copies_not_views_of_the_gather_buffer():
+    cache = _PleRowCache(4, NGRAM_DIM)
+    src = _rows(1, start=13)
+    cache.insert([1], [0], src)
+    src.zero_()  # the gather buffer is reused every step; the cache must not follow it
+    out = torch.zeros(1, NGRAM_DIM, dtype=torch.uint8)
+    assert cache.take_hits([1], [0], out) == ([], [])
+    assert torch.equal(out[0], _rows(1, start=13)[0])
+
+
+def test_row_cache_evicts_in_fifo_order():
+    cache = _PleRowCache(2, NGRAM_DIM)
+    src = _rows(3)
+    cache.insert([10, 11], [0, 1], src)
+    cache.insert([12], [2], src)  # takes slot 0 back from id 10
+    out = torch.zeros(3, NGRAM_DIM, dtype=torch.uint8)
+    assert cache.take_hits([10, 11, 12], [0, 1, 2], out) == ([10], [0])
+    assert torch.equal(out[1], src[1])
+    assert torch.equal(out[2], src[2])
+
+
+def test_row_cache_never_holds_more_than_capacity_rows():
+    """A miss batch larger than the whole cache reuses slots inside one insert."""
+    cache = _PleRowCache(3, NGRAM_DIM)
+    src = _rows(10)
+    cache.insert(list(range(10)), list(range(10)), src)
+    assert len(cache._slot_of) == 3
+    assert sorted(cache._slot_of.values()) == [0, 1, 2]  # no slot claimed twice
+    for row_id, slot in cache._slot_of.items():
+        assert torch.equal(cache._slab[slot], src[row_id])  # every survivor is its own row
+
+
+def test_row_cache_inserts_a_repeated_id_once():
+    cache = _PleRowCache(4, NGRAM_DIM)
+    src = _rows(3)
+    cache.insert([5, 5, 6], [0, 1, 2], src)
+    assert len(cache._slot_of) == 2
+    assert torch.equal(cache._slab[cache._slot_of[5]], src[0])  # the first copy wins
+    assert torch.equal(cache._slab[cache._slot_of[6]], src[2])
+
+
+def test_row_cache_capacity_of_one_still_works():
+    cache = _PleRowCache(1, NGRAM_DIM)
+    src = _rows(2)
+    cache.insert([4], [0], src)
+    cache.insert([9], [1], src)
+    out = torch.zeros(2, NGRAM_DIM, dtype=torch.uint8)
+    assert cache.take_hits([4, 9], [0, 1], out) == ([4], [0])
+    assert torch.equal(out[1], src[1])
+
+
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_gathered_bytes_are_identical_at_every_cache_size(
+    checkpoint, monkeypatch, request, prefetch
+):
+    """Same id stream through no cache, a huge cache and a thrashing one."""
+    if prefetch:
+        request.getfixturevalue("prefetch_enabled")
+    folder, raw = checkpoint
+    reference = _ngram_reference(raw)
+    rng = random.Random(11)
+    streams = [[rng.randrange(-2, ALL_ROWS + 2) for _ in range(9)] for _ in range(24)]
+    got: dict[str, list[torch.Tensor]] = {}
+    for capacity in ("0", "1048576", "3"):
+        monkeypatch.setenv("FREETOKEN_PLE_ROW_CACHE", capacity)
+        table = _open_mmap_ple(folder)
+        try:
+            got[capacity] = [_gather(table.storage, ids).clone() for ids in streams]
+        finally:
+            table.storage.close()
+    for index, ids in enumerate(streams):
+        want = _serial_gather(reference, ids)
+        for capacity in got:
+            assert torch.equal(got[capacity][index], want), (capacity, ids)
 
 
 # ======================================================================================

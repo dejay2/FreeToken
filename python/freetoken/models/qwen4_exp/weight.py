@@ -13,9 +13,9 @@ is explicitly enabled.
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+import ctypes
 import json
 import mmap
 import os
@@ -35,9 +35,11 @@ from freetoken.models.nvfp4_banks import (
     load_nvfp4_expert_source_banks,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
-from freetoken.utils import download_hf_weight
+from freetoken.utils import download_hf_weight, init_logger
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
+
+logger = init_logger(__name__)
 
 # Routed NVFP4 experts (nvidia modelopt layout): per-expert, un-fused. Matched against the RAW
 # weight_map key in nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP head's
@@ -256,14 +258,51 @@ class PleLayout:
 # A gather splits into _PLE_GATHER_WORKERS chunks, one per NVMe queue slot. Measured on this
 # box (47.7 GiB table, uniformly random ids) 4 is the peak at every batch size -- 1/2/4/8/16
 # chunks cost 8.8/4.9/3.3/3.6/4.2 ms for 64 rows -- past 4 the fault path stops scaling and
-# the extra dispatch is pure loss.
+# the extra dispatch is pure loss. This is the fallback: where PrefetchVirtualMemory is
+# available (see _prefetch_rows) it is both faster and simpler than the fan-out.
 _PLE_GATHER_WORKERS = 4
 _PLE_MIN_GATHER_CHUNK = 4  # below this the pool round-trip costs more than the faults it hides
 _PLE_ROW_CACHE_ENV = "FREETOKEN_PLE_ROW_CACHE"
-_PLE_ROW_CACHE_DEFAULT = 65536  # rows; 10 MiB at the checkpoint's 160 B head_dim
+# 1 Mi rows = 160 MiB of slab, +8 MiB for the slot->id list, +~110 MiB for the id->slot dict
+# at full occupancy (1 M boxed int keys and their slots). This box has ~8 GiB free with the
+# server up, so ~280 MiB buys 16x the old residency for ~3.5% of the headroom; the slab is
+# allocated up front, so shrink FREETOKEN_PLE_ROW_CACHE on tighter hosts.
+_PLE_ROW_CACHE_DEFAULT = 1_048_576
+# Below two rows the PrefetchVirtualMemory syscall costs more than the fault it hides
+# (measured: 1 row 0.15 ms plain vs 0.17 ms prefetched; 2 rows 0.29 vs 0.20).
+_PLE_MIN_PREFETCH_ROWS = 2
 
 _gather_pool: ThreadPoolExecutor | None = None
 _gather_pool_lock = threading.Lock()
+
+
+def _resolve_prefetch_virtual_memory():
+    """``(PrefetchVirtualMemory, GetCurrentProcess())``, or ``(None, None)`` off Windows.
+
+    Resolved once at import: ``ctypes.wintypes`` does not exist on POSIX and the symbol is
+    Win8+/Server-2012+, so either step may raise. The entries pointer is typed ``c_void_p``
+    because the array is built as a torch tensor, not a ctypes array -- see _range_entries.
+    """
+    try:
+        import ctypes.wintypes as wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        prefetch = kernel32.PrefetchVirtualMemory
+        prefetch.argtypes = [
+            wintypes.HANDLE,     # hProcess
+            ctypes.c_size_t,     # NumberOfEntries (ULONG_PTR)
+            ctypes.c_void_p,     # PWIN32_MEMORY_RANGE_ENTRY
+            wintypes.DWORD,      # Flags (reserved, must be 0)
+        ]
+        prefetch.restype = wintypes.BOOL
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p  # else the -1 pseudo-handle
+        return prefetch, kernel32.GetCurrentProcess()         # comes back as a signed int
+    except Exception:  # non-Windows, or a kernel too old to export the symbol
+        return None, None
+
+
+_prefetch_virtual_memory, _current_process = _resolve_prefetch_virtual_memory()
+_prefetch_failed = False  # set once if the call ever returns FALSE; then never retried
 
 
 def _ple_gather_pool() -> ThreadPoolExecutor:
@@ -278,39 +317,91 @@ def _ple_gather_pool() -> ThreadPoolExecutor:
 
 
 class _PleRowCache:
-    """Bounded LRU of table rows.
+    """Bounded cache of table rows: one ``uint8 [capacity, head_dim]`` slab, a dict id -> slot
+    and FIFO (round-robin) slot reuse.
 
-    Only the thread coordinating a gather touches it -- hits are served before the parallel
-    dispatch and insertions happen after the join -- so it needs no lock.
+    The dict-of-cloned-row-tensors this replaces paid a tensor allocation per cached row and
+    a Python-level ``out[i].copy_(row)`` per hit. Here both directions are one vectorized
+    ``index_copy_``, which on this box costs (ms per gather, all rows resident):
+
+        rows      OrderedDict   slab (loop)   slab (index_copy)
+          16          0.027        0.042           0.009
+          96          0.162        0.249           0.022
+        1120          1.982        3.197           0.238
+
+    and on the insert side 0.062/0.310/3.49 ms -> 0.021/0.040/0.636 ms. The per-row loop over
+    the slab is the *slowest* of the three (every hit builds a row view), so the batched
+    index_copy_ is what makes the slab win, not the slab itself.
+
+    FIFO, not LRU: recency bookkeeping is what made the OrderedDict path expensive, and the
+    n-gram ids are near-uniform over 320 M rows, so a hit is luck rather than recency.
+
+    Only the thread coordinating a gather touches it -- hits are served before the fault and
+    insertions happen after it -- so it needs no lock.
     """
 
-    def __init__(self, capacity: int) -> None:
+    def __init__(self, capacity: int, head_dim: int) -> None:
         self.capacity = capacity
-        self._rows: OrderedDict[int, torch.Tensor] = OrderedDict()
+        self._slab = torch.empty((capacity, head_dim), dtype=torch.uint8)
+        self._slot_of: dict[int, int] = {}
+        # slot -> row id (-1 free). A plain list, not a tensor/array: it is read once per
+        # inserted row and ``int(tensor[i])`` is ~50x a list index. It holds no int objects
+        # of its own -- the ids are the very objects ``_slot_of`` already keys on.
+        self._id_at: list[int] = [-1] * capacity
+        self._next = 0  # FIFO hand
 
     def take_hits(
         self, valid_ids: list[int], positions: list[int], out: torch.Tensor
     ) -> tuple[list[int], list[int]]:
         """Copy cached rows into ``out``; return the (ids, positions) still to be faulted."""
+        slot_of = self._slot_of.get
+        hit_slots: list[int] = []
+        hit_positions: list[int] = []
         miss_ids: list[int] = []
         miss_positions: list[int] = []
         for row_id, position in zip(valid_ids, positions):
-            row = self._rows.get(row_id)
-            if row is None:
+            slot = slot_of(row_id, -1)
+            if slot < 0:
                 miss_ids.append(row_id)
                 miss_positions.append(position)
-                continue
-            self._rows.move_to_end(row_id)
-            out[position].copy_(row)
+            else:
+                hit_slots.append(slot)
+                hit_positions.append(position)
+        if hit_slots:
+            out.index_copy_(
+                0,
+                torch.tensor(hit_positions, dtype=torch.int64),
+                self._slab.index_select(0, torch.tensor(hit_slots, dtype=torch.int64)),
+            )
         return miss_ids, miss_positions
 
     def insert(self, row_ids: list[int], positions: list[int], out: torch.Tensor) -> None:
-        for row_id, position in zip(row_ids, positions):
-            if row_id in self._rows:
-                continue
-            self._rows[row_id] = out[position].clone()  # clone: never retain an mmap view
-            if len(self._rows) > self.capacity:
-                self._rows.popitem(last=False)
+        """Copy the freshly faulted rows out of ``out`` into the slab (never an mmap view)."""
+        slot_of = self._slot_of
+        id_at = self._id_at
+        hand = self._next
+        capacity = self.capacity
+        writes: dict[int, int] = {}  # slot -> out position; a dict so a slot reused twice in
+        for row_id, position in zip(row_ids, positions):  # one batch keeps only its last row
+            if row_id in slot_of:
+                continue  # duplicate id within this batch
+            slot = hand
+            hand += 1
+            if hand == capacity:
+                hand = 0
+            evicted = id_at[slot]
+            if evicted >= 0:
+                del slot_of[evicted]
+            id_at[slot] = row_id
+            slot_of[row_id] = slot
+            writes[slot] = position
+        self._next = hand
+        if writes:
+            self._slab.index_copy_(
+                0,
+                torch.tensor(list(writes), dtype=torch.int64),
+                out.index_select(0, torch.tensor(list(writes.values()), dtype=torch.int64)),
+            )
 
 
 class MmapPleStorage:
@@ -325,7 +416,7 @@ class MmapPleStorage:
         self._maps: dict[str, mmap.mmap] = {}
         self._shards: list[torch.Tensor] = []
         capacity = int(os.environ.get(_PLE_ROW_CACHE_ENV, _PLE_ROW_CACHE_DEFAULT))
-        self._row_cache = _PleRowCache(capacity) if capacity > 0 else None
+        self._row_cache = _PleRowCache(capacity, self.head_dim) if capacity > 0 else None
         try:
             for shard in layout.shards:
                 mapping = self._maps.get(shard.path)
@@ -346,6 +437,12 @@ class MmapPleStorage:
         except Exception:
             self.close()
             raise
+        # Virtual address of each shard's row 0, for the prefetch range array. int64, not
+        # uint64: Windows user-mode addresses live below 0x8000_0000_0000, so the signed
+        # arithmetic torch actually supports cannot overflow.
+        self._shard_bases = torch.tensor(
+            [shard.data_ptr() for shard in self._shards], dtype=torch.int64
+        )
 
     def gather(self, row_ids: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """Copy valid rows into a CPU buffer; invalid IDs produce zeros."""
@@ -385,10 +482,85 @@ class MmapPleStorage:
         cache.insert(miss_ids, miss_positions, out)
         return out
 
+    def _range_entries(self, valid_ids: torch.Tensor) -> torch.Tensor:
+        """``int64 [n, 2]`` laid out exactly as ``WIN32_MEMORY_RANGE_ENTRY[n]``.
+
+        The struct is ``{PVOID VirtualAddress; SIZE_T NumberOfBytes;}`` -- two pointer-sized
+        fields, 16 B per entry on x64 -- so a contiguous ``[n, 2]`` int64 tensor is the array,
+        and its ``data_ptr()`` is the pointer the API wants. Built with vectorized address
+        math rather than a Python loop over a ``(_Range * n)()``: measured 0.011/0.018/0.057/
+        0.26 ms here at 16/1120/11200/112 000 entries against 0.003/0.27/2.2/29.0 ms for the
+        loop, which at prefill sizes would have eaten most of the win.
+
+        No coalescing of adjacent rows: the ids are near-uniform over 320 M rows, so runs are
+        vanishingly rare, and the API is happy to be handed 10 rows of the same 4 KiB page.
+        """
+        shard_ids = torch.div(valid_ids, self.rows_per_shard, rounding_mode="floor")
+        local_ids = valid_ids - shard_ids * self.rows_per_shard
+        entries = torch.empty((valid_ids.numel(), 2), dtype=torch.int64)
+        torch.add(
+            self._shard_bases.index_select(0, shard_ids),
+            local_ids,
+            alpha=self.head_dim,
+            out=entries[:, 0],
+        )
+        entries[:, 1] = self.head_dim
+        return entries
+
+    def _prefetch_rows(self, valid_ids: torch.Tensor) -> bool:
+        """Ask Windows to fault every row in one syscall; False if that is not available.
+
+        One PrefetchVirtualMemory over the whole miss set, then a plain serial copy, beats the
+        4-worker fan-out at every batch size measured on this box (47.7 GiB table, uniformly
+        random ids, cold, row cache off; ms per gather, mean of 40-60 batches at 16/96/1120
+        and 6-12 at 11200/112000):
+
+            rows     pool fan-out   prefetch+serial   prefetch+pool   of which the syscall
+              16          0.90            0.44            0.78              0.18
+              96          3.92            1.53            3.39              0.68
+            1120         37.2            10.9            29.7               7.8
+           11200        275              79              83                68
+          112000       1691             731             721               642
+
+        So: serial copy, because it wins by 2-3x up to 1120 rows and only ties (within the
+        ~10% run-to-run spread) at 11200 and above -- fanning out after the prefetch buys
+        nothing once the pages are already resident, it just adds dispatch.
+
+        And a single call, not several: chunking the entries into 16 384-entry calls measured
+        0.41/1.53/12.0/84/808 ms against 0.44/1.54/10.9/86/731 for one call -- indistinguishable
+        everywhere, so take the simpler shape. The array itself is one allocation either way.
+
+        A FALSE return disables the path for the process: the documented failure is a bad
+        parameter or a working-set/quota refusal, neither of which a retry fixes.
+        """
+        global _prefetch_failed
+        if _prefetch_virtual_memory is None or _prefetch_failed:
+            return False
+        n = valid_ids.numel()
+        if n < _PLE_MIN_PREFETCH_ROWS:
+            return False
+        entries = self._range_entries(valid_ids)
+        if _prefetch_virtual_memory(
+            _current_process, n, ctypes.c_void_p(entries.data_ptr()), 0
+        ):
+            return True
+        _prefetch_failed = True
+        logger.warning(
+            "PrefetchVirtualMemory failed for %d PLE rows (error %d); falling back to "
+            "thread-fanned page faults for the rest of this process",
+            n,
+            ctypes.get_last_error(),
+        )
+        return False
+
     def _fault(
         self, valid_ids: torch.Tensor, positions: torch.Tensor, out: torch.Tensor
     ) -> None:
-        """Read rows from the maps, spreading the page faults over the gather pool."""
+        """Read rows from the maps: one prefetch syscall where Windows offers it, otherwise
+        by spreading the page faults over the gather pool."""
+        if self._prefetch_rows(valid_ids):
+            self._read_rows(valid_ids, positions, out)  # pages are resident: copy serially
+            return
         n = valid_ids.numel()
         chunk = max(_PLE_MIN_GATHER_CHUNK, -(-n // _PLE_GATHER_WORKERS))
         if chunk >= n:
