@@ -424,6 +424,19 @@ class _FixedWidthGraphRunner:
     def last_attempt(self, width: int) -> MTPGraphCaptureResult | None:
         return self._last_attempt.get(width)
 
+    def refund_attempt(self, width: int) -> None:
+        """Give one retryable attempt back, so a boot-time try costs the live path nothing.
+
+        ``Engine._capture_spec_graphs_at_boot`` attempts every width while boot memory is still
+        fresh. That attempt is a bonus, not a budget: a width that cannot capture at boot must
+        reach its first live step exactly as capturable as it was before boot capture existed,
+        with all ``_MAX_RETRYABLE_ATTEMPTS`` still in hand. Only a RETRYABLE outcome is
+        refundable -- a captured or permanently-unsupported width has a verdict, and the verdict
+        stands.
+        """
+        if self._attempts.get(width, 0) > 0:
+            self._attempts[width] -= 1
+
     def capture_pending(self, width: int) -> bool:
         """Whether the NEXT live step at this width would attempt a capture.
 

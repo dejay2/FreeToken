@@ -38,6 +38,12 @@ logger = init_logger(__name__)
 # stall for an allocator failure on the next prefill.
 _SPEC_GRAPH_GUARD_BYTES = 128 << 20
 
+# The context length the boot-time speculative captures pretend the dummy request already has.
+# Small on purpose, and >0 on purpose: a verify batch continues an existing sequence
+# (has_initial_state), and every length-dependent value the step reads -- positions, out_loc,
+# the page/ring metadata -- is refilled per replay, so nothing about this number is baked.
+_SPEC_BOOT_CAPTURE_BASE_LEN = 8
+
 # The armed graph runner's replay split, as (its key, the probe's stage name).
 _SPEC_REPLAY_TIMINGS = (
     ("copy_ms", "replay.copy"),
@@ -529,9 +535,7 @@ class Engine:
                 f"{mem_GB(self.spec_draft.resident_bytes)} resident"
             )
         if config.spec_decode.graph_widths:
-            # Nothing is captured here: the widths are captured lazily on their first live
-            # step, so a boot that never speculates pays only this object. With
-            # FREETOKEN_MTP_SPEC_GRAPH unset the runner does not exist and the step is eager.
+            # With FREETOKEN_MTP_SPEC_GRAPH unset the runner does not exist and the step is eager.
             from .spec_graph import SpecVerifyGraphRunner
 
             self.spec_graph_runner = SpecVerifyGraphRunner(
@@ -546,6 +550,8 @@ class Engine:
                 "Integrated MTP graphs armed for widths "
                 f"{config.spec_decode.graph_widths} (1 = the capture-decode step)"
             )
+            # ...and captured HERE, beside the decode graphs, while boot memory is still fresh.
+            self._capture_spec_graphs_at_boot()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1063,6 +1069,180 @@ class Engine:
                 widths=spec_graph_widths,
                 guard_bytes=_SPEC_GRAPH_GUARD_BYTES,
             )
+
+    def _capture_spec_graphs_at_boot(self) -> None:
+        """Capture every armed speculative width NOW, while boot memory is still fresh.
+
+        The decode graphs capture at boot for a reason, and the speculative ones need the same
+        reason applied: capture admission needs free VRAM, and the first request's prefill
+        activation spike is what takes it away. Capturing LAZILY on each width's first live step
+        put every capture strictly AFTER a prefill -- so a long-context boot logged
+        MEMORY_ADMISSION per width, exhausted the retry budget, and then served every step
+        eagerly at roughly half the graphed rate, silently.
+
+        Nothing here is load-bearing. A width that cannot capture now is left exactly as
+        capturable at its first live step as it was before this method existed (see
+        ``SpecVerifyGraphRunner.refund_attempt``), the boot never aborts on a capture failure,
+        and every side effect of the warm-up forwards -- the dummy request's page-table row, the
+        MoE offload cache's expert residency, the GDN slot the warm-up advanced -- is undone.
+
+        ``FREETOKEN_MTP_SPEC_BOOT_CAPTURE=0`` restores the old lazy behaviour for debugging.
+        """
+        runner = self.spec_graph_runner
+        if runner is None:
+            return
+        if os.environ.get("FREETOKEN_MTP_SPEC_BOOT_CAPTURE", "1").strip() == "0":
+            logger.info_rank0(
+                "MTP spec graph boot capture disabled (FREETOKEN_MTP_SPEC_BOOT_CAPTURE=0): "
+                "every width captures lazily on its first live step"
+            )
+            return
+        if self.device.type != "cuda":
+            return
+        widths = sorted(runner.widths)
+        needed = _SPEC_BOOT_CAPTURE_BASE_LEN + max(widths)
+        if self.max_seq_len < needed:
+            logger.info_rank0(
+                f"MTP spec graph boot capture skipped: max_seq_len {self.max_seq_len} is "
+                f"below the {needed} dummy tokens the widest capture needs"
+            )
+            return
+
+        dummy_row = self.page_table[self.dummy_req.table_idx]
+        dummy_slot = int(dummy_row[0].item())
+        started = torch.cuda.Event(enable_timing=True)
+        ended = torch.cuda.Event(enable_timing=True)
+        started.record(self.stream)
+        captured = 0
+        try:
+            for width in widths:
+                if not runner.capture_pending(width):
+                    continue
+                try:
+                    batch = self._spec_boot_batch(
+                        width, _SPEC_BOOT_CAPTURE_BASE_LEN, dummy_row
+                    )
+                    if batch is None:
+                        continue
+                    result = self._capture_spec_width(runner, batch)
+                except Exception as exc:  # noqa: BLE001 -- a bonus capture, never a boot gate
+                    # the runner classifies its OWN failures; anything that escapes it came from
+                    # building the batch, and the width simply stays lazily capturable
+                    logger.warning_rank0(
+                        f"MTP spec graph width {width}: boot capture raised "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    continue
+                finally:
+                    # the verify shapes repoint the row at the KV slots their rows write
+                    dummy_row.fill_(dummy_slot)
+                if result.status == "captured":
+                    captured += 1
+                elif result.status == "retryable":
+                    runner.refund_attempt(width)
+        finally:
+            dummy_row.fill_(dummy_slot)
+            if self.moe_offload_cache is not None:
+                # the warm-up forwards moved routed experts into the cache; leave it exactly as
+                # GraphRunner and _warmup_prefill leave it (their finally does the same)
+                self.moe_offload_cache.reset()
+        ended.record(self.stream)
+        torch.cuda.synchronize(self.device)
+        logger.info_rank0(
+            f"MTP spec graphs captured at boot: {captured}/{len(widths)} "
+            f"(widths {tuple(widths)}) in {started.elapsed_time(ended) / 1000.0:.3f} s"
+        )
+
+    def _capture_spec_width(self, runner, batch: Batch):
+        """One boot capture, with the ladder's wind-back around the warm-up that executes."""
+        ladder = self.spec_state_ladder
+        if ladder is None:
+            return runner.capture(batch)
+        # Capture's warm-up EXECUTES the forward and so advances the slot this batch names --
+        # the dummy request's, i.e. the pool's padding slot. Borrowing the ladder's snapshot is
+        # the same undo _capture_decode_graph takes for the width-1 graph's first live step;
+        # the speculative step's own ``begin`` snapshot has no boot-time equivalent, and its
+        # per-layer stash is not wanted here (nothing rolls back a dummy forward).
+        with ladder.borrow_snapshot(self.dummy_req) as restore_state:
+            return runner.capture(batch, restore_state=restore_state)
+
+    def _spec_boot_batch(self, width: int, base: int, dummy_row: torch.Tensor) -> "Batch | None":
+        """One capturable batch at ``width``, built on the dummy request's page-table row.
+
+        The shape contract is ``spec_graph._check_batch``: width 1 is DECODE-shaped (the
+        capture-decode graph records the ordinary forward) and every other width is the
+        ``mtp_verify`` prefill batch. The source of truth for the verify shape is
+        ``Scheduler._prepare_spec_batch`` (positions from ``extend_len``, ``out_loc`` read back
+        from the page-table row, ``emit_width``, the ``mtp_verify`` marker, the GDN slot map)
+        and for the decode shape ``GraphRunner._capture_graphs``; both are replicated minimally
+        here rather than imported, because the scheduler's builders need a cache manager, live
+        pages and a token pool that boot does not have -- and because a boot batch must redirect
+        to the dummy row instead of a real request's.
+
+        Returns ``None`` when this width has no capturable shape at boot.
+        """
+        pool = self.linear_state_pool
+        slot = (
+            self.dummy_req.linear_slot_idx
+            if self.dummy_req.linear_slot_idx is not None
+            else self.dummy_req.table_idx
+        )
+        if width == 1:
+            batch = Batch(reqs=[self.dummy_req], phase="decode")
+            batch.padded_reqs = batch.reqs
+            if not self.graph_runner.can_use_cuda_graph(batch):
+                # the width-1 graph stages its addressing through the backend's persistent
+                # decode buffers, which exist only when the plain decode graphs were armed
+                return None
+            batch.input_ids = torch.zeros(1, dtype=torch.int32, device=self.device)
+            batch.positions = torch.tensor(
+                [self.dummy_req.cached_len], dtype=torch.int32, device=self.device
+            )
+            batch.out_loc = dummy_row[:1]  # the dedicated dummy KV slot, as padded replay uses
+            batch.rope_positions = batch.positions.to(torch.int64).expand(3, -1).contiguous()
+            if pool is not None:
+                batch.linear_table_idx = torch.tensor(
+                    [slot], dtype=torch.int32, device=self.device
+                )
+            # attn_metadata comes from the backend's own decode-capture seam, which the runner
+            # calls for this width (prepare_for_capture) -- the same one GraphRunner uses.
+            return batch
+
+        warm_req = Req(
+            input_ids=torch.zeros(base + width, dtype=torch.int32, device="cpu"),
+            table_idx=self.dummy_req.table_idx,
+            cached_len=base,  # extend_len == width, which the runner validates
+            output_len=width,
+            uid=-1,
+            sampling_params=None,  # type: ignore[arg-type]
+            cache_handle=None,  # type: ignore[arg-type]
+        )
+        warm_req.linear_slot_idx = self.dummy_req.linear_slot_idx
+        # Point the dummy row at the KV slots these rows write, exactly as _warmup_prefill does;
+        # the caller restores the row (and with it padded decode replay's dummy slot) after.
+        dummy_row[: base + width] = torch.arange(
+            base + width, dtype=torch.int32, device=self.device
+        )
+        batch = Batch(reqs=[warm_req], phase="prefill")
+        batch.padded_reqs = batch.reqs
+        batch.mtp_verify = True
+        batch.emit_width = width
+        batch.input_ids = torch.zeros(width, dtype=torch.int32, device=self.device)
+        batch.positions = torch.arange(
+            base, base + width, dtype=torch.int32, device=self.device
+        )
+        batch.out_loc = dummy_row[base : base + width]
+        # rope_positions stays None, as it does for a text request: the graph buffer expands
+        # the scalar positions into its own three-axis slot.
+        # The verify buffer refills its slot map every replay and so needs one even on a model
+        # with no GDN pool, where the value is inert.
+        batch.linear_table_idx = torch.tensor([slot], dtype=torch.int32, device=self.device)
+        if pool is not None:
+            from freetoken.attention.linear import build_fla_metadata
+
+            batch.fla_metadata = build_fla_metadata(batch, self.device)
+        self.attn_backend.prepare_metadata(batch)
+        return batch
 
     def _capture_decode_graph(self, batch: Batch):
         """Replay the width-1 spec graph for an ordinary decode step, or None to run eagerly.
