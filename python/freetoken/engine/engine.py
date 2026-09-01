@@ -1154,17 +1154,45 @@ class Engine:
         )
 
     def _capture_spec_width(self, runner, batch: Batch):
-        """One boot capture, with the ladder's wind-back around the warm-up that executes."""
+        """One boot capture, ARMED and settled exactly the way a live speculative step is.
+
+        The ladder is not optional decoration on a verify width. Capture RECORDS the forward,
+        and the forward's per-layer stash writes are part of what gets recorded: ``begin`` sets
+        ``batch.spec_capture``, which is what makes ``gdn.forward`` and ``ple.forward`` copy each
+        row's replay inputs into the ladder's arena (``stash_gdn`` / ``stash_ple``). A graph
+        recorded WITHOUT them replays a step that can never be rolled back -- every later settle
+        dies in ``SpecStateLadder.rollback`` with "GDN layer index 0 never stashed", because the
+        replay runs no Python and the recorded pass wrote nothing into the arena. The lazy path
+        got this for free: the scheduler calls ``begin`` before the step whose forward triggers
+        the capture. Boot has to arm it deliberately.
+
+        ``begin`` takes its own snapshot -- the one ``restore_snapshot`` winds back to -- so it
+        SUPERSEDES ``borrow_snapshot`` rather than composing with it (borrowing under a live
+        step is refused outright), and ``rollback(req, 0)``, the complete undo, is the settle:
+        it restores that snapshot again and ends the step with no accepted rows to replay. What
+        ``begin`` leaves behind is host-side and per-step -- ``_live``, ``_width``, the n-gram
+        context row -- and the next live ``begin`` overwrites all of it. The one thing that
+        outlives the capture is ``_params``, which the ladder deliberately carries across steps
+        for exactly this reason: a graphed step never re-runs the hooks' Python.
+
+        WIDTH 1 STAYS UNARMED. It is decode-shaped, and ``gdn.forward`` stashes only on the
+        prefill branch -- but ``ple.forward`` stashes on the mere presence of ``spec_capture``,
+        so arming it would bake a PLE stash write into a graph replayed by ordinary decode
+        steps, which never roll back and must never touch the arena. Its warm-up still advances
+        the slot, so it keeps the plain borrow (the same undo ``_capture_decode_graph`` takes).
+        """
         ladder = self.spec_state_ladder
         if ladder is None:
             return runner.capture(batch)
-        # Capture's warm-up EXECUTES the forward and so advances the slot this batch names --
-        # the dummy request's, i.e. the pool's padding slot. Borrowing the ladder's snapshot is
-        # the same undo _capture_decode_graph takes for the width-1 graph's first live step;
-        # the speculative step's own ``begin`` snapshot has no boot-time equivalent, and its
-        # per-layer stash is not wanted here (nothing rolls back a dummy forward).
-        with ladder.borrow_snapshot(self.dummy_req) as restore_state:
-            return runner.capture(batch, restore_state=restore_state)
+        if not batch.mtp_verify:
+            with ladder.borrow_snapshot(self.dummy_req) as restore_state:
+                return runner.capture(batch, restore_state=restore_state)
+        req = batch.reqs[0]
+        ladder.begin(req, batch)
+        try:
+            return runner.capture(batch, restore_state=ladder.restore_snapshot)
+        finally:
+            ladder.rollback(req, 0)
 
     def _spec_boot_batch(self, width: int, base: int, dummy_row: torch.Tensor) -> "Batch | None":
         """One capturable batch at ``width``, built on the dummy request's page-table row.
