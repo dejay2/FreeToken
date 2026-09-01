@@ -1169,6 +1169,34 @@ class Scheduler(SchedulerIOMixin):
             probe.start_cycle()
         return probe
 
+    def _spec_policy(self, req: Req) -> "_SpecAcceptance | None":
+        """This request's acceptance policy, or None while the fallback is disabled.
+
+        Fresh per REQUEST: content changes at request boundaries, and a served request's own
+        early cycles are the only honest predictor of its later ones. With
+        ``FREETOKEN_MTP_SPEC_MIN_EMITTED=0`` nothing is constructed at all, so the dispatch
+        path is byte for byte the pre-adaptive one.
+        """
+        spec = self.config.spec_decode
+        if not spec.adaptive:
+            return None
+        states = getattr(self, "_spec_policies", None)
+        if states is None:
+            states = self._spec_policies = {}
+        policy = states.get(req.uid)
+        if policy is None:
+            live = {r.uid for r in self.decode_manager.running_reqs}
+            for uid in [u for u in states if u not in live]:
+                del states[uid]
+            policy = states[req.uid] = _SpecAcceptance(spec)
+        return policy
+
+    def _spec_record(self, req: Req, emitted: int) -> None:
+        """Feed one cycle's emitted-token count back into the request's policy."""
+        policy = self._spec_policy(req)
+        if policy is not None:
+            policy.record(emitted)
+
     def _spec_dispatch_ready(self) -> bool:
         """Whether this iteration should try a speculative step instead of a plain decode.
 
@@ -1209,6 +1237,12 @@ class Scheduler(SchedulerIOMixin):
         if req.remain_len < 2:
             return None
         if not self.engine.spec_draft.is_ready(req):
+            return None
+        policy = self._spec_policy(req)
+        if policy is not None and not policy.should_speculate():
+            # A cold draft loses to plain decode; the cooldown is counted in the steps this
+            # request actually decodes plainly, which is why the policy is consulted LAST --
+            # a structural miss above is not a step the policy chose to spend.
             return None
         return req
 
@@ -1272,7 +1306,12 @@ class Scheduler(SchedulerIOMixin):
             engine.spec_draft.commit(
                 req, hidden=output.hidden, token_ids=msg.next_tokens
             )
-        probe and probe.finish_cycle(emitted=emitted, accepted=decision.accepted_rows)
+        self._spec_record(req, emitted)
+        probe and probe.finish_cycle(
+            emitted=emitted,
+            accepted=decision.accepted_rows,
+            policy=self._spec_policy(req),
+        )
         self.decode_manager.filter_reqs([req])
 
         finished_now: Set[Req] = set()
@@ -1438,6 +1477,59 @@ def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
     return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
 
 
+class _SpecAcceptance:
+    """One request's speculative acceptance, and the fallback that acts on it.
+
+    A cycle emits ``1 + accepted`` tokens for a fixed cost of roughly ``min_emitted`` plain
+    steps, so the EMA of emitted-per-cycle IS the profit signal: above the threshold the
+    request is ahead, below it every cycle loses time. Cold is not permanent -- after a
+    cooldown of plain steps one probe cycle re-measures, because content changes mid-stream.
+
+    The probe is judged on its OWN emission, not on the EMA it inherited: a sluggish average
+    built while the draft was useless would veto a probe that just emitted a full run. So a
+    good probe replaces the EMA outright -- the pre-cold history describes content that has
+    since changed.
+    """
+
+    def __init__(self, spec) -> None:  # SpecDecodeConfig
+        self.ema = spec.ema_seed
+        self.alpha = spec.ema_alpha
+        self.min_emitted = spec.min_emitted
+        self.base_cooldown = spec.cooldown
+        self.cooldown_cap = spec.cooldown_cap
+        self.next_cooldown = spec.cooldown
+        self.remaining = 0        # plain steps still owed before the next probe
+        self.probing = False      # the next cycle is a probe, judged on its own emission
+        self.cycles = 0
+        self.plain_steps = 0
+
+    def should_speculate(self) -> bool:
+        if self.remaining > 0:
+            self.remaining -= 1
+            self.plain_steps += 1
+            return False
+        return True
+
+    def record(self, emitted: int) -> None:
+        self.cycles += 1
+        if self.probing:
+            self.probing = False
+            if emitted >= self.min_emitted:
+                self.ema = float(emitted)
+                self.next_cooldown = self.base_cooldown
+                return
+        else:
+            self.ema += self.alpha * (emitted - self.ema)
+            if self.ema >= self.min_emitted:
+                return
+        self._cool_down()
+
+    def _cool_down(self) -> None:
+        self.remaining = self.next_cooldown
+        self.probing = True
+        self.next_cooldown = min(2 * self.next_cooldown, self.cooldown_cap)
+
+
 class _SpecTimingProbe:
     """Accumulates per-stage wall time across speculative cycles; logs every 32 cycles."""
 
@@ -1462,16 +1554,25 @@ class _SpecTimingProbe:
         self.stages[stage] = self.stages.get(stage, 0.0) + (now - self._t0)
         self._t0 = now
 
-    def finish_cycle(self, *, emitted: int, accepted: int) -> None:
+    def finish_cycle(
+        self, *, emitted: int, accepted: int, policy: "_SpecAcceptance | None" = None
+    ) -> None:
         self.mark("tail")
         self.cycles += 1
         self.emitted += emitted
         self.accepted_rows += accepted
         if self.cycles % 32 == 0:
             per = {k: f"{1e3 * v / self.cycles:.1f}" for k, v in self.stages.items()}
+            # The EMA and the spec/plain split are what a live tuning pass of
+            # FREETOKEN_MTP_SPEC_MIN_EMITTED / _COOLDOWN reads.
+            adaptive = (
+                "off"
+                if policy is None
+                else f"{policy.ema:.2f} | spec/plain {policy.cycles}/{policy.plain_steps}"
+            )
             logger.info(
-                "spec timing over %d cycles: ms/cycle %s | emitted/cycle %.2f",
-                self.cycles, per, self.emitted / self.cycles,
+                "spec timing over %d cycles: ms/cycle %s | emitted/cycle %.2f | ema %s",
+                self.cycles, per, self.emitted / self.cycles, adaptive,
             )
 
 

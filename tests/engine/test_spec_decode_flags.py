@@ -254,3 +254,91 @@ def test_the_graph_flag_alone_captures_nothing_while_speculation_is_off():
     spec = resolve_spec_decode({"FREETOKEN_MTP_SPEC_GRAPH": "1"})
     assert spec.enabled is False
     assert spec.graph_widths == ()
+
+
+# ------------------------------------------------------- the adaptive fallback's three knobs
+#
+# A speculative cycle costs ~1.9 plain steps, so a draft that stops predicting the target is a
+# net LOSS. The fallback is part of speculation, not a second feature behind its own flag:
+# turning it off is ``FREETOKEN_MTP_SPEC_MIN_EMITTED=0``, which restores always-speculate.
+
+
+def test_the_fallback_defaults_are_the_measured_breakeven():
+    spec = resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"})
+    assert spec.ema_alpha == pytest.approx(0.3)
+    assert spec.min_emitted == pytest.approx(2.0)
+    assert spec.cooldown == 16
+    assert spec.adaptive is True
+
+
+def test_the_fallback_is_inert_while_speculation_is_off():
+    spec = resolve_spec_decode({})
+    assert spec.adaptive is False
+    assert spec.min_emitted == pytest.approx(2.0)  # parsed, but nothing consults it
+
+
+def test_a_zero_threshold_restores_always_speculate():
+    spec = resolve_spec_decode(
+        {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_MIN_EMITTED": "0"}
+    )
+    assert spec.min_emitted == 0.0
+    assert spec.adaptive is False
+
+
+def test_each_fallback_knob_is_read_from_its_own_variable():
+    spec = resolve_spec_decode(
+        {
+            "FREETOKEN_MTP_SPECULATE": "1",
+            "FREETOKEN_MTP_SPEC_EMA_ALPHA": "0.5",
+            "FREETOKEN_MTP_SPEC_MIN_EMITTED": "2.5",
+            "FREETOKEN_MTP_SPEC_COOLDOWN": "8",
+        }
+    )
+    assert (spec.ema_alpha, spec.min_emitted, spec.cooldown) == (0.5, 2.5, 8)
+
+
+def test_a_fresh_request_is_seeded_at_a_full_cycles_emission():
+    """Optimistic by construction: early noise must not lock speculation out before the
+    request has produced any evidence of its own."""
+    spec = resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"})
+    assert spec.ema_seed == pytest.approx(4.0) == pytest.approx(spec.batch_width)
+    narrow = resolve_spec_decode(
+        {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_DEPTH": "1"}
+    )
+    assert narrow.ema_seed == pytest.approx(2.0)
+
+
+def test_the_cooldown_backoff_is_bounded():
+    """A cold request must keep probing: content changes mid-stream, and a permanently
+    cold request would never discover that its draft went hot again."""
+    spec = resolve_spec_decode(
+        {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_COOLDOWN": "16"}
+    )
+    assert spec.cooldown_cap == 128
+
+
+@pytest.mark.parametrize("raw", ["0", "-0.1", "1.1", "x", "", "nan"])
+def test_an_ema_alpha_outside_zero_to_one_is_rejected(raw):
+    with pytest.raises(ValueError, match="FREETOKEN_MTP_SPEC_EMA_ALPHA"):
+        resolve_spec_decode({"FREETOKEN_MTP_SPEC_EMA_ALPHA": raw})
+
+
+@pytest.mark.parametrize("raw", ["-1", "x", "", "nan", "4.5"])
+def test_a_threshold_outside_zero_to_the_full_width_is_rejected(raw):
+    """Above ``1 + depth`` no cycle could ever clear the bar, so speculation would go cold
+    and never come back -- a configuration that silently means 'off'."""
+    with pytest.raises(ValueError, match="FREETOKEN_MTP_SPEC_MIN_EMITTED"):
+        resolve_spec_decode({"FREETOKEN_MTP_SPEC_MIN_EMITTED": raw})
+
+
+def test_the_threshold_ceiling_follows_the_configured_depth():
+    env = {"FREETOKEN_MTP_SPEC_DEPTH": "1", "FREETOKEN_MTP_SPEC_MIN_EMITTED": "2"}
+    assert resolve_spec_decode(env).min_emitted == pytest.approx(2.0)
+    with pytest.raises(ValueError, match="FREETOKEN_MTP_SPEC_MIN_EMITTED"):
+        resolve_spec_decode({**env, "FREETOKEN_MTP_SPEC_MIN_EMITTED": "2.5"})
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "x", "", "1.5"])
+def test_a_cooldown_below_one_step_is_rejected(raw):
+    with pytest.raises(ValueError, match="FREETOKEN_MTP_SPEC_COOLDOWN"):
+        resolve_spec_decode({"FREETOKEN_MTP_SPEC_COOLDOWN": raw})

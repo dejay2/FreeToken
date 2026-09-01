@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from functools import cached_property
@@ -16,6 +17,9 @@ if TYPE_CHECKING:
 # w = 1 + depth must stay a capturable MTP verify width (mtp_fast_verify captures 2, 3, 4).
 _MAX_SPEC_DEPTH = 3
 
+# A cold request probes at least once every ``cooldown_cap`` plain steps.
+_COOLDOWN_BACKOFF_CAP = 8
+
 
 @dataclass(frozen=True)
 class SpecDecodeConfig:
@@ -30,6 +34,32 @@ class SpecDecodeConfig:
     enabled: bool = False
     depth: int = _MAX_SPEC_DEPTH
     graph: bool = False
+    # --- the adaptive fallback (see ``adaptive``) ---
+    ema_alpha: float = 0.3
+    min_emitted: float = 2.0
+    cooldown: int = 16
+
+    @property
+    def adaptive(self) -> bool:
+        """Whether the acceptance fallback is armed.
+
+        A speculative cycle costs about ``min_emitted`` plain steps whatever the draft
+        produces, so below that it is a net loss. ``min_emitted`` 0 means never fall back --
+        the pre-adaptive always-speculate behaviour, exactly.
+        """
+        return self.enabled and self.min_emitted > 0.0
+
+    @property
+    def ema_seed(self) -> float:
+        """A fresh request starts optimistic -- one full cycle's emission -- so early noise
+        cannot lock speculation out before the request has evidence of its own."""
+        return float(self.batch_width)
+
+    @property
+    def cooldown_cap(self) -> int:
+        """The longest a cold request may go between probes. Content changes mid-stream; a
+        request that stopped probing could never discover its draft went hot again."""
+        return self.cooldown * _COOLDOWN_BACKOFF_CAP
 
     @property
     def graph_widths(self) -> tuple[int, ...]:
@@ -57,7 +87,9 @@ class SpecDecodeConfig:
 
 
 def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfig:
-    """Read ``FREETOKEN_MTP_SPECULATE`` / ``FREETOKEN_MTP_SPEC_DEPTH`` / ``..._SPEC_GRAPH``."""
+    """Read ``FREETOKEN_MTP_SPECULATE`` / ``FREETOKEN_MTP_SPEC_DEPTH`` / ``..._SPEC_GRAPH``,
+    plus the adaptive fallback's ``..._SPEC_EMA_ALPHA`` / ``..._SPEC_MIN_EMITTED`` /
+    ``..._SPEC_COOLDOWN``."""
     env = os.environ if env is None else env
     raw = env.get("FREETOKEN_MTP_SPECULATE", "0").strip()
     if raw not in ("0", "1"):
@@ -81,7 +113,48 @@ def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfi
         raise ValueError(
             "FREETOKEN_MTP_SPECULATE=1 is incompatible with FREETOKEN_MTP_SHADOW=1"
         )
-    return SpecDecodeConfig(enabled=enabled, depth=depth, graph=graph_raw == "1")
+    alpha = _float_env(env, "FREETOKEN_MTP_SPEC_EMA_ALPHA", "0.3")
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError(
+            f"FREETOKEN_MTP_SPEC_EMA_ALPHA must be in (0, 1], got {alpha!r}"
+        )
+    min_emitted = _float_env(env, "FREETOKEN_MTP_SPEC_MIN_EMITTED", "2.0")
+    if not 0.0 <= min_emitted <= 1 + depth:
+        # Above the full width no cycle could ever clear the bar, so speculation would go
+        # cold and never return -- a configuration that silently means "off".
+        raise ValueError(
+            f"FREETOKEN_MTP_SPEC_MIN_EMITTED must be 0..{1 + depth}, got {min_emitted!r}"
+        )
+    cooldown_raw = env.get("FREETOKEN_MTP_SPEC_COOLDOWN", "16").strip()
+    try:
+        cooldown = int(cooldown_raw)
+    except ValueError:
+        cooldown = 0
+    if cooldown < 1:
+        raise ValueError(
+            f"FREETOKEN_MTP_SPEC_COOLDOWN must be >= 1, got {cooldown_raw!r}"
+        )
+    return SpecDecodeConfig(
+        enabled=enabled,
+        depth=depth,
+        graph=graph_raw == "1",
+        ema_alpha=alpha,
+        min_emitted=min_emitted,
+        cooldown=cooldown,
+    )
+
+
+def _float_env(env: Mapping[str, str], name: str, default: str) -> float:
+    """A finite float, or a ValueError naming the variable. NaN fails every comparison the
+    caller then makes, so it has to be rejected here rather than silently pass a range test."""
+    raw = env.get(name, default).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from None
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite, got {raw!r}")
+    return value
 
 
 def require_speculation_supported(config) -> None:

@@ -566,6 +566,81 @@ def test_lengths_and_pages_settle_equal_to_plain_decode_after_every_cycle(
     assert torch.equal(stub.cache_manager.free_slots, plain_stub.cache_manager.free_slots)
 
 
+# ------------------------------------------------------------------- the adaptive fallback
+#
+# The unit gate for the policy is tests/scheduler/test_spec_adaptive.py. What is owed HERE is
+# that the real cycle feeds it the count it really emitted, and that a request whose draft is
+# useless converges to plain decoding without changing a single token of its output.
+
+
+def _run_adaptive(stub, req, target, *, limit=64):
+    """The loop's real alternation: speculate when ``_spec_candidate`` offers the request,
+    decode one row plainly when it does not."""
+    msgs, dispatches = [], []
+    while req.can_decode and req in stub.decode_manager.running_reqs:
+        candidate = stub._spec_candidate()
+        dispatches.append(candidate is req)
+        if candidate is req:
+            stub._speculative_decode_step(req)
+            msgs.extend(m for batch in stub.sent[-1:] for m in batch)
+        else:
+            stub.cache_manager.allocate_paged([req])
+            position = req.device_len - 1
+            token = target.next_token(int(stub.token_pool[0, position]), position)
+            stub.token_pool[0, req.device_len] = token
+            req.complete_one()
+            msgs.append(
+                Scheduler._emit_step_tokens(
+                    stub, req, torch.tensor([token], dtype=torch.int32)
+                )
+            )
+            if msgs[-1].finished:
+                with stub.cache_manager.lazy_free_region():
+                    stub.decode_manager.remove_req(req)
+                    stub._free_req_resources(req)
+        if msgs and msgs[-1].finished:
+            break
+        assert len(dispatches) <= limit, "the run never terminated"
+    return msgs, dispatches
+
+
+def test_a_garbage_draft_converges_to_plain_decoding_with_identical_output():
+    target = _FakeTarget()
+    _, plain_req, plain = _plain_decode(target, prompt_len=8, output_len=40)
+
+    spec_target = _FakeTarget()
+    stub = _scheduler(spec_target, _FakeDraft(spec_target, policy="garbage"))
+    stub.config.spec_decode = SpecDecodeConfig(
+        enabled=True, depth=3, min_emitted=2.0, cooldown=4, ema_alpha=0.5
+    )
+    req = _decode_req(stub, prompt_len=8, output_len=40)
+
+    msgs, dispatches = _run_adaptive(stub, req, spec_target)
+
+    assert _tokens(msgs) == _tokens(plain)[1:]  # the prefill token is not a decode step
+    assert msgs[-1].finished and msgs[-1].finish_reason == plain[-1].finish_reason
+    assert req.input_ids.tolist() == plain_req.input_ids.tolist()
+    # a wholly rejected cycle emits 1, so at alpha 0.5 the seed (4.0) crosses 2.0 on the
+    # second cycle -- and the cooldown then buys four plain steps
+    assert dispatches[:2] == [True, True]
+    assert dispatches[2:6] == [False] * 4
+    # and the fallback dominates the rest of the run
+    assert sum(dispatches) < len(dispatches) / 3
+
+
+def test_a_perfect_draft_never_falls_back():
+    target = _FakeTarget()
+    stub = _scheduler(target, _FakeDraft(target))
+    stub.config.spec_decode = SpecDecodeConfig(
+        enabled=True, depth=3, min_emitted=2.0, cooldown=4, ema_alpha=0.5
+    )
+    req = _decode_req(stub, prompt_len=8, output_len=40)
+
+    _msgs, dispatches = _run_adaptive(stub, req, target)
+
+    assert all(dispatches)
+
+
 # ------------------------------------------------------------ finishing under an inflight step
 
 
