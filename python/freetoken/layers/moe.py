@@ -14,7 +14,7 @@ from freetoken.moe.offload_cache import OffloadMoeCache
 # module attribute at every use so a test (or a future runtime re-arm) has ONE place to
 # swap it, shared with OffloadMoeCache._init_prefetch.
 from freetoken.moe import prefetch as _prefetch
-from freetoken.utils import div_even
+from freetoken.utils import div_even, init_logger
 
 from .base import BaseOP
 
@@ -59,6 +59,44 @@ def _read_small_prefill_rows() -> int:
 
 
 _SMALL_PREFILL_ROWS = _read_small_prefill_rows()
+
+# ``_expert_gemm``'s ``is_prefill`` flag picks the KERNEL, not just the movement, and for most
+# formats the two kernels are not the same arithmetic:
+#
+#   fp8_block   prefill is W8A8 (activations quantized to fp8 per-128-K group, fp8 tensor
+#               cores), decode is W8A16 (activations stay bf16). Measured on a real cache,
+#               the two agree with an fp32 reference to 4.9e-3 and 5.0e-4 respectively and
+#               differ from EACH OTHER by ~4% of the layer output -- at every row count,
+#               M=1 included. Over 48 layers that changes the prefill's hidden states, its
+#               KV, its GDN/PLE recurrent state and the MTP draft priming, so a greedy
+#               continuation near a decision boundary flips.
+#   bf16        grouped GEMM vs per-route GEMVs: a different reduction order (small, but
+#               not zero -- ~6e-3 absolute on a ~1.0 scale).
+#   mxfp4_triton / ds_fp4   separate prefill and decode kernels likewise.
+#
+# Only formats whose dispatch lands on ONE kernel for both phases can take decode movement
+# without also changing the model's math: there the movement decides which rows the banks
+# hold and ``topk_ids``/``alphas`` are remapped to match, and nothing else moves.
+_MOVEMENT_ONLY_FORMATS = frozenset({"nvfp4_marlin", "nvfp4_b12x"})
+_small_prefill_refused: set[str] = set()
+
+logger = init_logger(__name__)
+
+
+def _refuse_small_prefill(fmt: str | None) -> bool:
+    """Warn once per format, then decline. A wrong answer is worse than a slow one."""
+    key = str(fmt)
+    if key not in _small_prefill_refused:
+        _small_prefill_refused.add(key)
+        logger.warning(
+            "%s is set, but %r expert kernels are different arithmetic for prefill and "
+            "decode (not just different data movement), so routing a small prefill through "
+            "decode movement would change the model's output. Ignoring it for this format; "
+            "small prefills keep streaming the expert bank.",
+            _SMALL_PREFILL_ROWS_ENV,
+            fmt,
+        )
+    return False
 
 # Hybrid decode overlaps the CPU overflow GEMV behind the GPU PCIe fetch + GEMM by
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
@@ -543,15 +581,21 @@ class OffloadMoELayer(MoELayer):
         ``FREETOKEN_MOE_SMALL_PREFILL_ROWS``; at the default 0 this returns False before
         touching anything, so the movement choice is byte-identical to before.
 
-        Everything the decode path needs is already true of a prefill batch: it reads nothing
-        off ``batch`` past this point (no phase flag reaches the fused kernels -- ``is_prefill``
-        is passed explicitly to ``_expert_gemm``), it only needs ``[M, H]`` hidden states with
-        an ``[M, top_k]`` int32 ``topk_ids`` it may rewrite in place, and it touches none of the
-        prefill double-buffer bookkeeping (``begin_prefill`` / ``prefetch_prefill_layer`` /
-        ``_invalidate_prefill_buffer`` / ``release_prefill_layer``). Skipping that bookkeeping
-        is safe in both directions: nothing is claimed, so nothing is left unreleased, and the
-        next streaming prefill re-establishes the whole thing at its layer 0. What it does do
-        is evict LRU residents like any decode step -- which is the trade being made.
+        The hard precondition is ``_MOVEMENT_ONLY_FORMATS``: for most quant formats the decode
+        path is not merely a different way of getting the experts onto the GPU, it is different
+        ARITHMETIC (see that constant), and swapping it under a prefill changes what the model
+        computes. Formats outside the set are refused with a warning rather than silently
+        answered differently.
+
+        Given a format where the two paths are one kernel, everything else the decode path
+        needs is already true of a prefill batch: it reads nothing off ``batch`` past this
+        point, it only needs ``[M, H]`` hidden states with an ``[M, top_k]`` int32 ``topk_ids``
+        it may rewrite in place, and it touches none of the prefill double-buffer bookkeeping
+        (``begin_prefill`` / ``prefetch_prefill_layer`` / ``_invalidate_prefill_buffer`` /
+        ``release_prefill_layer``). Skipping that bookkeeping is safe in both directions:
+        nothing is claimed, so nothing is left unreleased, and the next streaming prefill
+        re-establishes the whole thing at its layer 0. What it does do is evict LRU residents
+        like any decode step -- which is the trade being made.
         """
         limit = _SMALL_PREFILL_ROWS
         if limit <= 0 or not 1 <= rows <= limit:
@@ -559,6 +603,9 @@ class OffloadMoELayer(MoELayer):
         cache = self.offload_cache
         if cache is None:
             return False
+        fmt = getattr(cache, "quant_format", None)
+        if fmt not in _MOVEMENT_ONLY_FORMATS:
+            return _refuse_small_prefill(fmt)
         # The cpu/hybrid decode target sizes its C++ scratch and pinned IO sets once, from
         # max(max_running_req, cuda_graph_max_bs, spec batch_width); a wider submit runs past
         # them. The GPU target has no such bound.

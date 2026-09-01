@@ -4,7 +4,9 @@ The offload prefill path streams every expert of every layer (48 x 1.32 GiB over
 regardless of prompt size, so a 26-token chat turn and a prefix-cache hit with three new rows
 each pay the full 63 GiB. The knob routes such batches through the decode LRU instead. These
 tests pin the exact admission conditions, that N=0 leaves every choice byte-identical, that
-the MTP verify guard is untouched, and that the two movements compute the same thing.
+the MTP verify guard is untouched, and -- the property a live failure proved is NOT free --
+that the knob is refused for every quant format whose prefill and decode kernels are different
+arithmetic rather than different data movement.
 """
 
 from __future__ import annotations
@@ -42,7 +44,17 @@ def _active_batch(monkeypatch, batch):
         yield
 
 
-def _layer(*, num_experts=16, top_k=10, hidden_size=32, intermediate_size=24, cache=object()):
+_DEFAULT = object()  # "no cache given", as distinct from "the cache is None"
+
+
+def _cache(**attrs):
+    """A cache stub on a movement-only format, so the guard's format gate is satisfied."""
+    attrs.setdefault("quant_format", "nvfp4_marlin")
+    attrs.setdefault("cpu_executor", None)
+    return SimpleNamespace(**attrs)
+
+
+def _layer(*, num_experts=16, top_k=10, hidden_size=32, intermediate_size=24, cache=_DEFAULT):
     _init_tp()
     layer = moe_module.OffloadMoELayer(
         layer_id=0,
@@ -51,7 +63,7 @@ def _layer(*, num_experts=16, top_k=10, hidden_size=32, intermediate_size=24, ca
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
-    layer.offload_cache = cache
+    layer.offload_cache = _cache() if cache is _DEFAULT else cache
     return layer
 
 
@@ -65,7 +77,7 @@ def _routed(monkeypatch, layer, rows, calls):
     return hidden, weights, ids
 
 
-def _movement(monkeypatch, *, rows, limit, phase="prefill", requests=1, cache=object()):
+def _movement(monkeypatch, *, rows, limit, phase="prefill", requests=1, cache=_DEFAULT):
     monkeypatch.setattr(moe_module, "_SMALL_PREFILL_ROWS", limit)
     layer = _layer(cache=cache)
     calls: list[str] = []
@@ -129,8 +141,38 @@ def test_a_cpu_decode_target_caps_the_width_at_its_pinned_io_size(
     monkeypatch, max_tokens, rows, expected
 ):
     """cpu/hybrid size their C++ scratch and pinned IO once; a wider submit runs past them."""
-    cache = SimpleNamespace(cpu_executor=SimpleNamespace(max_tokens=max_tokens))
+    cache = _cache(cpu_executor=SimpleNamespace(max_tokens=max_tokens))
     assert _movement(monkeypatch, rows=rows, limit=16, cache=cache) == [expected] * 2
+
+
+@pytest.mark.parametrize("fmt", ["fp8_block", "bf16", "mxfp4_triton", "ds_fp4", "q4_0", None])
+def test_a_format_whose_two_kernels_are_different_math_is_refused(monkeypatch, fmt):
+    """The live failure: fp8_block prefill is W8A8 and decode is W8A16 -- ~4% apart per layer.
+
+    Taking decode movement there does not just move bytes, it changes what the model
+    computes, so the knob is declined (loudly, once) instead of answered differently.
+    """
+    monkeypatch.setattr(moe_module, "_small_prefill_refused", set())
+    cache = SimpleNamespace(quant_format=fmt, cpu_executor=None)
+    assert _movement(monkeypatch, rows=4, limit=64, cache=cache) == ["prefill", "prefill"]
+    assert moe_module._small_prefill_refused == {str(fmt)}
+
+
+@pytest.mark.parametrize("fmt", sorted(moe_module._MOVEMENT_ONLY_FORMATS))
+def test_a_one_kernel_format_still_takes_the_path(monkeypatch, fmt):
+    """nvfp4_marlin / nvfp4_b12x run the same fused kernel for both phases."""
+    cache = SimpleNamespace(quant_format=fmt, cpu_executor=None)
+    assert _movement(monkeypatch, rows=4, limit=64, cache=cache) == ["decode", "decode"]
+
+
+def test_the_refusal_warns_once_per_format(monkeypatch):
+    monkeypatch.setattr(moe_module, "_small_prefill_refused", set())
+    for _ in range(3):
+        _movement(
+            monkeypatch, rows=4, limit=64,
+            cache=SimpleNamespace(quant_format="fp8_block", cpu_executor=None),
+        )
+    assert moe_module._small_prefill_refused == {"fp8_block"}
 
 
 def test_a_zero_row_batch_is_never_admitted(monkeypatch):
@@ -181,8 +223,6 @@ class _IdentitySlotCache:
 
     def __init__(self, gate_up: torch.Tensor, down: torch.Tensor):
         self._views = (gate_up, down)
-        self.decode_calls = 0
-        self.prefill_calls = 0
 
     def is_cpu_layer(self, layer_id: int) -> bool:
         return False
@@ -194,10 +234,10 @@ class _IdentitySlotCache:
         return False
 
     def ensure_experts(self, layer_id: int, ids: torch.Tensor) -> None:
-        self.decode_calls += 1
+        pass
 
     def materialize_layer(self, layer_id: int) -> None:
-        self.prefill_calls += 1
+        pass
 
     def copy_missing(self) -> None:
         pass
@@ -221,13 +261,15 @@ def _reference(hidden, gate_up, down, weights, ids):
             gate, up = projected.chunk(2)
             activated = torch.nn.functional.silu(gate) * up
             result[row] += (down[expert].float() @ activated) * weights[row, route]
-    return result.to(hidden.dtype)
+    return result
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("rows", [3, 8])
-def test_small_prefill_decode_movement_matches_the_streaming_path(monkeypatch, rows):
-    """Same batch, same routing, both movements -- and both match the python reference."""
+def test_the_two_bf16_movements_agree_to_kernel_rounding(monkeypatch, rows):
+    """bf16's grouped GEMM and per-route GEMVs are a different reduction order, not different
+    math -- both land on the reference. The movements are called DIRECTLY: bf16 is outside
+    ``_MOVEMENT_ONLY_FORMATS``, so the guard would never choose decode movement for it."""
     torch.manual_seed(4100 + rows)
     device = torch.device("cuda")
     num_experts, top_k, hidden_size, intermediate = 16, 8, 32, 24
@@ -237,13 +279,9 @@ def test_small_prefill_decode_movement_matches_the_streaming_path(monkeypatch, r
     down = 0.25 * torch.randn(
         num_experts, hidden_size, intermediate, device=device, dtype=torch.bfloat16
     )
-    cache = _IdentitySlotCache(gate_up, down)
     layer = _layer(
-        num_experts=num_experts,
-        top_k=top_k,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate,
-        cache=cache,
+        num_experts=num_experts, top_k=top_k, hidden_size=hidden_size,
+        intermediate_size=intermediate, cache=_IdentitySlotCache(gate_up, down),
     )
     hidden = 0.25 * torch.randn(rows, hidden_size, device=device, dtype=torch.bfloat16)
     raw = torch.rand(rows, top_k, device=device)
@@ -256,15 +294,85 @@ def test_small_prefill_decode_movement_matches_the_streaming_path(monkeypatch, r
     ).contiguous()
     expected = _reference(hidden, gate_up, down, weights, ids)
 
-    monkeypatch.setattr(moe_module, "_SMALL_PREFILL_ROWS", rows)
-    with _active_batch(monkeypatch, _batch(rows=rows)):
-        small = layer.routed_forward(hidden, weights, ids.clone())
-    monkeypatch.setattr(moe_module, "_SMALL_PREFILL_ROWS", 0)
-    with _active_batch(monkeypatch, _batch(rows=rows)):
-        streamed = layer.routed_forward(hidden, weights, ids.clone())
-
+    decode = layer._decode_routed(hidden.clone(), weights, ids.clone()).float()
+    prefill = layer._prefill_routed(hidden.clone(), weights, ids.clone()).float()
     torch.cuda.synchronize(device)
-    assert (cache.decode_calls, cache.prefill_calls) == (1, 1)
-    torch.testing.assert_close(small, expected, rtol=5e-2, atol=5e-2)
-    torch.testing.assert_close(streamed, expected, rtol=5e-2, atol=5e-2)
-    torch.testing.assert_close(small, streamed, rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(decode, expected, rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(prefill, expected, rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fp8_block_movements_are_different_arithmetic_not_just_movement():
+    """The evidence behind the refusal, and the regression guard for it.
+
+    fp8_block prefill quantizes the ACTIVATIONS to fp8 (W8A8, fp8 tensor cores); decode keeps
+    them bf16 (W8A16, weight-only fp8). Decode is the more accurate of the two, but they are
+    ~4% of the layer output apart -- at every row count, M=1 included -- which is what turned
+    a greedy continuation into an immediate EOS when a small prefill was routed through decode
+    movement on a live server.
+    """
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    device = torch.device("cuda")
+    num_experts, top_k, hidden_size, intermediate = 16, 4, 512, 512
+    torch.manual_seed(0)
+    gate_up_q = (torch.randn(num_experts, 2 * intermediate, hidden_size) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    down_q = (torch.randn(num_experts, hidden_size, intermediate) * 0.5).to(torch.float8_e4m3fn)
+    gate_up_s = (0.05 + 0.02 * torch.rand(
+        num_experts, 2 * intermediate // 128, hidden_size // 128
+    )).to(torch.bfloat16)
+    down_s = (0.05 + 0.02 * torch.rand(
+        num_experts, hidden_size // 128, intermediate // 128
+    )).to(torch.bfloat16)
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=num_experts, cache_size=48, device=device,
+        quant_format="fp8_block",
+    )
+    cache.set_bank_sources({
+        "gate_up": [gate_up_q.contiguous().pin_memory()],
+        "gate_up_scale": [gate_up_s.contiguous().pin_memory()],
+        "down": [down_q.contiguous().pin_memory()],
+        "down_scale": [down_s.contiguous().pin_memory()],
+    })
+    layer = _layer(
+        num_experts=num_experts, top_k=top_k, hidden_size=hidden_size,
+        intermediate_size=intermediate, cache=cache,
+    )
+
+    def dequant(q, s):
+        experts, n, k = q.shape
+        blocks = q.to(device).float().view(experts, n // 128, 128, k // 128, 128)
+        return (blocks * s.to(device).float().view(experts, n // 128, 1, k // 128, 1)).view(
+            experts, n, k
+        )
+
+    gate_up, down = dequant(gate_up_q, gate_up_s), dequant(down_q, down_s)
+    rows = 6
+    gen = torch.Generator(device="cpu").manual_seed(13)
+    hidden = (0.5 * torch.randn(rows, hidden_size, generator=gen)).to(device).to(
+        torch.bfloat16
+    ).contiguous()
+    ids = torch.stack(
+        [torch.randperm(num_experts, generator=gen)[:top_k] for _ in range(rows)]
+    ).to(torch.int32).to(device).contiguous()
+    raw = torch.rand(rows, top_k, generator=gen).to(device)
+    weights = (raw / raw.sum(dim=-1, keepdim=True)).float().contiguous()
+    expected = _reference(hidden, gate_up, down, weights, ids)
+
+    cache.reset()
+    prefill = layer._prefill_routed(hidden.clone(), weights, ids.clone()).float()
+    cache.reset()
+    decode = layer._decode_routed(hidden.clone(), weights, ids.clone()).float()
+    torch.cuda.synchronize(device)
+
+    scale = expected.abs().max().item()
+    prefill_err = (prefill - expected).abs().max().item() / scale
+    decode_err = (decode - expected).abs().max().item() / scale
+    gap = (prefill - decode).abs().max().item() / scale
+    # W8A16 is the accurate one; W8A8 is an order of magnitude further from the reference.
+    assert decode_err < 0.01, decode_err
+    assert prefill_err > 4 * decode_err, (prefill_err, decode_err)
+    # ... and the two are far too far apart to swap under a running model.
+    assert gap > 0.01, gap
