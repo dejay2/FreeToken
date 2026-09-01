@@ -710,6 +710,239 @@ class MTPGPUExpertRunner:
         return None
 
 
+class MTPNVFP4GPUExpertRunner(MTPGPUExpertRunner):
+    """Device-resident NVFP4 routed experts, dequantized to BF16 at gather time.
+
+    The exact banks are 5.03 GB of a card whose scarcest resource is the TARGET's expert
+    cache.  Held as NVFP4 the same 512 experts cost ~1.42 GB, and the routed call pays for
+    that by dequantizing -- ``fp4 * block_scale * row_global``, the manifest's six-bank
+    format read exactly as :func:`dequantize_nvfp4_rows` reads it -- the handful of expert
+    rows a speculative step actually routes.  Everything after the dequant is the BF16
+    gathered path's own kernels on its own dtypes, and the dequant itself is roughly free at
+    a speculative width: measured on the real banks, a 4-row/10-way call costs 0.73 ms
+    against the exact gather's 0.80 ms -- the scratch it writes is paid for by reading a
+    quarter as much weight.
+
+    The dequant writes into a scratch preallocated for ``max_gather_tokens * top_k`` pairs, so
+    a replay allocates nothing and the placement's cost is a fixed, declarable number.  That
+    width is the per-cycle speculative step (``1 + depth``), NOT the BF16 path's traffic
+    budget: here a wider gather would be a wider RESIDENT buffer, which is the very thing
+    this placement exists to shrink.  Anything wider -- prompt priming -- takes the
+    expert-major loop, exactly as the BF16 path already does at the real geometry.
+    """
+
+    def __init__(
+        self,
+        banks,
+        *,
+        top_k: int,
+        activation: str,
+        renormalize: bool,
+        max_tokens: int,
+        num_threads: int,
+        device: torch.device,
+        max_gather_tokens: int = _ROUTED_GATHER_MIN_TOKENS,
+    ) -> None:
+        if getattr(banks, "quant_format", None) != "nvfp4":
+            raise ValueError(
+                "MTP quantized resident expert runner needs nvfp4 banks, got "
+                f"{getattr(banks, 'quant_format', None)!r}"
+            )
+        if activation not in {"silu", "swish"}:
+            raise ValueError(f"MTP resident experts support silu, got {activation!r}")
+        if not 1 <= top_k <= banks.num_experts:
+            raise ValueError(f"invalid MTP top_k={top_k} for {banks.num_experts} experts")
+        if max_tokens < 1:
+            raise ValueError(f"MTP max_tokens must be positive, got {max_tokens}")
+        if max_gather_tokens < 1:
+            raise ValueError(
+                f"MTP max_gather_tokens must be positive, got {max_gather_tokens}"
+            )
+        del num_threads  # the resident path owns no CPU worker pool
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        self.top_k = int(top_k)
+        self.renormalize = bool(renormalize)
+        self.max_tokens = int(max_tokens)
+        self.device = device
+        self.stats = MTPExpertStats()
+        for name in MTPNVFP4ExpertBanks._NAMES:
+            setattr(self, name, getattr(banks, name).to(device))
+        # Only the geometry outlives the host banks, as in the exact runner.
+        self.banks = _MTPBankGeometry(
+            num_experts=int(banks.num_experts),
+            hidden_size=int(banks.hidden_size),
+            intermediate_size=int(banks.intermediate_size),
+            bytes_per_expert=int(banks.bytes_per_expert),
+        )
+        self.gather_max_tokens = int(max_gather_tokens)
+        self.max_gather_pairs = self.gather_max_tokens * self.top_k
+        self._gate_up_scratch = torch.empty(
+            self.max_gather_pairs,
+            2 * self.banks.intermediate_size,
+            self.banks.hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self._down_scratch = torch.empty(
+            self.max_gather_pairs,
+            self.banks.hidden_size,
+            self.banks.intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.bank_bytes = sum(
+            getattr(self, name).numel() * getattr(self, name).element_size()
+            for name in MTPNVFP4ExpertBanks._NAMES
+        )
+        self.scratch_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (self._gate_up_scratch, self._down_scratch)
+        )
+        self.resident_bytes = self.bank_bytes + self.scratch_bytes
+        self._e2m1 = _E2M1_VALUES.to(device)
+        self._triton_dequant = self._resolve_triton_dequant()
+
+    def _resolve_triton_dequant(self):
+        """The canonical fused gather+dequant, when the device has one.
+
+        It writes straight into the scratch with no intermediate of its own, and is already
+        pinned bit-exact against :func:`dequantize_nvfp4_rows`.  The first call compiles, so
+        it is warmed here -- a JIT compile inside a graph capture is not legal.
+        """
+        if self.device.type != "cuda":
+            return None
+        try:
+            from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
+        except Exception:  # pragma: no cover - triton is optional at runtime
+            return None
+        warm = torch.zeros(1, dtype=torch.int32, device=self.device)
+        dequant_nvfp4(
+            self.gate_up_packed,
+            self.gate_up_scale,
+            self.gate_up_global,
+            warm,
+            out=self._gate_up_scratch[:1],
+        )
+        dequant_nvfp4(
+            self.down_packed,
+            self.down_scale,
+            self.down_global,
+            warm,
+            out=self._down_scratch[:1],
+        )
+        return dequant_nvfp4
+
+    def _dequant_into(self, packed, scale, row_global, slots, out) -> None:
+        """``fp4 * block_scale * row_global`` for ``slots``' rows, into ``out``.
+
+        The multiplication order is the CPU reference's, and every factor is exact in fp32
+        (a 3-bit E2M1 value, a 3-bit E4M3 block scale, an 11-bit FP16 row global), so the
+        single rounding is the store to bf16 -- the same number the reference produces.
+        """
+        if self._triton_dequant is not None:
+            self._triton_dequant(
+                packed, scale, row_global, slots.to(torch.int32), out=out
+            )
+            return
+        pairs, rows, packed_width = out.shape[0], out.shape[1], packed.shape[-1]
+        width = 2 * packed_width
+        selected = packed.index_select(0, slots)
+        codes = torch.stack((selected & 0xF, selected >> 4), dim=-1).view(
+            pairs, rows, width
+        )
+        values = self._e2m1.index_select(0, codes.reshape(-1).to(torch.int32)).view(
+            pairs, rows, width // 16, 16
+        )
+        blocks = (
+            scale.view(torch.uint8)
+            .index_select(0, slots)
+            .view(torch.float8_e4m3fn)
+            .float()
+        )
+        globals_ = row_global.index_select(0, slots).float()
+        out.copy_(
+            (values * blocks.unsqueeze(-1)).view(pairs, rows, width)
+            * globals_.unsqueeze(-1)
+        )
+
+    def dequantize_experts(
+        self, expert_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Both banks' rows for ``expert_ids``, as bf16 views of the preallocated scratch."""
+
+        ids = expert_ids.reshape(-1).to(torch.int64)
+        pairs = ids.numel()
+        if pairs > self.max_gather_pairs:
+            raise ValueError(
+                f"the MTP quantized gather dequantizes at most {self.max_gather_pairs} "
+                f"routed pairs, got {pairs}"
+            )
+        gate_up = self._gate_up_scratch[:pairs]
+        down = self._down_scratch[:pairs]
+        self._dequant_into(
+            self.gate_up_packed, self.gate_up_scale, self.gate_up_global, ids, gate_up
+        )
+        self._dequant_into(self.down_packed, self.down_scale, self.down_global, ids, down)
+        return gate_up, down
+
+    def _run_gathered(
+        self,
+        hidden_states: torch.Tensor,
+        route_ids: torch.Tensor,
+        route_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """The BF16 gathered path with a dequant where its ``index_select`` was."""
+
+        tokens, hidden_size = hidden_states.shape
+        routed = route_ids >= 0
+        safe_ids = torch.where(routed, route_ids, torch.zeros_like(route_ids))
+        weights = torch.where(routed, route_weights, torch.zeros_like(route_weights))
+        gate_up, down = self.dequantize_experts(safe_ids)
+        rows = hidden_states.repeat_interleave(self.top_k, dim=0).unsqueeze(1)
+        projected = torch.bmm(rows, gate_up.transpose(1, 2)).squeeze(1)
+        gate, up = projected.chunk(2, dim=-1)
+        activated = (torch.nn.functional.silu(gate.float()) * up.float()).to(
+            hidden_states.dtype
+        )
+        value = torch.bmm(activated.unsqueeze(1), down.transpose(1, 2)).squeeze(1)
+        return (value.float() * weights[:, None]).view(tokens, self.top_k, hidden_size).sum(1)
+
+    def _run_expert_major(
+        self,
+        hidden_states: torch.Tensor,
+        route_ids: torch.Tensor,
+        route_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Bulk fallback: dequantize one routed expert at a time into the scratch's head.
+
+        Each iteration consumes its rows before the next overwrites them, and the loop's
+        host round trip is confined to priming, exactly as in the exact runner.
+        """
+        tokens = int(hidden_states.shape[0])
+        route_rows = torch.arange(
+            tokens, device=self.device
+        ).repeat_interleave(self.top_k)
+        result = torch.zeros(
+            hidden_states.shape, dtype=torch.float32, device=self.device
+        )
+        for expert in sorted({int(value) for value in route_ids.tolist()}):
+            if expert < 0:
+                continue
+            selected = (route_ids == expert).nonzero(as_tuple=True)[0]
+            rows = route_rows[selected]
+            gate_up, down = self.dequantize_experts(route_ids.new_full((1,), expert))
+            projected = hidden_states[rows] @ gate_up[0].t()
+            gate, up = projected.chunk(2, dim=-1)
+            activated = (torch.nn.functional.silu(gate.float()) * up.float()).to(
+                hidden_states.dtype
+            )
+            value = activated @ down[0].t()
+            result.index_add_(0, rows, value.float() * route_weights[selected, None])
+        return result
+
+
 class MTPExactExpertRunner(MTPCPUExpertRunner):
     """Exact file-backed BF16 placement."""
 
@@ -1431,6 +1664,7 @@ __all__ = [
     "MTPGPUExpertRunner",
     "MTPNVFP4ExpertBanks",
     "MTPNVFP4ExpertRunner",
+    "MTPNVFP4GPUExpertRunner",
     "MTPDraftSampler",
     "MTPExpertStats",
     "MTPIsolatedTargetVerifier",

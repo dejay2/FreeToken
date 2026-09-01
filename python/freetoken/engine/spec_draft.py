@@ -13,6 +13,13 @@ half of ``MTPShadowObserver.__init__`` out of the same pieces and nothing else:
     runner drops the host bank copy once it has uploaded, which is what keeps the ~5 GB
     transient from becoming a ~5 GB resident.
 
+``FREETOKEN_MTP_SPEC_EXPERT_FORMAT=nvfp4`` (with ``FREETOKEN_MTP_SPEC_NVFP4_MANIFEST``) swaps
+that last piece for ``MTPNVFP4GPUExpertRunner``: the same 512 experts held quantized (~1.42 GB
+plus a fixed dequant scratch) instead of exact (5.03 GB), returning ~3.2 GB to the TARGET's
+expert cache, whose hit rate is what decode speed actually turns on. Quantized draft weights
+move the draft's logits slightly, so acceptance may dip; correctness cannot -- the target
+still decides every token. The default is unchanged.
+
 WHAT THE HEAD REMEMBERS
 -----------------------
 The MTP head is a one-layer QSA model that attends its OWN running context, so it needs its
@@ -41,8 +48,10 @@ with. ``MTPDraftSampler.sample`` is exactly that filter's one-row form, pinned b
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Sequence
+from pathlib import Path
+from typing import TYPE_CHECKING, Mapping, Sequence
 
 import torch
 
@@ -51,6 +60,64 @@ if TYPE_CHECKING:
 
 # The GPU expert runner's per-call row cap; priming chunks are split to it.
 _MAX_DRAFT_ROWS = 128
+
+_EXPERT_FORMAT_ENV = "FREETOKEN_MTP_SPEC_EXPERT_FORMAT"
+_NVFP4_MANIFEST_ENV = "FREETOKEN_MTP_SPEC_NVFP4_MANIFEST"
+
+
+def resolve_spec_expert_placement(
+    environ: Mapping[str, str] | None = None,
+) -> tuple[str, Path | None]:
+    """Which expert banks the draft head puts on the card, and where they come from.
+
+    Parsed here rather than on ``EngineConfig``: the placement is a private bank layout of
+    this head, not a serving flag. The default is the exact bf16 banks read from the target
+    checkpoint -- the placement that shipped, unchanged.
+    """
+    env = os.environ if environ is None else environ
+    placement = (env.get(_EXPERT_FORMAT_ENV, "") or "bf16").strip().lower() or "bf16"
+    if placement not in {"bf16", "nvfp4"}:
+        raise ValueError(f"{_EXPERT_FORMAT_ENV} must be bf16 or nvfp4, got {placement!r}")
+    if placement == "bf16":
+        return "bf16", None
+    raw = (env.get(_NVFP4_MANIFEST_ENV, "") or "").strip()
+    if not raw:
+        raise ValueError(
+            f"{_EXPERT_FORMAT_ENV}=nvfp4 needs {_NVFP4_MANIFEST_ENV} to name the "
+            "pre-converted expert manifest"
+        )
+    manifest = Path(raw).expanduser()
+    if not manifest.is_file():
+        raise ValueError(f"{_NVFP4_MANIFEST_ENV} is not a manifest file: {manifest}")
+    return "nvfp4", manifest.resolve()
+
+
+def spec_expert_runner_type(placement: str):
+    from freetoken.models.qwen4_exp.mtp_spike import (
+        MTPGPUExpertRunner,
+        MTPNVFP4GPUExpertRunner,
+    )
+
+    if placement == "bf16":
+        return MTPGPUExpertRunner
+    if placement == "nvfp4":
+        return MTPNVFP4GPUExpertRunner
+    raise ValueError(f"MTP draft expert placement must be bf16 or nvfp4, got {placement!r}")
+
+
+def load_spec_expert_banks(placement: str, manifest: Path | None, store):
+    """The banks the placement asks for: the checkpoint's exact rows, or the NVFP4 six."""
+
+    from freetoken.models.qwen4_exp.mtp_spike import (
+        MTPBF16ExpertBanks,
+        MTPNVFP4ExpertBanks,
+    )
+
+    if placement == "bf16":
+        return MTPBF16ExpertBanks.from_store(store)
+    if manifest is None:
+        raise ValueError(f"the nvfp4 draft placement needs {_NVFP4_MANIFEST_ENV}")
+    return MTPNVFP4ExpertBanks.from_manifest(manifest, validate_hashes=True)
 
 
 def build_shifted_pairs(
@@ -168,13 +235,12 @@ class SpecDraftHead:
 
     def _load_weights(self) -> None:
         from freetoken.models.qwen4_exp.mtp_spike import (
-            MTPBF16ExpertBanks,
-            MTPGPUExpertRunner,
             MTPStagedModelRunner,
             MTPWeightStore,
             build_mtp_weight_plan,
         )
 
+        self.expert_placement, manifest = resolve_spec_expert_placement()
         model_state = self.model.state_dict()
         with MTPWeightStore(self.engine.config.model_path) as store:
             plan = build_mtp_weight_plan(store.keys, model_state.keys())
@@ -183,11 +249,18 @@ class SpecDraftHead:
                 for entry in plan.entries
                 if not entry.expert
             }
-            banks = MTPBF16ExpertBanks.from_store(store)
+            banks = load_spec_expert_banks(self.expert_placement, manifest, store)
         self.staged_model = MTPStagedModelRunner(
             self.model, cpu_weights, device=self.device, resident=True
         )
-        self.expert_runner = MTPGPUExpertRunner(
+        extra = (
+            {}
+            if self.expert_placement == "bf16"
+            # the quantized gather's scratch is resident, so it is sized for the widest
+            # per-cycle call -- the accepted run, ``1 + depth`` rows -- and nothing wider
+            else {"max_gather_tokens": self.depth + 1}
+        )
+        self.expert_runner = spec_expert_runner_type(self.expert_placement)(
             banks,
             top_k=self.mtp_config.num_experts_per_tok,
             activation=self.mtp_config.hidden_act,
@@ -195,9 +268,10 @@ class SpecDraftHead:
             max_tokens=_MAX_DRAFT_ROWS,
             num_threads=1,
             device=self.device,
+            **extra,
         )
-        # the runner uploaded both banks and kept only their geometry; this was the last
-        # reference pinning the ~5 GB host copy
+        # the runner uploaded the banks and kept only their geometry; this was the last
+        # reference pinning the host copy
         del banks
         self.model.layers.op_list[0].mlp.experts.attach_runner(self.expert_runner)
 
@@ -524,4 +598,7 @@ __all__ = [
     "SpecDraftHead",
     "build_shifted_pairs",
     "build_shifted_rope_positions",
+    "load_spec_expert_banks",
+    "resolve_spec_expert_placement",
+    "spec_expert_runner_type",
 ]
