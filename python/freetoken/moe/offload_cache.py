@@ -875,22 +875,37 @@ class OffloadMoeCache:
         was eight torch ops per layer per step, all captured into the decode graph.
         """
 
-    def record_decode_stats_hybrid(self, layer_id: int) -> None:
-        """Hybrid stats: full miss count (pre-cap), the PCIe-fetched count (capped), and
-        the active count. The CPU computes (missing - fetched) experts. Device-side;
-        accumulates both the scalar totals and the per-layer breakdown."""
-        assert 0 <= layer_id < self.num_layers, f"layer_id {layer_id} out of range [0, {self.num_layers})"
-        missing = self.num_missing_full.sum()
+    def _record_decode_copy_stats(self, layer_id: int) -> None:
+        """Record actual decode H2D rows only after ``copy_missing`` launched them."""
+        if not self.collect_stats or self._pending_whole_layer:
+            return
+        assert 0 <= layer_id < self.num_layers, (
+            f"layer_id {layer_id} out of range [0, {self.num_layers})"
+        )
         fetched = self.num_indices.sum()
+        self.stat_fetched += fetched
+        self.stat_fetched_layer[layer_id] += fetched
+        if self.decode_target != "hybrid":
+            return
+        missing = self.num_missing_full.sum()
         active = self.active_mask.sum()
         self.stat_missing += missing
-        self.stat_fetched += fetched
         self.stat_active += active
         self.stat_calls += 1
         self.stat_missing_layer[layer_id] += missing
-        self.stat_fetched_layer[layer_id] += fetched
         self.stat_active_layer[layer_id] += active
         self.stat_steps_layer[layer_id] += 1
+
+    def bytes_per_expert_row(self) -> int:
+        """Exact H2D bytes in one registered expert row across all cache banks."""
+        return sum(
+            tensor[0].numel() * tensor.element_size()
+            for tensor in self.bank_caches.values()
+        )
+
+    def actual_h2d_bytes(self) -> int:
+        """Cumulative measured decode H2D bytes since the last stats reset."""
+        return int(self.stat_fetched.item()) * self.bytes_per_expert_row()
 
     def decode_miss_stats(self) -> dict:
         if self.decode_target == "hybrid":
@@ -1006,6 +1021,7 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
+            self._record_decode_copy_stats(layer_id)
             return
 
         from freetoken.kernel import fast_index_copy_jit
@@ -1018,6 +1034,7 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
+        self._record_decode_copy_stats(layer_id)
 
 
 def iter_offload_moe_layers(model) -> Iterator:

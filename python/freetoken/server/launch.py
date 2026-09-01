@@ -137,6 +137,12 @@ def launch_server(
     )
     logger = init_logger(__name__, "initializer")
 
+    if os.getenv("FREETOKEN_MTP_SHADOW", "0").strip() == "1":
+        if server_args.server_host != "127.0.0.1":
+            raise SystemExit("private MTP shadow must bind exactly to 127.0.0.1")
+        if server_args.max_running_req != 1:
+            raise SystemExit("private MTP shadow requires --max-running-req 1")
+
     if server_args.gpu:
         # resolve here so a typo is one clear error before any worker spawns
         from freetoken.gpu_select import resolve_gpu_uuids

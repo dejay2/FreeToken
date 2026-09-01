@@ -22,7 +22,10 @@ param(
     [ValidateSet('layer-stream', 'gpu')]
     [string]$VisionExecution = 'layer-stream',
 
-    [switch]$EnableCacheReport
+    [switch]$EnableCacheReport,
+
+    [ValidateRange(-1, 1024)]
+    [int]$CudaGraphMaxBS = -1
 )
 
 $ErrorActionPreference = 'Stop'
@@ -117,6 +120,9 @@ $serveArgs = @(
 )
 if ($EnableCacheReport) {
     $serveArgs += '--enable-cache-report'
+}
+if ($CudaGraphMaxBS -ge 0) {
+    $serveArgs += @('--cuda-graph-max-bs', "$CudaGraphMaxBS")
 }
 
 & $resolvedPython @serveArgs

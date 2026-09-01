@@ -99,27 +99,30 @@ class ParallelLMHead(VocabParallelEmbedding):
             return super().state_dict(prefix=prefix, result=result)
         return {} if result is None else result
 
-    @nvtx_annotate("LMHead")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        ctx = get_global_ctx()
-        batch = ctx.batch
-        bs = batch.size
-        if batch.is_prefill:
-            indices = batch.attn_metadata.get_last_indices(bs)
-            x = x[indices].contiguous()
-            del indices
-
+    def _project(self, x: torch.Tensor) -> torch.Tensor:
         module = self.tied_embedding or self
         logits = F.linear(x, module.weight, self.bias)
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape
         output_tensor = self._comm.all_gather(logits)
-
-        if bs == 1:
+        if input_shape[0] == 1:
             return output_tensor.view(1, -1)[:, : self.num_embeddings]
-
         output_tensor = output_tensor.view((self.tp_size,) + input_shape)
         output_tensor = output_tensor.permute(1, 0, 2).contiguous()
         output_tensor = output_tensor.reshape(input_shape[:1] + (self.tp_size * input_shape[1],))
         return output_tensor[:, : self.num_embeddings]
+
+    def forward_all(self, x: torch.Tensor) -> torch.Tensor:
+        """Private teacher seam: project every input row without prefill last-row slicing."""
+        return self._project(x)
+
+    @nvtx_annotate("LMHead")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ctx = get_global_ctx()
+        batch = ctx.batch
+        if batch.is_prefill:
+            indices = batch.attn_metadata.get_last_indices(batch.size)
+            x = x[indices].contiguous()
+            del indices
+        return self._project(x)

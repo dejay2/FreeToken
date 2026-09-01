@@ -119,6 +119,10 @@ class Req:
 class Batch:
     reqs: List[Req]
     phase: Literal["prefill", "decode"]
+    # Private Qwen3.8 MTP verification keeps causal prefill semantics while the
+    # offloaded MoE reads only routed experts through its decode cache. Ordinary
+    # scheduler batches leave this disabled.
+    mtp_verify: bool = field(default=False, init=False)
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)

@@ -88,6 +88,8 @@ class Scheduler(SchedulerIOMixin):
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
+        if self.engine.mtp_shadow_observer is not None:
+            self.engine.mtp_shadow_observer.bind_cache_manager(self.cache_manager)
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager

@@ -622,6 +622,54 @@ class CacheManager:
             del self._free
             self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
 
+    @contextmanager
+    def temporary_page_lease(
+        self,
+        needed_pages: int,
+        *,
+        forbidden_pages: torch.Tensor | None = None,
+    ):
+        """Lease immediately free pages without eviction and restore exact allocation order."""
+        if needed_pages < 1:
+            raise ValueError("temporary page lease must request at least one page")
+        if needed_pages > len(self.free_slots):
+            raise RuntimeError(
+                f"temporary page lease needs {needed_pages} free pages, "
+                f"only {len(self.free_slots)} are immediately free"
+            )
+
+        before = self.free_slots.clone()
+        pages = before[:needed_pages].clone()
+        page_values = [int(value) for value in pages.detach().cpu().tolist()]
+        if len(set(page_values)) != len(page_values):
+            raise ValueError("temporary page lease pages must be unique")
+        if any(value % self.page_size for value in page_values):
+            raise ValueError("temporary page lease pages must be page-aligned")
+        limit = self.num_pages * self.page_size
+        if any(value < 0 or value >= limit for value in page_values):
+            raise ValueError("temporary page lease page is out of range")
+        forbidden_values = (
+            set()
+            if forbidden_pages is None
+            else {
+                int(value)
+                for value in forbidden_pages.detach().reshape(-1).cpu().tolist()
+            }
+        )
+        if forbidden_values.intersection(page_values):
+            raise RuntimeError("temporary page lease intersects a forbidden live page")
+
+        self.free_slots = self.free_slots[needed_pages:]
+        expected_remainder = before[needed_pages:]
+        try:
+            yield pages
+        finally:
+            if not torch.equal(self.free_slots, expected_remainder):
+                raise RuntimeError(
+                    "MTP temporary page lease observed allocator mutation"
+                )
+            self.free_slots = before
+
     def _allocate(self, needed_pages: int) -> torch.Tensor:
         if needed_pages > (free_pages := len(self.free_slots)):
             need = (needed_pages - free_pages) * self.page_size

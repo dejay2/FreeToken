@@ -107,9 +107,14 @@ class Qwen4ExpModel(BaseOP):
         return list(self._ple)
 
     def prepare_mmap_ple_graph_capture(self, batch: Batch) -> None:
+        tokens = (
+            int(batch.input_ids.shape[0])
+            if getattr(batch, "mtp_verify", False)
+            else batch.padded_size
+        )
         for ple in self._ple:
             table = ple.ple_embedding.table
-            table.prepare_cuda_graph_capture(batch.padded_size * ple.ple_embedding.num_heads)
+            table.prepare_cuda_graph_capture(tokens * ple.ple_embedding.num_heads)
 
     def prepare_mmap_ple_graph_replay(self, batch: Batch) -> None:
         from .ple import build_ple_metadata
@@ -152,10 +157,16 @@ class Qwen4ExpModel(BaseOP):
             )
         return hidden.masked_scatter(mask.unsqueeze(-1), mm_embeds.to(hidden.dtype))
 
-    def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
-        hidden = self.embed_tokens.forward(input_ids)
-        hidden = self._merge_multimodal(input_ids, hidden, getattr(batch, "mm_embeds", None))
-        hidden = hidden.repeat(1, self.hc_count)
+    def _forward_state(
+        self, input_ids: torch.Tensor, batch: Batch, *, capture_inputs: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        inputs_embeds = self.embed_tokens.forward(input_ids)
+        inputs_embeds = self._merge_multimodal(
+            input_ids, inputs_embeds, getattr(batch, "mm_embeds", None)
+        )
+        hidden = inputs_embeds.repeat(1, self.hc_count)
+        captured_inputs = inputs_embeds if capture_inputs else None
+        del inputs_embeds
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
@@ -169,7 +180,22 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
-        return self.hyper_connection_mixer.mix(hidden)[0]
+        return hidden, captured_inputs
+
+    def forward_mtp_capture(
+        self, input_ids: torch.Tensor, batch: Batch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Private eager seam returning final hidden, pre-final HC state, and merged inputs."""
+        multi_stream, inputs_embeds = self._forward_state(
+            input_ids, batch, capture_inputs=True
+        )
+        assert inputs_embeds is not None
+        final_hidden = self.hyper_connection_mixer.mix(multi_stream)[0]
+        return final_hidden, multi_stream, inputs_embeds
+
+    def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+        multi_stream, _ = self._forward_state(input_ids, batch)
+        return self.hyper_connection_mixer.mix(multi_stream)[0]
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
@@ -305,6 +331,21 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 PinnedUVATable(table.bank.tensor, float(table.weight_scale))
             )
         return table.bank.nbytes
+
+    def forward_mtp_capture(
+        self, *, all_row_logits: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return private in-process capture data; ordinary ``forward`` remains unchanged."""
+        batch = get_global_ctx().batch
+        final_hidden, multi_stream, inputs_embeds = self.model.forward_mtp_capture(
+            batch.input_ids, batch
+        )
+        logits = (
+            self.lm_head.forward_all(final_hidden)
+            if all_row_logits
+            else self.lm_head.forward(final_hidden)
+        )
+        return logits, multi_stream, inputs_embeds
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch

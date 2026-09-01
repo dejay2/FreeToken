@@ -170,6 +170,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._block_topk_kernel = _resolve_block_topk()
         # decode staging (static buffers under CUDA graphs; eager decode snapshots per step)
         self._graph: dict[str, torch.Tensor] = {}
+        self._mtp_verify_graph: dict[int, QSASparseMetadata] = {}
+        self._mtp_verify_scratch: dict[int, dict[str, torch.Tensor]] = {}
+        self._mtp_verify_active_width: int | None = None
         self.capture_bs: List[int] = []
 
     @staticmethod
@@ -318,7 +321,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
             self._plan_index_writes(md, batch)
 
         self._update_index_cache(index, md, slot)
-        indices = self._select(index, md, slot)
+        saved = getattr(batch, "mtp_qsa_saved_blocks", None)
+        if isinstance(saved, dict) and slot in saved:
+            indices = self._expand_selected_blocks(saved[slot], md)
+        else:
+            indices = self._select(index, md, slot)
+            capture = getattr(batch, "mtp_qsa_capture_blocks", None)
+            if isinstance(capture, dict):
+                capture[slot] = self._mtp_last_selected_blocks.detach().clone()
         return qsa_sparse_paged_attention(
             q,
             self.kvcache.k_cache(layer_id),
@@ -430,6 +440,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
         cmp_pages = self._cmp_pages(slot)
         columns = md.block_table.shape[1] * self.cmp_page_size
         indices = self._scratch("indices", rows, self.select_width, dtype=torch.int32)
+        selected_blocks = self._scratch(
+            "selected_blocks", rows, self.block_topk, dtype=torch.int32
+        )
         rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
         for start in range(0, rows, rows_per_chunk):
             end = min(start + rows_per_chunk, rows)
@@ -447,7 +460,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
                 logits,
                 visible,
             )
-            blocks = self._scratch("blocks", end - start, self.block_topk, dtype=torch.int32)
+            blocks = selected_blocks[chunk]
             self._top_blocks(logits, visible, blocks)
             expand_qsa_block_indices(
                 blocks,
@@ -458,6 +471,37 @@ class QSASparseAttnBackend(BaseAttnBackend):
                 self.token_topk,
                 indices[chunk],
             )
+        # qsa_forward clones this only when a private MTP proposal asks to capture step zero.
+        self._mtp_last_selected_blocks = selected_blocks
+        return indices
+
+    def _expand_selected_blocks(
+        self, blocks: torch.Tensor, md: QSASparseMetadata
+    ) -> torch.Tensor:
+        """Re-expand a proposal chain's step-zero block choices at later positions."""
+        from freetoken.kernel.triton.qsa import expand_qsa_block_indices
+
+        rows = md.positions.numel()
+        wrong_device = blocks.device.type != self.device.type or (
+            self.device.index is not None and blocks.device.index != self.device.index
+        )
+        if wrong_device or blocks.dtype is not torch.int32:
+            raise ValueError("saved MTP QSA blocks must be int32 on the attention device")
+        if tuple(blocks.shape) != (rows, self.block_topk):
+            raise ValueError(
+                f"saved MTP QSA blocks must be [{rows}, {self.block_topk}], got "
+                f"{tuple(blocks.shape)}"
+            )
+        indices = self._scratch("indices", rows, self.select_width, dtype=torch.int32)
+        expand_qsa_block_indices(
+            blocks,
+            md.positions,
+            md.seq_lens,
+            md.token_to_req,
+            self.ratio,
+            self.token_topk,
+            indices,
+        )
         return indices
 
     def _top_blocks(
@@ -502,7 +546,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
     def _scratch(self, name: str, rows: int, *shape: int, dtype: torch.dtype) -> torch.Tensor:
         """A per-forward transient: the static decode buffer when it is wide enough (so a
         captured graph keeps one address), otherwise a fresh allocation."""
-        buffer = self._graph.get(name)
+        buffers = self._graph
+        if self._mtp_verify_active_width is not None:
+            buffers = self._mtp_verify_scratch[self._mtp_verify_active_width]
+        buffer = buffers.get(name)
         if buffer is not None and rows <= buffer.shape[0] and buffer.shape[1:] == shape:
             return buffer[:rows]
         return torch.empty((rows, *shape), dtype=dtype, device=self.device)
@@ -529,6 +576,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             "logits": empty(chunk, columns, dtype=torch.float32),
             "visible": empty(max_bs, dtype=torch.int32),
             "blocks": empty(max_bs, self.block_topk, dtype=torch.int32),
+            "selected_blocks": empty(max_bs, self.block_topk, dtype=torch.int32),
             "indices": empty(max_bs, self.select_width, dtype=torch.int32),
             "pooled": empty(max_bs, self.index_head_dim, dtype=self.dtype),
             "first_pos": empty(max_bs, dtype=torch.int32),
@@ -554,9 +602,162 @@ class QSASparseAttnBackend(BaseAttnBackend):
         assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
         self._stage_decode(md, batch.padded_size, batch.active_table_idx.to(torch.int64))
 
+    def _ensure_mtp_verify_scratch(self, width: int) -> None:
+        if width in self._mtp_verify_scratch:
+            return
+        page_table_width = get_global_ctx().page_table.shape[1]
+        pages = -(-page_table_width // self.page_size)
+        columns = pages * self.cmp_page_size
+        chunk = max(1, min(width, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1)))
+        topk_scratch = self._topk_scratch_width(columns)
+
+        def empty(*shape: int, dtype: torch.dtype) -> torch.Tensor:
+            return torch.empty(shape, dtype=dtype, device=self.device)
+
+        scratch = {
+            "logits": empty(chunk, columns, dtype=torch.float32),
+            "visible": empty(width, dtype=torch.int32),
+            "blocks": empty(width, self.block_topk, dtype=torch.int32),
+            "selected_blocks": empty(width, self.block_topk, dtype=torch.int32),
+            "indices": empty(width, self.select_width, dtype=torch.int32),
+            "pooled": empty(width, self.index_head_dim, dtype=self.dtype),
+            "first_pos": empty(width, dtype=torch.int32),
+            "q_index": empty(
+                width, self.index_heads, self.index_head_dim, dtype=self.dtype
+            ),
+            "ring_positions": empty(width, 3, dtype=torch.int64),
+        }
+        if topk_scratch:
+            scratch["topk_scratch"] = empty(
+                chunk, topk_scratch, dtype=torch.int32
+            )
+        self._mtp_verify_scratch[width] = scratch
+
+    def prepare_mtp_verify_graph(self, batch: Batch) -> None:
+        """Bind one private 2--4-token prefill request to persistent QSA buffers."""
+        width = int(batch.input_ids.shape[0])
+        if width not in (2, 3, 4):
+            raise ValueError("MTP QSA graph width must be exactly 2, 3, or 4 token rows")
+        if not batch.is_prefill or batch.size != 1 or batch.padded_size != 1:
+            raise ValueError("MTP QSA graph requires one prefill request")
+        if not getattr(batch, "mtp_verify", False):
+            raise ValueError("MTP QSA graph requires the private verification marker")
+        self._ensure_mtp_verify_scratch(width)
+        self._mtp_verify_active_width = width
+        source = batch.attn_metadata
+        if not isinstance(source, QSASparseMetadata) or source.is_decode:
+            raise ValueError("MTP QSA graph requires prepared prefill metadata")
+        names = (
+            "last_indices",
+            "token_to_req",
+            "cu_seqlens",
+            "seq_lens",
+            "ring_slots",
+            "block_table",
+        )
+        if any(getattr(source, name) is None for name in names):
+            raise ValueError("MTP QSA graph metadata is incomplete")
+        static = self._mtp_verify_graph.get(width)
+        if static is None:
+            static = QSASparseMetadata(
+                is_decode=False,
+                last_indices=source.last_indices.clone(),
+                qo_indptr_cpu=source.qo_indptr_cpu.clone(),
+                kv_len_cpu=source.kv_len_cpu.clone(),
+                token_to_req=source.token_to_req.clone(),
+                cu_seqlens=source.cu_seqlens.clone(),
+                seq_lens=source.seq_lens.clone(),
+                ring_slots=source.ring_slots.clone(),
+                block_table=source.block_table.clone(),
+            )
+            self._mtp_verify_graph[width] = static
+        else:
+            self._copy_mtp_verify_metadata(source, static)
+        batch.attn_metadata = static
+
+    @staticmethod
+    def _copy_mtp_verify_metadata(
+        source: QSASparseMetadata, target: QSASparseMetadata
+    ) -> None:
+        for name in (
+            "last_indices",
+            "token_to_req",
+            "cu_seqlens",
+            "seq_lens",
+            "ring_slots",
+            "block_table",
+        ):
+            source_tensor = getattr(source, name)
+            target_tensor = getattr(target, name)
+            if source_tensor is None or target_tensor is None:
+                raise ValueError(f"MTP QSA graph metadata is missing {name}")
+            if source_tensor.shape != target_tensor.shape:
+                raise ValueError(
+                    f"MTP QSA graph {name} shape changed from "
+                    f"{tuple(target_tensor.shape)} to {tuple(source_tensor.shape)}"
+                )
+            target_tensor.copy_(source_tensor)
+        if source.qo_indptr_cpu.shape != target.qo_indptr_cpu.shape:
+            raise ValueError("MTP QSA graph query-indptr shape changed")
+        if source.kv_len_cpu.shape != target.kv_len_cpu.shape:
+            raise ValueError("MTP QSA graph length shape changed")
+        target.qo_indptr_cpu.copy_(source.qo_indptr_cpu)
+        target.kv_len_cpu.copy_(source.kv_len_cpu)
+
+    def stage_mtp_verify_graph(self, runtime_batch: Batch, static_batch: Batch) -> None:
+        """Copy one replay's page, ring, and sequence values without changing addresses."""
+        runtime_width = int(runtime_batch.input_ids.shape[0])
+        static_width = int(static_batch.input_ids.shape[0])
+        if runtime_width != static_width:
+            raise ValueError("MTP QSA graph replay width does not match capture width")
+        for batch in (runtime_batch, static_batch):
+            if not batch.is_prefill or batch.size != 1 or batch.padded_size != 1:
+                raise ValueError("MTP QSA graph replay requires one prefill request")
+            if not getattr(batch, "mtp_verify", False):
+                raise ValueError(
+                    "MTP QSA graph replay requires the private verification marker"
+                )
+        source = runtime_batch.attn_metadata
+        target = static_batch.attn_metadata
+        if not isinstance(source, QSASparseMetadata) or not isinstance(
+            target, QSASparseMetadata
+        ):
+            raise ValueError("MTP QSA graph replay requires QSA metadata")
+        self._copy_mtp_verify_metadata(source, target)
+
+    def mtp_verify_graph_bytes(self) -> int:
+        seen: set[int] = set()
+        total = 0
+        values = list(self._mtp_verify_graph.values())
+        for scratch in self._mtp_verify_scratch.values():
+            values.extend(scratch.values())
+        for value in values:
+            tensors = vars(value).values() if isinstance(value, QSASparseMetadata) else (value,)
+            for tensor in tensors:
+                if not isinstance(tensor, torch.Tensor) or tensor.data_ptr() in seen:
+                    continue
+                seen.add(tensor.data_ptr())
+                total += tensor.numel() * tensor.element_size()
+        return total
+
+    def finish_mtp_verify_graph_capture(self, width: int) -> None:
+        if self._mtp_verify_active_width == width:
+            self._mtp_verify_active_width = None
+
+    def discard_mtp_verify_graph(self, width: int) -> None:
+        self._mtp_verify_graph.pop(width, None)
+        self._mtp_verify_scratch.pop(width, None)
+        self.finish_mtp_verify_graph_capture(width)
+
+    def reset_mtp_verify_graph(self) -> None:
+        self._mtp_verify_graph = {}
+        self._mtp_verify_scratch = {}
+        self._mtp_verify_active_width = None
+
     def reset_capture(self) -> None:
         super().reset_capture()
         self._graph = {}
+        self.reset_mtp_verify_graph()
 
 
 __all__ = ["QSASparseAttnBackend", "QSASparseMetadata"]

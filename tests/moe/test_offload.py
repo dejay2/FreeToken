@@ -604,6 +604,79 @@ def test_nvfp4_materialize_keeps_bookkeeping_consistent_across_requests():
     assert [fingerprint(s) for s in ids3.tolist()] == [E + 1, E + 2]
 
 
+def test_decode_copy_seam_records_actual_fetched_experts_and_exact_transfer_bytes(
+    monkeypatch,
+):
+    import freetoken.kernel as kernel
+
+    layer, cache = _make_layer_and_cache()
+    cache.collect_stats = True
+    cache._unpinned_layers = frozenset()
+    cache._pending_src_layer = 0
+    cache._pending_whole_layer = False
+    cache.num_indices.fill_(2)
+    monkeypatch.setattr(kernel, "fast_index_copy_jit", lambda *args, **kwargs: None)
+    expected_row_bytes = sum(
+        tensor[0].numel() * tensor.element_size()
+        for tensor in cache.bank_caches.values()
+    )
+
+    cache.copy_missing()
+
+    assert int(cache.stat_fetched.item()) == 2
+    assert int(cache.stat_fetched_layer[0].item()) == 2
+    assert cache.bytes_per_expert_row() == expected_row_bytes
+    assert cache.actual_h2d_bytes() == 2 * expected_row_bytes
+
+
+def test_hit_only_and_whole_layer_copy_do_not_inflate_decode_fetched_counter(
+    monkeypatch,
+):
+    import freetoken.kernel as kernel
+
+    layer, cache = _make_layer_and_cache()
+    cache.collect_stats = True
+    cache._unpinned_layers = frozenset()
+    cache._pending_src_layer = 0
+    monkeypatch.setattr(kernel, "fast_index_copy_jit", lambda *args, **kwargs: None)
+
+    cache._pending_whole_layer = False
+    cache.num_indices.zero_()
+    cache.copy_missing()
+    assert int(cache.stat_fetched.item()) == 0
+    assert cache.actual_h2d_bytes() == 0
+
+    cache._pending_whole_layer = True
+    cache.num_indices.fill_(cache.num_experts)
+    cache.copy_missing()
+    assert int(cache.stat_fetched.item()) == 0
+    assert cache.actual_h2d_bytes() == 0
+
+
+def test_hybrid_copy_seam_reconciles_missing_fetched_and_cpu_experts(monkeypatch):
+    import freetoken.kernel as kernel
+
+    layer, cache = _make_layer_and_cache()
+    cache.decode_target = "hybrid"
+    cache.collect_stats = True
+    cache._unpinned_layers = frozenset()
+    cache._pending_src_layer = 0
+    cache._pending_whole_layer = False
+    cache.num_missing_full.fill_(3)
+    cache.num_indices.fill_(2)
+    cache.active_mask.zero_()
+    cache.active_mask[:4].fill_(1)
+    monkeypatch.setattr(kernel, "fast_index_copy_jit", lambda *args, **kwargs: None)
+
+    cache.copy_missing()
+
+    assert int(cache.stat_calls.item()) == 1
+    assert int(cache.stat_active.item()) == 4
+    assert int(cache.stat_missing.item()) == 3
+    assert int(cache.stat_fetched.item()) == 2
+    assert int(cache.stat_missing.item() - cache.stat_fetched.item()) == 1
+
+
 def test_offload_cache_rebuild_resizes_and_preserves_sources():
     from freetoken.moe.offload_cache import OffloadMoeCache
 

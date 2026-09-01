@@ -918,6 +918,12 @@ class Nvfp4LMHead(BaseOP):
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
 
+    def forward_all(self, x: torch.Tensor) -> torch.Tensor:
+        """Private teacher seam: project every input row without prefill last-row slicing."""
+        if self._transposed:
+            return nvfp4_dense_linear_t(x, self.weight, self.weight_scale, self.weight_global)
+        return nvfp4_dense_linear(x, self.weight, self.weight_scale, self.weight_global)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from freetoken.core import get_global_ctx
 
@@ -925,9 +931,7 @@ class Nvfp4LMHead(BaseOP):
         if batch.is_prefill:
             indices = batch.attn_metadata.get_last_indices(batch.size)
             x = x[indices].contiguous()
-        if self._transposed:
-            return nvfp4_dense_linear_t(x, self.weight, self.weight_scale, self.weight_global)
-        return nvfp4_dense_linear(x, self.weight, self.weight_scale, self.weight_global)
+        return self.forward_all(x)
 
 
 __all__ = [

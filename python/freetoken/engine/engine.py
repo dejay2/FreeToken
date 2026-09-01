@@ -294,6 +294,10 @@ class ForwardOutput(NamedTuple):
 
 class Engine:
     def __init__(self, config: EngineConfig):
+        from .mtp_shadow import MTPShadowConfig
+
+        self._mtp_shadow_config = MTPShadowConfig.from_env(config)
+        self.mtp_shadow_observer = None
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
@@ -437,6 +441,12 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        # Heavy private state is deliberately last: target weights, trusted pools, graphs, and
+        # warmup are complete before the opt-in observer gets any memory.
+        if self._mtp_shadow_config.enabled:
+            from .mtp_shadow import MTPShadowObserver
+
+            self.mtp_shadow_observer = MTPShadowObserver(self, self._mtp_shadow_config)
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -935,8 +945,14 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        mtp_capture = None
         with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
+            if self.mtp_shadow_observer is not None:
+                # Capture is private/eager; normal serving keeps its original graph path.
+                captured = self.model.forward_mtp_capture(all_row_logits=False)
+                logits, mtp_hidden, mtp_embeddings = captured
+                mtp_capture = (logits, mtp_hidden, mtp_embeddings)
+            elif self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
@@ -945,11 +961,18 @@ class Engine:
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
 
+        observer_capture = (
+            self.mtp_shadow_observer.prepare_capture(batch, mtp_capture)
+            if self.mtp_shadow_observer is not None
+            else None
+        )
         for req in batch.reqs:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if self.mtp_shadow_observer is not None:
+            self.mtp_shadow_observer.observe(observer_capture, next_tokens_gpu[0])
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
@@ -1013,6 +1036,9 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        if self.mtp_shadow_observer is not None:
+            self.mtp_shadow_observer.close()
+            self.mtp_shadow_observer = None
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()

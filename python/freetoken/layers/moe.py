@@ -219,16 +219,31 @@ class OffloadMoELayer(MoELayer):
         self.layer_id = layer_id
         self.offload_cache: OffloadMoeCache | None = None
 
+    @staticmethod
+    def _use_decode_movement(hidden_states: torch.Tensor) -> bool:
+        """Choose expert movement without changing the batch's causal phase."""
+        batch = get_global_ctx().batch
+        if not getattr(batch, "mtp_verify", False):
+            return batch.is_decode
+        if (
+            not batch.is_prefill
+            or len(batch.reqs) != 1
+            or hidden_states.shape[0] not in (2, 3, 4)
+        ):
+            raise ValueError(
+                "private MTP verification requires one prefill request and 2 to 4 rows"
+            )
+        return True
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
     ):
-        ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
-            final_hidden_states = self.prefill_forward(hidden_states, router_logits)
-        else:
+        if self._use_decode_movement(hidden_states):
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
+        else:
+            final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         return self._maybe_all_reduce(final_hidden_states)
 
     def routed_forward(
@@ -244,11 +259,10 @@ class OffloadMoELayer(MoELayer):
         past the router. ``topk_ids`` must be safe to mutate in place (decode
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
         """
-        ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
-            out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
-        else:
+        if self._use_decode_movement(hidden_states):
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
+        else:
+            out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         return self._maybe_all_reduce(out)
 
     def decode_forward(
@@ -342,8 +356,6 @@ class OffloadMoELayer(MoELayer):
         assert executor is not None, "CPU MoE executor was not initialized"
         raw = topk_ids.clone()  # raw expert ids for the CPU partial
         cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
-        if cache.collect_stats:
-            cache.record_decode_stats_hybrid(self.layer_id)
         on_gpu = topk_ids >= 0
 
         cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
