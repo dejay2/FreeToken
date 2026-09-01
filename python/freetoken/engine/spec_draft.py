@@ -236,6 +236,11 @@ class SpecDraftHead:
         self.engine = engine
         self.device = engine.device
         self.depth = int(spec_decode.depth)
+        # The confidence cut arrives on the SAME resolved object ``depth`` does, so nothing in
+        # engine.py has to learn about it (``SpecDraftHead(self, config.spec_decode)``). The
+        # getattr keeps a hand-built stub config (tests, the shadow tooling) working: a config
+        # that predates the field simply drafts the full depth, which is the old behaviour.
+        self.conf_cut = float(getattr(spec_decode, "conf_cut", 0.0))
         self.seed = resolve_spec_seed() if seed is None else int(seed)
         self.target_ctx = engine.ctx
         self.target_model = engine.model
@@ -616,10 +621,27 @@ class SpecDraftHead:
     # ------------------------------------------------------------------------- the proposal
 
     def propose(self, req: "Req", depth: int) -> DraftProposal:
-        """Draft ``depth`` tokens, leaving the private KV exactly as it was.
+        """Draft up to ``depth`` tokens, leaving the private KV exactly as it was.
 
         The recursive rows are written at ``committed_len + i`` and undone by rewinding the
         length; the two pending rings have no epoch tag, so they are restored explicitly.
+
+        THE CONFIDENCE CUT
+        ------------------
+        With ``conf_cut > 0`` the chain stops before the first token whose raw softmax top-1
+        probability falls under the bar, and the proposal comes back SHORT (``k < depth``).
+        That is not an error anywhere downstream: ``_prepare_spec_batch`` accepts 1..depth
+        drafts, verify width is ``1 + k``, and every width in that range is graph-capturable.
+
+        The cut gates CONTINUING, never STARTING: row 0 is drafted and proposed whatever its
+        confidence. A cycle exists to verify at least one draft -- refusing to propose would
+        just be a plain decode step taken the expensive way -- and a doubtful row 0 costs only
+        the jump from w=1 to w=2, which is the cheapest row a cycle can buy. Every row after it
+        is priced against a chain that has already shown it is guessing.
+
+        Cost of the cut: ONE small device readback per drafted token (never for the last one,
+        whose confidence could not change anything), and none at all while it is disabled --
+        the zero-sync chain below stays byte for byte what it was.
         """
         from freetoken.engine.spec_sample import request_filter_params
 
@@ -645,6 +667,7 @@ class SpecDraftHead:
         # sync the stream once per token, and only the returned tuple needs host ints
         drafted: list[torch.Tensor] = []
         rows: list[torch.Tensor] = []
+        cut = self.conf_cut
         try:
             for index in range(depth):
                 logits = self.target_model.lm_head.forward_all(sample)[0]
@@ -654,6 +677,10 @@ class SpecDraftHead:
                 rows.append(logits.detach().clone())
                 drafted.append(token)
                 if index + 1 == depth:
+                    break
+                # the one sync the cut costs, and it is taken only where it can save a verify
+                # row: after the LAST token there is nothing left to stop
+                if cut > 0.0 and _row_top1(logits) < cut:
                     break
                 embedding = self.target_model.model.embed_tokens.forward(
                     token.reshape(1).to(torch.int32)
@@ -691,6 +718,20 @@ class SpecDraftHead:
         runner = getattr(self, "expert_runner", None)
         if runner is not None:
             runner.close()
+
+
+def _row_top1(logits: torch.Tensor) -> float:
+    """ONE drafted row's raw softmax top-1 probability, as a host float.
+
+    The per-step form of ``_draft_confidence``'s ``top1`` -- same detach, same float32 softmax,
+    same maximum -- so the value a cut decides on and the value the diagnosis log records for
+    that row are the same number. Raw, not filtered: under a greedy request's filter ``q`` is
+    1.0 for every draft, sure or not, which is exactly the signal the cut needs to keep.
+
+    Deliberately a module-level function rather than an inlined expression: it is the single
+    place the cut's one device readback happens, so a test can count it.
+    """
+    return float(torch.softmax(logits.detach().float(), dim=-1).max().item())
 
 
 def _draft_confidence(

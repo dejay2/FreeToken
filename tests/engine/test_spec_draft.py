@@ -93,7 +93,7 @@ class _FakeTargetModel:
         )
 
 
-def _head(*, depth=3, seed=1729, logits_for=None) -> SpecDraftHead:
+def _head(*, depth=3, seed=1729, logits_for=None, conf_cut=0.0) -> SpecDraftHead:
     import freetoken.core as core
 
     core._GLOBAL_CTX = None
@@ -106,6 +106,9 @@ def _head(*, depth=3, seed=1729, logits_for=None) -> SpecDraftHead:
     head = object.__new__(SpecDraftHead)
     head.device = CPU
     head.depth = depth
+    # off unless a test arms it: the cut is a policy on top of the chain, and everything
+    # below pins the chain itself
+    head.conf_cut = conf_cut
     head.seed = seed
     head.num_pages = PAGES
     head.target_ctx = ctx
@@ -525,6 +528,164 @@ def test_an_unprimed_head_refuses_to_propose():
     head = _head()
     with pytest.raises(RuntimeError, match="primed"):
         head.propose(_req(), 3)
+
+
+# ------------------------------------------------------------------------ the confidence cut
+#
+# The head's own raw top-1 confidence predicts the target's verdict, and a verify row is the
+# expensive thing on this box, so the chain stops before the first doubtful token. What is
+# pinned here: the chain is unchanged while the cut is disabled or nothing is doubtful, a short
+# proposal undoes exactly what a full one does, and the cut can never propose zero tokens.
+
+_SURE = 20.0  # a one-hot-ish row: softmax top-1 ~ 1.0
+_DOUBTFUL = None  # a flat row: softmax top-1 = 1 / VOCAB
+
+
+def _stepwise(confidences):
+    """A ``logits_for`` whose i-th CALL is the i-th row of ``confidences``.
+
+    ``lm_head.forward_all`` is called exactly once per drafted token and nowhere else, so the
+    call index is the draft index -- which is what lets a test place the doubt on a chosen row.
+    """
+    calls = {"n": 0}
+
+    def logits_for(_hidden: torch.Tensor) -> torch.Tensor:
+        index = calls["n"]
+        calls["n"] += 1
+        peak = confidences[index] if index < len(confidences) else _SURE
+        row = torch.zeros(VOCAB)
+        if peak is not _DOUBTFUL:
+            row[index % VOCAB] = peak
+        return row
+
+    return logits_for
+
+
+def _primed_head(*, conf_cut, confidences=()) -> SpecDraftHead:
+    head = _head(conf_cut=conf_cut, logits_for=_stepwise(confidences))
+    batch, _ = _prefill_batch(5)
+    head.observe_forward(batch, _capture(5), torch.tensor(7))
+    head.staged_model.calls.clear()
+    return head
+
+
+def test_an_armed_cut_over_confident_rows_drafts_exactly_what_the_uncut_chain_did():
+    """Nothing doubtful, nothing cut: the proposal is the pre-cut one, token for token and
+    logit row for logit row, and it writes the same recursive rows."""
+    sure = (_SURE, _SURE, _SURE)
+    uncut = _primed_head(conf_cut=0.0, confidences=sure)
+    armed = _primed_head(conf_cut=0.8, confidences=sure)
+
+    reference = uncut.propose(_req(cached_len=5), 3)
+    proposal = armed.propose(_req(cached_len=5), 3)
+
+    assert len(proposal.tokens) == 3
+    assert proposal.tokens == reference.tokens
+    assert torch.equal(proposal.logits, reference.logits)
+    assert armed.staged_model.calls == uncut.staged_model.calls == [(1, 5), (1, 6)]
+
+
+def test_a_doubtful_first_row_stops_the_chain_at_one_token():
+    head = _primed_head(conf_cut=0.8, confidences=(_DOUBTFUL, _SURE, _SURE))
+
+    proposal = head.propose(_req(cached_len=5), 3)
+
+    assert len(proposal.tokens) == 1
+    assert proposal.logits.shape == (1, VOCAB)
+    # the rows the chain never reached were never run either: that is the whole saving
+    assert head.staged_model.calls == []
+
+
+def test_a_doubtful_later_row_keeps_the_prefix_and_stops_there():
+    """The cut is per row, not per chain: a confident row 0 followed by a coin-flip row 1
+    proposes both and refuses to build a third on top of the doubt."""
+    head = _primed_head(conf_cut=0.8, confidences=(_SURE, _DOUBTFUL, _SURE))
+
+    proposal = head.propose(_req(cached_len=5), 3)
+
+    assert len(proposal.tokens) == 2
+    assert head.staged_model.calls == [(1, 5)]
+
+
+def test_a_cut_proposal_undoes_its_private_state_exactly_as_a_full_one_does():
+    """A short chain is still speculative in the draft's OWN KV: the ring restore and the
+    length rewind are the same code, and this pins that the early exit still runs it."""
+    head = _primed_head(conf_cut=0.8, confidences=(_DOUBTFUL, _SURE, _SURE))
+    before_len = head.committed_len
+    before_ring = head.kv_cache._pending_ring.clone()
+    before_positions = head.kv_cache._pending_position_ring.clone()
+
+    proposal = head.propose(_req(cached_len=before_len), 3)
+
+    assert len(proposal.tokens) == 1
+    assert head.committed_len == before_len
+    assert torch.equal(head.kv_cache._pending_ring, before_ring)
+    assert torch.equal(head.kv_cache._pending_position_ring, before_positions)
+
+
+def test_the_cut_gates_continuing_not_starting():
+    """Every row doubtful, including the first: the cycle still gets a draft to verify. A
+    cycle that proposed nothing would just be a plain decode step taken expensively, and even
+    a doubtful row 0 only costs the step from w=1 to w=2."""
+    head = _primed_head(conf_cut=1.0, confidences=(_DOUBTFUL,) * 3)
+
+    proposal = head.propose(_req(cached_len=5), 3)
+
+    assert len(proposal.tokens) == 1
+
+
+def _counted_top1(monkeypatch) -> list[float]:
+    from freetoken.engine import spec_draft as module
+
+    seen: list[float] = []
+    real = module._row_top1
+
+    def counting(logits):
+        value = real(logits)
+        seen.append(value)
+        return value
+
+    monkeypatch.setattr(module, "_row_top1", counting)
+    return seen
+
+
+def test_a_disabled_cut_computes_no_confidence_at_all(monkeypatch):
+    """The zero-sync chain is a deliberate optimization: unarmed, the cut must not cost even
+    one readback, so the confidence is not merely ignored -- it is never computed."""
+    seen = _counted_top1(monkeypatch)
+    head = _primed_head(conf_cut=0.0, confidences=(_DOUBTFUL, _DOUBTFUL, _DOUBTFUL))
+
+    proposal = head.propose(_req(cached_len=5), 3)
+
+    assert len(proposal.tokens) == 3  # doubt and all
+    assert seen == []
+
+
+def test_an_armed_cut_never_reads_back_the_last_rows_confidence(monkeypatch):
+    """One readback per drafted token EXCEPT the last: after the final draft there is no
+    further row for the confidence to stop, so the sync would buy nothing."""
+    seen = _counted_top1(monkeypatch)
+    head = _primed_head(conf_cut=0.8, confidences=(_SURE, _SURE, _SURE))
+
+    head.propose(_req(cached_len=5), 3)
+
+    assert len(seen) == 2  # depth 3, rows 0 and 1 only
+
+
+def test_the_cut_reads_the_same_raw_confidence_the_diagnosis_records(monkeypatch):
+    """The number the cut decides on and the number the conf log reports for that row are the
+    same softmax top-1, so a log gathered at one bar predicts what another bar would have done."""
+    monkeypatch.setenv("FREETOKEN_MTP_SPEC_CONF_LOG", "1")
+    head = _primed_head(conf_cut=0.0, confidences=(_SURE, _DOUBTFUL, _SURE))
+
+    proposal = head.propose(_req(cached_len=5), 3)
+
+    from freetoken.engine.spec_draft import _row_top1
+
+    assert proposal.draft_top1 == pytest.approx(
+        [_row_top1(row) for row in proposal.logits]
+    )
+    assert proposal.draft_top1[1] == pytest.approx(1.0 / VOCAB)
 
 
 # ------------------------------------------------------- the confidence-cut diagnosis fields

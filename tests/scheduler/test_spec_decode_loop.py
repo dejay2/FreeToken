@@ -93,9 +93,12 @@ class _Committed:
 class _FakeDraft:
     """Proposes from ``policy`` and records what the cycle feeds back."""
 
-    def __init__(self, target: _FakeTarget, *, policy: str = "perfect"):
+    def __init__(self, target: _FakeTarget, *, policy: str = "perfect", cut_to=None):
         self.target = target
         self.policy = policy
+        # what a confidence cut leaves behind: a proposal SHORTER than the depth it was asked
+        # for. None = never cut, i.e. the always-full-width chain.
+        self.cut_to = cut_to
         self.committed: list[_Committed] = []
         self.ready = True
         self.reset_uids: list[int] = []
@@ -113,6 +116,8 @@ class _FakeDraft:
         position = req.cached_len
         tokens: list[int] = []
         rows: list[torch.Tensor] = []
+        if self.cut_to is not None:
+            depth = min(depth, self.cut_to)
         for step in range(depth):
             if self.policy == "perfect":
                 nxt = self.target.next_token(token, position)
@@ -452,6 +457,41 @@ def test_a_partly_accepted_cycle_keeps_the_prefix_plus_the_correction():
     (msg,) = stub.sent[-1]
     assert len(msg.next_tokens) == 2  # one accepted draft + the correction
     assert (req.cached_len, req.device_len) == (10, 11)
+
+
+@pytest.mark.parametrize("k", [1, 2])
+def test_a_cut_short_proposal_round_trips_the_whole_cycle(k):
+    """A confidence cut hands the scheduler FEWER drafts than the configured depth. The step
+    is already written for that (``depth`` is min'd with ``remain_len`` today), so nothing
+    special happens: verify width is 1 + k, and a perfect short draft emits k + 1 tokens."""
+    target = _FakeTarget()
+    ladder = _RecordingLadder()
+    stub = _scheduler(target, _FakeDraft(target, cut_to=k), depth=3, ladder=ladder)
+    req = _decode_req(stub, prompt_len=8)
+
+    stub._speculative_decode_step(req)
+
+    assert target.forwards == [1 + k]  # the narrow verify, not the configured width of 4
+    assert ladder.calls[0] == ("begin", 8, 1 + k)
+    (msg,) = stub.sent[-1]
+    assert len(msg.next_tokens) == k + 1  # k accepted drafts + the bonus token
+    assert (req.cached_len, req.device_len) == (8 + k + 1, 9 + k + 1)
+    assert req.input_ids.numel() == req.device_len
+    assert req.spec_inflight is None
+
+
+def test_a_cut_short_cycle_emits_what_plain_decode_would_have():
+    """The cut is a COST policy, never a correctness one: the target still decides every
+    token, so a one-draft cycle's output is the plain decode's, token for token."""
+    _, plain_req, plain = _plain_decode(_FakeTarget(), prompt_len=8, output_len=12)
+
+    target = _FakeTarget()
+    stub = _scheduler(target, _FakeDraft(target, cut_to=1))
+    req = _decode_req(stub, prompt_len=8, output_len=12)
+    msgs = _run_spec(stub, req)
+
+    assert _tokens(msgs) == _tokens(plain)[1:]  # the prefill token is not a decode step
+    assert req.input_ids.tolist() == plain_req.input_ids.tolist()
 
 
 def test_the_sampled_run_lands_in_the_token_pool_at_its_own_positions():

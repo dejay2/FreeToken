@@ -36,6 +36,14 @@ class SpecDecodeConfig:
     enabled: bool = False
     depth: int = _MAX_SPEC_DEPTH
     graph: bool = False
+    # --- the confidence cut (see ``SpecDraftHead.propose``) ---
+    # Stop the draft chain before the first token whose RAW softmax top-1 probability falls
+    # under this bar. Measured over 600 live cycles: accepted drafts average 0.91 confidence,
+    # rejected 0.46; the <0.5 bucket is accepted 20% of the time, the >=0.95 bucket 81%. Cutting
+    # at 0.8 takes the mean draft from 3.0 to 1.5 and acceptance-per-draft from 0.58 to 0.91,
+    # which models out at 1.18x on prose because verify width is what a cycle actually costs
+    # here (~6.5 ms/row of expert fetch). 0 disables the cut and restores always-full-depth.
+    conf_cut: float = 0.8
     # --- the adaptive fallback (see ``adaptive``) ---
     ema_alpha: float = 0.3
     min_emitted: float = 3.2
@@ -52,13 +60,21 @@ class SpecDecodeConfig:
         A speculative cycle costs about ``min_emitted`` plain steps whatever the draft
         produces, so below that it is a net loss. ``min_emitted`` 0 means never fall back --
         the pre-adaptive always-speculate behaviour, exactly.
+
+        What that cycle costs depends on ``conf_cut``: an always-full-width cycle verifies
+        ``1 + depth`` rows, a cut one verifies far fewer, so the two arm different bars. See
+        the unset default in ``resolve_spec_decode``.
         """
         return self.enabled and self.min_emitted > 0.0
 
     @property
     def ema_seed(self) -> float:
         """A fresh request starts optimistic -- one full cycle's emission -- so early noise
-        cannot lock speculation out before the request has evidence of its own."""
+        cannot lock speculation out before the request has evidence of its own.
+
+        Left at the full ``1 + depth`` even with ``conf_cut`` armed, where a cut cycle usually
+        emits less than that: the seed is a head start, not a prediction, and the first few
+        real cycles overwrite it at ``ema_alpha`` anyway."""
         return float(self.batch_width)
 
     @property
@@ -99,8 +115,9 @@ class SpecDecodeConfig:
 
 def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfig:
     """Read ``FREETOKEN_MTP_SPECULATE`` / ``FREETOKEN_MTP_SPEC_DEPTH`` / ``..._SPEC_GRAPH``,
-    plus the adaptive fallback's ``..._SPEC_EMA_ALPHA`` / ``..._SPEC_MIN_EMITTED`` /
-    ``..._SPEC_PROBE_RESUME`` / ``..._SPEC_COOLDOWN``."""
+    the drafting cut's ``..._SPEC_CONF_CUT``, plus the adaptive fallback's
+    ``..._SPEC_EMA_ALPHA`` / ``..._SPEC_MIN_EMITTED`` / ``..._SPEC_PROBE_RESUME`` /
+    ``..._SPEC_COOLDOWN``."""
     env = os.environ if env is None else env
     raw = env.get("FREETOKEN_MTP_SPECULATE", "0").strip()
     if raw not in ("0", "1"):
@@ -129,13 +146,29 @@ def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfi
         raise ValueError(
             f"FREETOKEN_MTP_SPEC_EMA_ALPHA must be in (0, 1], got {alpha!r}"
         )
-    # 3.6 is the measured end-to-end breakeven: a graphed depth-3 cycle costs ~3.7 plain
-    # steps (verify replay is PCIe expert-fetch bound at w rows), and same-boot profiles
-    # show prose LOSES at a 3.2 bar and recovers monotonically toward plain parity as the
-    # bar rises to it. At shallow depths the ceiling below binds first, so the unset
-    # default clamps to it.
+    conf_cut = _float_env(env, "FREETOKEN_MTP_SPEC_CONF_CUT", "0.8")
+    if not 0.0 <= conf_cut <= 1.0:
+        # It is a softmax probability, so anything outside 0..1 is either a typo or a bar no
+        # row could ever clear -- which would silently mean "always draft exactly 1 token".
+        raise ValueError(
+            f"FREETOKEN_MTP_SPEC_CONF_CUT must be 0..1, got {conf_cut!r}"
+        )
+    # The bar the adaptive fallback holds a cycle to is a function of what a cycle COSTS, and
+    # the cut changes that:
+    #   cut off (conf_cut == 0): every cycle verifies the full 1 + depth rows. 3.6 is the
+    #     measured end-to-end breakeven -- a graphed depth-3 cycle costs ~3.7 plain steps
+    #     (verify replay is PCIe expert-fetch bound at w rows), and same-boot profiles show
+    #     prose LOSES at a 3.2 bar and recovers monotonically toward plain parity as the bar
+    #     rises to it.
+    #   cut armed (conf_cut > 0): the doomed rows never get verified, so the mean cycle is
+    #     narrower and cheaper; the same cost model puts breakeven at ~1.9-2.0. The default is
+    #     2.4 rather than 2.0 -- deliberately conservative, since the cut's own saving is what
+    #     the bar is now being asked to trust.
+    # An explicit FREETOKEN_MTP_SPEC_MIN_EMITTED always wins over both. At shallow depths the
+    # 1 + depth ceiling binds first, so either default clamps to it.
+    breakeven = 3.6 if conf_cut == 0.0 else 2.4
     min_emitted = _float_env(
-        env, "FREETOKEN_MTP_SPEC_MIN_EMITTED", str(min(3.6, float(1 + depth)))
+        env, "FREETOKEN_MTP_SPEC_MIN_EMITTED", str(min(breakeven, float(1 + depth)))
     )
     if not 0.0 <= min_emitted <= 1 + depth:
         # Above the full width no cycle could ever clear the bar, so speculation would go
@@ -164,6 +197,7 @@ def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfi
         enabled=enabled,
         depth=depth,
         graph=graph_raw == "1",
+        conf_cut=conf_cut,
         ema_alpha=alpha,
         min_emitted=min_emitted,
         probe_resume=probe_resume,

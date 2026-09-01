@@ -85,8 +85,9 @@ def test_the_engine_config_resolves_the_flags_once_for_engine_and_scheduler(monk
     config = SchedulerConfig(
         model_path="unused", tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16
     )
-    # the unset MIN_EMITTED default clamps to the 1+depth ceiling at shallow depths
-    assert config.spec_decode == SpecDecodeConfig(enabled=True, depth=2, min_emitted=3.0)
+    # the unset MIN_EMITTED default is the cut-armed breakeven (the cut is on by default),
+    # clamped to the 1+depth ceiling at shallow depths
+    assert config.spec_decode == SpecDecodeConfig(enabled=True, depth=2, min_emitted=2.4)
     assert config.num_speculative_tokens == 2
     # memoized: the engine and the scheduler read the same object, never the env twice
     monkeypatch.setenv("FREETOKEN_MTP_SPEC_DEPTH", "3")
@@ -217,6 +218,66 @@ def test_speculation_refuses_more_than_one_running_request_at_boot():
     )
 
 
+# ------------------------------------------------ the CPU MoE executor's verify-width sizing
+#
+# The cpu/hybrid decode target cuts its C++ scratch and pinned IO buffers to ``max_tokens``
+# once, before graph capture. A verify step submits the whole w = 1 + depth row block in ONE
+# forward while max_running_req is pinned to 1, so the plain decode bounds miss it entirely.
+
+
+def _sizing_config(*, max_running_req=1, cuda_graph_max_bs=None, spec=SpecDecodeConfig()):
+    return SimpleNamespace(
+        max_running_req=max_running_req,
+        cuda_graph_max_bs=cuda_graph_max_bs,
+        spec_decode=spec,
+    )
+
+
+def test_the_cpu_moe_executor_is_sized_for_the_speculative_verify_width():
+    from freetoken.engine.engine import _cpu_moe_executor_tokens
+
+    # the candidate launcher's shape: one running request, no captured decode graph --
+    # without the verify width the pool would be cut to a single row.
+    spec = SpecDecodeConfig(enabled=True, depth=3)
+    assert _cpu_moe_executor_tokens(_sizing_config(spec=spec)) == 4
+    assert _cpu_moe_executor_tokens(
+        _sizing_config(cuda_graph_max_bs=0, spec=spec)
+    ) == 4
+
+
+@pytest.mark.parametrize("depth,tokens", [(1, 2), (2, 3), (3, 4)])
+def test_the_sizing_follows_the_configured_depth(depth, tokens):
+    from freetoken.engine.engine import _cpu_moe_executor_tokens
+
+    spec = SpecDecodeConfig(enabled=True, depth=depth)
+    assert _cpu_moe_executor_tokens(_sizing_config(spec=spec)) == tokens
+
+
+def test_the_plain_decode_bounds_still_win_when_they_are_wider():
+    from freetoken.engine.engine import _cpu_moe_executor_tokens
+
+    spec = SpecDecodeConfig(enabled=True, depth=3)
+    assert _cpu_moe_executor_tokens(_sizing_config(max_running_req=8, spec=spec)) == 8
+    assert _cpu_moe_executor_tokens(
+        _sizing_config(cuda_graph_max_bs=16, spec=spec)
+    ) == 16
+
+
+def test_speculation_off_leaves_the_sizing_exactly_as_it_was():
+    from freetoken.engine.engine import _cpu_moe_executor_tokens
+
+    off = SpecDecodeConfig()  # batch_width 1: inert
+    assert _cpu_moe_executor_tokens(_sizing_config(spec=off)) == 1
+    assert _cpu_moe_executor_tokens(_sizing_config(max_running_req=4, spec=off)) == 4
+    assert _cpu_moe_executor_tokens(
+        _sizing_config(max_running_req=4, cuda_graph_max_bs=8, spec=off)
+    ) == 8
+    # depth alone reserves nothing while the flag is off
+    assert _cpu_moe_executor_tokens(
+        _sizing_config(spec=SpecDecodeConfig(enabled=False, depth=3))
+    ) == 1
+
+
 # --------------------------------------------------- FREETOKEN_MTP_SPEC_GRAPH (default off)
 
 
@@ -269,9 +330,10 @@ def test_the_graph_flag_alone_captures_nothing_while_speculation_is_off():
 
 
 def test_the_fallback_defaults_are_the_measured_breakeven():
+    """The cut is armed by default, so the bar a cycle is held to is the CUT cycle's."""
     spec = resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"})
     assert spec.ema_alpha == pytest.approx(0.3)
-    assert spec.min_emitted == pytest.approx(3.6)
+    assert spec.min_emitted == pytest.approx(2.4)
     assert spec.cooldown == 16
     assert spec.adaptive is True
 
@@ -279,7 +341,7 @@ def test_the_fallback_defaults_are_the_measured_breakeven():
 def test_the_fallback_is_inert_while_speculation_is_off():
     spec = resolve_spec_decode({})
     assert spec.adaptive is False
-    assert spec.min_emitted == pytest.approx(3.6)  # parsed, but nothing consults it
+    assert spec.min_emitted == pytest.approx(2.4)  # parsed, but nothing consults it
 
 
 def test_a_zero_threshold_restores_always_speculate():
@@ -367,3 +429,68 @@ def test_the_threshold_ceiling_follows_the_configured_depth():
 def test_a_cooldown_below_one_step_is_rejected(raw):
     with pytest.raises(ValueError, match="FREETOKEN_MTP_SPEC_COOLDOWN"):
         resolve_spec_decode({"FREETOKEN_MTP_SPEC_COOLDOWN": raw})
+
+
+# ----------------------------------------------------------------------- the confidence cut
+#
+# The draft head's own top-1 confidence predicts the target's verdict (accepted drafts average
+# 0.91, rejected 0.46), and verify width is what a cycle costs on this box -- so stopping the
+# chain at the first doubtful row is the knob, and 0.8 is where it was measured.
+
+
+def test_the_cut_is_armed_at_the_measured_bar_by_default():
+    assert resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"}).conf_cut == pytest.approx(0.8)
+    assert resolve_spec_decode({}).conf_cut == pytest.approx(0.8)
+
+
+def test_the_cut_reads_its_own_variable():
+    spec = resolve_spec_decode(
+        {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_CONF_CUT": "0.55"}
+    )
+    assert spec.conf_cut == pytest.approx(0.55)
+
+
+def test_a_zero_cut_restores_always_full_depth_drafting():
+    spec = resolve_spec_decode(
+        {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_CONF_CUT": "0"}
+    )
+    assert spec.conf_cut == 0.0
+
+
+@pytest.mark.parametrize("raw", ["-0.1", "1.1", "2", "x", "", "nan"])
+def test_a_cut_outside_a_probability_is_rejected(raw):
+    """It is compared against a softmax probability: a bar above 1 no row could ever clear
+    would silently mean 'always draft exactly one token'."""
+    with pytest.raises(ValueError, match="FREETOKEN_MTP_SPEC_CONF_CUT"):
+        resolve_spec_decode({"FREETOKEN_MTP_SPEC_CONF_CUT": raw})
+
+
+def test_the_unset_emission_bar_follows_whether_the_cut_is_armed():
+    """A cut cycle verifies fewer rows, so it is cheaper, so the bar it has to clear to be
+    worth taking is lower: ~2.0 modelled, 2.4 chosen conservatively, against 3.6 uncut."""
+    armed = resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"})
+    assert armed.min_emitted == pytest.approx(2.4)
+    disabled = resolve_spec_decode(
+        {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_CONF_CUT": "0"}
+    )
+    assert disabled.min_emitted == pytest.approx(3.6)
+
+
+def test_the_cut_aware_default_still_clamps_to_the_full_width_ceiling():
+    """At depth 1 the ceiling (1 + depth = 2) binds below the cut-armed 2.4."""
+    spec = resolve_spec_decode(
+        {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_DEPTH": "1"}
+    )
+    assert spec.min_emitted == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize("cut", ["0", "0.8"])
+def test_an_explicit_emission_bar_wins_over_either_cut_default(cut):
+    spec = resolve_spec_decode(
+        {
+            "FREETOKEN_MTP_SPECULATE": "1",
+            "FREETOKEN_MTP_SPEC_CONF_CUT": cut,
+            "FREETOKEN_MTP_SPEC_MIN_EMITTED": "3.1",
+        }
+    )
+    assert spec.min_emitted == pytest.approx(3.1)
