@@ -26,6 +26,15 @@ from .hc import GatedResidual, GroupedPlusOneRMSNorm
 from .model import Qwen4ExpDecoderLayer
 
 
+# HBM the resident runner will spend gathering routed expert weights before it switches to the
+# expert-major loop.
+_ROUTED_GATHER_BUDGET_BYTES = 512 << 20
+# ...and a floor the budget cannot argue with. Every call on the per-cycle speculative path is
+# at most the widest step -- one row per draft step, and the accepted run (<= 1 + depth) when
+# the head commits it -- so those must never reach the loop, whose per-expert host round trip
+# is both a stall and capture-illegal. Their traffic is bounded by this row count either way.
+_ROUTED_GATHER_MIN_TOKENS = 4
+
 _EXPERT_MODEL_NAMES = frozenset(
     {
         "layers.0.mlp.experts.gate_up_proj",
@@ -551,6 +560,14 @@ class MTPGPUExpertRunner:
             tensor.numel() * tensor.element_size()
             for tensor in (self.gate_up, self.down)
         )
+        # Rows the routed gather may materialize before the expert-major loop takes over.
+        # The gathered path costs tokens * top_k * bytes_per_expert of pure HBM traffic, which
+        # is a rounding error at a speculative width and ~8 GB over a 128-row priming chunk.
+        self.gather_max_tokens = max(
+            _ROUTED_GATHER_MIN_TOKENS,
+            _ROUTED_GATHER_BUDGET_BYTES
+            // (self.top_k * max(self.banks.bytes_per_expert, 1)),
+        )
 
     def route(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
@@ -596,14 +613,76 @@ class MTPGPUExpertRunner:
 
         route_ids = topk_ids.reshape(-1).to(torch.int64)
         route_weights = topk_weights.reshape(-1).to(torch.float32)
+        if tokens <= self.gather_max_tokens:
+            result = self._run_gathered(hidden_states, route_ids, route_weights)
+        else:
+            result = self._run_expert_major(hidden_states, route_ids, route_weights)
+
+        self.stats.calls += 1
+        self.stats.tokens += tokens
+        self.stats.logical_expert_bytes += (
+            tokens * self.top_k * self.banks.bytes_per_expert
+        )
+        return result.to(hidden_states.dtype)
+
+    def _run_gathered(
+        self,
+        hidden_states: torch.Tensor,
+        route_ids: torch.Tensor,
+        route_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Route by GATHERING each (token, slot) pair's expert rows -- no host round trip.
+
+        The expert-major loop below has to learn which experts were routed, and the only way to
+        learn that on the host is ``route_ids.tolist()`` -- a device synchronization per expert
+        call, which is both a per-cycle stall and outright illegal under CUDA-graph capture.
+        Indexing the banks by ``route_ids`` instead keeps every decision on the device: the
+        routing tensors are read only by the gather, and the whole call becomes one fixed
+        sequence of kernels whose shapes depend on the token count alone.
+
+        Numerically this is the same arithmetic in the same order per route -- one bf16 GEMM
+        into fp32 accumulators, silu/multiply in fp32, a second bf16 GEMM, and an fp32 weighted
+        sum over the ``top_k`` routes of a token. Only the batching changes: ``bmm`` over the
+        pairs rather than one GEMM per expert over its rows.
+        """
+        tokens, hidden_size = hidden_states.shape
+        # A router may mark a slot unrouted with a negative id. Clamp it to a real row so the
+        # gather stays in bounds and zero its weight, which drops it from the sum -- the
+        # branchless twin of the loop's ``if expert < 0: continue``.
+        routed = route_ids >= 0
+        safe_ids = torch.where(routed, route_ids, torch.zeros_like(route_ids))
+        weights = torch.where(routed, route_weights, torch.zeros_like(route_weights))
+        rows = hidden_states.repeat_interleave(self.top_k, dim=0).unsqueeze(1)
+        gate_up = self.gate_up.index_select(0, safe_ids)
+        projected = torch.bmm(rows, gate_up.transpose(1, 2)).squeeze(1)
+        gate, up = projected.chunk(2, dim=-1)
+        activated = (torch.nn.functional.silu(gate.float()) * up.float()).to(
+            hidden_states.dtype
+        )
+        down = self.down.index_select(0, safe_ids)
+        value = torch.bmm(activated.unsqueeze(1), down.transpose(1, 2)).squeeze(1)
+        return (value.float() * weights[:, None]).view(tokens, self.top_k, hidden_size).sum(1)
+
+    def _run_expert_major(
+        self,
+        hidden_states: torch.Tensor,
+        route_ids: torch.Tensor,
+        route_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Bulk fallback: one GEMM per routed expert, reading its bank row as a view.
+
+        Beyond ``gather_max_tokens`` the gathered path's weight traffic stops being free, so
+        prompt priming (up to 128 rows a chunk, one-off per request) still runs this. It
+        synchronizes on ``route_ids`` and cannot be captured -- neither matters off the
+        per-cycle speculative path.
+        """
+        tokens = int(hidden_states.shape[0])
         route_rows = torch.arange(
             tokens, device=self.device
         ).repeat_interleave(self.top_k)
         result = torch.zeros(
             hidden_states.shape, dtype=torch.float32, device=self.device
         )
-        # Expert-major: indexing one bank row is a view, so the routed weights are never
-        # copied. The alternative (a per-route gather) materializes tokens x expert bytes.
         for expert in sorted({int(value) for value in route_ids.tolist()}):
             if expert < 0:
                 continue
@@ -616,13 +695,7 @@ class MTPGPUExpertRunner:
             )
             value = activated @ self.down[expert].t()
             result.index_add_(0, rows, value.float() * route_weights[selected, None])
-
-        self.stats.calls += 1
-        self.stats.tokens += tokens
-        self.stats.logical_expert_bytes += (
-            tokens * self.top_k * self.banks.bytes_per_expert
-        )
-        return result.to(hidden_states.dtype)
+        return result
 
     def forward(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor

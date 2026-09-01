@@ -1152,6 +1152,23 @@ class Scheduler(SchedulerIOMixin):
 
     # -------------------------------------------------------------- integrated speculation
 
+    def _spec_timing_probe(self) -> "_SpecTimingProbe | None":
+        """Per-stage cycle timing behind FREETOKEN_MTP_SPEC_TIMING=1. The probe device-syncs
+        at every mark, so it distorts absolute rates -- diagnosis only, never benchmarks."""
+        probe = getattr(self, "_spec_probe", False)
+        if probe is False:
+            import os
+
+            probe = (
+                _SpecTimingProbe(self.device)
+                if os.getenv("FREETOKEN_MTP_SPEC_TIMING") == "1"
+                else None
+            )
+            self._spec_probe = probe
+        if probe is not None:
+            probe.start_cycle()
+        return probe
+
     def _spec_dispatch_ready(self) -> bool:
         """Whether this iteration should try a speculative step instead of a plain decode.
 
@@ -1210,8 +1227,10 @@ class Scheduler(SchedulerIOMixin):
         radix guard refuses a commit under in-flight speculative rows.
         """
         engine = self.engine
+        probe = self._spec_timing_probe()
         depth = min(self.config.spec_decode.depth, req.remain_len)
         proposal = engine.spec_draft.propose(req, depth)
+        probe and probe.mark("draft")
 
         forward_input = self._prepare_spec_batch(req, proposal.tokens)
         batch, sample_args, input_mapping, write_mapping = forward_input
@@ -1219,12 +1238,14 @@ class Scheduler(SchedulerIOMixin):
         ladder = engine.spec_state_ladder
         if ladder is not None:
             ladder.begin(req, batch)
+        probe and probe.mark("prepare")
         output = engine.speculative_decode_batch(
             batch,
             sample_args,
             draft_tokens=proposal.tokens,
             draft_logits=proposal.logits,
         )
+        probe and probe.mark("verify+accept")
 
         msg = self._emit_step_tokens(
             req, torch.tensor(output.decision.tokens, dtype=torch.int32), settled=True
@@ -1241,6 +1262,7 @@ class Scheduler(SchedulerIOMixin):
             decision.accepted_rows,
             state_rollback=None if ladder is None else ladder.rollback,
         )
+        probe and probe.mark("emit+rollback")
 
         if msg.finished:
             engine.spec_draft.reset_request(req.uid)
@@ -1250,6 +1272,7 @@ class Scheduler(SchedulerIOMixin):
             engine.spec_draft.commit(
                 req, hidden=output.hidden, token_ids=msg.next_tokens
             )
+        probe and probe.finish_cycle(emitted=emitted, accepted=decision.accepted_rows)
         self.decode_manager.filter_reqs([req])
 
         finished_now: Set[Req] = set()
@@ -1413,6 +1436,43 @@ def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
     ]
     write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
     return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
+
+
+class _SpecTimingProbe:
+    """Accumulates per-stage wall time across speculative cycles; logs every 32 cycles."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.stages: dict[str, float] = {}
+        self.cycles = 0
+        self.emitted = 0
+        self.accepted_rows = 0
+        self._t0 = 0.0
+
+    def _now(self) -> float:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        return time.perf_counter()
+
+    def start_cycle(self) -> None:
+        self._t0 = self._now()
+
+    def mark(self, stage: str) -> None:
+        now = self._now()
+        self.stages[stage] = self.stages.get(stage, 0.0) + (now - self._t0)
+        self._t0 = now
+
+    def finish_cycle(self, *, emitted: int, accepted: int) -> None:
+        self.mark("tail")
+        self.cycles += 1
+        self.emitted += emitted
+        self.accepted_rows += accepted
+        if self.cycles % 32 == 0:
+            per = {k: f"{1e3 * v / self.cycles:.1f}" for k, v in self.stages.items()}
+            logger.info(
+                "spec timing over %d cycles: ms/cycle %s | emitted/cycle %.2f",
+                self.cycles, per, self.emitted / self.cycles,
+            )
 
 
 def _make_spec_write_tuple(batch: Batch, device: torch.device) -> Indice2D:

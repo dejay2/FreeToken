@@ -197,6 +197,9 @@ def _scheduler(target, draft, *, enabled=True, depth=3, page_size=64, num_pages=
         spec_sampler=SpecSampler(device=CPU, depth=depth),
         spec_draft=draft,
         spec_state_ladder=ladder,
+        # eager, as FREETOKEN_MTP_SPEC_GRAPH=0 leaves it: the loop's contract is the same
+        # either way, and the graph path has its own gate in tests/engine/test_spec_verify_graph
+        spec_graph_runner=None,
         cpu_moe_executor=None,
         mtp_shadow_observer=None,
     )

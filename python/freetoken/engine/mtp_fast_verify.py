@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import gc
 import math
 import time
-import traceback
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 from flashlib.kernels.slot_cache import Stat
@@ -20,11 +17,13 @@ from freetoken.engine.spec_sample import (  # noqa: F401
     batched_speculative_accept,
 )
 
-_GRAPH_CAPTURE_RESERVE_FLOOR = 64 << 20
-# the graph runner has no config handle, so the capture-failure traceback lands in the
-# approved private evidence dir by absolute path; every write is best-effort
-_CAPTURE_FAILURE_EVIDENCE_DIR = Path(
-    r"D:\FreeToken-ple-mmap-vision\.local\mtp-spike\evidence"
+# Survivable fixed-width capture now lives in spec_graph, shared with the integrated
+# speculative step; re-exported here because the observer and its tests import it from the
+# verifier and that surface has to keep working.
+from freetoken.engine.spec_graph import (  # noqa: F401
+    MTPGraphCaptureResult,
+    _FixedWidthGraphRunner,
+    _MTPVerifyGraphBuffer,
 )
 
 
@@ -504,97 +503,13 @@ class MTPFastVerifier:
         )
 
 
-@dataclass(frozen=True)
-class MTPGraphCaptureResult:
-    width: int
-    status: str
-    reason: str
-    memory_bytes: int
-    synchronizations: int = 0
+class MTPVerifyGraphRunner(_FixedWidthGraphRunner):
+    """Private fixed-width CUDA graphs for the 2--4-row target checker.
 
-
-@dataclass
-class _MTPVerifyGraphBuffer:
-    input_ids: torch.Tensor
-    positions: torch.Tensor
-    out_loc: torch.Tensor
-    rope_positions: torch.Tensor
-    linear_table_idx: torch.Tensor
-    fla_cu_seqlens: torch.Tensor
-    fla_has_initial_state: torch.Tensor
-    logits: torch.Tensor
-
-    @classmethod
-    def init(
-        cls, width: int, vocab_size: int, device: torch.device
-    ) -> _MTPVerifyGraphBuffer:
-        return cls(
-            input_ids=torch.empty(width, dtype=torch.int32, device=device),
-            positions=torch.empty(width, dtype=torch.int32, device=device),
-            out_loc=torch.empty(width, dtype=torch.int32, device=device),
-            rope_positions=torch.empty((3, width), dtype=torch.int64, device=device),
-            linear_table_idx=torch.empty(1, dtype=torch.int32, device=device),
-            # int64 so the GDN kernels' `.to(torch.int64)` is an identity no-op — the fla
-            # chunk-index cache is keyed on tensor identity, and a per-call cast would miss
-            # it inside capture and rebuild the indices via a pageable H2D copy
-            fla_cu_seqlens=torch.tensor([0, width], dtype=torch.int64, device=device),
-            fla_has_initial_state=torch.ones(1, dtype=torch.bool, device=device),
-            logits=torch.empty((width, vocab_size), dtype=torch.float32, device=device),
-        )
-
-    @property
-    def nbytes(self) -> int:
-        return sum(
-            tensor.numel() * tensor.element_size()
-            for tensor in vars(self).values()
-            if isinstance(tensor, torch.Tensor)
-        )
-
-    def copy_from(self, batch) -> None:
-        width = self.input_ids.shape[0]
-        if int(batch.input_ids.shape[0]) != width:
-            raise ValueError("MTP graph replay width does not match capture width")
-        if not batch.is_prefill or batch.size != 1 or batch.padded_size != 1:
-            raise ValueError("MTP graph replay requires one prefill request")
-        if not getattr(batch, "mtp_verify", False):
-            raise ValueError("MTP graph replay requires the private verification marker")
-        self.input_ids.copy_(batch.input_ids)
-        self.positions.copy_(batch.positions)
-        self.out_loc.copy_(batch.out_loc)
-        rope_positions = getattr(batch, "rope_positions", None)
-        if rope_positions is None:
-            self.rope_positions.copy_(
-                batch.positions.to(torch.int64).expand(3, -1)
-            )
-        else:
-            self.rope_positions.copy_(rope_positions)
-        self.linear_table_idx.copy_(batch.linear_table_idx[:1])
-        fla = getattr(batch, "fla_metadata", None)
-        has_initial_state = getattr(fla, "has_initial_state", None)
-        if has_initial_state is not None:
-            self.fla_has_initial_state.copy_(has_initial_state[:1])
-        else:
-            self.fla_has_initial_state.fill_(True)
-
-    def bind(self, batch) -> None:
-        from freetoken.attention.linear import FLAMetadata
-
-        batch.input_ids = self.input_ids
-        batch.positions = self.positions
-        batch.out_loc = self.out_loc
-        batch.rope_positions = self.rope_positions
-        batch.linear_table_idx = self.linear_table_idx
-        batch.fla_metadata = FLAMetadata(
-            cu_seqlens=self.fla_cu_seqlens,
-            cache_indices=self.linear_table_idx,
-            has_initial_state=self.fla_has_initial_state,
-            max_seq_len=int(self.input_ids.shape[0]),
-        )
-        batch.mtp_verify = True
-
-
-class MTPVerifyGraphRunner:
-    """Private fixed-width CUDA graphs for the 2--4-row target checker."""
+    The survivable-capture machinery lives in ``spec_graph`` so the integrated speculative step
+    shares it; what stays here is the observer's own surface -- MoE-movement instrumentation,
+    per-replay timing, and the logits-only fp32 buffer.
+    """
 
     widths = (2, 3, 4)
 
@@ -609,332 +524,35 @@ class MTPVerifyGraphRunner:
         vocab_size: int,
         guard_bytes: int,
     ) -> None:
-        self.target_ctx = target_ctx
-        self.target_model = target_model
-        self.attn_backend = attn_backend
-        self.moe_cache = moe_cache
-        self.device = torch.device(device)
-        self.vocab_size = int(vocab_size)
-        self.guard_bytes = int(guard_bytes)
-        if self.vocab_size <= 0:
+        if int(vocab_size) <= 0:
             raise ValueError("MTP graph vocabulary size must be positive")
-        if self.guard_bytes < 0:
-            raise ValueError("MTP graph guard bytes must be non-negative")
-        self._stream = (
-            torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
+        super().__init__(
+            target_ctx=target_ctx,
+            target_model=target_model,
+            attn_backend=attn_backend,
+            device=device,
+            guard_bytes=guard_bytes,
+            widths=self.widths,
         )
-        self._pool = None
-        self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
-        self._buffers: dict[int, _MTPVerifyGraphBuffer] = {}
-        self._batches: dict[int, object] = {}
-        self._events: dict[int, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
-        self._memory_bytes: dict[int, int] = {}
-        self._support: dict[int, MTPGraphCaptureResult] = {}
-        self._last_attempt: dict[int, MTPGraphCaptureResult] = {}
-        self._fla_index_pins: dict[int, tuple[torch.Tensor, ...]] = {}
-        self._destroyed = False
-        self._graphs_disabled = False
+        self.moe_cache = moe_cache
+        self.vocab_size = int(vocab_size)
 
-    @property
-    def graph_count(self) -> int:
-        return len(self._graphs)
+    def _new_buffer(self, width: int) -> _MTPVerifyGraphBuffer:
+        return _MTPVerifyGraphBuffer.init(width, self.vocab_size, self.device)
 
-    @property
-    def owned_buffer_bytes(self) -> int:
-        attention_bytes = getattr(
-            self.attn_backend, "mtp_verify_graph_bytes", lambda: 0
-        )()
-        return sum(buffer.nbytes for buffer in self._buffers.values()) + int(
-            attention_bytes
+    def _estimated_buffer_bytes(self, width: int) -> int:
+        return (
+            width * self.vocab_size * torch.float32.itemsize
+            + width * (3 * torch.int32.itemsize + 3 * torch.int64.itemsize)
+            + 64
         )
-
-    @property
-    def live_graph_memory_bytes(self) -> int:
-        return sum(self._memory_bytes.values())
-
-    def support(self, width: int) -> MTPGraphCaptureResult | None:
-        return self._support.get(width)
-
-    def last_attempt(self, width: int) -> MTPGraphCaptureResult | None:
-        return self._last_attempt.get(width)
-
-    def _validate_width(self, batch) -> int:
-        if self._destroyed:
-            raise RuntimeError("MTP graph runner was destroyed")
-        width = int(batch.input_ids.shape[0])
-        if width not in self.widths:
-            raise ValueError("MTP graph width must be exactly 2, 3, or 4 token rows")
-        if not batch.is_prefill or batch.size != 1 or batch.padded_size != 1:
-            raise ValueError("MTP graph requires one prefill request")
-        # the graph's fla_cu_seqlens is a fixed [0, width]; a request whose extend_len says
-        # otherwise would replay against metadata that does not describe it
-        if int(batch.reqs[0].extend_len) != width:
-            raise ValueError(
-                f"MTP graph request extend_len {batch.reqs[0].extend_len} != {width} token rows"
-            )
-        if not getattr(batch, "mtp_verify", False):
-            raise ValueError("MTP graph requires the private verification marker")
-        return width
 
     def _forward(self, batch) -> torch.Tensor:
         hidden = self.target_model.model.forward(batch.input_ids, batch)
         return self.target_model.lm_head.forward_all(hidden)
 
-    def _discard_attention_width(self, width: int) -> None:
-        discard = getattr(self.attn_backend, "discard_mtp_verify_graph", None)
-        if discard is not None:
-            discard(width)
-
-    def _record_attempt(
-        self,
-        width: int,
-        *,
-        status: str,
-        reason: str,
-        memory_bytes: int = 0,
-        synchronizations: int = 0,
-    ) -> MTPGraphCaptureResult:
-        if status not in {"captured", "retryable", "permanently-unsupported"}:
-            raise ValueError(f"invalid MTP graph attempt status {status!r}")
-        result = MTPGraphCaptureResult(
-            width=width,
-            status=status,
-            reason=reason,
-            memory_bytes=memory_bytes,
-            synchronizations=synchronizations,
-        )
-        self._last_attempt[width] = result
-        if status in {"captured", "permanently-unsupported"}:
-            self._support[width] = result
-        else:
-            self._support.pop(width, None)
-        return result
-
-    def _cleanup_failed_attempt(self, width: int) -> None:
-        self._discard_attention_width(width)
-        self._graphs.pop(width, None)
-        self._buffers.pop(width, None)
-        self._batches.pop(width, None)
-        self._events.pop(width, None)
-        self._memory_bytes.pop(width, None)
-        self._fla_index_pins.pop(width, None)
-        if not self._graphs:
-            # the shared pool belonged to a graph that is going away with this attempt
-            self._pool = None
-        gc.collect()
-
-    def _reset_capture_context(self) -> bool:
-        """Rebuild the private capture stream and probe the context after a failed capture.
-
-        A ``capture_end`` that raises skips torch's stream restore, leaving the thread on the
-        capture stream with the allocator still pointed at the dead graph pool; the probe reports
-        whether the context survived at all.
-        """
-        self._pool = None
-        try:
-            self._stream = torch.cuda.Stream(device=self.device)
-            torch.zeros(1, device=self.device)
-            torch.cuda.synchronize(self.device)
-        except Exception:
-            return False
-        return True
-
-    def _disable_all_widths(self, reason: str) -> None:
-        self._graphs_disabled = True
-        for other in self.widths:
-            self._record_attempt(
-                other, status="permanently-unsupported", reason=reason
-            )
-
-    def capture(self, batch) -> MTPGraphCaptureResult:
-        width = self._validate_width(batch)
-        previous = self._support.get(width)
-        if previous is not None:
-            return previous
-        if self._graphs_disabled:
-            return self._record_attempt(
-                width,
-                status="permanently-unsupported",
-                reason="CAPTURE_CONTEXT_LOST",
-            )
-        if self.device.type != "cuda":
-            return self._record_attempt(
-                width,
-                status="permanently-unsupported",
-                reason="CUDA_REQUIRED",
-            )
-        free_before = int(torch.cuda.mem_get_info(self.device)[0])
-        owned_before = self.owned_buffer_bytes
-        estimated_buffer_bytes = (
-            width * self.vocab_size * torch.float32.itemsize
-            + width * (3 * torch.int32.itemsize + 3 * torch.int64.itemsize)
-            + 64
-        )
-        if free_before < self.guard_bytes + estimated_buffer_bytes:
-            return self._record_attempt(
-                width,
-                status="retryable",
-                reason="MEMORY_ADMISSION",
-            )
-
-        graph = torch.cuda.CUDAGraph()
-        buffer = _MTPVerifyGraphBuffer.init(width, self.vocab_size, self.device)
-        synchronizations = 0
-        entered_capture = False
-        body_error: Exception | None = None
-        # a raising capture_end skips torch's own stream restore, so own the restore here
-        entry_stream = torch.cuda.current_stream(self.device)
-        try:
-            buffer.copy_from(batch)
-            buffer.bind(batch)
-            # the fla chunk-index cache is a four-entry identity LRU and three widths need six
-            # entries: prime it so capture takes no miss, and hold the tensors so a later
-            # prefill cannot evict and free what this graph is about to bake an address for
-            # (imported lazily: fla.utils initializes CUDA at import, before Engine allows it)
-            from freetoken.kernel.fla.index import prime_chunk_index_cache
-
-            self._fla_index_pins[width] = prime_chunk_index_cache(
-                buffer.fla_cu_seqlens, width
-            )
-            prepare_attention = getattr(
-                self.attn_backend, "prepare_mtp_verify_graph", None
-            )
-            if prepare_attention is not None:
-                prepare_attention(batch)
-            prepare_model = getattr(
-                self.target_model, "prepare_cuda_graph_capture", None
-            )
-            with self.target_ctx.forward_batch(batch):
-                if prepare_model is not None:
-                    prepare_model(batch)
-                # warm up on the stream that gets captured, so per-stream lazy resources
-                # (cuBLAS workspaces, kernel modules) are already materialized there
-                self._stream.wait_stream(entry_stream)
-                with torch.cuda.stream(self._stream):
-                    buffer.logits.copy_(self._forward(batch))
-                entry_stream.wait_stream(self._stream)
-                torch.cuda.synchronize(self.device)
-                synchronizations += 1
-                free_after_warm = int(torch.cuda.mem_get_info(self.device)[0])
-                warm_reserve = max(
-                    _GRAPH_CAPTURE_RESERVE_FLOOR,
-                    free_before - free_after_warm,
-                )
-                if free_after_warm < self.guard_bytes + warm_reserve:
-                    self._cleanup_failed_attempt(width)
-                    return self._record_attempt(
-                        width,
-                        status="retryable",
-                        reason="MEMORY_ADMISSION_AFTER_WARM",
-                        synchronizations=synchronizations,
-                    )
-                entered_capture = True
-                with torch.cuda.graph(
-                    graph,
-                    pool=self._pool,
-                    stream=self._stream,
-                    # background threads (ple-mmap staging, the CPU-MoE watchdog) must not
-                    # invalidate this capture from outside
-                    capture_error_mode="thread_local",
-                ):
-                    try:
-                        buffer.logits.copy_(self._forward(batch))
-                    except Exception as exc:
-                        # capture_end raises next and would otherwise mask the real cause
-                        body_error = exc
-                        raise
-            finish_attention = getattr(
-                self.attn_backend, "finish_mtp_verify_graph_capture", None
-            )
-            if finish_attention is not None:
-                finish_attention(width)
-            captured_pool = graph.pool() if self._pool is None else self._pool
-            torch.cuda.synchronize(self.device)
-            synchronizations += 1
-            free_after = int(torch.cuda.mem_get_info(self.device)[0])
-            if free_after < self.guard_bytes:
-                self._cleanup_failed_attempt(width)
-                return self._record_attempt(
-                    width,
-                    status="retryable",
-                    reason="MEMORY_GUARD_AFTER_CAPTURE",
-                    synchronizations=synchronizations,
-                )
-        except Exception as exc:
-            torch.cuda.set_stream(entry_stream)
-            failure = body_error if body_error is not None else exc
-            graph = None
-            self._cleanup_failed_attempt(width)
-            detail = " ".join(str(failure).split())[:300]
-            reason = f"CAPTURE_FAILED:{type(failure).__name__}:{detail}"
-            try:
-                _CAPTURE_FAILURE_EVIDENCE_DIR.joinpath(
-                    f"capture-failure-tb-width{width}.txt"
-                ).write_text(
-                    "".join(
-                        traceback.format_exception(
-                            type(failure), failure, failure.__traceback__
-                        )
-                    ),
-                    encoding="utf-8",
-                )
-            except Exception:
-                pass
-            if entered_capture:
-                # retrying would re-execute the same capture-illegal op and re-poison the context
-                if not self._reset_capture_context():
-                    self._disable_all_widths("CAPTURE_CONTEXT_LOST")
-                return self._record_attempt(
-                    width,
-                    status="permanently-unsupported",
-                    reason=reason,
-                    synchronizations=synchronizations,
-                )
-            status = (
-                "permanently-unsupported"
-                if isinstance(failure, NotImplementedError)
-                else "retryable"
-            )
-            return self._record_attempt(
-                width,
-                status=status,
-                reason=reason,
-                synchronizations=synchronizations,
-            )
-        finally:
-            torch.cuda.set_stream(entry_stream)
-
-        try:
-            events = (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
-            )
-            self._graphs[width] = graph
-            self._buffers[width] = buffer
-            self._batches[width] = batch
-            self._events[width] = events
-            memory_bytes = max(
-                self.owned_buffer_bytes - owned_before,
-                free_before - free_after,
-            )
-            self._memory_bytes[width] = memory_bytes
-            if self._pool is None:
-                self._pool = captured_pool
-        except Exception as exc:
-            self._cleanup_failed_attempt(width)
-            return self._record_attempt(
-                width,
-                status="retryable",
-                reason=f"FINALIZE_FAILED:{type(exc).__name__}",
-                synchronizations=synchronizations,
-            )
-        return self._record_attempt(
-            width,
-            status="captured",
-            reason="",
-            memory_bytes=memory_bytes,
-            synchronizations=synchronizations,
-        )
+    def _run(self, batch, buffer, *, allocate: bool) -> None:
+        buffer.logits.copy_(self._forward(batch))
 
     def capture_forward(self, batch) -> MTPVerifyForwardResult:
         """Adapter used inside the observer's scratch-state transaction."""
@@ -988,7 +606,6 @@ class MTPVerifyGraphRunner:
             reason = support.reason if support is not None else "NOT_CAPTURED"
             raise RuntimeError(f"MTP graph width {width} is unavailable: {reason}")
         buffer = self._buffers[width]
-        static_batch = self._batches[width]
         instrumentation_started = time.perf_counter()
         before = MTPFastVerifier._stats_snapshot(self.moe_cache)
         instrumentation_synchronizations = 0
@@ -1001,16 +618,7 @@ class MTPVerifyGraphRunner:
         start_event, end_event = self._events[width]
         started = time.perf_counter()
         start_event.record()
-        buffer.copy_from(batch)
-        stage_attention = getattr(
-            self.attn_backend, "stage_mtp_verify_graph", None
-        )
-        if stage_attention is not None:
-            stage_attention(batch, static_batch)
-        prepare_model = getattr(self.target_model, "prepare_cuda_graph_replay", None)
-        if prepare_model is not None:
-            prepare_model(batch)
-        graph.replay()
+        self._replay_into_buffers(batch)
         owned_logits = buffer.logits.clone()
         end_event.record()
         torch.cuda.synchronize(self.device)
@@ -1042,23 +650,6 @@ class MTPVerifyGraphRunner:
             instrumentation_synchronizations=instrumentation_synchronizations,
             expert_movement=movement,
         )
-
-    def destroy(self) -> None:
-        self._graphs = {}
-        self._buffers = {}
-        self._batches = {}
-        self._events = {}
-        self._memory_bytes = {}
-        self._fla_index_pins = {}
-        self._support = {}
-        self._last_attempt = {}
-        self._pool = None
-        self._stream = None
-        self._destroyed = True
-        reset_attention = getattr(self.attn_backend, "reset_mtp_verify_graph", None)
-        if reset_attention is not None:
-            reset_attention()
-        gc.collect()
 
 
 __all__ = [

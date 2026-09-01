@@ -29,6 +29,20 @@ class SpecDecodeConfig:
 
     enabled: bool = False
     depth: int = _MAX_SPEC_DEPTH
+    graph: bool = False
+
+    @property
+    def graph_widths(self) -> tuple[int, ...]:
+        """The verify widths worth capturing: ``2 .. batch_width``, or nothing when off.
+
+        A step drafts ``min(depth, remain_len)`` tokens, so near a request's budget end it can
+        narrow below the full width -- but never below 2, and never above ``1 + depth``. Each
+        graph costs a warm-up forward and its own buffers, so capturing outside that range
+        would spend both on a width the configuration can never emit.
+        """
+        if not (self.enabled and self.graph):
+            return ()
+        return tuple(range(2, self.batch_width + 1))
 
     @property
     def num_speculative_tokens(self) -> int:
@@ -43,12 +57,15 @@ class SpecDecodeConfig:
 
 
 def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfig:
-    """Read ``FREETOKEN_MTP_SPECULATE`` / ``FREETOKEN_MTP_SPEC_DEPTH``."""
+    """Read ``FREETOKEN_MTP_SPECULATE`` / ``FREETOKEN_MTP_SPEC_DEPTH`` / ``..._SPEC_GRAPH``."""
     env = os.environ if env is None else env
     raw = env.get("FREETOKEN_MTP_SPECULATE", "0").strip()
     if raw not in ("0", "1"):
         raise ValueError("FREETOKEN_MTP_SPECULATE must be 0 or 1")
     enabled = raw == "1"
+    graph_raw = env.get("FREETOKEN_MTP_SPEC_GRAPH", "0").strip()
+    if graph_raw not in ("0", "1"):
+        raise ValueError("FREETOKEN_MTP_SPEC_GRAPH must be 0 or 1")
     depth_raw = env.get("FREETOKEN_MTP_SPEC_DEPTH", str(_MAX_SPEC_DEPTH)).strip()
     try:
         depth = int(depth_raw)
@@ -64,7 +81,7 @@ def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfi
         raise ValueError(
             "FREETOKEN_MTP_SPECULATE=1 is incompatible with FREETOKEN_MTP_SHADOW=1"
         )
-    return SpecDecodeConfig(enabled=enabled, depth=depth)
+    return SpecDecodeConfig(enabled=enabled, depth=depth, graph=graph_raw == "1")
 
 
 def require_speculation_supported(config) -> None:

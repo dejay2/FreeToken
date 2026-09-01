@@ -154,7 +154,11 @@ class SpecStateLadder:
         self.pool.copy_from(slot, self.slot)
         self._live = slot
         self._width = width
-        self._params = [None] * len(self._params)
+        # ``_params`` deliberately survives the step. A captured verify graph bakes the stash
+        # hooks' COPIES but never re-runs their Python, so a replay step records nothing here;
+        # what they record is the layer's own ``A_log``/``dt_bias`` tensors and a constant
+        # scale, which never change, so carrying them forward is both necessary and correct.
+        # ``rollback``'s per-layer assertion still catches a hook that never ran at all.
         if self._ngram_hist is not None:
             ids = batch.input_ids
             assert ids is not None and ids.numel() == width, (
@@ -201,6 +205,21 @@ class SpecStateLadder:
 
     # ------------------------------------------------------------------------- on settle
 
+    def restore_snapshot(self) -> None:
+        """Put the live slot back where ``begin`` left it, WITHOUT ending the step.
+
+        This is the seam CUDA-graph capture needs. Capture runs the forward twice: a warm-up
+        pass that EXECUTES (and so advances this slot by ``w`` rows) and a recorded pass that
+        executes nothing at all. Between them the slot has to go back, or the replay that
+        actually produces the step's values would start one whole speculative width late.
+
+        Nothing else the forward writes needs this: the KV store, the compressed slab and the
+        pending rings are all position-addressed and re-derive from the same inputs.
+        """
+        if self._live is None:
+            raise RuntimeError("no speculative step is in flight on this ladder")
+        self.pool.copy_from(self.slot, self._live)
+
     def rollback(self, req: "Req", accepted: int) -> None:
         """Leave the slot holding exactly ``accepted`` of the step's rows.
 
@@ -215,7 +234,7 @@ class SpecStateLadder:
         if not 0 <= accepted <= self._width:
             raise ValueError(f"accepted must be 0..{self._width} rows, got {accepted}")
         slot = self._live
-        self.pool.copy_from(self.slot, slot)
+        self.restore_snapshot()
         if accepted:
             self._replay_recurrent(slot, accepted)
             self._replay_conv(slot, accepted)

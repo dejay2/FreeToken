@@ -212,3 +212,45 @@ def test_speculation_refuses_more_than_one_running_request_at_boot():
     require_speculation_supported(
         SimpleNamespace(max_running_req=4, spec_decode=SpecDecodeConfig())
     )
+
+
+# --------------------------------------------------- FREETOKEN_MTP_SPEC_GRAPH (default off)
+
+
+def test_the_verify_graph_is_off_by_default_so_speculation_stays_eager():
+    assert resolve_spec_decode({}).graph is False
+    assert resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"}).graph is False
+
+
+def test_the_verify_graph_flag_turns_capture_on():
+    spec = resolve_spec_decode(
+        {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_GRAPH": "1"}
+    )
+    assert spec.graph is True
+    assert spec.graph_widths == (2, 3, 4)
+
+
+@pytest.mark.parametrize("depth,widths", [(1, (2,)), (2, (2, 3)), (3, (2, 3, 4))])
+def test_only_the_widths_the_depth_can_actually_produce_are_captured(depth, widths):
+    """A graph costs a warm-up forward and a slab of pinned buffers; capturing a width the
+    configured depth can never emit would spend both for nothing."""
+    spec = resolve_spec_decode(
+        {
+            "FREETOKEN_MTP_SPECULATE": "1",
+            "FREETOKEN_MTP_SPEC_GRAPH": "1",
+            "FREETOKEN_MTP_SPEC_DEPTH": str(depth),
+        }
+    )
+    assert spec.graph_widths == widths
+
+
+@pytest.mark.parametrize("raw", ["2", "yes", "true", ""])
+def test_a_non_binary_graph_flag_is_rejected(raw):
+    with pytest.raises(ValueError, match="FREETOKEN_MTP_SPEC_GRAPH"):
+        resolve_spec_decode({"FREETOKEN_MTP_SPEC_GRAPH": raw})
+
+
+def test_the_graph_flag_alone_captures_nothing_while_speculation_is_off():
+    spec = resolve_spec_decode({"FREETOKEN_MTP_SPEC_GRAPH": "1"})
+    assert spec.enabled is False
+    assert spec.graph_widths == ()

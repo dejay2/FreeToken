@@ -33,6 +33,11 @@ from freetoken.kvcache.linear_state_pool import (
 
 logger = init_logger(__name__)
 
+# Free VRAM a speculative verify graph refuses to capture below. Same floor the observer's
+# private verify graphs use: a capture that leaves the card with no headroom trades a decode
+# stall for an allocator failure on the next prefill.
+_SPEC_GRAPH_GUARD_BYTES = 128 << 20
+
 
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
     """The offload MoE cache needs at least one slot per expert per layer. A too-small size
@@ -322,6 +327,7 @@ class Engine:
         self.spec_draft = None
         self.spec_sampler = None
         self.spec_state_ladder = None
+        self.spec_graph_runner = None
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
@@ -493,6 +499,24 @@ class Engine:
                 "Integrated MTP speculation enabled: depth "
                 f"{config.spec_decode.depth}, draft head "
                 f"{mem_GB(self.spec_draft.resident_bytes)} resident"
+            )
+        if config.spec_decode.graph_widths:
+            # Nothing is captured here: the widths are captured lazily on their first live
+            # step, so a boot that never speculates pays only this object. With
+            # FREETOKEN_MTP_SPEC_GRAPH unset the runner does not exist and the step is eager.
+            from .spec_graph import SpecVerifyGraphRunner
+
+            self.spec_graph_runner = SpecVerifyGraphRunner(
+                target_ctx=self.ctx,
+                target_model=self.model,
+                attn_backend=self.attn_backend,
+                device=self.device,
+                widths=config.spec_decode.graph_widths,
+                guard_bytes=_SPEC_GRAPH_GUARD_BYTES,
+            )
+            logger.info_rank0(
+                "Integrated MTP verify graphs armed for widths "
+                f"{config.spec_decode.graph_widths}"
             )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
@@ -944,6 +968,13 @@ class Engine:
         # untouched (no rollback needed); after it, only a rebuild restores service.
         self.rebuild_teardown_started = True
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
+        # The speculative verify graphs go first: they bake KV-pool and page-table addresses,
+        # and reset_capture drops the QSA verify metadata they replay against.
+        spec_graph_widths = ()
+        if self.spec_graph_runner is not None:
+            spec_graph_widths = self.spec_graph_runner.widths
+            self.spec_graph_runner.destroy()
+            self.spec_graph_runner = None
         self.attn_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
         # 2. Resize caches in place (each frees its old GPU tensors before allocating).
@@ -993,6 +1024,19 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+        if spec_graph_widths:
+            # re-armed, not re-captured: the widths capture lazily on their next live step,
+            # against the tensors this rebuild just allocated
+            from .spec_graph import SpecVerifyGraphRunner
+
+            self.spec_graph_runner = SpecVerifyGraphRunner(
+                target_ctx=self.ctx,
+                target_model=self.model,
+                attn_backend=self.attn_backend,
+                device=self.device,
+                widths=spec_graph_widths,
+                guard_bytes=_SPEC_GRAPH_GUARD_BYTES,
+            )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
@@ -1063,8 +1107,20 @@ class Engine:
             raise RuntimeError("speculative decode is not enabled on this engine")
         if not batch.mtp_verify or batch.size != 1:
             raise RuntimeError("a speculative step forwards one mtp_verify batch")
-        with self.ctx.forward_batch(batch):
-            logits, hidden, _ = self.model.forward_mtp_capture(all_row_logits=True)
+        captured = None
+        if self.spec_graph_runner is not None:
+            ladder = self.spec_state_ladder
+            captured = self.spec_graph_runner.forward(
+                batch,
+                # capture's warm-up EXECUTES this forward against the live GDN slot; the
+                # ladder's own pre-step snapshot is the wind-back (spec_graph, spec_state_ladder)
+                restore_state=None if ladder is None else ladder.restore_snapshot,
+            )
+        if captured is None:
+            with self.ctx.forward_batch(batch):
+                logits, hidden, _ = self.model.forward_mtp_capture(all_row_logits=True)
+        else:
+            logits, hidden = captured
         if self.cpu_moe_executor is not None:
             self.cpu_moe_executor.raise_if_unhealthy()
         decision = self.spec_sampler.step(
@@ -1143,6 +1199,9 @@ class Engine:
         if self.spec_draft is not None:
             self.spec_draft.close()
             self.spec_draft = None
+        if self.spec_graph_runner is not None:
+            self.spec_graph_runner.destroy()
+            self.spec_graph_runner = None
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()

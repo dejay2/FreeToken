@@ -438,3 +438,115 @@ def test_a_pool_rebuild_hands_the_ladder_a_fresh_slot():
 
 def teardown_module():
     core._GLOBAL_CTX = None
+
+
+# ------------------------------------------------- the ladder under a captured verify graph
+
+
+def test_the_stash_hooks_are_cuda_graph_capturable_and_refill_on_replay():
+    """The stash hooks run INSIDE the speculative forward, so a captured verify graph bakes
+    them. Both are pure fixed-shape D2D copies into a preallocated arena -- no allocation, no
+    host round trip, no shape that depends on a value -- which is what makes that legal."""
+    world = _World()
+    ladder = SpecStateLadder(world.pool, WIDTH)
+    ladder._live = SLOT
+    ladder._width = WIDTH
+    gen = torch.Generator(device=DEV).manual_seed(11)
+    layer_id = world.group.layer_ids[0]
+    gdn = world.gdn[layer_id]
+    conv_dim = world.pool.conv_states.shape[2]
+    conv_in = torch.empty(WIDTH, conv_dim, device=DEV, dtype=DTYPE).normal_(generator=gen)
+    mixed = torch.empty_like(conv_in).normal_(generator=gen)
+    a = torch.empty(WIDTH, world.group.num_value_heads, device=DEV, dtype=DTYPE).normal_(
+        generator=gen
+    )
+    b = torch.empty_like(a).normal_(generator=gen)
+    ple_in = torch.empty(
+        WIDTH, world.args.ple_state_width, device=DEV, dtype=DTYPE
+    ).normal_(generator=gen)
+
+    def stash():
+        ladder.stash_gdn(
+            layer_id, conv_in=conv_in, mixed=mixed, a=a, b=b,
+            A_log=gdn.A_log, dt_bias=gdn.dt_bias, scale=1.0,
+        )
+        ladder.stash_ple(world.ple.layer_id, ple_in)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        stash()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        stash()
+
+    conv_in.normal_(generator=gen)
+    mixed.normal_(generator=gen)
+    ple_in.normal_(generator=gen)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    li = world.pool.local_index(layer_id)
+    km1 = world.pool.conv_states.shape[-1]
+    assert torch.equal(
+        ladder._conv_hist[li, :, km1 : km1 + WIDTH], conv_in.transpose(0, 1)
+    )
+    assert torch.equal(ladder._mixed[li, :WIDTH], mixed)
+    row = ladder._ple_rows[world.ple.layer_id]
+    state_len = ladder._ple_state_len
+    assert torch.equal(
+        ladder._ple_hist[row, :, state_len : state_len + WIDTH], ple_in.transpose(0, 1)
+    )
+    graph.reset()
+
+
+def test_a_step_whose_forward_was_a_graph_replay_still_settles():
+    """A captured forward never re-runs the Python stash hooks, so the per-layer kernel
+    parameters they record must survive from the capture step to every replay step. They are
+    module weights and a constant, so persisting them is also the only correct thing."""
+    cached_len = 64
+    ids = _token_ids(cached_len + WIDTH + 4)
+    world = _World()
+    hidden, ple_in = _inputs(WIDTH, world.config.hidden_size, world.args.ple_state_width, 2)
+    _warm(world, cached_len, ids)
+    ladder = SpecStateLadder(world.pool, WIDTH)
+
+    req, _ = world.prefill(
+        hidden, ple_in, ids, cached_len=cached_len, mtp_verify=True, ladder=ladder
+    )
+    ladder.rollback(req, WIDTH)
+    # second cycle: begin arms the ladder, but the "forward" is a graph replay that refills
+    # the arena without ever calling stash_gdn again
+    batch = Batch(reqs=[req], phase="prefill")
+    batch.padded_reqs = batch.reqs
+    batch.input_ids = ids[cached_len : cached_len + WIDTH].to(DEV)
+    batch.mtp_verify = True
+    batch.emit_width = WIDTH
+    ladder.begin(req, batch)
+
+    ladder.rollback(req, 2)  # must not trip the "never stashed" assertion
+
+
+def test_restore_snapshot_rewinds_the_slot_without_ending_the_step():
+    """Capture's warm-up pass executes the forward and advances the live slot; the recorded
+    pass executes nothing. This is the seam between them, and the step stays in flight."""
+    cached_len = 64
+    ids = _token_ids(cached_len + WIDTH + 4)
+    world = _World()
+    hidden, ple_in = _inputs(WIDTH, world.config.hidden_size, world.args.ple_state_width, 2)
+    _warm(world, cached_len, ids)
+    ladder = SpecStateLadder(world.pool, WIDTH)
+    before = world.families(SLOT)
+
+    req, _ = world.prefill(
+        hidden, ple_in, ids, cached_len=cached_len, mtp_verify=True, ladder=ladder
+    )
+    advanced = world.families(SLOT)
+    ladder.restore_snapshot()
+
+    _assert_bitwise(before, world.families(SLOT))
+    assert not torch.equal(advanced["recurrent"], before["recurrent"])
+    ladder.rollback(req, 0)  # the step was still in flight and settles normally
+    _assert_bitwise(before, world.families(SLOT))

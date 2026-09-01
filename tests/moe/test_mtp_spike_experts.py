@@ -369,3 +369,149 @@ def test_real_bf16_banks_are_direct_file_backed_views():
         assert banks.num_layers == 1
         assert banks.bank_sources["gate_up"][0] is banks.gate_up
         assert banks.bank_sources["down"][0] is banks.down
+
+
+# ------------------------------------------------------- capture-safe routed path (no sync)
+
+
+class _SyncTrap:
+    """Fail the test on any device->host round trip the routed path might take."""
+
+    def __init__(self, monkeypatch):
+        for name in ("tolist", "item", "__int__", "__float__", "__bool__"):
+            monkeypatch.setattr(
+                torch.Tensor,
+                name,
+                lambda self, _name=name, *args, **kwargs: pytest.fail(
+                    f"the routed expert path synchronized through Tensor.{_name}"
+                ),
+                raising=True,
+            )
+
+
+def _expert_major_reference(runner, hidden_states, topk_weights, topk_ids):
+    """The pre-gather expert-major loop, kept here as the numerical oracle."""
+    tokens = int(hidden_states.shape[0])
+    route_ids = topk_ids.reshape(-1).to(torch.int64)
+    route_weights = topk_weights.reshape(-1).to(torch.float32)
+    route_rows = torch.arange(
+        tokens, device=hidden_states.device
+    ).repeat_interleave(runner.top_k)
+    result = torch.zeros(hidden_states.shape, dtype=torch.float32, device=hidden_states.device)
+    for expert in sorted({int(value) for value in route_ids.tolist()}):
+        if expert < 0:
+            continue
+        selected = (route_ids == expert).nonzero(as_tuple=True)[0]
+        rows = route_rows[selected]
+        projected = hidden_states[rows] @ runner.gate_up[expert].t()
+        gate, up = projected.chunk(2, dim=-1)
+        activated = (F.silu(gate.float()) * up.float()).to(hidden_states.dtype)
+        value = activated @ runner.down[expert].t()
+        result.index_add_(0, rows, value.float() * route_weights[selected, None])
+    return result.to(hidden_states.dtype)
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 3, 4])
+def test_resident_routed_path_takes_no_device_synchronization(tokens, monkeypatch):
+    banks, hidden_size, _ = _banks(seed=400 + tokens)
+    runner = _resident_runner(banks, device=torch.device("cpu"), max_tokens=8)
+    generator = torch.Generator().manual_seed(410 + tokens)
+    hidden = (torch.randn(tokens, hidden_size, generator=generator) * 0.5).to(torch.bfloat16)
+    weights, ids = _routes(tokens, banks.num_experts, 2, seed=420 + tokens)
+    assert tokens <= runner.gather_max_tokens
+
+    _SyncTrap(monkeypatch)
+    got = runner.run_routed(hidden, weights, ids)
+
+    assert got.shape == hidden.shape
+
+
+@pytest.mark.parametrize("tokens", [1, 4, 16])
+def test_resident_routed_path_agrees_with_the_expert_major_loop(tokens):
+    banks, hidden_size, _ = _banks(seed=500 + tokens)
+    runner = _resident_runner(banks, device=torch.device("cpu"), max_tokens=32)
+    generator = torch.Generator().manual_seed(510 + tokens)
+    hidden = (torch.randn(tokens, hidden_size, generator=generator) * 0.5).to(torch.bfloat16)
+    weights, ids = _routes(tokens, banks.num_experts, 2, seed=520 + tokens)
+
+    got = runner.run_routed(hidden, weights, ids)
+
+    expected = _expert_major_reference(runner, hidden, weights, ids)
+    torch.testing.assert_close(got.float(), expected.float(), rtol=0, atol=1e-2)
+
+
+def test_resident_routed_path_zeroes_unrouted_negative_expert_ids():
+    banks, hidden_size, _ = _banks(seed=600)
+    runner = _resident_runner(banks, device=torch.device("cpu"), max_tokens=8)
+    generator = torch.Generator().manual_seed(601)
+    hidden = (torch.randn(2, hidden_size, generator=generator) * 0.5).to(torch.bfloat16)
+    weights, ids = _routes(2, banks.num_experts, 2, seed=602)
+    ids[1, 1] = -1
+
+    got = runner.run_routed(hidden, weights, ids)
+
+    expected = _expert_major_reference(runner, hidden, weights, ids)
+    torch.testing.assert_close(got.float(), expected.float(), rtol=0, atol=1e-2)
+
+
+def test_resident_runner_falls_back_to_the_expert_major_loop_beyond_the_gather_budget():
+    banks, hidden_size, _ = _banks(seed=700)
+    runner = _resident_runner(banks, device=torch.device("cpu"), max_tokens=8)
+    runner.gather_max_tokens = 1
+    generator = torch.Generator().manual_seed(701)
+    hidden = (torch.randn(4, hidden_size, generator=generator) * 0.5).to(torch.bfloat16)
+    weights, ids = _routes(4, banks.num_experts, 2, seed=702)
+
+    got = runner.run_routed(hidden, weights, ids)
+
+    expected = _expert_major_reference(runner, hidden, weights, ids)
+    torch.testing.assert_close(got.float(), expected.float(), rtol=0, atol=1e-2)
+
+
+@requires_cuda
+@pytest.mark.parametrize("tokens", [1, 4])
+def test_resident_routed_path_is_cuda_graph_capturable(tokens):
+    banks, hidden_size, _ = _banks(seed=800 + tokens)
+    device = torch.device("cuda")
+    runner = _resident_runner(banks, device=device, max_tokens=8)
+    generator = torch.Generator().manual_seed(810 + tokens)
+    hidden_buf = (
+        torch.randn(tokens, hidden_size, generator=generator) * 0.5
+    ).to(torch.bfloat16).to(device)
+    weights_cpu, ids_cpu = _routes(tokens, banks.num_experts, 2, seed=820 + tokens)
+    weight_buf = weights_cpu.to(device)
+    id_buf = ids_cpu.to(device).to(torch.int32)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        out = runner.run_routed(hidden_buf, weight_buf, id_buf)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        out = runner.run_routed(hidden_buf, weight_buf, id_buf)
+
+    next_weights, next_ids = _routes(tokens, banks.num_experts, 2, seed=880 + tokens)
+    hidden_buf.copy_(
+        (torch.randn(tokens, hidden_size, generator=generator) * 0.5).to(torch.bfloat16)
+    )
+    weight_buf.copy_(next_weights)
+    id_buf.copy_(next_ids.to(torch.int32))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected = _expert_major_reference(runner, hidden_buf, weight_buf, id_buf)
+    torch.testing.assert_close(out.float(), expected.float(), rtol=0, atol=2e-2)
+    graph.reset()
+
+
+def test_the_gather_path_covers_the_widest_speculative_step_whatever_the_banks_cost():
+    """Every per-cycle draft-head call is at most 1 + depth rows -- the recursive draft steps
+    at one row each, and the accepted run when the head commits it. A bank fat enough to blow
+    the byte budget must not push those onto the synchronizing loop."""
+    banks, _, _ = _banks(seed=900)
+    banks.bytes_per_expert = 1 << 40
+    runner = _resident_runner(banks, device=torch.device("cpu"), max_tokens=8)
+
+    assert runner.gather_max_tokens >= 4
