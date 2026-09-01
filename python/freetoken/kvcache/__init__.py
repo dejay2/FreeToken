@@ -111,6 +111,11 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        # A speculative step writes `depth` extra pending-ring rows per forward; the ring is
+        # addressed by `position % ring_capacity`, so a ratio-wide ring would alias them onto
+        # the open compression group's still-needed members. QSAKVCache.kv_cost reads the same
+        # field, so the boot budget prices exactly what gets allocated here. 0 when off.
+        num_speculative_tokens=getattr(config, "num_speculative_tokens", 0),
     )
 
 
@@ -191,6 +196,12 @@ def create_kvcache_pool(
         spec = kv_specs[0]
         if num_req_slots is None:
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
+        ring_capacity = QSAKVCache.ring_capacity_for(spec.index_ratio, num_speculative_tokens)
+        assert ring_capacity >= spec.index_ratio + num_speculative_tokens, (
+            f"QSA ring {ring_capacity} cannot hold a whole {spec.index_ratio}-token group plus "
+            f"{num_speculative_tokens} speculative rows; the surplus rows would alias onto the "
+            "open group's still-needed members"
+        )
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
             num_layers=model_config.num_layers,
@@ -203,9 +214,7 @@ def create_kvcache_pool(
             num_index_layers=spec.num_index_layers,
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
-            ring_capacity=QSAKVCache.ring_capacity_for(
-                spec.index_ratio, num_speculative_tokens
-            ),
+            ring_capacity=ring_capacity,
             layer_ids=spec.layer_ids,
         )
 

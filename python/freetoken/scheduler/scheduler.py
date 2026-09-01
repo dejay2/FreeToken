@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    List,
+    NamedTuple,
+    NoReturn,
+    Sequence,
+    Set,
+    Tuple,
+    TypeAlias,
+)
 
 import torch
 from freetoken.attention.linear import build_fla_metadata
-from freetoken.core import Batch, Req
+from freetoken.core import Batch, Req, SpecInflight
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
 from freetoken.message import (
@@ -21,6 +31,7 @@ from freetoken.message import (
     UserMsg,
 )
 from freetoken.utils import (
+    div_ceil,
     init_logger,
     load_eos_token_ids,
     load_tokenizer,
@@ -927,6 +938,168 @@ class Scheduler(SchedulerIOMixin):
             write_tuple=write_mapping,
         )
 
+    def _prepare_spec_batch(self, req: Req, draft_tokens: Sequence[int]) -> ForwardInput:
+        """Build one request's ``w = 1 + len(draft_tokens)`` row speculative verify batch.
+
+        The decode-batch builder above, generalized from one row to ``w``: row 0 is the last
+        accepted token (already in the token pool at ``cached_len``) and rows 1..k are the
+        drafts, staged into the token pool at the positions they would occupy if every one
+        were accepted. Positions, page allocation and ``out_loc`` then fall out of the same
+        ``extend_len``-driven helpers plain decode uses.
+
+        Unlike ``mtp_shadow._target_verify_batch`` this redirects NOTHING -- the request's own
+        ``table_idx``, its own page-table row, its own pages and its own GDN slot. The dummy
+        table / page lease / shadow slot live outside the ``mtp_verify`` flag, and dropping
+        them is exactly what makes the integrated forward cheap.
+
+        The step's length advance is NOT ``complete_many``: ``_rollback_spec_tokens`` is the
+        single authority that settles ``cached_len`` / ``device_len`` once the accepted run is
+        known, because a rejected row must leave no trace.
+        """
+        spec = self.config.spec_decode
+        if not spec.enabled:
+            raise RuntimeError(
+                "speculative decode is off; set FREETOKEN_MTP_SPECULATE=1 to enable it"
+            )
+        k = len(draft_tokens)
+        if not 1 <= k <= spec.depth:
+            raise ValueError(
+                f"a speculative step needs 1..{spec.depth} draft tokens, got {k}"
+            )
+        if req.spec_inflight is not None:
+            raise RuntimeError(
+                f"request {req.uid} already has a speculative step in flight"
+            )
+        if req.extend_len != 1:
+            raise RuntimeError(
+                f"speculation needs a request in decode shape (extend_len 1), got "
+                f"{req.extend_len}"
+            )
+        if req.input_ids.numel() != req.device_len:
+            # Spec steps drain synchronously (design 6.2), so the host ids are caught up. Under
+            # overlap they lag by the in-flight tokens and the drafts would be staged over a
+            # position whose accepted token has not been appended yet.
+            raise RuntimeError(
+                f"request {req.uid} host ids ({req.input_ids.numel()}) lag device_len "
+                f"({req.device_len}); a speculative step must drain synchronously"
+            )
+        w = 1 + k
+        if req.remain_len < w - 1:
+            # device_len must stay <= max_device_len; the last row's sampled token may still
+            # fall past the budget and take the write mapping's -1 discard slot.
+            raise RuntimeError(
+                f"request {req.uid} has {req.remain_len} tokens of output budget left, "
+                f"short of the {w}-row speculative step"
+            )
+
+        page_size = self.cache_manager.page_size
+        base = req.cached_len                     # row i reads position base + i
+        first_page = div_ceil(base, page_size)
+        device_len_before = req.device_len
+        req.device_len = base + w                 # extend_len = w drives every helper below
+        last_page = div_ceil(req.device_len, page_size)
+        page_row = self.engine.page_table[
+            req.table_idx, first_page * page_size : last_page * page_size
+        ].clone()
+        self.cache_manager.allocate_paged([req])
+        req.spec_inflight = SpecInflight(
+            width=w,
+            cached_len=base,
+            device_len=device_len_before,
+            first_page=first_page,
+            last_page=last_page,
+            # Read back from the row rather than from the free list: this is what the step
+            # actually got, eviction included.
+            pages=self.engine.page_table[
+                req.table_idx, first_page * page_size : last_page * page_size : page_size
+            ].clone(),
+            page_row=page_row,
+        )
+        self.token_pool[req.table_idx, base + 1 : base + w] = torch.tensor(
+            list(draft_tokens), dtype=self.token_pool.dtype, device=self.token_pool.device
+        )
+
+        batch = Batch(reqs=[req], phase="prefill")
+        batch.padded_reqs = batch.reqs
+        # Causal prefill semantics over w rows, with the offloaded MoE still reading routed
+        # experts through its decode cache (layers/moe.py _use_decode_movement).
+        batch.mtp_verify = True
+        batch.emit_width = w
+        batch.positions = _make_positions(batch, self.device)
+        batch.rope_positions = _make_rope_positions(batch, self.device)
+        input_mapping = _make_input_tuple(batch, self.device)
+        write_mapping = _make_spec_write_tuple(batch, self.device)
+        batch.out_loc = self.engine.page_table[input_mapping]
+        if self.engine.linear_state_pool is not None:
+            pool = self.engine.linear_state_pool
+            slot = req.linear_slot_idx if req.linear_slot_idx is not None else pool.padding_slot
+            batch.linear_table_idx = torch.tensor(
+                [slot], dtype=torch.int32, device=self.device
+            )
+            # w <= 4 never reaches a x64 track boundary, so no GDN snapshot is scheduled.
+            batch.fla_metadata = build_fla_metadata(batch, self.device)
+        self.engine.attn_backend.prepare_metadata(batch)
+        return ForwardInput(
+            batch=batch,
+            sample_args=self.engine.sampler.prepare(batch),
+            input_tuple=input_mapping,
+            write_tuple=write_mapping,
+        )
+
+    def _rollback_spec_tokens(
+        self,
+        req: Req,
+        accepted: int,
+        *,
+        state_rollback: "Callable[[Req, int], None] | None" = None,
+    ) -> None:
+        """Settle a speculative step, keeping ``accepted`` of its ``width`` forwarded rows.
+
+        Row ``i`` samples the token for position ``cached_len + i + 1``, so keeping ``accepted``
+        rows emits exactly ``accepted`` tokens -- ``j`` accepted drafts plus the bonus token
+        from row ``j``. Production therefore always keeps at least one row; ``accepted == 0``
+        is the complete undo, which is what makes the state-digest gate meaningful.
+
+        Leaves the request exactly where ``accepted`` plain decode steps would have: lengths
+        back in decode shape, the over-allocated pages returned to the head of the free list in
+        allocation order (so a full rollback is byte-identical to never having run the step,
+        which ``_free``'s tail-append could not give), and their page-table cells restored.
+
+        Rejected QSA rows need no KV rewind: the K/V write is position-addressed and the
+        compressed-slab scorer clamps visible blocks to ``sequence_length // index_ratio``, so
+        the length rewind alone makes them unreachable.
+
+        Scope is KV / page / length bookkeeping. The GDN conv + recurrent state (and the PLE
+        conv / n-gram context riding its slot) still hold all ``width`` rows: rolling those
+        back is Phase 3 (Strategy R -- restore the pre-step snapshot and replay the accepted
+        prefix through the recurrent decode kernel). ``state_rollback`` is that seam; it is
+        called with ``(req, accepted)`` only after the lengths are final, because the accepted
+        run can still shrink under a stop condition.
+        """
+        spec = req.spec_inflight
+        if spec is None:
+            raise RuntimeError(f"request {req.uid} has no speculative step to settle")
+        if not 0 <= accepted <= spec.width:
+            raise ValueError(
+                f"accepted must be 0..{spec.width} rows, got {accepted}"
+            )
+        page_size = self.cache_manager.page_size
+        req.cached_len = spec.cached_len + accepted
+        req.device_len = req.cached_len + 1
+        keep = max(0, min(div_ceil(req.cached_len, page_size), spec.last_page) - spec.first_page)
+        returned = spec.pages[keep:]
+        if returned.numel():
+            self.cache_manager.free_slots = torch.cat(
+                [returned, self.cache_manager.free_slots]
+            )
+            start = (spec.first_page + keep) * page_size
+            self.engine.page_table[req.table_idx, start : spec.last_page * page_size] = (
+                spec.page_row[keep * page_size :]
+            )
+        req.spec_inflight = None
+        if state_rollback is not None:
+            state_rollback(req, accepted)
+
     def _gather_multimodal(self, batch: Batch) -> None:
         """Gather only the picture feature rows used by this prefill step.
 
@@ -1077,5 +1250,26 @@ def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
         for req in batch.reqs
         for i in range(batch.emit_width)
     ]
+    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
+    return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
+
+
+def _make_spec_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
+    """Destination of each row of a speculative step's sampled tokens.
+
+    Row ``i`` reads position ``cached_len + i`` and samples the token for ``cached_len + i +
+    1``, so the run's write base is one past row 0 -- not ``device_len``, which the batch has
+    already advanced to the last speculative row. (For plain decode the two coincide, which is
+    why ``_make_write_tuple`` can key off ``device_len``.) A slot past the request's output
+    budget writes to the token pool's -1 discard column, as it always has.
+    """
+    mapping_list: List[int] = []
+    write_list: List[int] = []
+    for req in batch.reqs:
+        for i in range(batch.emit_width):
+            position = req.cached_len + 1 + i
+            mapping_list.append(req.table_idx)
+            write_list.append(position if position < req.max_device_len else -1)
+    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
     write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
     return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)

@@ -165,6 +165,9 @@ class QSAKVCache(MHAKVCache):
         from freetoken.attention import AttnType
 
         num_req_slots = config.max_running_req + 1
+        # Same field create_kv_pool threads into the factory: the budget must price the ring
+        # the engine will actually allocate, or a speculative boot under-counts its fixed cost.
+        num_speculative_tokens = int(getattr(config, "num_speculative_tokens", 0) or 0)
         per_token = 0
         fixed = 0
         for spec in config.model_config.kv_cache_group_specs():
@@ -174,7 +177,9 @@ class QSAKVCache(MHAKVCache):
             if spec.attn_type is AttnType.QSA:
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
-                ring_capacity = cls.ring_capacity_for(spec.index_ratio)
+                ring_capacity = cls.ring_capacity_for(
+                    spec.index_ratio, num_speculative_tokens
+                )
                 fixed += num_req_slots * row * (ring_capacity + 1)
                 fixed += (
                     num_req_slots

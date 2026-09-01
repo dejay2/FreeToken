@@ -31,6 +31,27 @@ class SamplingParams:
         return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
 
 
+@dataclass
+class SpecInflight:
+    """The undo record of one speculative decode step, written by
+    ``Scheduler._prepare_spec_batch`` and consumed by ``Scheduler._rollback_spec_tokens``.
+
+    A speculative step forwards ``width`` rows on the request's REAL page table and KV, then
+    keeps only the accepted prefix. Rejected QSA rows need no KV rewind (the K/V write is
+    position-addressed and the compressed-slab scorer clamps visibility to
+    ``sequence_length // index_ratio``), but the lengths, the pages and the page-table cells
+    the step stamped all do.
+    """
+
+    width: int          # w = 1 + drafts
+    cached_len: int     # the request's KV-valid length before the step
+    device_len: int     # the request's device length before the step (== cached_len + 1)
+    first_page: int     # first page index the step's allocate_paged considered
+    last_page: int      # one past the last
+    pages: torch.Tensor       # page-base token indices the step allocated, allocation order
+    page_row: torch.Tensor    # page_table[table_idx, first_page*ps : last_page*ps] before it
+
+
 @dataclass(eq=False)
 class Req:
     input_ids: torch.Tensor  # cpu tensor
@@ -66,6 +87,11 @@ class Req:
     # reaches it (snapshot_toolcall_anchor) and donated at finish. SWA: caps the proactive
     # out-of-window eviction so the window ending here stays resumable.
     toolcall_anchor_len: int | None = None
+    # Non-None between _prepare_spec_batch and _rollback_spec_tokens: this request has
+    # forwarded speculative rows that are not yet settled. A radix commit under one is
+    # forbidden (CacheManager.cache_req) -- it re-points the page-table row, which no
+    # device_len rewind can undo.
+    spec_inflight: SpecInflight | None = None
     # Abort arrived while this request's forward was in flight (overlap scheduling). The abort
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).

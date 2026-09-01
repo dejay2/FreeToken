@@ -286,6 +286,17 @@ class CacheManager:
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
+        # Design rule: a speculative step must never reach a commit. Every commit path below
+        # inserts into the prefix cache, frees the deduped pages and RE-POINTS this request's
+        # page-table row at the tree's canonical pages (and the hybrid one also donates its GDN
+        # state slot) -- none of which a device_len rewind can undo. Speculation lives inside
+        # the decode phase, where commits are unreachable by construction; assert it anyway.
+        if getattr(req, "spec_inflight", None) is not None:
+            raise RuntimeError(
+                f"request {req.uid} has {req.spec_inflight.width} unsettled speculative rows; "
+                "a prefix commit re-points its page-table row and cannot be rolled back "
+                "(settle the step with Scheduler._rollback_spec_tokens first)"
+            )
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)
         if self.is_hybrid:

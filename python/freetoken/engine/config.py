@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Mapping
 
 import torch
 from freetoken.distributed import DistributedInfo
@@ -11,6 +12,59 @@ from freetoken.utils import cached_load_hf_config
 
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
+
+# w = 1 + depth must stay a capturable MTP verify width (mtp_fast_verify captures 2, 3, 4).
+_MAX_SPEC_DEPTH = 3
+
+
+@dataclass(frozen=True)
+class SpecDecodeConfig:
+    """Resolved integrated speculative decode settings.
+
+    ``num_speculative_tokens`` is the single number every sizing surface must agree on: the
+    QSA pending ring is ``position % ring_capacity`` with no epoch tag, so a ring narrower
+    than ``index_ratio + depth`` aliases a speculative row onto an open compression group's
+    still-needed members -- silently wrong keys, no crash.
+    """
+
+    enabled: bool = False
+    depth: int = _MAX_SPEC_DEPTH
+
+    @property
+    def num_speculative_tokens(self) -> int:
+        """Extra rows a step may add beyond the confirmed one; 0 while speculation is off, so
+        every pool and budget keeps its non-speculative geometry exactly."""
+        return self.depth if self.enabled else 0
+
+    @property
+    def batch_width(self) -> int:
+        """``w`` = the confirmed row plus the drafts."""
+        return 1 + self.num_speculative_tokens
+
+
+def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfig:
+    """Read ``FREETOKEN_MTP_SPECULATE`` / ``FREETOKEN_MTP_SPEC_DEPTH``."""
+    env = os.environ if env is None else env
+    raw = env.get("FREETOKEN_MTP_SPECULATE", "0").strip()
+    if raw not in ("0", "1"):
+        raise ValueError("FREETOKEN_MTP_SPECULATE must be 0 or 1")
+    enabled = raw == "1"
+    depth_raw = env.get("FREETOKEN_MTP_SPEC_DEPTH", str(_MAX_SPEC_DEPTH)).strip()
+    try:
+        depth = int(depth_raw)
+    except ValueError:
+        depth = 0
+    if not 1 <= depth <= _MAX_SPEC_DEPTH:
+        raise ValueError(
+            f"FREETOKEN_MTP_SPEC_DEPTH must be 1..{_MAX_SPEC_DEPTH}, got {depth_raw!r}"
+        )
+    if enabled and env.get("FREETOKEN_MTP_SHADOW", "0").strip() == "1":
+        # The observer takes the eager capture path in Engine.forward_batch and would double
+        # every verify forward.
+        raise ValueError(
+            "FREETOKEN_MTP_SPECULATE=1 is incompatible with FREETOKEN_MTP_SHADOW=1"
+        )
+    return SpecDecodeConfig(enabled=enabled, depth=depth)
 
 
 @dataclass(frozen=True)
@@ -81,6 +135,18 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+
+    @cached_property
+    def spec_decode(self) -> SpecDecodeConfig:
+        """Resolved once per config instance. The Engine and the Scheduler hold the SAME
+        instance (SchedulerConfig extends EngineConfig), and it is the sole argument to both
+        ``create_kv_pool`` and every pool family's ``kv_cost`` -- so the pool geometry and the
+        boot budget cannot disagree about the speculative width."""
+        return resolve_spec_decode()
+
+    @property
+    def num_speculative_tokens(self) -> int:
+        return self.spec_decode.num_speculative_tokens
 
     @cached_property
     def hf_config(self):
