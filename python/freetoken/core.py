@@ -9,6 +9,7 @@ import torch
 if TYPE_CHECKING:
     from freetoken.attention import BaseAttnBackend, BaseAttnMetadata
     from freetoken.attention.linear import FLAMetadata
+    from freetoken.engine.spec_state_ladder import SpecStateLadder
     from freetoken.kvcache import BaseCacheHandle, BaseKVCachePool
     from freetoken.kvcache.linear_state_pool import LinearStatePool
     from freetoken.moe import BaseMoeBackend
@@ -159,6 +160,10 @@ class Batch:
     # Tokens this step emits per request. Plain decode emits one; a wider step reserves
     # emit_width sampled-token slots per request in the write mapping.
     emit_width: int = field(default=1, init=False)
+    # The speculative step's SpecStateLadder, armed only by SpecStateLadder.begin: the linear
+    # layers copy each row's replay inputs into its arena so a partly accepted step can be
+    # rebuilt. None on every ordinary batch, which therefore stashes nothing.
+    spec_capture: "SpecStateLadder | None" = field(default=None, init=False)
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)

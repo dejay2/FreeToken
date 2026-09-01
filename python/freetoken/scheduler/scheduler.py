@@ -1036,7 +1036,11 @@ class Scheduler(SchedulerIOMixin):
             batch.linear_table_idx = torch.tensor(
                 [slot], dtype=torch.int32, device=self.device
             )
-            # w <= 4 never reaches a x64 track boundary, so no GDN snapshot is scheduled.
+            # No track checkpoint can ride a speculative step, whatever cached_len is: the
+            # hybrid-radix snapshot is scheduled per FORWARD, at c = (extend_len - 1) // 64
+            # chunks into it (attention/linear.py:123-127), so a w <= 4 row batch gives c == 0
+            # and is skipped -- absolute x64 alignment never enters it. Were one scheduled it
+            # would freeze rejected rows into a donatable prefix-cache slot.
             batch.fla_metadata = build_fla_metadata(batch, self.device)
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(

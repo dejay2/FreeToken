@@ -203,6 +203,15 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state,
                 fla.max_seq_len)
+            if batch.spec_capture is not None:
+                # A speculative step keeps only its accepted prefix; the chunked kernel below
+                # leaves the state holding every row, so copy this layer's per-row replay
+                # inputs out before the next layer reuses the buffers.
+                batch.spec_capture.stash_gdn(
+                    self.layer_id, conv_in=conv_in, mixed=mixed, a=a, b=b,
+                    A_log=self.A_log, dt_bias=self.dt_bias,
+                    scale=self.head_k_dim ** -0.5,
+                )
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)

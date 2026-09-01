@@ -33,7 +33,36 @@ CPU = torch.device("cpu")
 TABLE_WIDTH = 512
 
 
-def _scheduler(*, page_size=64, num_pages=8, depth=3, enabled=True, cache_type="naive"):
+@pytest.fixture(autouse=True)
+def _no_ctx_leak():
+    import freetoken.core as core
+
+    yield
+    core._GLOBAL_CTX = None  # only the GDN-pool scenarios set one
+
+
+def _gdn_pool():
+    """A tiny CPU LinearStatePool -- enough for build_fla_metadata's track-checkpoint path,
+    which reads the conv history width off the live pool."""
+    import freetoken.core as core
+    from freetoken.core import Context, set_global_ctx
+    from freetoken.kvcache.linear_state_pool import LinearStatePool
+    from freetoken.models.config import LinearGatedDeltaGroupConfig
+
+    group = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=(0,), num_key_heads=1, num_value_heads=1,
+        key_head_dim=8, value_head_dim=8, conv_kernel_dim=4, output_gate="sigmoid",
+    )
+    pool = LinearStatePool(group, 4, torch.float32, CPU, tp_size=1)
+    core._GLOBAL_CTX = None
+    ctx = Context(page_size=64)
+    ctx.linear_state_pool = pool
+    set_global_ctx(ctx)
+    return pool
+
+
+def _scheduler(*, page_size=64, num_pages=8, depth=3, enabled=True, cache_type="naive",
+               gdn=False):
     page_table = torch.zeros(2, TABLE_WIDTH, dtype=torch.int32)
     cm = CacheManager(num_pages, page_size, page_table, cache_type)
     stub = Scheduler.__new__(Scheduler)
@@ -43,7 +72,7 @@ def _scheduler(*, page_size=64, num_pages=8, depth=3, enabled=True, cache_type="
     stub.prepared = []
     stub.engine = SimpleNamespace(
         page_table=page_table,
-        linear_state_pool=None,
+        linear_state_pool=_gdn_pool() if gdn else None,
         attn_backend=SimpleNamespace(prepare_metadata=stub.prepared.append),
         sampler=SimpleNamespace(prepare=lambda batch: "sample-args"),
     )
@@ -318,6 +347,50 @@ def test_the_phase_three_state_seam_is_called_with_the_settled_run():
     )
     # GDN/PLE rollback (Phase 3) runs after the lengths are final, never before
     assert seen == [(66, 67, 2)]
+
+
+# ------------------------------------------------------------- the track-checkpoint hazard
+#
+# A hybrid-radix track checkpoint freezes a request's GDN + PLE state into a DONATABLE pool
+# slot on the forward stream. One taken during a speculative step would publish a state
+# containing rejected rows into the prefix cache -- a rollback surface nothing else covers.
+# It cannot happen, and not for the reason a x64-alignment intuition suggests: the boundary is
+# counted in THIS FORWARD's rows (attention/linear.py:123-127, c = (extend_len - 1) // 64), so
+# only a forward of at least 65 rows can schedule one. w <= 4 never can, at any cached_len.
+
+
+@pytest.mark.parametrize("prompt_len", [62, 63, 64, 127, 128])
+def test_no_track_checkpoint_can_ride_a_speculative_step(prompt_len):
+    stub = _scheduler(gdn=True)
+    req = _decode_req(stub, prompt_len=prompt_len, output_len=128)
+    req.linear_slot_idx = 1
+    req.mamba_ping_pong = (2, 3)  # eligible to snapshot; only the row count stops it
+
+    fla = stub._prepare_spec_batch(req, [11, 12, 13]).batch.fla_metadata
+    assert req.extend_len == 4
+    assert (fla.track_dst, fla.track_h_row, fla.track_conv_src, fla.track_boundary_row) == (
+        None, None, None, None
+    )
+    assert req.mamba_last_track_seqlen is None and req.mamba_next_track_idx == 0
+
+
+def test_the_same_request_does_schedule_one_on_a_wide_enough_prefill():
+    """The control: nothing about the request or the pool suppresses the checkpoint -- only the
+    speculative step's row count does."""
+    from freetoken.attention.linear import build_fla_metadata
+    from freetoken.core import Batch
+
+    stub = _scheduler(gdn=True)
+    req = _decode_req(stub, prompt_len=62, output_len=128)
+    req.linear_slot_idx = 1
+    req.mamba_ping_pong = (2, 3)
+    req.cached_len, req.device_len = 62, 62 + 65
+
+    batch = Batch(reqs=[req], phase="prefill")
+    batch.padded_reqs = batch.reqs
+    fla = build_fla_metadata(batch, CPU)
+    assert fla.track_dst is not None and fla.track_dst.tolist() == [2]
+    assert req.mamba_last_track_seqlen == 62 + 64  # counted from cached_len, not from 0
 
 
 # --------------------------------------------------------------- the radix-commit guard (#4)

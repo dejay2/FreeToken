@@ -780,6 +780,9 @@ class PLELayer(BaseOP):
         fla = getattr(batch, "fla_metadata", None)
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)
+        ladder = getattr(batch, "spec_capture", None)
+        if ladder is not None:
+            ladder.stash_ple(self.layer_id, x)  # the conv state is this stream's shift register
         return gated + self._short_conv(x, meta, states)
 
     def _write_track_snapshot(self, states: torch.Tensor, x: torch.Tensor, fla) -> None:

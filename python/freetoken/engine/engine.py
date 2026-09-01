@@ -384,6 +384,17 @@ class Engine:
         else:
             self.linear_state_pool = None
 
+        # Integrated speculation's linear-state rollback (design section 4, Strategy R). Sized
+        # once here so the spare pool slot and the activation arena are charged at boot rather
+        # than at the first speculative cycle; None -- and costing nothing -- when the flag is off.
+        self.spec_state_ladder = None
+        if config.spec_decode.enabled and self.linear_state_pool is not None:
+            from freetoken.engine.spec_state_ladder import SpecStateLadder
+
+            self.spec_state_ladder = SpecStateLadder(
+                self.linear_state_pool, config.spec_decode.batch_width
+            )
+
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
         self.max_seq_len = min(config.max_seq_len, num_tokens)
@@ -922,6 +933,10 @@ class Engine:
             # teardown and re-capture so the recaptured graphs bind the new state tensors.
             # +1 for the reserved padding sink: num_mamba_slots is the usable count.
             self.linear_state_pool.rebuild(num_mamba_slots + 1)
+            if self.spec_state_ladder is not None:
+                # rebuild resets the free list, so the ladder's snapshot slot would otherwise
+                # be handed out to a live request as well.
+                self.spec_state_ladder.rebind()
         # 3. Refresh max_seq_len (+ generic page table) for the new token budget.
         self._refresh_seq_state(config)
         aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)

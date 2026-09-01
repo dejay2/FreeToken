@@ -119,6 +119,10 @@ class LinearStatePool:
             return t[0]
         return t[self._state_layer_index[name][layer_id]]
 
+    def slot_state_layer_ids(self, name: str) -> tuple[int, ...]:
+        """Layer ids of a declared sibling state, in the order of its layer rows."""
+        return tuple(self._state_layer_index[name])
+
     @property
     def num_free_slots(self) -> int:
         return len(self._free_slots)
