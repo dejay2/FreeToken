@@ -94,6 +94,44 @@ def test_greedy_sampler_is_exact_and_validates_sampling_controls():
         sampler.sample(logits.view(1, -1), temperature=1.0)
 
 
+def test_device_native_sampling_matches_the_host_int_form_on_every_branch():
+    """``sample`` is ``int(sample_device)``; drafting uses the latter to skip the per-token
+    sync, so the two forms must select identically and advance the generator identically."""
+    logits = torch.tensor([0.2, 0.7, -0.1, 1.1, 0.3])
+    branches = (
+        {"temperature": 0.0},
+        {"temperature": 1.0, "top_k": 1},
+        {"temperature": 0.8},
+        {"temperature": 0.8, "top_k": 3},
+        {"temperature": 0.8, "top_p": 0.9},
+        {"temperature": 0.8, "top_k": 4, "top_p": 0.9},
+    )
+    for params in branches:
+        host = MTPDraftSampler(seed=77, device=torch.device("cpu"))
+        device = MTPDraftSampler(seed=77, device=torch.device("cpu"))
+        for _ in range(16):
+            picked = device.sample_device(logits, **params)
+            assert isinstance(picked, torch.Tensor)
+            assert picked.device == device.device
+            assert picked.dtype == torch.int64
+            assert picked.numel() == 1
+            assert host.sample(logits, **params) == int(picked)
+
+
+def test_device_native_sampling_validates_the_same_controls():
+    sampler = MTPDraftSampler(seed=4, device=torch.device("cpu"))
+    logits = torch.tensor([-2.0, 5.0, 3.0])
+    assert int(sampler.sample_device(logits, temperature=0.0)) == 1
+    with pytest.raises(ValueError, match="temperature"):
+        sampler.sample_device(logits, temperature=-1.0)
+    with pytest.raises(ValueError, match="top_p"):
+        sampler.sample_device(logits, temperature=1.0, top_p=0.0)
+    with pytest.raises(ValueError, match="top_k"):
+        sampler.sample_device(logits, temperature=1.0, top_k=0)
+    with pytest.raises(ValueError, match="one-dimensional"):
+        sampler.sample_device(logits.view(1, -1), temperature=1.0)
+
+
 def test_exact_prefix_acceptance_stops_at_first_mismatch():
     assert accepted_draft_prefix([1, 2, 3], [1, 2, 3]) == 3
     assert accepted_draft_prefix([1, 2, 3], [1, 9, 3]) == 1

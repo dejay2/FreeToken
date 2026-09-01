@@ -1222,6 +1222,25 @@ class MTPDraftSampler:
         top_k: int | None = None,
         top_p: float | None = None,
     ) -> int:
+        # the one host-int form; every branch, validation and generator draw lives in
+        # ``sample_device`` so the two forms cannot diverge
+        return int(
+            self.sample_device(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+        )
+
+    def sample_device(
+        self,
+        logits: torch.Tensor,
+        *,
+        temperature: float,
+        top_k: int | None = None,
+        top_p: float | None = None,
+    ) -> torch.Tensor:
+        """``sample`` without the device->host sync: the selected id stays on device.
+
+        Callers that draft a chain use this so no step blocks on a readback; the ops and
+        their order are identical to ``sample``'s, so the generator advances the same way.
+        """
         if logits.ndim != 1:
             raise ValueError(f"MTP draft logits must be one-dimensional, got {tuple(logits.shape)}")
         if logits.device != self.device:
@@ -1234,7 +1253,7 @@ class MTPDraftSampler:
         if top_k is not None and top_k != -1 and top_k < 1:
             raise ValueError(f"MTP draft top_k must be -1 or positive, got {top_k}")
         if temperature == 0 or top_k == 1:
-            return int(torch.argmax(logits))
+            return torch.argmax(logits)
 
         filtered = logits.float() / float(temperature)
         if top_k not in (None, -1) and top_k < vocab:
@@ -1250,7 +1269,7 @@ class MTPDraftSampler:
                 0, order, sorted_probabilities
             )
             probabilities /= probabilities.sum()
-        return int(torch.multinomial(probabilities, 1, generator=self.generator))
+        return torch.multinomial(probabilities, 1, generator=self.generator)
 
 
 @dataclass(frozen=True)
