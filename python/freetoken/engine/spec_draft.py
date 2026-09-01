@@ -55,7 +55,7 @@ with. ``MTPDraftSampler.sample`` is exactly that filter's one-row form, pinned b
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping, Sequence
 
@@ -69,6 +69,20 @@ _MAX_DRAFT_ROWS = 128
 
 _EXPERT_FORMAT_ENV = "FREETOKEN_MTP_SPEC_EXPERT_FORMAT"
 _NVFP4_MANIFEST_ENV = "FREETOKEN_MTP_SPEC_NVFP4_MANIFEST"
+_CONF_LOG_ENV = "FREETOKEN_MTP_SPEC_CONF_LOG"
+
+
+def spec_conf_log_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether the confidence-cut diagnosis log is armed (``FREETOKEN_MTP_SPEC_CONF_LOG``).
+
+    Read fresh on every call rather than frozen into a module constant: the flag arms an
+    instrumentation-only side channel, so a test that sets it must be able to see it take
+    effect without reimporting the module. The cost of an armed proposal is a topk over the
+    logit rows it already keeps plus one readback; the cost of an unarmed one is this dict
+    lookup and nothing else -- in particular no device sync.
+    """
+    env = os.environ if environ is None else environ
+    return bool((env.get(_CONF_LOG_ENV, "") or "").strip())
 
 
 def resolve_spec_expert_placement(
@@ -185,10 +199,20 @@ class DraftProposal:
 
     Rejection sampling corrects from the residual ``(p - q)+``, so the sampler needs all of
     ``q``, not just the proposed tokens' probabilities.
+
+    ``draft_top1`` / ``draft_top1_gap`` are diagnosis only and are None unless
+    ``spec_conf_log_enabled()``. They are the draft head's RAW softmax top-1 probability and
+    its top1-minus-top2 margin per drafted token -- the head's own confidence, which is what a
+    confidence cut would have to decide on. The verdict's ``draft_probabilities`` cannot serve:
+    that is ``q`` under the REQUEST's sampling filter, and a greedy request's filter makes it
+    degenerate (1.0 for every draft, accepted or not). Timing-only fields, hence
+    ``compare=False`` -- the same treatment ``SpecDecision`` gives its own instrumentation.
     """
 
     tokens: tuple[int, ...]
     logits: torch.Tensor  # [k, vocab]
+    draft_top1: tuple[float, ...] | None = field(default=None, compare=False)
+    draft_top1_gap: tuple[float, ...] | None = field(default=None, compare=False)
 
 
 class SpecDraftHead:
@@ -654,12 +678,44 @@ class SpecDraftHead:
             self.committed_len = base_len
         # one readback for the whole chain
         tokens = torch.cat([token.reshape(1) for token in drafted]).tolist()
-        return DraftProposal(tokens=tuple(int(t) for t in tokens), logits=torch.stack(rows))
+        stacked = torch.stack(rows)
+        top1, gap = _draft_confidence(stacked)
+        return DraftProposal(
+            tokens=tuple(int(t) for t in tokens),
+            logits=stacked,
+            draft_top1=top1,
+            draft_top1_gap=gap,
+        )
 
     def close(self) -> None:
         runner = getattr(self, "expert_runner", None)
         if runner is not None:
             runner.close()
+
+
+def _draft_confidence(
+    logits: torch.Tensor,
+) -> tuple[tuple[float, ...] | None, tuple[float, ...] | None]:
+    """Per drafted token: the raw softmax top-1 probability and the top1-top2 margin.
+
+    ``(None, None)`` unless the confidence log is armed, and then nothing is computed at all --
+    the proposal path must stay byte for byte what it was when the flag is unset. Armed, this
+    is one softmax and one width-2 topk over rows ``propose`` already holds, plus the single
+    readback that turns them into host floats (a sync, which the flag licenses).
+    """
+    if not spec_conf_log_enabled():
+        return None, None
+    probabilities = torch.softmax(logits.detach().float(), dim=-1)
+    width = min(2, probabilities.shape[-1])
+    best = probabilities.topk(width, dim=-1).values
+    top1 = best[:, 0]
+    runner_up = best[:, 1] if width == 2 else torch.zeros_like(top1)
+    # clamped because a float32 softmax can put the two within an ulp of each other
+    margin = (top1 - runner_up).clamp_min(0.0)
+    return (
+        tuple(float(v) for v in top1.tolist()),
+        tuple(float(v) for v in margin.tolist()),
+    )
 
 
 def _draft_seed(seed: int, uid: int, *, purpose: int = 1) -> int:
@@ -675,5 +731,6 @@ __all__ = [
     "build_shifted_rope_positions",
     "load_spec_expert_banks",
     "resolve_spec_expert_placement",
+    "spec_conf_log_enabled",
     "spec_expert_runner_type",
 ]

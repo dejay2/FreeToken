@@ -15,6 +15,7 @@ everything between the model and the client is proven here.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -887,6 +888,104 @@ def test_the_probe_is_handed_the_untruncated_verdicts_acceptance_timings():
     assert decision.accepted_rows == 4
     assert decision.filter_ms >= 0.0 and decision.decide_ms >= 0.0
     assert decision.sync_ms >= 0.0
+
+
+# -------------------------------------------------------------------- the confidence-cut log
+
+
+def test_an_unset_conf_log_flag_arms_nothing(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_MTP_SPEC_CONF_LOG", raising=False)
+    target = _FakeTarget()
+    stub = _scheduler(target, _FakeDraft(target))
+    req = _decode_req(stub)
+
+    stub._speculative_decode_step(req)
+
+    assert stub._spec_conf_log() is None
+    (msg,) = stub.sent[-1]
+    assert len(msg.next_tokens) == 4
+
+
+def test_an_armed_conf_log_writes_one_well_formed_line_per_cycle(monkeypatch, tmp_path):
+    monkeypatch.setenv("FREETOKEN_MTP_SPEC_CONF_LOG", str(tmp_path))
+    target = _FakeTarget()
+    stub = _scheduler(target, _FakeDraft(target))
+    req = _decode_req(stub)
+    cached_len = req.cached_len
+
+    stub._speculative_decode_step(req)
+    stub._spec_conf_log().flush()  # the buffer is drained every 100 cycles or at exit
+
+    (path,) = list(tmp_path.glob("conf-log-*.jsonl"))
+    (line,) = [json.loads(raw) for raw in path.read_text().splitlines()]
+    assert set(line) == {
+        "uid",
+        "cached_len",
+        "draft_q",
+        "draft_top1",
+        "draft_top1_gap",
+        "accepted_drafts",
+        "emitted",
+        "greedy",
+    }
+    assert line["uid"] == req.uid
+    # the length the drafts were made AT, not the one the cycle settled the request to
+    assert line["cached_len"] == cached_len
+    assert len(line["draft_q"]) == 3  # one per draft, whatever the run's own length
+    assert all(0.0 <= q <= 1.0 for q in line["draft_q"])
+    assert line["accepted_drafts"] == 3 and line["emitted"] == 4
+    assert line["greedy"] is True
+    # the fake draft head does not compute them; the field is present and null either way
+    assert line["draft_top1"] is None and line["draft_top1_gap"] is None
+
+
+def test_the_conf_log_carries_the_draft_heads_confidence_when_the_head_reports_it(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FREETOKEN_MTP_SPEC_CONF_LOG", str(tmp_path))
+    target = _FakeTarget()
+    draft = _FakeDraft(target)
+    inner = draft.propose
+
+    def _with_confidence(req, depth):
+        from freetoken.engine.spec_draft import DraftProposal
+
+        proposal = inner(req, depth)
+        return DraftProposal(
+            tokens=proposal.tokens,
+            logits=proposal.logits,
+            draft_top1=tuple(0.9 - 0.1 * i for i in range(len(proposal.tokens))),
+            draft_top1_gap=tuple(0.5 - 0.1 * i for i in range(len(proposal.tokens))),
+        )
+
+    draft.propose = _with_confidence
+    stub = _scheduler(target, draft)
+    req = _decode_req(stub)
+
+    stub._speculative_decode_step(req)
+    stub._spec_conf_log().flush()
+
+    (path,) = list(tmp_path.glob("conf-log-*.jsonl"))
+    (line,) = [json.loads(raw) for raw in path.read_text().splitlines()]
+    assert line["draft_top1"] == pytest.approx([0.9, 0.8, 0.7])
+    assert line["draft_top1_gap"] == pytest.approx([0.5, 0.4, 0.3])
+
+
+def test_the_conf_log_buffers_rather_than_writing_a_line_at_a_time(monkeypatch, tmp_path):
+    """A cycle is ~20 ms live; the log must not put a file write in the middle of every one."""
+    monkeypatch.setenv("FREETOKEN_MTP_SPEC_CONF_LOG", str(tmp_path))
+    target = _FakeTarget()
+    stub = _scheduler(target, _FakeDraft(target))
+    req = _decode_req(stub)
+
+    _run_spec(stub, req, cycles=8)
+
+    log = stub._spec_conf_log()
+    assert log.cycles >= 2
+    assert not list(tmp_path.glob("conf-log-*.jsonl"))  # nothing on disk before a flush
+    log.flush()
+    (path,) = list(tmp_path.glob("conf-log-*.jsonl"))
+    assert len(path.read_text().splitlines()) == log.cycles
 
 
 def test_an_unarmed_probe_leaves_the_cycle_exactly_as_it_was():

@@ -1169,6 +1169,23 @@ class Scheduler(SchedulerIOMixin):
             probe.start_cycle()
         return probe
 
+    def _spec_conf_log(self) -> "_SpecConfLog | None":
+        """The per-cycle (confidence, acceptance) log behind FREETOKEN_MTP_SPEC_CONF_LOG=<dir>.
+
+        Resolved once per process, the same lazy shape as ``_spec_timing_probe``. Unset it is a
+        single ``getattr`` per cycle and no device work whatsoever; set, it costs a readback of
+        the draft's own confidences and a buffered line of JSON -- a diagnosis flag, never a
+        serving one.
+        """
+        log = getattr(self, "_spec_conf", False)
+        if log is False:
+            import os
+
+            directory = (os.getenv("FREETOKEN_MTP_SPEC_CONF_LOG", "") or "").strip()
+            log = _SpecConfLog(directory) if directory else None
+            self._spec_conf = log
+        return log
+
     def _spec_policy(self, req: Req) -> "_SpecAcceptance | None":
         """This request's acceptance policy, or None while the fallback is disabled.
 
@@ -1262,6 +1279,10 @@ class Scheduler(SchedulerIOMixin):
         """
         engine = self.engine
         probe = self._spec_timing_probe()
+        conf_log = self._spec_conf_log()
+        # read before the cycle settles it: what a confidence cut has to be judged against is
+        # the context length the drafts were made AT
+        cached_len = int(req.cached_len) if conf_log is not None else 0
         depth = min(self.config.spec_decode.depth, req.remain_len)
         proposal = engine.spec_draft.propose(req, depth)
         probe and probe.mark("draft")
@@ -1314,6 +1335,15 @@ class Scheduler(SchedulerIOMixin):
             policy=self._spec_policy(req),
             # the untruncated verdict: the acceptance timings are the step's, not the run's
             decision=output.decision,
+        )
+        conf_log and conf_log.record(
+            uid=req.uid,
+            cached_len=cached_len,
+            proposal=proposal,
+            # untruncated for the same reason the probe takes it untruncated: what was accepted
+            # is a property of the step, not of where a stop condition cut the run
+            decision=output.decision,
+            emitted=emitted,
         )
         self.decode_manager.filter_reqs([req])
 
@@ -1630,6 +1660,79 @@ class _SpecTimingProbe:
                 "emitted/cycle %.2f | ema %s",
                 self.cycles, per, accept, replay, self.emitted / self.cycles, adaptive,
             )
+
+
+class _SpecConfLog:
+    """One JSON line per speculative cycle: what the draft believed, and what was accepted.
+
+    The evidence for CONFIDENCE-CUT DRAFTING. The head drafts a fixed ``depth`` every cycle and
+    the target verifies all of them, so a draft that was never going to be accepted still costs
+    its row in the verify forward -- the expensive direction on an expert-offload box. The
+    question this log answers is whether the draft's OWN confidence says which drafts those
+    are, before the target is asked. Analysis is offline (see the companion script): here we
+    only record, never decide, and nothing in the serving path reads a line back.
+
+    Two confidences are written because they answer it at different temperatures.
+    ``draft_q`` is the acceptance test's own ``q`` -- the drafted token's probability under the
+    REQUEST's sampling filter -- which is exactly what a sampled request's ratio divides by,
+    but is degenerate at temperature 0 (the filter collapses onto the argmax, so ``q`` is 1.0
+    for every draft whether or not the target agrees). ``draft_top1`` / ``draft_top1_gap`` are
+    the head's RAW softmax top-1 and its top1-top2 margin, which stay informative under a
+    greedy filter; they are None when the draft head did not compute them.
+
+    Buffered and appended, because a cycle is ~20 ms and an fsync per cycle would be a
+    measurable share of it. The file is opened per flush rather than held open so that a
+    killed server leaves everything up to the last flush readable.
+    """
+
+    FLUSH_EVERY = 100
+
+    def __init__(self, directory: str) -> None:
+        import atexit
+        import os
+
+        os.makedirs(directory, exist_ok=True)
+        self.path = os.path.join(directory, f"conf-log-{os.getpid()}.jsonl")
+        self.cycles = 0
+        self._lines: List[str] = []
+        self._broken = False
+        atexit.register(self.flush)
+
+    def record(self, *, uid: int, cached_len: int, proposal, decision, emitted: int) -> None:
+        import json
+
+        top1 = getattr(proposal, "draft_top1", None)
+        gap = getattr(proposal, "draft_top1_gap", None)
+        self._lines.append(
+            json.dumps(
+                {
+                    "uid": int(uid),
+                    "cached_len": int(cached_len),
+                    "draft_q": [float(v) for v in decision.draft_probabilities],
+                    "draft_top1": None if top1 is None else [float(v) for v in top1],
+                    "draft_top1_gap": None if gap is None else [float(v) for v in gap],
+                    "accepted_drafts": int(decision.accepted_drafts),
+                    "emitted": int(emitted),
+                    "greedy": bool(decision.greedy),
+                }
+            )
+        )
+        self.cycles += 1
+        if len(self._lines) >= self.FLUSH_EVERY:
+            self.flush()
+
+    def flush(self) -> None:
+        """Append the buffer, best effort -- a diagnosis log never takes the server down."""
+        lines, self._lines = self._lines, []
+        if not lines:
+            return
+        try:
+            with open(self.path, "a", encoding="utf-8") as handle:
+                handle.write("".join(line + "\n" for line in lines))
+        except OSError as error:  # pragma: no cover - a full or vanished log directory
+            if not self._broken:
+                self._broken = True
+                logger.warning("spec confidence log %s is not writable: %s", self.path, error)
 
 
 def _make_spec_write_tuple(batch: Batch, device: torch.device) -> Indice2D:

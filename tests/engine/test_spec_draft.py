@@ -527,6 +527,68 @@ def test_an_unprimed_head_refuses_to_propose():
         head.propose(_req(), 3)
 
 
+# ------------------------------------------------------- the confidence-cut diagnosis fields
+
+
+def _proposed(depth: int = 3) -> DraftProposal:
+    head = _head()
+    batch, _ = _prefill_batch(5)
+    head.observe_forward(batch, _capture(5), torch.tensor(7))
+    return head.propose(_req(cached_len=5), depth)
+
+
+def test_the_draft_confidences_are_absent_unless_the_conf_log_is_armed(monkeypatch):
+    """Instrumentation only: unarmed, the proposal is exactly the tuple it always was, and no
+    softmax/topk/readback happens over the logit rows on the way out."""
+    monkeypatch.delenv("FREETOKEN_MTP_SPEC_CONF_LOG", raising=False)
+
+    proposal = _proposed()
+
+    assert proposal.draft_top1 is None
+    assert proposal.draft_top1_gap is None
+
+
+def test_an_armed_conf_log_attaches_the_raw_softmax_confidence_of_every_draft(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_MTP_SPEC_CONF_LOG", "/some/dir")
+
+    proposal = _proposed()
+
+    assert proposal.draft_top1 is not None and proposal.draft_top1_gap is not None
+    assert len(proposal.draft_top1) == len(proposal.tokens) == 3
+    assert len(proposal.draft_top1_gap) == 3
+    assert all(0.0 < value <= 1.0 for value in proposal.draft_top1)
+    assert all(value >= 0.0 for value in proposal.draft_top1_gap)
+
+
+def test_the_armed_confidence_is_the_raw_softmax_of_the_row_not_the_requests_filter(
+    monkeypatch,
+):
+    """The request below is greedy, under whose filter ``q`` is 1.0 for every draft. The
+    confidence a cut policy would read has to come from the RAW row instead, which is what
+    makes it able to separate a sure draft from a coin flip."""
+    monkeypatch.setenv("FREETOKEN_MTP_SPEC_CONF_LOG", "1")
+
+    proposal = _proposed()
+
+    probabilities = torch.softmax(proposal.logits.float(), dim=-1)
+    best = probabilities.topk(2, dim=-1).values
+    assert proposal.draft_top1 == pytest.approx(best[:, 0].tolist())
+    assert proposal.draft_top1_gap == pytest.approx((best[:, 0] - best[:, 1]).tolist())
+    # ... and it is emphatically not the degenerate filtered q the verdict carries
+    assert all(value < 1.0 for value in proposal.draft_top1)
+
+
+def test_the_conf_log_flag_is_re_read_rather_than_frozen_at_import(monkeypatch):
+    from freetoken.engine.spec_draft import spec_conf_log_enabled
+
+    monkeypatch.delenv("FREETOKEN_MTP_SPEC_CONF_LOG", raising=False)
+    assert spec_conf_log_enabled() is False
+    monkeypatch.setenv("FREETOKEN_MTP_SPEC_CONF_LOG", "  ")
+    assert spec_conf_log_enabled() is False  # whitespace is not a directory
+    monkeypatch.setenv("FREETOKEN_MTP_SPEC_CONF_LOG", "/tmp/conf")
+    assert spec_conf_log_enabled() is True
+
+
 # --------------------------------------------------------------- the distribution contract
 
 
