@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
+from freetoken import diag
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.utils import init_logger, mem_GB
@@ -205,7 +206,10 @@ class GraphRunner:
         assert self.can_use_cuda_graph(batch)
         self.buffer.copy_from(batch)
         g = self.graph_map[batch.padded_size]
-        self.model.prepare_cuda_graph_replay(batch)
+        # The host-blocking mmap PLE gather -- the one part of a "graph replay" step that is
+        # not the graph (freetoken/diag.py; default-off).
+        with diag.region("diag.ple_gather"):
+            self.model.prepare_cuda_graph_replay(batch)
         self.attn_backend.prepare_for_replay(batch)
         g.replay()
         return self.buffer.logits[: batch.size]

@@ -13,6 +13,7 @@ from freetoken.layers import (
 )
 
 from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged, Fp8BlockLinear
+from freetoken.layers.moe import register_predict_router
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -75,6 +76,9 @@ class Qwen3_5MoE(BaseOP):
             weight_format=weight_format,
         )
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
+        # Routing-predictor study (FREETOKEN_MOE_PREDICT_LOG): layer L scores layers L+1/L+2's
+        # routers on its OWN input, so it needs their gate modules. A no-op while unarmed.
+        register_predict_router(layer_id, self.gate)
         self.shared_expert = _SharedExpert(
             config, config.hidden_size, config.shared_expert_intermediate_size
         )

@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List
 
 import torch
+from freetoken import diag
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
@@ -171,9 +172,12 @@ class Qwen4ExpModel(BaseOP):
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
 
-            meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
-            for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
-                ple.start_prefetch(batch, meta)
+            # The eager mirror of the graph path's staging gather (freetoken/diag.py; off by
+            # default) -- the hash + row_ids build and the table's own prefetch.
+            with diag.region("diag.ple_gather"):
+                meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
+                for ple in self._ple:  # gather the PLE rows while the early layers run
+                    ple.start_prefetch(batch, meta)
         for layer in self.layers.op_list:
             hidden = layer.forward(hidden, batch)
         if meta is not None:
@@ -200,11 +204,14 @@ class Qwen4ExpModel(BaseOP):
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
-        from freetoken.models.config import vision_execution_mode
+        from freetoken.models.config import embed_host_enabled, vision_execution_mode
 
         self._config = config
         self._mmap_ple = False
         self._vision_execution = vision_execution_mode() if config.is_multimodal else "gpu"
+        # A tied lm_head projects against the SAME matrix every step, so the full-vocab GEMV
+        # would drag all 1.27 GB over PCIe per token: host residency is only a win untied.
+        self._embed_host = embed_host_enabled() and not config.tie_word_embeddings
         self.model = Qwen4ExpModel(config)
         if getattr(config, "lm_head_quant", "none") == "nvfp4":
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
@@ -232,11 +239,22 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         """Choose persistent storage without leaking Qwen key names into the engine."""
         if self._vision_execution == "layer-stream" and key.startswith("visual."):
             return torch.device("cpu")
+        if getattr(self, "_embed_host", False) and key == "model.embed_tokens.weight":
+            # Landed on the host unpinned here; ``load_host_tables`` re-homes it into exact-size
+            # cudaHostAlloc storage (the caching pinned allocator would round 1.27 GB to 2 GB).
+            return torch.device("cpu")
         return engine_device
 
     def weight_placement_report(self) -> str:
+        lines = []
+        if getattr(self, "_embed_host", False):
+            embed = self.model.embed_tokens.weight
+            lines.append(
+                f"Token embedding: host-resident, bytes={embed.numel() * embed.element_size()}, "
+                f"device={embed.device.type}"
+            )
         if not hasattr(self, "visual"):
-            return ""
+            return "\n".join(lines)
         tensors = self.visual.state_dict().values()
         count = 0
         nbytes = 0
@@ -245,10 +263,11 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             count += 1
             nbytes += tensor.numel() * tensor.element_size()
             devices.add(tensor.device.type)
-        return (
+        lines.append(
             f"Picture weights: mode={self._vision_execution}, tensors={count}, "
             f"bytes={nbytes}, devices={','.join(sorted(devices))}"
         )
+        return "\n".join(lines)
 
     @torch.inference_mode()
     def encode_images(
@@ -256,7 +275,10 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     ) -> torch.Tensor:
         if not hasattr(self, "visual"):
             raise RuntimeError("Qwen4-Exp picture weights are not loaded")
-        language_device = self.model.embed_tokens.weight.device
+        # ``.device``, not ``.weight.device``: the embedding table may be host-resident, in
+        # which case its weight sits on the CPU while the language model still runs on the GPU.
+        embed_tokens = self.model.embed_tokens
+        language_device = getattr(embed_tokens, "device", None) or embed_tokens.weight.device
         if self._vision_execution == "layer-stream":
             return self.visual.forward_layer_streamed(
                 pixel_values,
@@ -280,11 +302,27 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         if self._mmap_ple:
             self.model.reset_mmap_ple_graph()
 
+    def _load_host_embedding(self) -> int:
+        """Re-home ``model.embed_tokens`` into exact-size pinned host storage.
+
+        ``weight_device_for_key`` already landed it on the CPU, but as ordinary pageable
+        memory; the UVA gather needs it pinned and device-mapped. Dummy-weight boots ignore
+        ``device_for_key`` and leave the table on the GPU -- nothing to do there.
+        """
+        embed = self.model.embed_tokens
+        if not self._embed_host or embed.weight.device.type != "cpu":
+            return 0
+        from freetoken.kernel.pinned import copy_to_pinned_tensor
+
+        pinned = copy_to_pinned_tensor(embed.weight.contiguous())
+        return embed.attach_host_table(pinned, torch.device("cuda", torch.cuda.current_device()))
+
     def load_host_tables(self, engine_config) -> int:
-        """Attach the PLE table and return persistent pinned bytes."""
+        """Attach the PLE table (and any host-resident embedding) and return pinned bytes."""
+        host_bytes = self._load_host_embedding()
         ple_layers = self.model.ple_layers
         if not ple_layers:
-            return 0
+            return host_bytes
         from .ple import PinnedUVATable, ZeroTable, derive_ngram_hash_constants
 
         if getattr(engine_config, "use_dummy_weight", False):
@@ -304,7 +342,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.ngram_heads_vocab_sizes.copy_(torch.tensor(sizes, dtype=torch.int64))
                 emb.ngram_heads_offsets.copy_(torch.tensor(offsets, dtype=torch.int64))
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
-            return 0
+            return host_bytes
 
         ple_backend = getattr(engine_config, "ple_backend", "pinned")
         if ple_backend == "mmap":
@@ -318,7 +356,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 ple.ple_embedding.attach_table(
                     MmapStagedTable(table.storage, float(table.weight_scale))
                 )
-            return 0
+            return host_bytes
         if ple_backend != "pinned":
             raise ValueError(f"unsupported PLE backend {ple_backend!r}")
 
@@ -330,7 +368,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             ple.ple_embedding.attach_table(
                 PinnedUVATable(table.bank.tensor, float(table.weight_scale))
             )
-        return table.bank.nbytes
+        return host_bytes + table.bank.nbytes
 
     def forward_mtp_capture(
         self, *, all_row_logits: bool = False

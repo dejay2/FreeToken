@@ -34,6 +34,17 @@ def vision_load_enabled() -> bool:
     return os.getenv("FREETOKEN_LOAD_VISION", "0").strip().lower() in _VISION_TRUE
 
 
+def embed_host_enabled() -> bool:
+    """Keep the token embedding table in pinned host memory (default OFF).
+
+    ``model.embed_tokens`` is 248,320 x 2560 bf16 = 1.27 GB of resident VRAM that decode
+    reads 1-6 rows of per step and prefill up to one chunk of rows. With
+    ``FREETOKEN_EMBED_HOST=1`` the table stays pinned on the host and rows are gathered
+    over UVA, handing the 1.27 GB to the GPU expert cache. Only safe when ``lm_head`` is
+    untied (a tied head would still need the whole matrix on device for its GEMV)."""
+    return os.getenv("FREETOKEN_EMBED_HOST", "0").strip().lower() in _VISION_TRUE
+
+
 def detect_expert_quant(hf_config: Any) -> str:
     """Routed-expert quantization from a checkpoint's ``quantization_config``: ``"nvfp4"`` for
     a ModelOpt FP4 build, else the lowercased algo string (``"none"`` when unquantized). Models

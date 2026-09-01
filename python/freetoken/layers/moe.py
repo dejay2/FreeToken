@@ -94,6 +94,199 @@ if _ROUTE_LOG_DIR is not None:
     atexit.register(_route_log_flush_atexit)
 
 
+# ----------------------------------------------------------------------
+# Throwaway routing-PREDICTOR diagnostics (expert-prefetch feasibility, part two).
+#
+# The question: can layer L+1's routed experts be read off the hidden state that is
+# already available at layer L? If they can, layer L+1's PCIe fetch can be started
+# while layer L is still computing, and the serialized fetch stops being serialized.
+#
+# What this records is the CEILING of the cheapest possible predictor: layer L+1's OWN
+# router, scored on layer L's router input. It is not a proposal for a mechanism -- it
+# is the measurement that says whether any mechanism could work.
+#
+# Enabled only when FREETOKEN_MOE_PREDICT_LOG names a directory; the single cached
+# module-level check below is the entire cost when it is unset. Prefill/eager only:
+# the capture guard below self-disables the whole thing under CUDA graph capture, and
+# a captured decode never re-enters this code.
+# ----------------------------------------------------------------------
+_PREDICT_LOG_DIR = os.getenv("FREETOKEN_MOE_PREDICT_LOG") or None
+_PREDICT_DUMP = os.getenv("FREETOKEN_MOE_PREDICT_DUMP") == "1"
+_PREDICT_TOPK = 20  # how deep the prediction is scored (recall@10/@15/@20 offline)
+_PREDICT_DUMP_STRIDE = 4  # keep every 4th token's router input for offline training
+_PREDICT_FLUSH_EVERY = 50
+_predict_routers: "dict[int, object]" = {}
+_predict_records: list = []
+_predict_path: str | None = None
+_predict_dump: "dict[int, dict]" = {}
+_predict_dump_last_layer = -1
+_predict_dump_chunk = 0
+
+
+def register_predict_router(layer_id, gate) -> None:
+    """Register layer ``layer_id``'s router (gate) module for the prediction study.
+
+    A registry populated at model construction rather than a walk back up to the parent
+    model: an MoE layer has no handle on its siblings and nothing in serving wants one.
+    It holds the MODULE (never a weight copy), so ``_predict_topk`` scores with the real
+    router; and it is populated only while the study is armed, so an unarmed process
+    keeps an empty dict and one ``is None`` test per model layer at construction.
+    """
+    if _PREDICT_LOG_DIR is None or layer_id is None:
+        return
+    _predict_routers[int(layer_id)] = gate
+
+
+def _predict_flush() -> None:
+    global _predict_path
+    if not _predict_records:
+        return
+    if _predict_path is None:
+        assert _PREDICT_LOG_DIR is not None
+        os.makedirs(_PREDICT_LOG_DIR, exist_ok=True)
+        _predict_path = os.path.join(_PREDICT_LOG_DIR, f"predict-log-{os.getpid()}.jsonl")
+    batch, _predict_records[:] = list(_predict_records), []
+    with open(_predict_path, "a", encoding="utf-8") as fh:
+        for rec in batch:
+            fh.write(json.dumps(rec) + "\n")
+
+
+def _predict_topk(layer_id: int, x: torch.Tensor, renormalize: bool):
+    """Top-``_PREDICT_TOPK`` experts of layer ``layer_id``'s router, scored on ``x``.
+
+    Deliberately the real path: the registered gate module, then ``fused_topk`` with the
+    calling layer's own ``renormalize`` -- the same scoring function the live router runs,
+    not a re-implementation of it. Only the ids are kept.
+    """
+    gate = _predict_routers.get(layer_id)
+    if gate is None:
+        return None
+    logits = gate.forward(x)
+    topk = min(_PREDICT_TOPK, int(logits.shape[-1]))
+    _, ids = fused_topk(
+        hidden_states=x, gating_output=logits, topk=topk, renormalize=renormalize
+    )
+    return ids
+
+
+def _predict_ids(ids) -> list:
+    if ids is None:
+        return []
+    return ids.detach().reshape(ids.shape[0], -1).cpu().tolist()
+
+
+def _predict_dump_flush() -> None:
+    """Write the pending forward's per-layer training dumps and drop them.
+
+    Stitching is why the dump is buffered at all: layer L's record wants the ACTUAL top-10
+    of layers L+1 and L+2, which are only routed later in the same forward. Exactly one
+    forward's worth is ever held (``_predict_dump_note`` flushes when a new forward starts),
+    so memory stays bounded by one prefill chunk.
+    """
+    global _predict_dump_chunk
+    pending = dict(_predict_dump)
+    _predict_dump.clear()
+    if not pending:
+        return
+    assert _PREDICT_LOG_DIR is not None
+    os.makedirs(_PREDICT_LOG_DIR, exist_ok=True)
+    chunk = _predict_dump_chunk
+    _predict_dump_chunk += 1
+    for layer_id, entry in sorted(pending.items()):
+        nxt = pending.get(layer_id + 1)
+        nxt2 = pending.get(layer_id + 2)
+        if nxt is None or nxt2 is None:
+            continue  # the top two layers have nothing to predict
+        rows = entry["x"].shape[0]
+        if nxt["top10"].shape[0] != rows or nxt2["top10"].shape[0] != rows:
+            continue  # different forward shapes: not the same tokens
+        path = os.path.join(_PREDICT_LOG_DIR, f"x_layer{layer_id:02d}_{chunk}.pt")
+        torch.save(
+            {
+                "layer": layer_id,
+                "num_experts": entry["num_experts"],
+                "positions": entry["positions"],
+                "x": entry["x"],
+                "top10_l": entry["top10"],
+                "top10_l1": nxt["top10"],
+                "top10_l2": nxt2["top10"],
+            },
+            path,
+        )
+
+
+def _predict_dump_note(layer_id: int, x: torch.Tensor, topk_ids, positions, experts) -> None:
+    """Buffer every ``_PREDICT_DUMP_STRIDE``-th token's router input for this layer."""
+    global _predict_dump_last_layer
+    if layer_id <= _predict_dump_last_layer:
+        _predict_dump_flush()  # a new forward started; the previous one is complete
+    _predict_dump_last_layer = layer_id
+    step = _PREDICT_DUMP_STRIDE
+    _predict_dump[layer_id] = {
+        "num_experts": int(experts),
+        "positions": list(positions[::step]),
+        "x": x.detach()[::step].to(torch.float16).cpu(),
+        "top10": topk_ids.detach()[::step].to(torch.int32).cpu(),
+    }
+
+
+def _predict_log(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> None:
+    """Record one MoE forward's routing decision beside the next two layers' predictions.
+
+    ``x`` must be the tensor the router itself consumed, and ``topk_ids`` this layer's real
+    decision -- so both hooks sit before ``ensure_experts``' in-place rewrite. Best effort:
+    never raises.
+    """
+    try:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+        layer_id = int(layer.layer_id)
+        pred_next = _predict_topk(layer_id + 1, x, layer.renormalize)
+        pred_next2 = _predict_topk(layer_id + 2, x, layer.renormalize)
+        batch = get_global_ctx().batch
+        tokens = batch.input_ids.detach().reshape(-1).cpu().tolist()
+        raw_positions = getattr(batch, "positions", None)
+        positions = (
+            [] if raw_positions is None else raw_positions.detach().reshape(-1).cpu().tolist()
+        )
+        actual = _predict_ids(topk_ids)
+        if not positions:
+            positions = list(range(len(actual)))
+        _predict_records.append(
+            {
+                "layer": layer_id,
+                "phase": batch.phase,
+                "positions": positions,
+                "tokens": tokens,
+                "actual_top10": actual,
+                "pred_next_top20": _predict_ids(pred_next),
+                "pred_next2_top20": _predict_ids(pred_next2),
+            }
+        )
+        if _PREDICT_DUMP:
+            _predict_dump_note(layer_id, x, topk_ids, positions, layer.num_experts)
+        if len(_predict_records) >= _PREDICT_FLUSH_EVERY:
+            _predict_flush()
+    except Exception:  # diagnostics must never break a forward
+        pass
+
+
+def _predict_flush_atexit() -> None:
+    try:
+        if _PREDICT_DUMP:
+            _predict_dump_flush()
+    except Exception:
+        pass
+    try:
+        _predict_flush()
+    except Exception:
+        pass
+
+
+if _PREDICT_LOG_DIR is not None:
+    atexit.register(_predict_flush_atexit)
+
+
 class MoELayer(BaseOP):
     def __init__(
         self,
@@ -330,6 +523,8 @@ class OffloadMoELayer(MoELayer):
         """
         if _ROUTE_LOG_DIR is not None:
             _route_log(self.layer_id, topk_ids)  # before ensure_experts' in-place rewrite
+        if _PREDICT_LOG_DIR is not None:
+            _predict_log(self, hidden_states, topk_ids)
         if self._use_decode_movement(hidden_states):
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
         else:
@@ -349,6 +544,8 @@ class OffloadMoELayer(MoELayer):
         )
         if _ROUTE_LOG_DIR is not None:
             _route_log(self.layer_id, topk_ids)  # before ensure_experts' in-place rewrite
+        if _PREDICT_LOG_DIR is not None:
+            _predict_log(self, hidden_states, topk_ids)
         return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
     def prefill_forward(
@@ -364,6 +561,8 @@ class OffloadMoELayer(MoELayer):
         )
         if _ROUTE_LOG_DIR is not None:
             _route_log(self.layer_id, topk_ids)
+        if _PREDICT_LOG_DIR is not None:
+            _predict_log(self, hidden_states, topk_ids)
         return self._prefill_routed(hidden_states, topk_weights, topk_ids)
 
     # ------------------------------------------------------------------

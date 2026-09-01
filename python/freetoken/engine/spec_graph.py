@@ -60,6 +60,7 @@ from typing import Callable, Sequence
 
 import torch
 
+from freetoken import diag
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -755,7 +756,8 @@ class _FixedWidthGraphRunner:
         self._stage_attention(batch, self._batches[width], width)
         prepare_model = getattr(self.target_model, "prepare_cuda_graph_replay", None)
         if prepare_model is not None:
-            prepare_model(batch)
+            with diag.region("diag.ple_gather"):  # host-blocking mmap gather (freetoken/diag.py)
+                prepare_model(batch)
         graph.replay()
         return buffer
 

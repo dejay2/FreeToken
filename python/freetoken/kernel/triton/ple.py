@@ -68,12 +68,17 @@ def ple_gather_rows(
     out: torch.Tensor,
     scale: float = 1.0,
     is_fp8: bool = True,
+    num_warps: int = _NUM_WARPS,
 ) -> torch.Tensor:
     """Gather ``row_ids`` from the host-resident table at ``table_ptr`` into ``out``.
 
     ``row_ids`` is a flat device int tensor; ``out`` is ``[row_ids.numel(), embed_dim]``
     bf16 on the same device. ``table_ptr`` is the address the GPU must dereference
     (``kernel/pinned.device_ptr``), not necessarily the host ``data_ptr``.
+
+    ``num_warps`` defaults to the PLE row width (160 elements, one warp is plenty). A wider
+    table -- the 2560-wide token embedding -- passes more so a row is not 128 registers deep
+    in a single warp.
     """
     n = row_ids.numel()
     assert out.shape == (n, embed_dim) and out.is_contiguous(), out.shape
@@ -87,7 +92,7 @@ def ple_gather_rows(
             EMB_DIM=embed_dim,
             IS_FP8=is_fp8,
             BLOCK_D=triton.next_power_of_2(embed_dim),
-            num_warps=_NUM_WARPS,
+            num_warps=num_warps,
         )
     return out
 
