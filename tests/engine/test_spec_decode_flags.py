@@ -33,9 +33,9 @@ def test_speculation_is_off_and_costs_nothing_by_default():
 def test_the_flag_turns_it_on_at_the_default_depth():
     spec = resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"})
     assert spec.enabled is True
-    assert spec.depth == 3
-    assert spec.num_speculative_tokens == 3
-    assert spec.batch_width == 4
+    assert spec.depth == 5
+    assert spec.num_speculative_tokens == 5
+    assert spec.batch_width == 6
 
 
 @pytest.mark.parametrize("depth", [1, 2, 3, 4, 5])
@@ -49,15 +49,15 @@ def test_depth_is_honoured_over_its_whole_range(depth):
     assert 2 <= spec.batch_width <= 6
 
 
-def test_the_ceiling_is_five_and_the_default_stays_three():
-    """Raising the CAP is not raising the default. The confidence cut is what makes a deep
-    chain safe (only confident cycles get there), and depth 3 is the width the live sweep
-    actually measured, so 4 and 5 are opt-in until another sweep moves the default."""
+def test_the_ceiling_and_the_default_are_both_five():
+    """The default followed the ceiling only once the paired sweep proved it: depth 5 with
+    the confidence cut AND the cost-aware bar beat depth 3 on numbers/code/8k, while the
+    flat-bar depth 5 had regressed long context -11..-24% -- both companions are load-bearing."""
     from freetoken.engine.config import _DEFAULT_SPEC_DEPTH, _MAX_SPEC_DEPTH
 
-    assert (_MAX_SPEC_DEPTH, _DEFAULT_SPEC_DEPTH) == (5, 3)
-    assert resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"}).depth == 3
-    assert SpecDecodeConfig().depth == 3
+    assert (_MAX_SPEC_DEPTH, _DEFAULT_SPEC_DEPTH) == (5, 5)
+    assert resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"}).depth == 5
+    assert SpecDecodeConfig().depth == 5
 
 
 def test_depth_alone_reserves_nothing_while_speculation_is_off():
@@ -305,7 +305,7 @@ def test_the_verify_graph_flag_turns_capture_on():
     assert spec.graph is True
     # width 1 is the graphed capture-decode: the ordinary forward a spec-enabled boot still
     # runs, which without a graph of its own falls back to eager at half the decode rate.
-    assert spec.graph_widths == (1, 2, 3, 4)
+    assert spec.graph_widths == (1, 2, 3, 4, 5, 6)
 
 
 @pytest.mark.parametrize(
@@ -389,7 +389,7 @@ def test_a_fresh_request_is_seeded_at_a_full_cycles_emission():
     """Optimistic by construction: early noise must not lock speculation out before the
     request has produced any evidence of its own."""
     spec = resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"})
-    assert spec.ema_seed == pytest.approx(4.0) == pytest.approx(spec.batch_width)
+    assert spec.ema_seed == pytest.approx(6.0) == pytest.approx(spec.batch_width)
     narrow = resolve_spec_decode(
         {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_DEPTH": "1"}
     )
@@ -452,7 +452,7 @@ def test_the_probe_is_judged_on_its_own_threshold_not_the_averages():
     assert tuned.probe_resume == pytest.approx(1.5)
 
 
-@pytest.mark.parametrize("raw", ["0", "-1", "x", "", "nan", "4.5"])
+@pytest.mark.parametrize("raw", ["0", "-1", "x", "", "nan", "6.5"])
 def test_a_probe_resume_outside_the_emittable_range_is_rejected(raw):
     """Zero is rejected too: a probe that resumes on any emission is not a probe. Turning
     the fallback off is still ``FREETOKEN_MTP_SPEC_MIN_EMITTED=0``."""
@@ -466,7 +466,7 @@ def test_an_ema_alpha_outside_zero_to_one_is_rejected(raw):
         resolve_spec_decode({"FREETOKEN_MTP_SPEC_EMA_ALPHA": raw})
 
 
-@pytest.mark.parametrize("raw", ["-1", "x", "", "nan", "4.5"])
+@pytest.mark.parametrize("raw", ["-1", "x", "", "nan", "6.5"])
 def test_a_threshold_outside_zero_to_the_full_width_is_rejected(raw):
     """Above ``1 + depth`` no cycle could ever clear the bar, so speculation would go cold
     and never come back -- a configuration that silently means 'off'."""

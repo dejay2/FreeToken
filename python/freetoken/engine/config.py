@@ -29,9 +29,11 @@ if TYPE_CHECKING:
 # cycles. So the CEILING is 5; the DEFAULT stays 3 until a live sweep moves it.
 _MAX_SPEC_DEPTH = 5
 
-# What an unset ``FREETOKEN_MTP_SPEC_DEPTH`` means. Deliberately below the ceiling: depth 3 is
-# the only width live-swept end to end (slice 34), and 4/5 are opt-in until one says otherwise.
-_DEFAULT_SPEC_DEPTH = 3
+# What an unset ``FREETOKEN_MTP_SPEC_DEPTH`` means. 5 since the live paired sweep with the
+# confidence cut AND the cost-aware bar (both required): depth 5 flat-bar regressed 8k context
+# -11..-24%, but with the measured bar it beat depth 3 on numbers +7, code +4, and 8k +3
+# tok/s while the bar priced dear cycles out. Without cost_aware, prefer depth 3.
+_DEFAULT_SPEC_DEPTH = 5
 
 # A cold request probes at least once every ``cooldown_cap`` plain steps. 4x rather than 8x
 # because a re-cool now takes TWO consecutive failed probes, so each rung of the ladder is
