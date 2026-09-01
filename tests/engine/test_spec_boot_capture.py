@@ -259,7 +259,14 @@ def _dummy_req(device):
 
 
 class _Forbidden:
-    """Any touch is a failure: boot capture must never reach the draft head."""
+    """Any touch past the graph arm is a failure.
+
+    Boot capture asks the draft head one question -- ``graphs_enabled``, which decides whether
+    its own chain and commit graphs are worth recording -- and this stub answers "no". The
+    VERIFY-width capture these tests exercise must reach the head for nothing else.
+    """
+
+    graphs_enabled = False
 
     def __getattr__(self, name):
         raise AssertionError(f"boot capture touched the draft head ({name})")
@@ -657,6 +664,98 @@ def test_boot_capture_is_on_by_default(monkeypatch):
     engine._capture_spec_graphs_at_boot()
 
     assert runner.graph_count == 1
+
+
+# ------------------------------------------------- the draft head's own graphs, and the ladder
+#
+# The verify widths are one of three things boot capture records. The DRAFT chain (843 launches
+# over 7.2 ms of kernels) and the commit forward after it are the other two, and the ladder's
+# per-accepted-depth replay rungs are the third -- captured lazily they cost ~300 ms apiece on
+# the settle that first needs them.
+
+
+class _DraftStub:
+    def __init__(self, *, raises=False):
+        self.graphs_enabled = True
+        self.raises = raises
+        self.calls = 0
+
+    def capture_graphs_at_boot(self):
+        self.calls += 1
+        if self.raises:
+            raise RuntimeError("synthetic draft capture failure")
+        return {"chain:mrope=0": "captured", "commit:1:mrope=0": "retryable"}
+
+
+class _LadderStub:
+    """Enough ladder for the verify widths to arm against, plus the rung capture seam."""
+
+    def __init__(self, *, raises=False):
+        self.raises = raises
+        self.requests = []
+
+    def begin(self, req, batch):
+        batch.spec_capture = self
+
+    def stash(self, *args, **kwargs):
+        return None
+
+    def restore_snapshot(self):
+        return None
+
+    def rollback(self, req, accepted):
+        return None
+
+    def capture_replays(self, req):
+        self.requests.append(req)
+        if self.raises:
+            raise RuntimeError("synthetic ladder capture failure")
+        return {1: True, 2: True}
+
+
+@pytest.mark.skipif(not _CUDA, reason="CUDA is required")
+def test_boot_capture_records_the_draft_graphs_and_the_ladder_rungs():
+    device = torch.device("cuda")
+    ctx = _Context()
+    engine = _engine(_runner(device, (2,), ctx=ctx, model=_Model(ctx)), device=device)
+    draft, ladder = _DraftStub(), _LadderStub()
+    engine.spec_draft = draft
+    engine.spec_state_ladder = ladder
+
+    engine._capture_spec_graphs_at_boot()
+
+    assert draft.calls == 1
+    assert ladder.requests == [engine.dummy_req]
+
+
+@pytest.mark.skipif(not _CUDA, reason="CUDA is required")
+def test_neither_the_draft_graphs_nor_the_ladder_can_abort_a_boot():
+    """Both are a bonus over boot memory, never a gate: a failure logs and serving goes on
+    with the eager chain and the lazily-captured rungs."""
+    device = torch.device("cuda")
+    ctx = _Context()
+    runner = _runner(device, (2,), ctx=ctx, model=_Model(ctx))
+    engine = _engine(runner, device=device)
+    engine.spec_draft = _DraftStub(raises=True)
+    engine.spec_state_ladder = _LadderStub(raises=True)
+
+    engine._capture_spec_graphs_at_boot()  # must not raise
+
+    assert runner.graph_count == 1  # ...and the verify width still captured
+
+
+@pytest.mark.skipif(not _CUDA, reason="CUDA is required")
+def test_an_ungraphed_draft_head_is_never_asked_to_capture():
+    device = torch.device("cuda")
+    ctx = _Context()
+    engine = _engine(_runner(device, (2,), ctx=ctx, model=_Model(ctx)), device=device)
+    draft = _DraftStub()
+    draft.graphs_enabled = False
+    engine.spec_draft = draft
+
+    engine._capture_spec_graphs_at_boot()
+
+    assert draft.calls == 0
 
 
 # ------------------------------------------------------------------------- the quiet paths

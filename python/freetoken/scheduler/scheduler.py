@@ -228,7 +228,12 @@ class Scheduler(SchedulerIOMixin):
             or self._pending_rebuild is not None  # a queued rebuild to drain toward + execute
         )
         for msg in self.receive_msg(blocking=blocking):
-            self._process_one_msg(msg)
+            # Per-message so an idle poll never counts as traffic (freetoken/diag.py arms on
+            # the first opened range). Online this covers validation, the vision tower and the
+            # queue insert -- the text tokenizer itself runs in the tokenizer PROCESS and is
+            # invisible here; offline it also covers ``LLM._tokenize_one``.
+            with diag.region("diag.prefill_tokenize"):
+                self._process_one_msg(msg)
 
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
@@ -270,7 +275,12 @@ class Scheduler(SchedulerIOMixin):
                 # COW-restore GDN snapshots for prefix hits ON THE ENGINE STREAM, after the
                 # cross-stream wait and before the forward reads the live slot (program order
                 # vs the prior batch's snapshot writes). Doing this on self.stream would race.
-                self._restore_linear_states(forward_input.batch)
+                with diag.region(
+                    "diag.prefill_restore_state"
+                    if forward_input.batch.is_prefill
+                    else None
+                ):
+                    self._restore_linear_states(forward_input.batch)
                 ongoing_data = (forward_input, self._forward(forward_input))
 
         # The drain issues GPU-visible writes to state the batch just launched still reads: the
@@ -290,7 +300,12 @@ class Scheduler(SchedulerIOMixin):
             or self._pending_rebuild is not None  # a queued rebuild to execute at idle
         )
         for msg in self.receive_msg(blocking=blocking):
-            self._process_one_msg(msg)
+            # Per-message so an idle poll never counts as traffic (freetoken/diag.py arms on
+            # the first opened range). Online this covers validation, the vision tower and the
+            # queue insert -- the text tokenizer itself runs in the tokenizer PROCESS and is
+            # invisible here; offline it also covers ``LLM._tokenize_one``.
+            with diag.region("diag.prefill_tokenize"):
+                self._process_one_msg(msg)
 
         # Non-overlap mode has no last_data to drain; execute a queued rebuild as soon as
         # the scheduler is idle (no pending prefill / running decode). Without this, a
@@ -387,7 +402,8 @@ class Scheduler(SchedulerIOMixin):
                     # client's terminal reply.
                     continue
                 # One row per request, whatever the step's width (a scalar row for decode).
-                msg = self._emit_step_tokens(req, next_tokens_cpu[i].reshape(-1))
+                with diag.region("diag.prefill_emit" if batch.is_prefill else None):
+                    msg = self._emit_step_tokens(req, next_tokens_cpu[i].reshape(-1))
                 finished = msg.finished
                 reply.append(msg)
 
@@ -405,15 +421,18 @@ class Scheduler(SchedulerIOMixin):
                     # never reach this commit -- but if a future path frees one early, skip
                     # rather than re-read the freed page-table row (and on hybrid, deref the
                     # None'd GDN ping-pong slots).
-                    self.cache_manager.cache_req(req, finished=False)
+                    with diag.region("diag.prefill_cache_commit"):
+                        self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
-        self._ship_replies(
-            batch,
-            reply,
-            # One token per scheduled request, as ever, plus whatever a wider step added.
-            generated_tokens=len(batch.reqs) + sum(len(m.next_tokens) - 1 for m in reply),
-        )
+        with diag.region("diag.prefill_emit" if batch.is_prefill else None):
+            self._ship_replies(
+                batch,
+                reply,
+                # One token per scheduled request, as ever, plus whatever a wider step added.
+                generated_tokens=len(batch.reqs)
+                + sum(len(m.next_tokens) - 1 for m in reply),
+            )
 
     def _ship_replies(
         self, batch: Batch, reply: List[DetokenizeMsg], *, generated_tokens: int
@@ -1353,7 +1372,7 @@ class Scheduler(SchedulerIOMixin):
         cached_len = int(req.cached_len) if conf_log is not None else 0
         depth = min(self.config.spec_decode.depth, req.remain_len)
         with diag.region("diag.spec_draft"):
-            proposal = engine.spec_draft.propose(req, depth)
+            proposal = engine.spec_draft.propose(req, depth, probe=probe)
         probe and probe.mark("draft")
 
         forward_input = self._prepare_spec_batch(req, proposal.tokens)
@@ -1405,7 +1424,10 @@ class Scheduler(SchedulerIOMixin):
             # i+1); this cycle contributed exactly `emitted` of them.
             with diag.region("diag.spec_commit"):
                 engine.spec_draft.commit(
-                    req, hidden=output.hidden, token_ids=msg.next_tokens
+                    req,
+                    hidden=output.hidden,
+                    token_ids=msg.next_tokens,
+                    probe=probe,
                 )
         probe and probe.mark("tail.commit")
         self._spec_record(req, emitted)
@@ -1484,7 +1506,8 @@ class Scheduler(SchedulerIOMixin):
         )
         if batch is None:
             return None
-        forward_input = self._prepare_batch(batch)
+        with diag.region("diag.prefill_batch" if batch.is_prefill else None):
+            forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
 

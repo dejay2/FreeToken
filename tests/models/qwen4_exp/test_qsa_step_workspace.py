@@ -145,6 +145,64 @@ def test_the_transient_scratch_is_kept_at_its_high_water_mark(pair):
     assert backend._scratch("pooled", 4, 16, dtype=torch.bfloat16).data_ptr() == wider.data_ptr()
 
 
+def test_a_growing_high_water_mark_retires_the_old_buffer_rather_than_freeing_it(pair):
+    """A GRAPHED chain baked the address of the buffer it was captured against.
+
+    Freeing it when a later, wider eager flush grows the mark would leave every replay writing
+    through a dangling pointer, so the replaced buffer is retired (kept alive) instead. Every
+    one of these transients is written before it is read within a forward, so the graph's
+    retired copy stays a correct private scratch.
+    """
+    fixture, _ = pair
+    backend = fixture.backend
+
+    first = backend._scratch("pooled", 4, 16, dtype=torch.bfloat16)
+    wider = backend._scratch("pooled", 9, 16, dtype=torch.bfloat16)
+
+    assert wider.data_ptr() != first.data_ptr()
+    assert any(held.data_ptr() == first.data_ptr() for held in backend._step_scratch_retired)
+    # ...and the retired buffer is still writable and readable at its captured address
+    first.fill_(1.0)
+    assert float(first[0, 0]) == 1.0
+
+
+def test_a_device_length_source_replaces_the_baked_host_scalar(pair):
+    """``fill_`` bakes its host argument into the launch, which a captured chain would then
+    serve forever. Armed with a source cell, the length becomes a device-to-device copy the
+    replay re-reads -- and the value is the same one the host scalar would have written."""
+    fixture, _ = pair
+    backend = fixture.backend
+    req = _decode_req(fixture, 0, prefix=5)
+
+    md = _metadata(backend, fixture, req, "decode")
+    baked = int(md.seq_lens[0])
+
+    source = torch.tensor([baked + 7], dtype=torch.int32)
+    backend.step_seq_len_source = source
+    try:
+        armed = _metadata(backend, fixture, req, "decode")
+        assert int(armed.seq_lens[0]) == baked + 7
+        # the cell is the live one: rewriting it and restaging follows it
+        source.fill_(baked)
+        restaged = _metadata(backend, fixture, req, "decode")
+        assert int(restaged.seq_lens[0]) == baked
+    finally:
+        backend.step_seq_len_source = None
+
+    # cleared, the host scalar is back and nothing about the unarmed path has moved
+    assert int(_metadata(backend, fixture, req, "decode").seq_lens[0]) == baked
+
+
+def test_an_unarmed_backend_has_no_length_source(pair):
+    """The target's path must be exactly what it was: the class default reads None, so a
+    backend built by hand (the shadow tooling does) never reaches the copy at all."""
+    _, reference = pair
+
+    assert reference.step_seq_len_source is None
+    assert QSASparseAttnBackend.step_seq_len_source is None
+    assert QSASparseAttnBackend._step_scratch_retired is None
+
+
 def test_an_unarmed_backend_keeps_allocating_per_forward(pair):
     """The target's path must be exactly what it was: no workspace, no scratch cache."""
     _, reference = pair

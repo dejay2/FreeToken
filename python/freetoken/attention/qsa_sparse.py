@@ -157,6 +157,11 @@ class QSASparseAttnBackend(BaseAttnBackend):
     _step_ws: dict[int, "_QSAStepWorkspace"] | None = None
     _step_scratch: dict[str, torch.Tensor] | None = None
     _step_active: "_QSAStepWorkspace | None" = None
+    _step_scratch_retired: list[torch.Tensor] | None = None
+    #: A device int32 ``[1]`` holding this forward's ``device_len``, or None for the host
+    #: scalar. See ``_stage_step``: a ``fill_`` bakes its host argument into the launch, which
+    #: is exactly wrong under CUDA-graph capture, where the length moves every replay.
+    step_seq_len_source: "torch.Tensor | None" = None
 
     def __init__(self, config: ModelConfig) -> None:
         from freetoken.kvcache.qsa_pool import QSAKVCache
@@ -204,6 +209,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._step_ws: dict[int, _QSAStepWorkspace] | None = None
         self._step_scratch: dict[str, torch.Tensor] | None = None
         self._step_active: _QSAStepWorkspace | None = None
+        self._step_scratch_retired: list[torch.Tensor] | None = None
+        self.step_seq_len_source: torch.Tensor | None = None
         self.capture_bs: List[int] = []
 
     @staticmethod
@@ -264,6 +271,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         if self._step_ws is None:
             self._step_ws = {}
             self._step_scratch = {}
+            self._step_scratch_retired = []
 
     def _step_workspace(self, rows: int) -> _QSAStepWorkspace:
         ws = self._step_ws.get(rows)
@@ -308,7 +316,15 @@ class QSASparseAttnBackend(BaseAttnBackend):
         # with a non-blocking H2D is a race (the host can overwrite the value before the copy
         # runs) and a blocking one is a device synchronization. A fill bakes the scalar into
         # the launch, so it is stream-ordered, allocation-free and neither of those.
-        md.seq_lens.fill_(length)
+        source = self.step_seq_len_source
+        if source is None:
+            md.seq_lens.fill_(length)
+        else:
+            # ...unless the caller is recording this forward into a CUDA graph. ``fill_``
+            # bakes its host argument into the launch, so a captured chain would attend the
+            # capture's context length forever; a device-to-device copy re-reads the caller's
+            # cell on every replay, which is where the live ``device_len`` is written.
+            md.seq_lens.copy_(source)
         md.ring_slots.fill_(table_idx)
         ws.table_idx.fill_(table_idx)
         md.kv_len_cpu[0] = length  # the host-side mirror; nothing asynchronous reads it
@@ -671,6 +687,15 @@ class QSASparseAttnBackend(BaseAttnBackend):
             return buffer[:rows]
         buffer = torch.empty((rows, *shape), dtype=dtype, device=self.device)
         if buffers is self._step_scratch:
+            replaced = buffers.get(name)
+            if replaced is not None and self._step_scratch_retired is not None:
+                # A GRAPHED chain baked the address of the buffer it was captured against, and
+                # freeing that buffer here -- a later, wider eager flush growing the high-water
+                # mark -- would leave every replay writing through a dangling pointer. Retiring
+                # it instead keeps the graph's private scratch alive and correct: every one of
+                # these transients is written before it is read within a single forward, so a
+                # retired buffer serves the graph exactly as the live one served the capture.
+                self._step_scratch_retired.append(replaced)
             # An armed backend keeps its transients at the high-water mark instead of
             # reallocating them every forward: the draft chain runs a handful of shapes over
             # and over, so after the first forward of each shape this allocates nothing. The

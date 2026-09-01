@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING, Mapping, Sequence
 
 import torch
 
@@ -373,6 +373,48 @@ class SpecStateLadder:
             return
         self._graph_slot.copy_(self._slot_ids[slot : slot + 1])
         graph.replay()
+
+    def capture_replays(self, req: "Req", steps: "Sequence[int] | None" = None) -> dict[int, bool]:
+        """Record every accepted-depth replay NOW rather than on its first live settle.
+
+        Each lazy capture costs ~300 ms, and a boot serves its first ~30 cycles before the six
+        rungs have all been hit -- 1.8 s of stall spread over exactly the window a benchmark
+        measures. Nothing here is load-bearing: a rung that fails to capture is dropped back to
+        the eager per-layer loop by ``_capture_replay`` itself, which is the pre-graph ladder.
+
+        The preconditions are the ones a live settle satisfies for free and boot must arrange:
+        a LIVE SLOT to advance (``borrow_snapshot`` takes the snapshot ``_capture_replay`` winds
+        the warm-up back to) and a populated ``_params`` -- the per-layer ``A_log``/``dt_bias``
+        the stash hooks record, which only an armed forward can have produced. On a boot where
+        the verify captures never ran there is nothing to record against, and this says so.
+        """
+        results: dict[int, bool] = {}
+        if not self._graph_enabled or self.pool.device.type != "cuda":
+            return results
+        if any(params is None for params in self._params):
+            logger.info(
+                "spec ladder boot capture skipped: no armed forward has stashed the per-layer "
+                "replay parameters yet; the rungs stay lazily captured"
+            )
+            return results
+        widths = range(1, self.max_width + 1) if steps is None else steps
+        with self.borrow_snapshot(req) as restore:
+            try:
+                for count in widths:
+                    if not self._graph_enabled:
+                        # a failed rung switches graphing off for good (an in-capture failure
+                        # poisons the context); the rest of the ladder is the eager loop
+                        break
+                    if count in self._graphs:
+                        continue
+                    if not 1 <= count <= self.max_width:
+                        raise ValueError(
+                            f"a ladder replay advances 1..{self.max_width} rows, got {count}"
+                        )
+                    results[count] = self._capture_replay(count) is not None
+            finally:
+                restore()
+        return results
 
     def _drop_graphs(self) -> None:
         self._graphs.clear()

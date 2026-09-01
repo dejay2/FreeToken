@@ -50,6 +50,18 @@ rewinding ``committed_len`` (the identity page table means the next real row ove
 same slots) plus restoring the two pending rings, which have no epoch tag and would otherwise
 survive the rewind.
 
+THE CHAIN AND THE COMMIT ARE CUDA GRAPHS
+----------------------------------------
+Both are a FIXED sequence of kernels over this head's own private pool, and the kernel profile
+says both are host-bound by a wide margin (the depth-5 chain: 18 ms of wall clock over 7.2 ms
+of kernels, 843 launches). ``_chain_graph_body`` and ``_commit_graph_body`` are those two
+sequences written into fixed buffers; ``spec_draft_graph`` holds the capture discipline and the
+table of what moves per cycle and how each moving value became a device input -- of which
+``_graph_base``, the int32 cell every graphed position, ``out_loc`` gather and QSA context
+length is derived from, is the load-bearing one. Greedy proposals only (the private draft RNG
+is rebuilt per request and cannot be baked into a record); off with
+``FREETOKEN_MTP_SPEC_DRAFT_GRAPH=0``, which restores exactly the eager chain and commit below.
+
 THE DISTRIBUTION CONTRACT
 -------------------------
 ``SpecSampler``'s acceptance divides by the draft's own ``q``, so the proposal must be drawn
@@ -61,14 +73,19 @@ with. ``MTPDraftSampler.sample`` is exactly that filter's one-row form, pinned b
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
 import torch
 
+from freetoken.utils import init_logger
+
 if TYPE_CHECKING:
     from freetoken.core import Batch, Req
+
+logger = init_logger(__name__)
 
 # The GPU expert runner's per-call row cap; priming chunks are split to it.
 _MAX_DRAFT_ROWS = 128
@@ -238,6 +255,17 @@ class DraftProposal:
 class SpecDraftHead:
     """The resident MTP head plus the running context it attends."""
 
+    # Class-level defaults so a head built without ``__init__`` reads "ungraphed" rather than
+    # raising -- the same courtesy ``QSASparseAttnBackend`` extends its own reusable-staging
+    # arms, and for the same callers (tests and the shadow tooling build heads by hand).
+    _graph_runner = None
+    _graph_buffers_ready = False
+    _graph_disabled_reason: str | None = None
+    _sampled_chain_logged = False
+    _device_base_offset: int | None = None
+    #: the MTP head is one QSA layer, so its block-selection capture has exactly one slot
+    _graph_qsa_slot = 0
+
     def __init__(
         self,
         engine,
@@ -310,6 +338,19 @@ class SpecDraftHead:
         self._saved_blocks: dict[int, torch.Tensor] | None = None
         self._buffered: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = []
         self._sampler = None
+        # ------------------------------------------------------------------ graph state
+        # ``None`` -- the default -- means every ``_batch`` derives its positions from the
+        # host ``committed_len``, which is what the eager chain has always done. A graph body
+        # sets it to the step's offset, and ``_stage_device_positions`` then derives the whole
+        # forward's addressing from the ``_graph_base`` cell instead (see spec_draft_graph).
+        self._device_base_offset: int | None = None
+        # the MTP head is one QSA layer, so its block-selection capture has exactly one slot
+        self._graph_qsa_slot = 0
+        self._graph_runner = None
+        self._graph_buffers_ready = False
+        self._graph_disabled_reason: str | None = None
+        self._sampled_chain_logged = False
+        self._init_graph_runner()
 
     # ------------------------------------------------------------------------ construction
 
@@ -490,8 +531,14 @@ class SpecDraftHead:
             table_idx=0, cached_len=start, device_len=start + rows, extend_len=rows
         )
         positions, out_loc, active_table_idx = self._step_tensors(rows)
-        torch.arange(start, start + rows, out=positions)
-        out_loc.copy_(self.page_table[0, start : start + rows])
+        offset = self._device_base_offset
+        length_source = None
+        if offset is None:
+            torch.arange(start, start + rows, out=positions)
+            out_loc.copy_(self.page_table[0, start : start + rows])
+        else:
+            # under capture the two lines above would bake ``start`` into the record
+            length_source = self._stage_device_positions(rows, offset, positions, out_loc)
         batch = SimpleNamespace(
             reqs=[req],
             padded_reqs=[req],
@@ -514,7 +561,13 @@ class SpecDraftHead:
         # row through ``get_global_ctx().page_table``, which outside this swap is the TARGET's
         # table -- a different (and for a private pool, out-of-range) set of physical pages.
         with self._private_context_fields():
-            self.attn_backend.prepare_metadata(batch)
+            # ``_stage_step``'s ``md.seq_lens.fill_(length)`` bakes a host scalar into the
+            # launch; a graphed forward hands it the device cell to copy from instead.
+            self.attn_backend.step_seq_len_source = length_source
+            try:
+                self.attn_backend.prepare_metadata(batch)
+            finally:
+                self.attn_backend.step_seq_len_source = None
         return batch
 
     def _run_rows(self, embeddings, hidden, *, rope_positions=None, capture=None, saved=None):
@@ -535,6 +588,362 @@ class SpecDraftHead:
             self.committed_len += hi - lo
         assert outputs is not None
         return outputs[0][-1:], outputs[1][-1:]
+
+    # ------------------------------------------------------------------------- CUDA graphs
+    #
+    # The chain and the commit forward are 843 and ~120 launches of a FIXED sequence of
+    # kernels, and between them they spend ~17 ms of the 25 ms cycle on the host. Everything
+    # below turns each into one ``graph.replay()``; ``spec_draft_graph`` holds the capture
+    # discipline and the table of what moves per cycle and how each became a device input.
+
+    def _init_graph_runner(self) -> None:
+        """Arm graphing for this head, or record (once) why it stays eager."""
+        from freetoken.engine.spec_draft_graph import (
+            DRAFT_GRAPH_ENV,
+            SpecDraftGraphRunner,
+            draft_graph_enabled,
+        )
+
+        if not draft_graph_enabled():
+            self._graph_disabled_reason = f"{DRAFT_GRAPH_ENV}=0"
+        elif self.draft_cut_mode == "step" and self.conf_cut > 0.0:
+            # ``step`` reads each row's confidence back to the host inside the chain, which is
+            # a device synchronization per drafted token and outright capture-illegal.
+            self._graph_disabled_reason = "draft_cut_mode=step"
+        elif self.device.type != "cuda":
+            self._graph_disabled_reason = "CUDA_REQUIRED"
+        else:
+            slots = sorted(getattr(self.attn_backend, "_idx_slot", {}).values())
+            if slots != [0]:
+                self._graph_disabled_reason = f"unexpected QSA slots {slots}"
+        if self._graph_disabled_reason is not None:
+            logger.info_rank0(
+                f"MTP draft graphs off ({self._graph_disabled_reason}): the chain and the "
+                "commit forward run eager"
+            )
+            return
+        self._graph_runner = SpecDraftGraphRunner(device=self.device)
+
+    @property
+    def graphs_enabled(self) -> bool:
+        return self._graph_runner is not None
+
+    def _ensure_graph_buffers(self) -> None:
+        """Allocate every fixed input/output slot the graphs read and write, once.
+
+        Eagerly and on the CALLING stream, deliberately: a buffer first allocated inside the
+        capture's warm-up would belong to the capture stream (and one allocated inside the
+        recorded pass to the graph's private pool), and both are the wrong owner for a tensor
+        the serving path writes between replays.
+        """
+        if self._graph_buffers_ready:
+            return
+        device = self.device
+        dtype = self.kv_cache.dtype
+        hidden_size = int(self.mtp_config.hidden_size)
+        width = int(self.mtp_config.qwen4_args.hc_count) * hidden_size
+        depth = self.depth
+        rows = depth + 1  # the widest accepted run a cycle can commit
+        # THE cell every graphed position is derived from, plus the two it derives.
+        self._graph_base = torch.zeros(1, dtype=torch.int32, device=device)
+        self._graph_len = torch.zeros(1, dtype=torch.int32, device=device)
+        self._graph_index64: dict[int, torch.Tensor] = {}
+        self._graph_offsets: dict[tuple[int, int], torch.Tensor] = {}
+        # picture requests only: the chain's per-step (3, 1) rotary coordinate is
+        # ``committed_len + mrope_position_delta + step``, so the origin is a cell too
+        self._graph_rope_base = torch.zeros((3, 1), dtype=torch.int64, device=device)
+        self._graph_rope_step = torch.zeros((3, 1), dtype=torch.int64, device=device)
+        # the chain's inputs
+        self._graph_in_sample = torch.zeros((1, hidden_size), dtype=dtype, device=device)
+        self._graph_in_recursive = torch.zeros((1, width), dtype=dtype, device=device)
+        self._graph_in_blocks = torch.zeros(
+            (1, int(self.attn_backend.block_topk)), dtype=torch.int32, device=device
+        )
+        # ...and its outputs. The logit dtype is whatever THIS head's LM head produces, taken
+        # from the head itself rather than assumed, so the graphed rows are the eager rows.
+        probe = self.draft_lm_head.forward_all(self._graph_in_sample)
+        self._graph_out_logits = torch.zeros(
+            (depth, int(probe.shape[-1])), dtype=probe.dtype, device=device
+        )
+        del probe
+        self._graph_out_tokens = torch.zeros(depth, dtype=torch.int64, device=device)
+        self._graph_out_conf = torch.zeros(depth, dtype=torch.float32, device=device)
+        # ids and confidences travel home together in ONE float64 readback, exactly as the
+        # eager chain packs them (a float64 holds an int64 token id exactly to 2^53)
+        self._graph_out_packed = torch.zeros(2 * depth, dtype=torch.float64, device=device)
+        # the commit forward's inputs and outputs
+        self._commit_in_hidden = torch.zeros((rows, width), dtype=dtype, device=device)
+        self._commit_in_embeds = torch.zeros((rows, hidden_size), dtype=dtype, device=device)
+        self._commit_in_rope = torch.zeros((3, rows), dtype=torch.int64, device=device)
+        self._commit_out_sample = torch.zeros((1, hidden_size), dtype=dtype, device=device)
+        self._commit_out_recursive = torch.zeros((1, width), dtype=dtype, device=device)
+        self._commit_out_blocks = torch.zeros_like(self._graph_in_blocks)
+        # the pending rings are restored around every proposal; preallocating the backups
+        # keeps two allocations per cycle off the host path
+        self._ring_backup = torch.empty_like(self.kv_cache._pending_ring)
+        self._position_ring_backup = torch.empty_like(
+            self.kv_cache._pending_position_ring
+        )
+        self._graph_buffers_ready = True
+
+    @contextmanager
+    def _device_base(self, offset: int):
+        """Derive the next ``_batch``'s addressing from ``_graph_base + offset`` on device."""
+        previous = self._device_base_offset
+        self._device_base_offset = int(offset)
+        try:
+            yield
+        finally:
+            self._device_base_offset = previous
+
+    def _stage_device_positions(self, rows: int, offset: int, positions, out_loc):
+        """``_batch``'s position/out_loc/length staging, with no host scalar anywhere.
+
+        ``positions = base + offset + arange(rows)``, ``out_loc`` is the page table gathered at
+        those positions (an ``index_select``, not a host slice, so the graph re-reads the row
+        every replay), and the returned cell holds ``device_len`` for the QSA metadata.
+        """
+        base = self._graph_base
+        torch.add(base, self._graph_offset_arange(rows, offset), out=positions)
+        index = self._graph_index64.get(rows)
+        if index is None:
+            index = self._graph_index64[rows] = torch.zeros(
+                rows, dtype=torch.int64, device=self.device
+            )
+        index.copy_(positions)
+        torch.index_select(self.page_table[0], 0, index, out=out_loc)
+        torch.add(base, offset + rows, out=self._graph_len)
+        return self._graph_len
+
+    def _graph_offset_arange(self, rows: int, offset: int) -> torch.Tensor:
+        key = (rows, offset)
+        buffer = self._graph_offsets.get(key)
+        if buffer is None:
+            buffer = self._graph_offsets[key] = torch.arange(
+                offset, offset + rows, dtype=torch.int32, device=self.device
+            )
+        return buffer
+
+    # ------------------------------------------------------------------------- the chain
+
+    def _chain_graph_key(self, *, mrope: bool) -> str:
+        return f"chain:mrope={int(mrope)}"
+
+    def _chain_graph_body(self, *, mrope: bool) -> None:
+        """The whole depth-``self.depth`` greedy chain, into the fixed output slots.
+
+        Step by step this is ``propose``'s loop with three substitutions and no other change:
+        the seed rows come from the input buffers, the sampler's greedy arm is inlined (see
+        ``MTPDraftSampler.sample_device``: ``temperature == 0 or top_k == 1`` IS
+        ``torch.argmax``), and each row's logits/id/confidence are written to a slot instead of
+        appended to a Python list. Every step's confidence is recorded whether or not a cut is
+        armed -- inside the graph it is free, and it makes one recorded chain serve both.
+        """
+        base = self.committed_len
+        depth = self.depth
+        sample, recursive = self._graph_in_sample, self._graph_in_recursive
+        saved = {self._graph_qsa_slot: self._graph_in_blocks}
+        for index in range(depth):
+            logits = self.draft_lm_head.forward_all(sample)[0]
+            token = torch.argmax(logits)
+            self._graph_out_logits[index].copy_(logits)
+            self._graph_out_tokens[index].copy_(token)
+            _record_row_top1(logits, self._graph_out_conf, index)
+            if index + 1 == depth:
+                break
+            embedding = self.target_model.model.embed_tokens.forward(
+                token.reshape(1).to(torch.int32)
+            )
+            self.committed_len = base + index
+            rope = None
+            if mrope:
+                rope = self._graph_rope_step
+                torch.add(self._graph_rope_base, index, out=rope)
+            with self._device_base(index):
+                sample, recursive = self._run_rows(
+                    embedding, recursive, rope_positions=rope, saved=saved
+                )
+        self._graph_out_packed[:depth].copy_(self._graph_out_tokens)
+        self._graph_out_packed[depth:].copy_(self._graph_out_conf)
+        self.committed_len = base
+
+    def _graph_restore(self, base: int) -> None:
+        """Undo a capture pass: the rings it mutated and the length it advanced.
+
+        The KV rows themselves need nothing -- they are position-addressed and a replay (or a
+        later real commit) rewrites the same slots from the same inputs -- but the two pending
+        rings carry no epoch tag, exactly as ``propose`` documents.
+        """
+        self.committed_len = int(base)
+        self.kv_cache._pending_ring.copy_(self._ring_backup)
+        self.kv_cache._pending_position_ring.copy_(self._position_ring_backup)
+
+    def _backup_rings(self) -> None:
+        self._ring_backup.copy_(self.kv_cache._pending_ring)
+        self._position_ring_backup.copy_(self.kv_cache._pending_position_ring)
+
+    def _chain_graph(self, *, mrope: bool) -> str | None:
+        """This cycle's chain graph key, capturing it first if that is still worth trying.
+
+        THE INPUTS ARE ALREADY STAGED when this is called. Capture's warm-up EXECUTES the
+        chain, and it must execute the one the replay is about to run -- at this cycle's base,
+        off this cycle's seed rows -- or the warm-up writes draft rows at the wrong positions
+        and leaves them behind at addresses the undo does not cover.
+        """
+        runner = self._graph_runner
+        if runner is None:
+            return None
+        key = self._chain_graph_key(mrope=mrope)
+        if runner.available(key):
+            return key
+        if not runner.capture_pending(key):
+            return None
+        base = self.committed_len
+        result = runner.capture(
+            key,
+            lambda: self._chain_graph_body(mrope=mrope),
+            restore=lambda: self._graph_restore(base),
+        )
+        return key if result.status == "captured" else None
+
+    def _stage_chain_inputs(self, *, base: int, mrope: bool, delta: int) -> None:
+        """Write this cycle's moving inputs into the addresses the chain graph baked."""
+        assert self._sample is not None and self._recursive is not None
+        assert self._saved_blocks is not None
+        self._graph_in_sample.copy_(self._sample)
+        self._graph_in_recursive.copy_(self._recursive)
+        self._graph_in_blocks.copy_(self._saved_blocks[self._graph_qsa_slot])
+        self._graph_base.fill_(base)
+        if mrope:
+            self._graph_rope_base.fill_(base + delta)
+        self._backup_rings()
+
+    # ------------------------------------------------------------------ the commit forward
+
+    def _commit_graph_key(self, rows: int, *, mrope: bool) -> str:
+        return f"commit:{rows}:mrope={int(mrope)}"
+
+    def _commit_graph_body(self, rows: int, *, mrope: bool) -> None:
+        """``_commit_pairs``' forward for a fixed row count, into the fixed output slots.
+
+        The captured block selection is taken exactly as the eager path takes it -- the last
+        row's choices, which is what the next proposal's recursive rows are frozen to.
+        """
+        base = self.committed_len
+        capture: dict[int, torch.Tensor] = {}
+        with self._device_base(0):
+            sample, recursive = self._run_rows(
+                self._commit_in_embeds[:rows],
+                self._commit_in_hidden[:rows],
+                rope_positions=self._commit_in_rope[:, :rows] if mrope else None,
+                capture=capture,
+            )
+        self._commit_out_sample.copy_(sample)
+        self._commit_out_recursive.copy_(recursive)
+        self._commit_out_blocks.copy_(capture[self._graph_qsa_slot][-1:])
+        self.committed_len = base
+
+    def _commit_graphable(self, rows: int) -> bool:
+        """Whether this commit's row count is one of the accepted-run widths that are graphed.
+
+        Buffered flushes of any other width stay eager: their row counts are unbounded (a whole
+        backed-off cooldown of decode observations), so recording them would be one graph per
+        cooldown length for a call that happens once in a while.
+        """
+        return self._graph_runner is not None and 1 <= rows <= self.depth + 1
+
+    def _stage_commit_inputs(self, rows: int, hidden, embeds, rope) -> None:
+        self._commit_in_hidden[:rows].copy_(hidden)
+        self._commit_in_embeds[:rows].copy_(embeds)
+        if rope is not None:
+            self._commit_in_rope[:, :rows].copy_(rope)
+        self._graph_base.fill_(self.committed_len)
+
+    def _commit_graph(self, rows: int, *, mrope: bool) -> str | None:
+        """As ``_chain_graph``: the inputs are staged before this, so the warm-up is the step."""
+        runner = self._graph_runner
+        if runner is None:
+            return None
+        key = self._commit_graph_key(rows, mrope=mrope)
+        if runner.available(key):
+            return key
+        if not runner.capture_pending(key):
+            return None
+        base = self.committed_len
+        self._backup_rings()
+        result = runner.capture(
+            key,
+            lambda: self._commit_graph_body(rows, mrope=mrope),
+            restore=lambda: self._graph_restore(base),
+        )
+        return key if result.status == "captured" else None
+
+    # ------------------------------------------------------------------------ boot capture
+
+    def capture_graphs_at_boot(self) -> dict[str, str]:
+        """Capture every draft graph NOW, while boot memory is still fresh.
+
+        Same reason the verify widths capture at boot: admission needs free VRAM and the first
+        request's prefill activation spike is what takes it away. Nothing here is load-bearing
+        -- a key that cannot capture now reaches its first live use exactly as capturable as it
+        was (``refund_attempt``), and any failure leaves the eager path.
+
+        WIDEST FIRST, then the chain. The QSA backend keeps its per-forward transients at a
+        high-water mark, so capturing the 6-row commit before the 1-row one means every
+        narrower shape is a VIEW of buffers that already exist at their final size -- no
+        capture bakes an address that a later, wider warm-up would replace.
+        """
+        runner = self._graph_runner
+        results: dict[str, str] = {}
+        if runner is None:
+            return results
+        if self._uid is not None or self.committed_len:
+            # boot capture runs before any request; a live head would have to be wound back
+            logger.info_rank0("MTP draft graph boot capture skipped: the head is in use")
+            return results
+        self._ensure_graph_buffers()
+        # Boot has no request to draft for, so the inputs stay at their zeroed defaults and
+        # the base cell names position 0 -- the same value ``committed_len`` holds. What the
+        # warm-ups leave in the private KV and rings is wiped by the first ``reset_request``.
+        self._graph_base.fill_(0)
+        self._graph_rope_base.fill_(0)
+        plans: list[tuple[str, Callable[[], None]]] = []
+        for rows in range(self.depth + 1, 0, -1):
+            plans.append(
+                (
+                    self._commit_graph_key(rows, mrope=False),
+                    (lambda n: lambda: self._commit_graph_body(n, mrope=False))(rows),
+                )
+            )
+        plans.append(
+            (
+                self._chain_graph_key(mrope=False),
+                lambda: self._chain_graph_body(mrope=False),
+            )
+        )
+        for key, body in plans:
+            if not runner.capture_pending(key):
+                continue
+            base = self.committed_len
+            self._backup_rings()
+            try:
+                result = runner.capture(
+                    key, body, restore=lambda: self._graph_restore(base)
+                )
+            except Exception as exc:  # noqa: BLE001 -- a bonus capture, never a boot gate
+                logger.warning_rank0(
+                    f"MTP draft graph {key}: boot capture raised {type(exc).__name__}: {exc}"
+                )
+                self._graph_restore(base)
+                continue
+            results[key] = result.status
+            if result.status == "retryable":
+                runner.refund_attempt(key)
+        # the captures wrote draft rows into the private KV and rings; the first request's
+        # ``reset_request`` zeroes both, but leave them clean regardless
+        self.committed_len = 0
+        self._saved_blocks = None
+        return results
 
     # ---------------------------------------------------------------------- request lifecycle
 
@@ -624,7 +1033,14 @@ class SpecDraftHead:
         self._flush_pairs()
         self._commit_pairs(paired_hidden, paired_embeds, paired_rope)
 
-    def commit(self, req: "Req", *, hidden: torch.Tensor, token_ids: Sequence[int]) -> None:
+    def commit(
+        self,
+        req: "Req",
+        *,
+        hidden: torch.Tensor,
+        token_ids: Sequence[int],
+        probe=None,
+    ) -> None:
         """Consume a speculative step's accepted rows.
 
         Row ``i`` of the step read position ``cached_len + i`` and its emitted token occupies
@@ -656,7 +1072,7 @@ class SpecDraftHead:
                 .expand(3, -1)
                 .contiguous()
             )
-        self._commit_pairs(hidden[:n], embeds, rope)
+        self._commit_pairs(hidden[:n], embeds, rope, probe=probe)
 
     @property
     def _buffered_rows(self) -> int:
@@ -700,7 +1116,25 @@ class SpecDraftHead:
                 else torch.cat([segment for _, _, segment in run], dim=1),
             )
 
-    def _commit_pairs(self, hidden, embeds, rope) -> None:
+    def _commit_pairs(self, hidden, embeds, rope, *, probe=None) -> None:
+        rows = int(hidden.shape[0])
+        if self._commit_graphable(rows):
+            self._ensure_graph_buffers()
+            if hidden.dtype is not self._commit_in_hidden.dtype or (
+                embeds.dtype is not self._commit_in_embeds.dtype
+            ):
+                # staging would CAST where the eager call passes the rows straight through,
+                # so a target that hands over a different dtype gets the eager commit
+                return self._commit_pairs_eager(hidden, embeds, rope)
+            self._stage_commit_inputs(rows, hidden, embeds, rope)
+            key = self._commit_graph(rows, mrope=rope is not None)
+            if key is not None:
+                self._replay_commit(key, rows)
+                probe and probe.mark("tail.commit.replay")
+                return
+        self._commit_pairs_eager(hidden, embeds, rope)
+
+    def _commit_pairs_eager(self, hidden, embeds, rope) -> None:
         capture: dict[int, torch.Tensor] = {}
         self._sample, self._recursive = self._run_rows(
             embeds, hidden, rope_positions=rope, capture=capture
@@ -710,9 +1144,23 @@ class SpecDraftHead:
             {slot: blocks[-1:].clone() for slot, blocks in capture.items()} or None
         )
 
+    def _replay_commit(self, key: str, rows: int) -> None:
+        """One graphed commit: run the staged rows, then adopt the graph's outputs.
+
+        The three outputs are the graph's own buffers rather than copies. They are safe to
+        hand on as ``_sample`` / ``_recursive`` / ``_saved_blocks`` because the only writer is
+        the next commit replay, and the cycle reads them (into the chain graph's inputs, or
+        into an eager chain) before that ever happens.
+        """
+        self._graph_runner.replay(key)
+        self._sample = self._commit_out_sample
+        self._recursive = self._commit_out_recursive
+        self._saved_blocks = {self._graph_qsa_slot: self._commit_out_blocks}
+        self.committed_len += rows
+
     # ------------------------------------------------------------------------- the proposal
 
-    def propose(self, req: "Req", depth: int) -> DraftProposal:
+    def propose(self, req: "Req", depth: int, *, probe=None) -> DraftProposal:
         """Draft up to ``depth`` tokens, leaving the private KV exactly as it was.
 
         The recursive rows are written at ``committed_len + i`` and undone by rewinding the
@@ -763,14 +1211,25 @@ class SpecDraftHead:
         # the SAME filter acceptance will divide by -- read off the request the way
         # Sampler.prepare would, not off its raw params (design 5.2's precondition)
         temperature, top_k, top_p = request_filter_params(req.sampling_params)
+        mrope = getattr(req, "mrope_position_ids", None) is not None
+        delta = int(getattr(req, "mrope_position_delta", 0))
+
+        if self._chain_graphable(temperature, top_k, top_p):
+            # Staged BEFORE the graph is asked for, because asking may capture it and capture's
+            # warm-up executes the chain: it has to be this cycle's chain, at this cycle's base.
+            self._ensure_graph_buffers()
+            self._stage_chain_inputs(
+                base=self.committed_len, mrope=mrope, delta=delta
+            )
+            key = self._chain_graph(mrope=mrope)
+            if key is not None:
+                return self._propose_graphed(key, depth, probe=probe)
 
         sample, recursive = self._sample, self._recursive
         saved = self._saved_blocks
         base_len = self.committed_len
         ring = self.kv_cache._pending_ring.clone()
         position_ring = self.kv_cache._pending_position_ring.clone()
-        mrope = getattr(req, "mrope_position_ids", None) is not None
-        delta = int(getattr(req, "mrope_position_delta", 0))
         # the drafted ids stay on device for the whole chain: a per-step ``int()`` would
         # sync the stream once per token, and only the returned tuple needs host ints
         drafted: list[torch.Tensor] = []
@@ -838,6 +1297,71 @@ class SpecDraftHead:
             draft_top1_gap=gap,
         )
 
+    def _chain_graphable(self, temperature: float, top_k, top_p) -> bool:
+        """Whether this request's chain may be replayed from a graph at all.
+
+        GREEDY ONLY, and the test is ``MTPDraftSampler.sample_device``'s own first branch, so
+        the graphed chain draws exactly what the eager one would. A sampled request's chain
+        divides by a HOST temperature, slices a HOST ``top_k`` and draws through a generator
+        that ``reset_request`` rebuilds per request -- three host values a record would bake --
+        so it keeps the chain it has today and says so once (see spec_draft_graph's module
+        docstring for why registering the generator is not the answer).
+        """
+        if self._graph_runner is None:
+            return False
+        if self._sample is None or self._recursive is None or self._saved_blocks is None:
+            return False
+        if self._graph_qsa_slot not in self._saved_blocks:
+            return False
+        if not (temperature == 0 or top_k == 1):
+            if not self._sampled_chain_logged:
+                self._sampled_chain_logged = True
+                logger.info_rank0(
+                    "MTP draft chain stays eager for sampled requests (temperature "
+                    f"{temperature}, top_k {top_k}, top_p {top_p}): the draft's private "
+                    "generator is rebuilt per request, so its state cannot be baked into a "
+                    "graph. Greedy requests are graphed."
+                )
+            return False
+        return True
+
+    def _propose_graphed(self, key: str, depth: int, *, probe=None) -> DraftProposal:
+        """``propose``, as one launch: write the inputs, replay, take the single readback.
+
+        The graph always drafts the full ``self.depth``; a proposal that wanted fewer keeps the
+        prefix. That is the trade ``chain`` mode already makes for the confidence cut -- rows
+        past the cut are computed and thrown away -- and it is why one recorded chain serves
+        every depth. The surplus rows are undone exactly as the kept ones are: the length is
+        rewound and both pending rings are restored.
+        """
+        base_len = self.committed_len
+        probe and probe.mark("draft.stage")
+        self._graph_runner.replay(key)
+        probe and probe.mark("draft.replay")
+        # THE one readback: ``self.depth`` ids followed by ``self.depth`` confidences, in one
+        # float64 tensor, exactly as the eager chain packs them.
+        values = self._graph_out_packed.tolist()
+        probe and probe.mark("draft.readback")
+        self.kv_cache._pending_ring.copy_(self._ring_backup)
+        self.kv_cache._pending_position_ring.copy_(self._position_ring_backup)
+        self.committed_len = base_len
+        cut = self.conf_cut
+        keep = (
+            depth
+            if cut <= 0.0
+            else _confidence_prefix(
+                values[self.depth : self.depth + depth], cut
+            )
+        )
+        stacked = self._graph_out_logits[:keep].clone()
+        top1, gap = _draft_confidence(stacked)
+        return DraftProposal(
+            tokens=tuple(int(value) for value in values[:keep]),
+            logits=stacked,
+            draft_top1=top1,
+            draft_top1_gap=gap,
+        )
+
     def _confidence_buffer(self, depth: int) -> torch.Tensor:
         """The chain's ``[depth]`` device slots for per-step top-1 probabilities.
 
@@ -852,6 +1376,10 @@ class SpecDraftHead:
         return buffer[:depth]
 
     def close(self) -> None:
+        graphs = getattr(self, "_graph_runner", None)
+        if graphs is not None:
+            graphs.destroy()
+            self._graph_runner = None
         runner = getattr(self, "expert_runner", None)
         if runner is not None:
             runner.close()

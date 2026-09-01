@@ -21,6 +21,8 @@ that projection noise.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -598,3 +600,92 @@ def test_a_borrowed_snapshot_is_released_and_refuses_to_nest():
 
     with pytest.raises(RuntimeError, match="no speculative"):
         ladder.restore_snapshot()
+
+
+# ------------------------------------------------------ the rungs, captured at boot
+#
+# Captured lazily, each rung costs ~300 ms on the settle that first needs it, so a depth-5
+# boot pays ~1.8 s spread over its first ~30 cycles -- inside the window a benchmark measures.
+# ``capture_replays`` moves all of them to boot, beside the verify graphs.
+
+
+def test_boot_capture_records_every_rung_and_leaves_the_slot_alone():
+    """Capture's warm-up ADVANCES the live slot and the recorded pass runs nothing, so the
+    ladder has to be handed a snapshot to wind back to. That is the whole precondition, and
+    the slot must come out of the capture exactly as it went in."""
+    cached_len = 64
+    ids = _token_ids(cached_len + WIDTH + 4)
+    world = _World()
+    hidden, ple_in = _inputs(WIDTH, world.config.hidden_size, world.args.ple_state_width, 3)
+    _warm(world, cached_len, ids)
+    ladder = SpecStateLadder(world.pool, WIDTH)
+    # a real armed forward, which is what populates the per-layer replay parameters
+    req, _ = world.prefill(
+        hidden, ple_in, ids, cached_len=cached_len, mtp_verify=True, ladder=ladder
+    )
+    ladder.rollback(req, 0)
+    ladder._drop_graphs()
+    before = world.families(SLOT)
+
+    results = ladder.capture_replays(req)
+
+    assert results == {steps: True for steps in range(1, WIDTH + 1)}
+    assert sorted(ladder._graphs) == list(range(1, WIDTH + 1))
+    _assert_bitwise(before, world.families(SLOT))
+    # ...and the ladder is not left mid-step: a live cycle can begin normally
+    assert ladder._live is None and ladder._width == 0
+
+
+def test_a_boot_captured_rung_settles_exactly_like_a_lazily_captured_one():
+    """The graphs a boot capture records are the graphs a settle would have recorded, so a
+    later settle through one has to land on the same state, bit for bit."""
+    cached_len = 64
+    accepted = 2
+    ids = _token_ids(cached_len + WIDTH + 4)
+    hidden, ple_in = _inputs(WIDTH, _config().hidden_size, _config().qwen4_args.ple_state_width, 4)
+
+    lazy_world = _World()
+    _warm(lazy_world, cached_len, ids)
+    lazy = SpecStateLadder(lazy_world.pool, WIDTH)
+    req, _ = lazy_world.prefill(
+        hidden, ple_in, ids, cached_len=cached_len, mtp_verify=True, ladder=lazy
+    )
+    lazy.rollback(req, accepted)
+    expected = lazy_world.families(SLOT)
+
+    booted_world = _World()
+    _warm(booted_world, cached_len, ids)
+    booted = SpecStateLadder(booted_world.pool, WIDTH)
+    warm_req, _ = booted_world.prefill(
+        hidden, ple_in, ids, cached_len=cached_len, mtp_verify=True, ladder=booted
+    )
+    booted.rollback(warm_req, 0)
+    booted.capture_replays(warm_req)
+    step_req, _ = booted_world.prefill(
+        hidden, ple_in, ids, cached_len=cached_len, mtp_verify=True, ladder=booted
+    )
+    booted.rollback(step_req, accepted)
+
+    _assert_bitwise(expected, booted_world.families(SLOT))
+
+
+def test_boot_capture_says_so_and_stays_lazy_when_nothing_has_stashed_yet():
+    """The rungs replay the arena the stash hooks fill; with no armed forward behind it there
+    is nothing to record against, and the ladder must say so rather than assert."""
+    world = _World()
+    ladder = SpecStateLadder(world.pool, WIDTH)
+    req = SimpleNamespace(linear_slot_idx=SLOT, table_idx=SLOT)
+
+    assert ladder.capture_replays(req) == {}
+    assert ladder._graphs == {}
+    assert ladder._live is None
+
+
+def test_boot_capture_is_a_no_op_when_the_ladder_graph_is_switched_off(monkeypatch):
+    from freetoken.engine.spec_state_ladder import LADDER_GRAPH_ENV
+
+    monkeypatch.setenv(LADDER_GRAPH_ENV, "0")
+    world = _World()
+    ladder = SpecStateLadder(world.pool, WIDTH)
+
+    assert ladder.capture_replays(SimpleNamespace(linear_slot_idx=SLOT)) == {}

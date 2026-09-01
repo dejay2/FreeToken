@@ -553,7 +553,10 @@ class Engine:
                 "Integrated MTP graphs armed for widths "
                 f"{config.spec_decode.graph_widths} (1 = the capture-decode step)"
             )
-            # ...and captured HERE, beside the decode graphs, while boot memory is still fresh.
+        if config.spec_decode.enabled or config.spec_decode.graph_widths:
+            # ...and captured HERE, beside the decode graphs, while boot memory is still fresh:
+            # the verify widths, then the DRAFT head's own chain and commit graphs, then the
+            # ladder's replay rungs (which need the verify warm-ups' stash to have run).
             self._capture_spec_graphs_at_boot()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
@@ -1091,9 +1094,6 @@ class Engine:
 
         ``FREETOKEN_MTP_SPEC_BOOT_CAPTURE=0`` restores the old lazy behaviour for debugging.
         """
-        runner = self.spec_graph_runner
-        if runner is None:
-            return
         if os.environ.get("FREETOKEN_MTP_SPEC_BOOT_CAPTURE", "1").strip() == "0":
             logger.info_rank0(
                 "MTP spec graph boot capture disabled (FREETOKEN_MTP_SPEC_BOOT_CAPTURE=0): "
@@ -1101,6 +1101,21 @@ class Engine:
             )
             return
         if self.device.type != "cuda":
+            return
+        try:
+            self._capture_spec_verify_graphs_at_boot()
+        finally:
+            # The draft head's graphs and the ladder's rungs do not depend on the verify
+            # widths having captured, only on the boot memory this method runs in -- and the
+            # ladder's rungs DO depend on a verify warm-up having stashed the per-layer replay
+            # parameters, which is why they come last.
+            self._capture_draft_graphs_at_boot()
+            self._capture_ladder_replays_at_boot()
+
+    def _capture_spec_verify_graphs_at_boot(self) -> None:
+        """The ``w``-row target forward, one graph per armed width."""
+        runner = self.spec_graph_runner
+        if runner is None:
             return
         widths = sorted(runner.widths)
         needed = _SPEC_BOOT_CAPTURE_BASE_LEN + max(widths)
@@ -1154,6 +1169,74 @@ class Engine:
         logger.info_rank0(
             f"MTP spec graphs captured at boot: {captured}/{len(widths)} "
             f"(widths {tuple(widths)}) in {started.elapsed_time(ended) / 1000.0:.3f} s"
+        )
+
+    def _capture_draft_graphs_at_boot(self) -> None:
+        """The DRAFT head's chain and commit graphs, for the same reason the verify ones.
+
+        ~11 ms of a 25 ms cycle is the host walking the chain's 843 launches and ~120 more for
+        the commit; both are fixed sequences over the head's own private KV, so both record.
+        Never a boot gate: a failure inside ``SpecDraftHead`` is already classified and logged
+        by its own runner, and anything that escapes leaves the head running eager.
+        """
+        head = self.spec_draft
+        if head is None or not getattr(head, "graphs_enabled", False):
+            return
+        started = torch.cuda.Event(enable_timing=True)
+        ended = torch.cuda.Event(enable_timing=True)
+        started.record(self.stream)
+        try:
+            results = head.capture_graphs_at_boot()
+        except Exception as exc:  # noqa: BLE001 -- a bonus capture, never a boot gate
+            logger.warning_rank0(
+                f"MTP draft graph boot capture raised {type(exc).__name__}: {exc}; "
+                "the draft chain and commit run eager"
+            )
+            return
+        finally:
+            if self.moe_offload_cache is not None:
+                # the draft head owns its own expert banks, but a warm-up that fell through to
+                # the target's MoE would have moved experts into the shared cache
+                self.moe_offload_cache.reset()
+        ended.record(self.stream)
+        torch.cuda.synchronize(self.device)
+        captured = sum(1 for status in results.values() if status == "captured")
+        logger.info_rank0(
+            f"MTP draft graphs captured at boot: {captured}/{len(results)} "
+            f"in {started.elapsed_time(ended) / 1000.0:.3f} s"
+        )
+
+    def _capture_ladder_replays_at_boot(self) -> None:
+        """The state ladder's per-accepted-depth recurrent replays, up front.
+
+        Captured lazily they cost ~300 ms each on the settle that first needs them, so the
+        first ~30 cycles of a boot pay 1.8 s between them -- inside the window a benchmark
+        measures. The ladder needs a live slot and a populated stash to record against; the
+        dummy request supplies the slot and the verify captures above supplied the stash.
+        """
+        ladder = self.spec_state_ladder
+        if ladder is None:
+            return
+        started = torch.cuda.Event(enable_timing=True)
+        ended = torch.cuda.Event(enable_timing=True)
+        started.record(self.stream)
+        try:
+            results = ladder.capture_replays(self.dummy_req)
+        except Exception as exc:  # noqa: BLE001 -- a bonus capture, never a boot gate
+            logger.warning_rank0(
+                f"MTP spec ladder boot capture raised {type(exc).__name__}: {exc}; "
+                "the rungs stay lazily captured"
+            )
+            return
+        if not results:
+            return
+        ended.record(self.stream)
+        torch.cuda.synchronize(self.device)
+        captured = sum(1 for ok in results.values() if ok)
+        logger.info_rank0(
+            f"MTP spec ladder replays captured at boot: {captured}/{len(results)} "
+            f"(steps {tuple(sorted(results))}) in "
+            f"{started.elapsed_time(ended) / 1000.0:.3f} s"
         )
 
     def _capture_spec_width(self, runner, batch: Batch):
@@ -1335,11 +1418,16 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        # Nested inside diag.prefill_forward, so prefill_forward's self time loses exactly
+        # what these two take (freetoken/diag.py; default-off).
+        with diag.region("diag.prefill_sample" if batch.is_prefill else None):
+            next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         if self.mtp_shadow_observer is not None:
             self.mtp_shadow_observer.observe(observer_capture, next_tokens_gpu[0])
         if self.spec_draft is not None:
-            self.spec_draft.observe_forward(batch, mtp_capture, next_tokens_gpu[0])
+            # The MTP draft head's prompt priming: once per prompt (per chunk), eager.
+            with diag.region("diag.prefill_prime_draft" if batch.is_prefill else None):
+                self.spec_draft.observe_forward(batch, mtp_capture, next_tokens_gpu[0])
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)

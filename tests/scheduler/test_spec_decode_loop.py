@@ -104,13 +104,18 @@ class _FakeDraft:
         self.reset_uids: list[int] = []
         self.last_token: int | None = None
         self.last_position: int | None = None
+        # the timing probe the scheduler hands the head, so the graphed chain and commit can
+        # subdivide "draft" / "tail.commit" with their own replay sub-marks
+        self.probes: list[object | None] = []
 
     # the seam the scheduler dispatches on
     def is_ready(self, req: Req) -> bool:
         return self.ready
 
-    def propose(self, req: Req, depth: int):
+    def propose(self, req: Req, depth: int, *, probe=None):
         from freetoken.engine.spec_draft import DraftProposal
+
+        self.probes.append(probe)
 
         token = int(req.input_ids[-1])
         position = req.cached_len
@@ -134,7 +139,7 @@ class _FakeDraft:
             token, position = nxt, position + 1
         return DraftProposal(tokens=tuple(tokens), logits=torch.stack(rows))
 
-    def commit(self, req: Req, *, hidden: torch.Tensor, token_ids) -> None:
+    def commit(self, req: Req, *, hidden: torch.Tensor, token_ids, probe=None) -> None:
         n = len(token_ids)
         assert hidden.shape[0] >= n, "the step's hidden rows must cover the emitted run"
         self.committed.append(
@@ -1224,10 +1229,10 @@ def test_the_conf_log_carries_the_draft_heads_confidence_when_the_head_reports_i
     draft = _FakeDraft(target)
     inner = draft.propose
 
-    def _with_confidence(req, depth):
+    def _with_confidence(req, depth, *, probe=None):
         from freetoken.engine.spec_draft import DraftProposal
 
-        proposal = inner(req, depth)
+        proposal = inner(req, depth, probe=probe)
         return DraftProposal(
             tokens=proposal.tokens,
             logits=proposal.logits,
