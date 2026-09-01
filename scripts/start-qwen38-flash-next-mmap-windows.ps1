@@ -24,6 +24,17 @@ param(
 
     [switch]$EnableCacheReport,
 
+    # Weight-only int8 for every dense projection the checkpoint ships bf16 (GDN, QSA,
+    # hyper-connections, shared experts, lm_head): ~2x the decode GEMV speed and 3.9 GiB of
+    # VRAM back for -MoECacheSize. Measured 2026-09-02 on the RTX 5090: 8k decode 53 -> 72
+    # tok/s with the freed VRAM spent on slots. Quantization is per-output-row symmetric.
+    [ValidateSet('', 'int8')]
+    [string]$DenseQuant = '',
+
+    # Keep the 1.27 GB token embedding in pinned host RAM (rows gathered over PCIe); frees
+    # that VRAM for expert slots. Untied lm_head only.
+    [switch]$EmbedHost,
+
     [ValidateRange(-1, 1024)]
     [int]$CudaGraphMaxBS = -1,
 
@@ -102,6 +113,9 @@ else {
     $env:FREETOKEN_LOAD_VISION = '0'
     $env:FREETOKEN_VISION_EXECUTION = 'gpu'
 }
+# Switches only ever SET these; an operator who exported the env vars keeps them.
+if ($DenseQuant -ne '') { $env:FREETOKEN_DENSE_QUANT = $DenseQuant }
+if ($EmbedHost) { $env:FREETOKEN_EMBED_HOST = '1' }
 $pathParts += $sourceDir
 $env:PYTHONPATH = ($pathParts -join ';') + $(if ($env:PYTHONPATH) { ";$env:PYTHONPATH" } else { '' })
 
