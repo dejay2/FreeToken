@@ -322,15 +322,15 @@ def test_batched_normal_acceptance_uses_one_cuda_sync_and_not_global_rng():
 
 
 def test_acceptance_timing_excludes_evidence_conversion(monkeypatch):
-    import freetoken.engine.mtp_fast_verify as fast_verify
+    import freetoken.engine.spec_sample as spec_sample
 
-    original = fast_verify._tensor_to_tuple
+    original = spec_sample._tensor_to_tuple
 
     def slow_conversion(tensor, cast):
         time.sleep(0.002)
         return original(tensor, cast)
 
-    monkeypatch.setattr(fast_verify, "_tensor_to_tuple", slow_conversion)
+    monkeypatch.setattr(spec_sample, "_tensor_to_tuple", slow_conversion)
     result = batched_speculative_accept(
         proposals=[1],
         draft_logits=_logits([1]),

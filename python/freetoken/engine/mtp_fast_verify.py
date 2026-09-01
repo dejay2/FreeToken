@@ -4,11 +4,21 @@ import gc
 import math
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 from flashlib.kernels.slot_cache import Stat
+
+# The acceptance core lives in spec_sample so the integrated decode path can import it without
+# this module's verifier / graph-runner / flashlib surface; re-exported here because the shadow
+# observer and its tests import it from the verifier.
+from freetoken.engine.spec_sample import (  # noqa: F401
+    MTPAcceptanceResult,
+    _sampling_probabilities_batch,
+    _tensor_to_tuple,
+    batched_speculative_accept,
+)
 
 _GRAPH_CAPTURE_RESERVE_FLOOR = 64 << 20
 # the graph runner has no config handle, so the capture-failure traceback lands in the
@@ -185,29 +195,6 @@ def compare_verifier_distributions(
 
 
 @dataclass(frozen=True)
-class MTPAcceptanceResult:
-    accepted_prefix: int
-    corrected_token: int
-    target_tokens: tuple[int, ...]
-    acceptance_probabilities: tuple[float, ...]
-    draft_probabilities: tuple[float, ...]
-    target_probabilities: tuple[float, ...]
-    greedy: bool
-    required_wall_ms: float = field(compare=False)
-    required_synchronizations: int = 0
-    instrumentation_wall_ms: float = field(default=0.0, compare=False)
-    instrumentation_synchronizations: int = 0
-
-    @property
-    def acceptance_ms(self) -> float:
-        return self.required_wall_ms
-
-    @property
-    def synchronizations(self) -> int:
-        return self.required_synchronizations + self.instrumentation_synchronizations
-
-
-@dataclass(frozen=True)
 class MTPProjectionSample:
     prompt_ms: float
     draft_ms: float
@@ -260,32 +247,6 @@ class MTPProjectionSample:
             "A": self.acceptance_ms,
             "E": self.emitted_tokens,
         }
-
-
-def _sampling_probabilities_batch(
-    logits: torch.Tensor,
-    *,
-    temperature: float,
-    top_k: int,
-    top_p: float,
-) -> torch.Tensor:
-    if logits.ndim != 2:
-        raise ValueError("sampling logits must be a row matrix")
-    if temperature <= 0 or top_k == 1:
-        winners = torch.argmax(logits, dim=-1, keepdim=True)
-        return torch.zeros_like(logits, dtype=torch.float32).scatter_(1, winners, 1.0)
-    filtered = logits.float() / float(temperature)
-    if 1 <= top_k < filtered.shape[1]:
-        threshold = torch.topk(filtered, top_k, dim=-1).values[:, -1:]
-        filtered = filtered.masked_fill(filtered < threshold, -float("inf"))
-    probabilities = torch.softmax(filtered, dim=-1)
-    if top_p < 1:
-        ordered, indices = probabilities.sort(dim=-1, descending=True)
-        remove = ordered.cumsum(dim=-1) - ordered >= top_p
-        ordered = ordered.masked_fill(remove, 0)
-        probabilities = torch.zeros_like(probabilities).scatter(1, indices, ordered)
-        probabilities /= probabilities.sum(dim=-1, keepdim=True)
-    return probabilities
 
 
 def sampling_support_order_matches(
@@ -364,111 +325,6 @@ def sampling_distribution_divergence(
     return float(divergence.max()) if divergence.numel() else 0.0
 
 
-def _tensor_to_tuple(tensor: torch.Tensor, cast) -> tuple:
-    return tuple(cast(value) for value in tensor.tolist())
-
-
-def batched_speculative_accept(
-    *,
-    proposals: list[int],
-    draft_logits: torch.Tensor,
-    target_logits: torch.Tensor,
-    temperature: float,
-    top_k: int,
-    top_p: float,
-    generator: torch.Generator,
-) -> MTPAcceptanceResult:
-    depth = len(proposals)
-    if depth not in (1, 2, 3):
-        raise ValueError("batched MTP acceptance requires one to three proposals")
-    if draft_logits.ndim != 2 or draft_logits.shape[0] != depth:
-        raise ValueError("draft logits must have one row per proposal")
-    if target_logits.ndim != 2 or target_logits.shape[0] != depth + 1:
-        raise ValueError("target acceptance requires depth+1 logit rows")
-    if draft_logits.shape[1] != target_logits.shape[1]:
-        raise ValueError("draft and target logits must use the same vocabulary")
-    if draft_logits.device != target_logits.device:
-        raise ValueError("draft and target logits must use the same device")
-
-    started = time.perf_counter()
-    device = target_logits.device
-    proposal_ids = torch.tensor(proposals, dtype=torch.int64, device=device)
-    greedy = temperature <= 0 or top_k == 1
-    q_rows = _sampling_probabilities_batch(
-        draft_logits,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-    )
-    p_rows = _sampling_probabilities_batch(
-        target_logits,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-    )
-    gather_ids = proposal_ids.unsqueeze(1)
-    q_selected = q_rows.gather(1, gather_ids).squeeze(1)
-    p_selected = p_rows[:depth].gather(1, gather_ids).squeeze(1)
-    ratios = torch.where(
-        q_selected <= 0,
-        torch.ones_like(q_selected),
-        (p_selected / q_selected).clamp(max=1.0),
-    )
-    target_tokens_device = torch.argmax(target_logits[:depth], dim=-1)
-
-    if greedy:
-        accepted_rows = proposal_ids == target_tokens_device
-        accepted_prefix_device = accepted_rows.to(torch.int32).cumprod(0).sum()
-        correction_options = torch.cat(
-            (target_tokens_device, torch.argmax(target_logits[depth:depth + 1], dim=-1))
-        )
-        corrected_device = correction_options[accepted_prefix_device.to(torch.int64)]
-    else:
-        draws = torch.rand(depth, generator=generator, device=device)
-        accepted_rows = draws <= ratios
-        accepted_prefix_device = accepted_rows.to(torch.int32).cumprod(0).sum()
-        residual = (p_rows[:depth] - q_rows).clamp_min(0)
-        residual_sum = residual.sum(dim=-1, keepdim=True)
-        residual = torch.where(residual_sum > 0, residual, p_rows[:depth])
-        residual /= residual.sum(dim=-1, keepdim=True)
-        correction_rows = torch.cat((residual, p_rows[depth:depth + 1]), dim=0)
-        possible_corrections = torch.multinomial(
-            correction_rows, 1, generator=generator
-        ).squeeze(1)
-        corrected_device = possible_corrections[
-            accepted_prefix_device.to(torch.int64)
-        ]
-
-    required_synchronizations = 0
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-        required_synchronizations = 1
-    required_wall_ms = (time.perf_counter() - started) * 1000.0
-
-    instrumentation_started = time.perf_counter()
-    accepted_prefix = int(accepted_prefix_device)
-    corrected_token = int(corrected_device)
-    target_tokens = _tensor_to_tuple(target_tokens_device, int)
-    acceptance_probabilities = _tensor_to_tuple(ratios, float)
-    draft_probabilities = _tensor_to_tuple(q_selected, float)
-    target_probabilities = _tensor_to_tuple(p_selected, float)
-    instrumentation_wall_ms = (
-        time.perf_counter() - instrumentation_started
-    ) * 1000.0
-    result = MTPAcceptanceResult(
-        accepted_prefix=accepted_prefix,
-        corrected_token=corrected_token,
-        target_tokens=target_tokens,
-        acceptance_probabilities=acceptance_probabilities,
-        draft_probabilities=draft_probabilities,
-        target_probabilities=target_probabilities,
-        greedy=greedy,
-        required_wall_ms=required_wall_ms,
-        required_synchronizations=required_synchronizations,
-        instrumentation_wall_ms=instrumentation_wall_ms,
-        instrumentation_synchronizations=0,
-    )
-    return result
 
 
 class MTPFastVerifier:
