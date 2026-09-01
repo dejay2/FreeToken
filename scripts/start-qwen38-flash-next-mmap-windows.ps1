@@ -25,7 +25,15 @@ param(
     [switch]$EnableCacheReport,
 
     [ValidateRange(-1, 1024)]
-    [int]$CudaGraphMaxBS = -1
+    [int]$CudaGraphMaxBS = -1,
+
+    [ValidateRange(0, 1048576)]
+    [int]$MoECacheSize = 0,
+
+    # Hard KV-pool capacity in tokens (--num-tokens); 0 keeps the default sizing, where
+    # the pool grows into free memory and -ContextTokens is only a floor.
+    [ValidateRange(0, 4194304)]
+    [int]$KVCacheTokens = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -102,9 +110,19 @@ Write-Host "  Model:  $resolvedModel"
 Write-Host "  API:    http://127.0.0.1:$Port/v1"
 Write-Host "  Context tokens: $ContextTokens"
 Write-Host "  Active requests: $MaxRunningRequests"
+Write-Host "  MoE cache slots: $(if ($MoECacheSize -gt 0) { $MoECacheSize } else { 'auto' })"
 Write-Host "  Picture input: $($EnableVision.IsPresent)"
 Write-Host "  Picture execution: $(if ($EnableVision) { $VisionExecution } else { 'disabled' })"
 Write-Host 'FreeToken Desktop supplies the Windows runtime but does not need to be open.'
+
+# --moe-cache-size and --moe-cache-auto are mutually exclusive; an explicit size opts out
+# of the auto sizing entirely.
+$moeCacheArgs = if ($MoECacheSize -gt 0) {
+    @('--moe-cache-size', "$MoECacheSize")
+}
+else {
+    @('--moe-cache-auto')
+}
 
 $serveArgs = @(
     '-m', 'freetoken.cli', 'serve',
@@ -112,8 +130,8 @@ $serveArgs = @(
     '--host', '127.0.0.1',
     '--port', "$Port",
     '--ple-backend', 'mmap',
-    '--moe-backend', 'offload',
-    '--moe-cache-auto',
+    '--moe-backend', 'offload'
+) + $moeCacheArgs + @(
     '--max-running-requests', "$MaxRunningRequests",
     '--kv-reserve-tokens', "$ContextTokens",
     '--expert-load', 'serial'
@@ -123,6 +141,9 @@ if ($EnableCacheReport) {
 }
 if ($CudaGraphMaxBS -ge 0) {
     $serveArgs += @('--cuda-graph-max-bs', "$CudaGraphMaxBS")
+}
+if ($KVCacheTokens -gt 0) {
+    $serveArgs += @('--num-tokens', "$KVCacheTokens")
 }
 
 & $resolvedPython @serveArgs

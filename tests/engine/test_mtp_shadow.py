@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from freetoken.engine.mtp_shadow import (
+    _GUARD_BYTES,
     MTPShadowConfig,
     MTPShadowObserver,
     build_shifted_pairs,
     build_shifted_rope_positions,
 )
 from freetoken.models.qwen4_exp.mtp_spike import (
+    MTPExactExpertRunner,
+    MTPGPUExpertRunner,
+    MTPNVFP4ExpertRunner,
     MTPStagedModelRunner,
     Qwen4ExpMTPModel,
     derive_mtp_model_config,
@@ -82,6 +87,50 @@ def test_shadow_config_rejects_scope_or_geometry_drift(monkeypatch):
     ):
         with pytest.raises(ValueError, match=message):
             MTPShadowConfig.from_env(_engine_config(**{field: value}))
+
+
+def test_shadow_config_resident_is_off_by_default_and_env_enables_it(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_MTP_SHADOW", "1")
+    monkeypatch.delenv("FREETOKEN_MTP_RESIDENT", raising=False)
+
+    assert MTPShadowConfig(enabled=False).resident is False
+    assert MTPShadowConfig.from_env(_engine_config()).resident is False
+    monkeypatch.setenv("FREETOKEN_MTP_RESIDENT", "1")
+    assert MTPShadowConfig.from_env(_engine_config()).resident is True
+
+
+def test_shadow_config_target_geometry_defaults_to_the_full_reservation(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_MTP_SHADOW", "1")
+    for name in ("FREETOKEN_MTP_TARGET_PAGES", "FREETOKEN_MTP_TARGET_EXPERTS"):
+        monkeypatch.delenv(name, raising=False)
+
+    default = MTPShadowConfig.from_env(_engine_config())
+    assert (default.target_pages, default.target_experts) == (4097, 4063)
+    assert (MTPShadowConfig(enabled=False).target_pages, MTPShadowConfig(
+        enabled=False
+    ).target_experts) == (4097, 4063)
+
+    monkeypatch.setenv("FREETOKEN_MTP_TARGET_PAGES", "1025")
+    monkeypatch.setenv("FREETOKEN_MTP_TARGET_EXPERTS", "3000")
+    reduced = MTPShadowConfig.from_env(_engine_config())
+    assert (reduced.target_pages, reduced.target_experts) == (1025, 3000)
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("FREETOKEN_MTP_RESIDENT", "yes", "must be 0 or 1"),
+        ("FREETOKEN_MTP_TARGET_PAGES", "0", "positive"),
+        ("FREETOKEN_MTP_TARGET_EXPERTS", "-1", "positive"),
+    ],
+)
+def test_shadow_config_rejects_malformed_resident_values(
+    monkeypatch, name, value, message
+):
+    monkeypatch.setenv("FREETOKEN_MTP_SHADOW", "1")
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=message):
+        MTPShadowConfig.from_env(_engine_config())
 
 
 def _draft_rng_observer(*, seed=411, uid=37):
@@ -359,35 +408,117 @@ def test_shifted_pairs_preserve_actual_picture_embedding_at_boundary():
     assert torch.equal(tail, hidden[-1:])
 
 
+def _meta_mtp_model_and_weights(*, fill: bool = False):
+    from freetoken.utils.torch_utils import torch_dtype
+
+    config = derive_mtp_model_config(parsed_config())
+    with torch.device("meta"), torch_dtype(torch.bfloat16):
+        model = Qwen4ExpMTPModel(config)
+    generator = torch.Generator().manual_seed(7)
+    weights = {}
+    for name, tensor in model.state_dict().items():
+        if ".experts." in name:
+            continue
+        value = torch.zeros(tensor.shape, dtype=tensor.dtype)
+        if fill and value.is_floating_point():
+            value.normal_(0.0, 0.05, generator=generator)
+        weights[name] = value
+    return model, weights
+
+
+def _group_owners(model, names):
+    owners = []
+    for name in names:
+        parts = name.split(".")
+        owner = model
+        for part in parts[:-1]:
+            owner = owner.op_list[int(part)] if part.isdigit() else getattr(owner, part)
+        owners.append((owner, parts[-1]))
+    return owners
+
+
 def test_dense_weights_are_present_only_inside_their_stage():
     from freetoken.layers.rotary import get_rope, set_rope_device
 
     get_rope.cache_clear()
     set_rope_device(torch.device("cpu"))
     try:
-        config = derive_mtp_model_config(parsed_config())
-        with torch.device("meta"):
-            model = Qwen4ExpMTPModel(config)
-        weights = {
-            name: torch.zeros(tensor.shape, dtype=tensor.dtype)
-            for name, tensor in model.state_dict().items()
-            if ".experts." not in name
-        }
+        model, weights = _meta_mtp_model_and_weights()
         runner = MTPStagedModelRunner(model, weights, device=torch.device("cpu"))
-        names = runner.groups["attention"]
-        owners = []
-        for name in names:
-            parts = name.split(".")
-            owner = model
-            for part in parts[:-1]:
-                owner = owner.op_list[int(part)] if part.isdigit() else getattr(owner, part)
-            owners.append((owner, parts[-1]))
+        owners = _group_owners(model, runner.groups["attention"])
         assert all(getattr(owner, attr).is_meta for owner, attr in owners)
         with runner.stage("attention"):
             assert all(not getattr(owner, attr).is_meta for owner, attr in owners)
         assert all(getattr(owner, attr).is_meta for owner, attr in owners)
         assert runner.stats.stages == 1
         assert runner.stats.copied_bytes == runner.max_component_bytes
+        assert runner.staging_bytes == runner.max_component_bytes
+        assert runner.resident_bytes == 0
+    finally:
+        get_rope.cache_clear()
+        set_rope_device(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
+
+def test_resident_dense_weights_never_leave_the_device_or_move_per_call():
+    from freetoken.layers.rotary import get_rope, set_rope_device
+
+    get_rope.cache_clear()
+    set_rope_device(torch.device("cpu"))
+    try:
+        model, weights = _meta_mtp_model_and_weights()
+        runner = MTPStagedModelRunner(
+            model, weights, device=torch.device("cpu"), resident=True
+        )
+        owners = [
+            owner
+            for group in runner.groups
+            for owner in _group_owners(model, runner.groups[group])
+        ]
+        assert all(not getattr(owner, attr).is_meta for owner, attr in owners)
+        for group in runner.groups:
+            with runner.stage(group):
+                assert all(not getattr(owner, attr).is_meta for owner, attr in owners)
+        assert all(not getattr(owner, attr).is_meta for owner, attr in owners)
+
+        assert runner.stats.stages == len(runner.groups)
+        assert runner.stats.copied_bytes == 0
+        assert runner.stats.copy_ms == 0.0
+        assert runner.stats.peak_component_bytes == 0
+        assert runner.staging_bytes == 0
+        assert runner.resident_bytes == sum(
+            tensor.numel() * tensor.element_size() for tensor in weights.values()
+        )
+    finally:
+        get_rope.cache_clear()
+        set_rope_device(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
+
+def test_resident_and_staged_dense_paths_compute_the_same_fusion():
+    from freetoken.layers.rotary import get_rope, set_rope_device
+
+    get_rope.cache_clear()
+    set_rope_device(torch.device("cpu"))
+    try:
+        staged_model, weights = _meta_mtp_model_and_weights(fill=True)
+        resident_model, _ = _meta_mtp_model_and_weights(fill=True)
+        staged = MTPStagedModelRunner(
+            staged_model, weights, device=torch.device("cpu")
+        )
+        resident = MTPStagedModelRunner(
+            resident_model, weights, device=torch.device("cpu"), resident=True
+        )
+        config = staged_model.config
+        embeddings = torch.randn(2, config.hidden_size).to(torch.bfloat16)
+        hidden = torch.randn(
+            2, config.qwen4_args.hc_count * config.hidden_size
+        ).to(torch.bfloat16)
+
+        with staged.stage("pre_fc"):
+            expected = staged_model.fuse_inputs(embeddings, hidden)
+        with resident.stage("pre_fc"):
+            got = resident_model.fuse_inputs(embeddings, hidden)
+
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
     finally:
         get_rope.cache_clear()
         set_rope_device(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
@@ -563,3 +694,122 @@ def test_observer_init_tolerates_a_target_without_an_offload_cache(tmp_path):
 
     with pytest.raises(RuntimeError, match="KV geometry"):
         MTPShadowObserver(engine, MTPShadowConfig(enabled=True, private_root=tmp_path))
+
+
+def _geometry_engine(tmp_path, *, num_pages, cache_size):
+    return SimpleNamespace(
+        device=torch.device("cpu"),
+        ctx=SimpleNamespace(),
+        model=SimpleNamespace(),
+        config=SimpleNamespace(
+            model_config=parsed_config(), model_path=tmp_path, page_size=64
+        ),
+        moe_offload_cache=SimpleNamespace(collect_stats=False, cache_size=cache_size),
+        num_pages=num_pages,
+        linear_state_pool=None,
+    )
+
+
+def test_observer_geometry_gate_follows_the_configured_target_expectations(tmp_path):
+    engine = _geometry_engine(tmp_path, num_pages=1025, cache_size=3000)
+
+    with pytest.raises(RuntimeError, match="KV geometry"):
+        MTPShadowObserver(engine, MTPShadowConfig(enabled=True, private_root=tmp_path))
+    with pytest.raises(RuntimeError, match="requires 4063 target experts, got 3000"):
+        MTPShadowObserver(
+            engine,
+            MTPShadowConfig(
+                enabled=True, private_root=tmp_path, target_pages=1025
+            ),
+        )
+    # both gates cleared: the run stops at the next unrelated target requirement
+    with pytest.raises(RuntimeError, match="eight target recurrent slots"):
+        MTPShadowObserver(
+            engine,
+            MTPShadowConfig(
+                enabled=True,
+                private_root=tmp_path,
+                target_pages=1025,
+                target_experts=3000,
+            ),
+        )
+
+
+def test_observer_still_pins_the_page_size_when_the_page_count_is_reduced(tmp_path):
+    engine = _geometry_engine(tmp_path, num_pages=1025, cache_size=3000)
+    engine.config.page_size = 128
+
+    with pytest.raises(RuntimeError, match="KV geometry"):
+        MTPShadowObserver(
+            engine,
+            MTPShadowConfig(
+                enabled=True,
+                private_root=tmp_path,
+                target_pages=1025,
+                target_experts=3000,
+            ),
+        )
+
+
+def test_memory_plan_counts_resident_bytes_and_leaves_the_staged_plan_unchanged():
+    staged = MTPShadowObserver._build_memory_plan(
+        free=1 << 30, qsa_bytes=100, staging_bytes=50, resident_bytes=0
+    )
+    resident = MTPShadowObserver._build_memory_plan(
+        free=1 << 30, qsa_bytes=100, staging_bytes=0, resident_bytes=7
+    )
+
+    assert staged == {
+        "free_before": 1 << 30,
+        "mtp_qsa_bytes": 100,
+        "max_dense_stage_bytes": 50,
+        "guard_bytes": _GUARD_BYTES,
+        "required_bytes": 150 + _GUARD_BYTES,
+    }
+    assert resident["resident_bytes"] == 7
+    assert resident["max_dense_stage_bytes"] == 0
+    assert resident["required_bytes"] == 107 + _GUARD_BYTES
+
+
+def _placement_observer(tmp_path, **overrides):
+    observer = object.__new__(MTPShadowObserver)
+    observer.config = MTPShadowConfig(
+        enabled=True, private_root=tmp_path, **overrides
+    )
+    observer.engine = SimpleNamespace(
+        config=SimpleNamespace(model_path=tmp_path)
+    )
+    observer._weight_store = None
+    return observer
+
+
+def test_resident_mode_selects_the_device_expert_runner(tmp_path):
+    assert _placement_observer(tmp_path)._expert_runner_type() is MTPExactExpertRunner
+    assert (
+        _placement_observer(tmp_path, placement="nvfp4")._expert_runner_type()
+        is MTPNVFP4ExpertRunner
+    )
+    assert (
+        _placement_observer(tmp_path, resident=True)._expert_runner_type()
+        is MTPGPUExpertRunner
+    )
+
+
+def test_resident_expert_placement_refuses_nvfp4(tmp_path):
+    observer = _placement_observer(tmp_path, placement="nvfp4", resident=True)
+
+    with pytest.raises(ValueError, match="bf16"):
+        observer._load_expert_banks()
+
+
+def test_launcher_passes_an_explicit_moe_cache_size_only_when_asked():
+    launcher = (
+        Path(__file__).parents[2]
+        / "scripts"
+        / "start-qwen38-flash-next-mmap-windows.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert "[int]$MoECacheSize" in launcher
+    assert "if ($MoECacheSize -gt 0)" in launcher
+    assert "'--moe-cache-size', \"$MoECacheSize\"" in launcher
+    assert "'--moe-cache-auto'" in launcher

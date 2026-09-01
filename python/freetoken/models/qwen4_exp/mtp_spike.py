@@ -495,6 +495,133 @@ class MTPCPUExpertRunner:
             gc.collect()
 
 
+class MTPGPUExpertRunner:
+    """Fully device-resident BF16 MTP routed experts; no per-call host transfer."""
+
+    def __init__(
+        self,
+        banks,
+        *,
+        top_k: int,
+        activation: str,
+        renormalize: bool,
+        max_tokens: int,
+        num_threads: int,
+        device: torch.device,
+    ) -> None:
+        if getattr(banks, "quant_format", None) != "bf16":
+            raise ValueError(
+                "MTP resident expert runner needs bf16 banks, got "
+                f"{getattr(banks, 'quant_format', None)!r}"
+            )
+        if activation not in {"silu", "swish"}:
+            raise ValueError(f"MTP resident experts support silu, got {activation!r}")
+        if not 1 <= top_k <= banks.num_experts:
+            raise ValueError(f"invalid MTP top_k={top_k} for {banks.num_experts} experts")
+        if max_tokens < 1:
+            raise ValueError(f"MTP max_tokens must be positive, got {max_tokens}")
+        del num_threads  # the resident path owns no CPU worker pool
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        self.banks = banks
+        self.top_k = int(top_k)
+        self.renormalize = bool(renormalize)
+        self.max_tokens = int(max_tokens)
+        self.device = device
+        self.stats = MTPExpertStats()
+        self.gate_up = banks.gate_up.to(device)
+        self.down = banks.down.to(device)
+        self.resident_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (self.gate_up, self.down)
+        )
+
+    def route(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from freetoken.moe.fused import fused_topk
+
+        if router_logits.shape != (hidden_states.shape[0], self.banks.num_experts):
+            raise ValueError(
+                "MTP router logits must be "
+                f"[{hidden_states.shape[0]}, {self.banks.num_experts}], got "
+                f"{tuple(router_logits.shape)}"
+            )
+        return fused_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+        )
+
+    def run_routed(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        tokens = int(hidden_states.shape[0])
+        if not 1 <= tokens <= self.max_tokens:
+            raise ValueError(
+                f"MTP expert calls support at most {self.max_tokens} tokens, got {tokens}"
+            )
+        if hidden_states.device != self.device or hidden_states.dtype is not torch.bfloat16:
+            raise ValueError(
+                f"MTP expert hidden states must be bfloat16 on {self.device}, got "
+                f"{hidden_states.device}/{hidden_states.dtype}"
+            )
+        expected = (tokens, self.top_k)
+        if tuple(topk_weights.shape) != expected or not topk_weights.dtype.is_floating_point:
+            raise ValueError(f"MTP top-k weights must be floating {expected}")
+        if tuple(topk_ids.shape) != expected or topk_ids.dtype is not torch.int32:
+            raise ValueError(f"MTP top-k ids must be int32 {expected}")
+        if topk_weights.device != self.device or topk_ids.device != self.device:
+            raise ValueError("MTP routing tensors must use the runner device")
+
+        route_ids = topk_ids.reshape(-1).to(torch.int64)
+        route_weights = topk_weights.reshape(-1).to(torch.float32)
+        route_rows = torch.arange(
+            tokens, device=self.device
+        ).repeat_interleave(self.top_k)
+        result = torch.zeros(
+            hidden_states.shape, dtype=torch.float32, device=self.device
+        )
+        # Expert-major: indexing one bank row is a view, so the routed weights are never
+        # copied. The alternative (a per-route gather) materializes tokens x expert bytes.
+        for expert in sorted({int(value) for value in route_ids.tolist()}):
+            if expert < 0:
+                continue
+            selected = (route_ids == expert).nonzero(as_tuple=True)[0]
+            rows = route_rows[selected]
+            projected = hidden_states[rows] @ self.gate_up[expert].t()
+            gate, up = projected.chunk(2, dim=-1)
+            activated = (torch.nn.functional.silu(gate.float()) * up.float()).to(
+                hidden_states.dtype
+            )
+            value = activated @ self.down[expert].t()
+            result.index_add_(0, rows, value.float() * route_weights[selected, None])
+
+        self.stats.calls += 1
+        self.stats.tokens += tokens
+        self.stats.logical_expert_bytes += (
+            tokens * self.top_k * self.banks.bytes_per_expert
+        )
+        return result.to(hidden_states.dtype)
+
+    def forward(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> torch.Tensor:
+        weights, ids = self.route(hidden_states, router_logits)
+        return self.run_routed(hidden_states, weights, ids)
+
+    def raise_if_unhealthy(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
 class MTPExactExpertRunner(MTPCPUExpertRunner):
     """Exact file-backed BF16 placement."""
 
@@ -575,10 +702,12 @@ class MTPStagedModelRunner:
         cpu_weights: Mapping[str, torch.Tensor],
         *,
         device: torch.device,
+        resident: bool = False,
     ) -> None:
         self.model = model
         self.cpu_weights = dict(cpu_weights)
         self.device = torch.device(device)
+        self.resident = bool(resident)
         self.stats = MTPStagingStats()
         self.groups: dict[str, tuple[str, ...]] = {}
         used: set[str] = set()
@@ -594,6 +723,11 @@ class MTPStagedModelRunner:
         missing = set(self.cpu_weights) - used
         if missing:
             raise ValueError(f"unstaged MTP dense weights: {sorted(missing)}")
+        if self.resident:
+            for names in self.groups.values():
+                for name in names:
+                    owner, attr = _resolve_state_owner(self.model, name)
+                    setattr(owner, attr, self.cpu_weights[name].to(self.device))
 
     @property
     def max_component_bytes(self) -> int:
@@ -605,9 +739,28 @@ class MTPStagedModelRunner:
             for names in self.groups.values()
         )
 
+    @property
+    def resident_bytes(self) -> int:
+        if not self.resident:
+            return 0
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in self.cpu_weights.values()
+        )
+
+    @property
+    def staging_bytes(self) -> int:
+        """Device bytes a single forward stages on top of whatever is already resident."""
+
+        return 0 if self.resident else self.max_component_bytes
+
     @contextmanager
     def stage(self, group: str):
         names = self.groups[group]
+        if self.resident:
+            self.stats.stages += 1
+            yield
+            return
         prior = []
         staged = []
         started = time.perf_counter()
@@ -1187,6 +1340,7 @@ __all__ = [
     "MTPBF16ExpertBanks",
     "MTPCPUExpertRunner",
     "MTPExactExpertRunner",
+    "MTPGPUExpertRunner",
     "MTPNVFP4ExpertBanks",
     "MTPNVFP4ExpertRunner",
     "MTPDraftSampler",

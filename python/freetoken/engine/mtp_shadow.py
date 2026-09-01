@@ -31,6 +31,7 @@ from freetoken.models.qwen4_exp.mtp_spike import (
     MTPBF16ExpertBanks,
     MTPDraftSampler,
     MTPExactExpertRunner,
+    MTPGPUExpertRunner,
     MTPNVFP4ExpertBanks,
     MTPNVFP4ExpertRunner,
     MTPStagedModelRunner,
@@ -61,6 +62,9 @@ class MTPShadowConfig:
     seed: int = 1729
     cpu_threads: int = 8
     verify_mode: str = "oracle"
+    resident: bool = False
+    target_pages: int = 4097
+    target_experts: int = 4063
 
     @classmethod
     def from_env(cls, engine_config) -> "MTPShadowConfig":
@@ -89,6 +93,15 @@ class MTPShadowConfig:
         cpu_threads = int(os.getenv("FREETOKEN_MTP_CPU_THREADS", "8"))
         if cpu_threads < 1:
             raise ValueError("FREETOKEN_MTP_CPU_THREADS must be positive")
+        raw_resident = os.getenv("FREETOKEN_MTP_RESIDENT", "0").strip()
+        if raw_resident not in {"0", "1"}:
+            raise ValueError("FREETOKEN_MTP_RESIDENT must be 0 or 1")
+        target_pages = int(os.getenv("FREETOKEN_MTP_TARGET_PAGES", "4097"))
+        target_experts = int(os.getenv("FREETOKEN_MTP_TARGET_EXPERTS", "4063"))
+        if target_pages < 1:
+            raise ValueError("FREETOKEN_MTP_TARGET_PAGES must be positive")
+        if target_experts < 1:
+            raise ValueError("FREETOKEN_MTP_TARGET_EXPERTS must be positive")
         if engine_config.model_config.model_type != "qwen4_exp":
             raise ValueError("MTP shadow supports only the private Qwen3.8 target")
         if engine_config.max_running_req != 1:
@@ -105,6 +118,9 @@ class MTPShadowConfig:
             seed=int(os.getenv("FREETOKEN_MTP_DRAFT_SEED", "1729")),
             cpu_threads=cpu_threads,
             verify_mode=verify_mode,
+            resident=raw_resident == "1",
+            target_pages=target_pages,
+            target_experts=target_experts,
         )
 
 
@@ -260,6 +276,7 @@ class MTPShadowObserver:
         self.trace_path = config.private_root / "evidence" / f"live-{config.placement}.jsonl"
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)
         self._weight_store: MTPWeightStore | None = None
+        self._expert_banks = None
         self._pending_hidden_cpu: torch.Tensor | None = None
         self._pending_rope_cpu: torch.Tensor | None = None
         self._uid: int | None = None
@@ -280,11 +297,16 @@ class MTPShadowObserver:
         self._init_private_rng()
         self._init_target_expert_temperature()
 
-        if engine.num_pages != 4097 or engine.config.page_size != 64:
+        # The page count and expert-cache size follow the boot's KV reservation; the QSA page
+        # size is a model property and stays pinned.
+        if engine.num_pages != config.target_pages or engine.config.page_size != 64:
             raise RuntimeError("MTP shadow refuses target KV geometry drift")
         cache_size = getattr(engine.moe_offload_cache, "cache_size", None)
-        if cache_size != 4063:
-            raise RuntimeError(f"MTP shadow requires 4063 target experts, got {cache_size}")
+        if cache_size != config.target_experts:
+            raise RuntimeError(
+                f"MTP shadow requires {config.target_experts} target experts, "
+                f"got {cache_size}"
+            )
         slots = self._usable_linear_slots(engine.linear_state_pool)
         if slots != 8:
             raise RuntimeError(f"MTP shadow requires eight target recurrent slots, got {slots}")
@@ -299,20 +321,26 @@ class MTPShadowObserver:
                 for entry in plan.entries
                 if not entry.expert
             }
-        self.staged_model = MTPStagedModelRunner(
-            self.model, cpu_weights, device=self.device
-        )
-
         predicted_pool = self._predicted_pool_bytes()
-        required = predicted_pool + self.staged_model.max_component_bytes + _GUARD_BYTES
+        # Read the budget before anything resident lands on the device, so the plan and the
+        # measurement describe the same starting point.
         free = torch.cuda.mem_get_info(self.device)[0]
-        self.memory_plan = {
-            "free_before": int(free),
-            "mtp_qsa_bytes": int(predicted_pool),
-            "max_dense_stage_bytes": int(self.staged_model.max_component_bytes),
-            "guard_bytes": _GUARD_BYTES,
-            "required_bytes": int(required),
-        }
+        self.staged_model = MTPStagedModelRunner(
+            self.model, cpu_weights, device=self.device, resident=config.resident
+        )
+        resident_bytes = 0
+        if config.resident:
+            self._expert_banks = self._load_expert_banks()
+            resident_bytes = self.staged_model.resident_bytes + int(
+                self._expert_banks.total_bytes
+            )
+        self.memory_plan = self._build_memory_plan(
+            free=free,
+            qsa_bytes=predicted_pool,
+            staging_bytes=self.staged_model.staging_bytes,
+            resident_bytes=resident_bytes,
+        )
+        required = self.memory_plan["required_bytes"]
         if free < required:
             raise RuntimeError(
                 f"MTP shadow needs {required} free bytes including guard, only {free} available"
@@ -375,16 +403,47 @@ class MTPShadowObserver:
         with self._private_context_fields():
             self.attn_backend = QSASparseAttnBackend(self.mtp_config)
 
-    def _init_experts(self) -> None:
+    @staticmethod
+    def _build_memory_plan(
+        *, free: int, qsa_bytes: int, staging_bytes: int, resident_bytes: int
+    ) -> dict:
+        required = qsa_bytes + staging_bytes + resident_bytes + _GUARD_BYTES
+        plan = {
+            "free_before": int(free),
+            "mtp_qsa_bytes": int(qsa_bytes),
+            "max_dense_stage_bytes": int(staging_bytes),
+            "guard_bytes": _GUARD_BYTES,
+            "required_bytes": int(required),
+        }
+        if resident_bytes:
+            plan["resident_bytes"] = int(resident_bytes)
+        return plan
+
+    def _load_expert_banks(self):
         if self.config.placement == "bf16":
-            self._weight_store = MTPWeightStore(self.engine.config.model_path)
-            self._weight_store.__enter__()
-            banks = MTPBF16ExpertBanks.from_store(self._weight_store)
-            runner_type = MTPExactExpertRunner
-        else:
-            manifest = self.config.private_root / "weights" / "mtp-experts-nvfp4" / "manifest.json"
-            banks = MTPNVFP4ExpertBanks.from_manifest(manifest, validate_hashes=True)
-            runner_type = MTPNVFP4ExpertRunner
+            if self._weight_store is None:
+                self._weight_store = MTPWeightStore(self.engine.config.model_path)
+                self._weight_store.__enter__()
+            return MTPBF16ExpertBanks.from_store(self._weight_store)
+        if self.config.resident:
+            raise ValueError(
+                "FREETOKEN_MTP_RESIDENT supports only the bf16 expert placement"
+            )
+        manifest = self.config.private_root / "weights" / "mtp-experts-nvfp4" / "manifest.json"
+        return MTPNVFP4ExpertBanks.from_manifest(manifest, validate_hashes=True)
+
+    def _expert_runner_type(self):
+        if self.config.resident:
+            return MTPGPUExpertRunner
+        if self.config.placement == "bf16":
+            return MTPExactExpertRunner
+        return MTPNVFP4ExpertRunner
+
+    def _init_experts(self) -> None:
+        banks = self._expert_banks
+        if banks is None:
+            banks = self._load_expert_banks()
+        runner_type = self._expert_runner_type()
         self.expert_runner = runner_type(
             banks,
             top_k=self.mtp_config.num_experts_per_tok,
