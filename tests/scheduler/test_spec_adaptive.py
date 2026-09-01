@@ -345,3 +345,47 @@ def test_the_probe_survives_a_disabled_fallback(caplog):
             probe.finish_cycle(emitted=3, accepted=2, policy=None)
     (record,) = [r for r in caplog.records if "spec timing" in r.getMessage()]
     assert "emitted/cycle 3.00" in record.getMessage()
+
+
+def test_the_probe_reports_the_acceptance_split_a_decision_carries(caplog):
+    decision = SimpleNamespace(filter_ms=2.0, decide_ms=4.0, sync_ms=30.0)
+    probe = _SpecTimingProbe(CPU)
+    with caplog.at_level(logging.INFO):
+        for _ in range(32):
+            probe.start_cycle()
+            probe.finish_cycle(emitted=3, accepted=2, decision=decision)
+    (record,) = [r for r in caplog.records if "spec timing" in r.getMessage()]
+    message = record.getMessage()
+    assert "'filter_ms': '2.0'" in message
+    assert "'decide_ms': '4.0'" in message
+    assert "'sync_ms': '30.0'" in message
+
+
+def test_the_probe_reports_the_replay_split_the_graph_runner_measures(caplog):
+    probe = _SpecTimingProbe(CPU)
+    with caplog.at_level(logging.INFO):
+        for _ in range(32):
+            probe.start_cycle()
+            probe.add_ms("replay.model", 12.0)
+            probe.add_ms("replay.gpu", 3.5)
+            probe.finish_cycle(emitted=3, accepted=2)
+
+    assert probe.extra == {"replay.model": 32 * 12.0, "replay.gpu": 32 * 3.5}
+    (record,) = [r for r in caplog.records if "spec timing" in r.getMessage()]
+    message = record.getMessage()
+    assert "replay {" in message
+    assert "'replay.model': '12.0'" in message
+    assert "'replay.gpu': '3.5'" in message
+
+
+def test_a_dotted_sub_mark_does_not_eat_the_enclosing_stages_span():
+    """The engine subdivides "verify+accept" from inside; the coarse stage must keep spanning
+    the whole of it, or the report's stages stop summing to the cycle."""
+    probe = _SpecTimingProbe(CPU)
+    probe.start_cycle()
+    probe.mark("verify.forward")
+    probe.mark("verify.accept")
+    probe.mark("verify+accept")
+
+    subdivided = probe.stages["verify.forward"] + probe.stages["verify.accept"]
+    assert probe.stages["verify+accept"] >= subdivided

@@ -829,3 +829,73 @@ def test_a_settled_emission_reads_the_budget_from_the_host_not_the_device():
         stub, req, torch.tensor([3, 4], dtype=torch.int32), settled=True
     )
     assert msg.next_tokens == (3,) and msg.finish_reason == "length"
+
+
+# ------------------------------------------------------------------------- the timing probe
+
+
+class _RecordingProbe:
+    """A ``_SpecTimingProbe`` in name only -- the engine duck-types on ``.mark``."""
+
+    def __init__(self):
+        self.marks: list[str] = []
+        self.finished: list[tuple] = []
+
+    def start_cycle(self) -> None:
+        self.marks.clear()
+
+    def mark(self, stage: str) -> None:
+        self.marks.append(stage)
+
+    def finish_cycle(self, *, emitted, accepted, policy=None, decision=None):
+        self.finished.append((emitted, accepted, decision))
+
+
+def test_the_cycle_subdivides_its_verify_stage_when_a_probe_is_armed():
+    target = _FakeTarget()
+    stub = _scheduler(target, _FakeDraft(target))
+    req = _decode_req(stub)
+    probe = _RecordingProbe()
+    stub._spec_probe = probe
+
+    stub._speculative_decode_step(req)
+
+    assert probe.marks == [
+        "draft",
+        "prepare",
+        "verify.forward",
+        "verify.accept",
+        "verify.pack",
+        # the coarse stage still closes AFTER the engine returns, so it still spans the whole
+        # verify -- the sub-marks only subdivide it
+        "verify+accept",
+        "emit+rollback",
+    ]
+
+
+def test_the_probe_is_handed_the_untruncated_verdicts_acceptance_timings():
+    target = _FakeTarget()
+    stub = _scheduler(target, _FakeDraft(target))
+    req = _decode_req(stub)
+    probe = _RecordingProbe()
+    stub._spec_probe = probe
+
+    stub._speculative_decode_step(req)
+
+    (emitted, accepted, decision) = probe.finished[-1]
+    assert emitted == accepted == 4
+    assert decision.accepted_rows == 4
+    assert decision.filter_ms >= 0.0 and decision.decide_ms >= 0.0
+    assert decision.sync_ms >= 0.0
+
+
+def test_an_unarmed_probe_leaves_the_cycle_exactly_as_it_was():
+    target = _FakeTarget()
+    stub = _scheduler(target, _FakeDraft(target))
+    req = _decode_req(stub)
+    stub._spec_probe = None
+
+    stub._speculative_decode_step(req)
+
+    (msg,) = stub.sent[-1]
+    assert len(msg.next_tokens) == 4

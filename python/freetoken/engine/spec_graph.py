@@ -52,12 +52,17 @@ Sampling stays outside: the graph's outputs are fixed buffers the caller reads.
 from __future__ import annotations
 
 import gc
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
 import torch
+
+from freetoken.utils import init_logger
+
+logger = init_logger(__name__)
 
 _GRAPH_CAPTURE_RESERVE_FLOOR = 64 << 20
 # the graph runner has no config handle, so the capture-failure traceback lands in the
@@ -349,6 +354,11 @@ class _FixedWidthGraphRunner:
         self._fla_index_pins: dict[int, tuple[torch.Tensor, ...]] = {}
         self._destroyed = False
         self._graphs_disabled = False
+        #: diagnosis seam: set to a dict to have every replay fill it with its host-side
+        #: staging split and the graph's own GPU duration. None -- production -- costs nothing:
+        #: no clock reads, no timing events, and no synchronization.
+        self.replay_timings: dict[str, float] | None = None
+        self._replay_events_pair: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
 
     # ------------------------------------------------------------------ subclass contract
 
@@ -477,6 +487,12 @@ class _FixedWidthGraphRunner:
             self._support[width] = result
         else:
             self._support.pop(width, None)
+        # capture outcomes decide whether whole serving paths run graphed or eager, and a
+        # failure is otherwise survivable-and-silent -- always say what happened
+        logger.info(
+            f"MTP spec graph width {width}: {status}"
+            + (f" ({reason})" if reason else "")
+        )
         return result
 
     def _cleanup_failed_attempt(self, width: int) -> None:
@@ -719,6 +735,9 @@ class _FixedWidthGraphRunner:
             reason = support.reason if support is not None else "NOT_CAPTURED"
             raise RuntimeError(f"MTP graph width {width} is unavailable: {reason}")
         buffer = self._buffers[width]
+        timings = self.replay_timings
+        if timings is not None:
+            return self._replay_timed(batch, graph, buffer, width, timings)
         buffer.copy_from(batch)
         self._stage_attention(batch, self._batches[width], width)
         prepare_model = getattr(self.target_model, "prepare_cuda_graph_replay", None)
@@ -726,6 +745,53 @@ class _FixedWidthGraphRunner:
             prepare_model(batch)
         graph.replay()
         return buffer
+
+    def _replay_timed(
+        self, batch, graph, buffer, width: int, timings: dict[str, float]
+    ) -> _GraphInputBuffer:
+        """``_replay_into_buffers``, armed: the same sequence, split into wall-ms per step.
+
+        ``launch_ms`` is host time only -- ``graph.replay()`` returns once the graph is
+        launched -- so the graph's own duration needs the device clock, which is what the event
+        pair reads. The sync is why this path is a diagnosis tool and not the default one.
+        """
+        clock = time.perf_counter
+        t0 = clock()
+        buffer.copy_from(batch)
+        t1 = clock()
+        self._stage_attention(batch, self._batches[width], width)
+        t2 = clock()
+        prepare_model = getattr(self.target_model, "prepare_cuda_graph_replay", None)
+        if prepare_model is not None:
+            prepare_model(batch)
+        t3 = clock()
+        start, end = self._timing_events()
+        if start is not None:
+            start.record()
+        graph.replay()
+        t4 = clock()
+        timings["copy_ms"] = 1e3 * (t1 - t0)
+        timings["attn_ms"] = 1e3 * (t2 - t1)
+        timings["model_ms"] = 1e3 * (t3 - t2)
+        timings["launch_ms"] = 1e3 * (t4 - t3)
+        if end is None:
+            timings["gpu_ms"] = 0.0
+            return buffer
+        end.record()
+        end.synchronize()
+        timings["gpu_ms"] = float(start.elapsed_time(end))
+        return buffer
+
+    def _timing_events(self):
+        """The armed path's device clock: one pair for the runner's life, built on first use."""
+        if self._replay_events_pair is None and self.device.type == "cuda":
+            self._replay_events_pair = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+        if self._replay_events_pair is None:
+            return None, None
+        return self._replay_events_pair
 
     def destroy(self) -> None:
         self._graphs = {}

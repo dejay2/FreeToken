@@ -30,7 +30,9 @@ import torch
 from freetoken.core import SamplingParams
 from freetoken.engine.sample import BatchSamplingArgs
 from freetoken.engine.spec_sample import (
+    MTPAcceptanceResult,
     SpecSampler,
+    batched_speculative_accept,
     default_rng_guard,
     filtered_probs,
     resolve_spec_seed,
@@ -566,3 +568,66 @@ def test_acceptance_statistics_accumulate_over_a_run():
     assert stats["drafts_accepted"] == 4
     assert stats["tokens_emitted"] == 7  # (0+1) + (3+1) + (1+1)
     assert stats["acceptance_histogram"] == (1, 1, 0, 1)
+
+
+# --------------------------------------------------------------- the acceptance time split
+
+
+def _accept(depth=3):
+    drafts = list(range(1, depth + 1))
+    return batched_speculative_accept(
+        proposals=drafts,
+        draft_logits=_peaked(drafts),
+        target_logits=_peaked(drafts + [7]),
+        temperature=0.0,
+        top_k=-1,
+        top_p=1.0,
+        generator=torch.Generator(device=CPU),
+    )
+
+
+def test_acceptance_splits_its_required_time_into_filter_decide_and_sync():
+    result = _accept()
+    parts = (result.filter_wall_ms, result.decide_wall_ms, result.sync_wall_ms)
+    assert all(isinstance(part, float) and part >= 0.0 for part in parts)
+    # host-side wall time of async launches, so no arithmetic identity is pinned against
+    # required_wall_ms -- the split is an attribution hint, not an accounting
+    assert result.required_wall_ms >= 0.0
+
+
+def test_the_time_split_stays_out_of_the_results_equality():
+    """Every other timing field is ``compare=False`` for the same reason: two runs of the same
+    acceptance are the same verdict, and phase-2 tests compare verdicts."""
+    fast = _accept()
+    slow = MTPAcceptanceResult(
+        accepted_prefix=fast.accepted_prefix,
+        corrected_token=fast.corrected_token,
+        target_tokens=fast.target_tokens,
+        acceptance_probabilities=fast.acceptance_probabilities,
+        draft_probabilities=fast.draft_probabilities,
+        target_probabilities=fast.target_probabilities,
+        greedy=fast.greedy,
+        required_wall_ms=fast.required_wall_ms,
+        required_synchronizations=fast.required_synchronizations,
+        instrumentation_wall_ms=fast.instrumentation_wall_ms,
+        filter_wall_ms=fast.filter_wall_ms + 11.0,
+        decide_wall_ms=fast.decide_wall_ms + 22.0,
+        sync_wall_ms=fast.sync_wall_ms + 33.0,
+    )
+    assert slow == fast
+
+
+def test_the_decision_carries_the_split_through_a_truncation():
+    decision = _sampler().step(
+        uid=1,
+        draft_tokens=[1, 2, 3],
+        draft_logits=_peaked([1, 2, 3]),
+        target_logits=_peaked([1, 2, 3, 4]),
+        args=_args(temperature=None),
+    )
+    split = (decision.filter_ms, decision.decide_ms, decision.sync_ms)
+    assert all(isinstance(part, float) and part >= 0.0 for part in split)
+    assert decision.acceptance_ms > 0.0
+    truncated = decision.truncated(2)
+    assert (truncated.filter_ms, truncated.decide_ms, truncated.sync_ms) == split
+    assert truncated.acceptance_ms == decision.acceptance_ms

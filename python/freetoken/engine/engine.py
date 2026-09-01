@@ -38,6 +38,15 @@ logger = init_logger(__name__)
 # stall for an allocator failure on the next prefill.
 _SPEC_GRAPH_GUARD_BYTES = 128 << 20
 
+# The armed graph runner's replay split, as (its key, the probe's stage name).
+_SPEC_REPLAY_TIMINGS = (
+    ("copy_ms", "replay.copy"),
+    ("attn_ms", "replay.attn"),
+    ("model_ms", "replay.model"),
+    ("launch_ms", "replay.launch"),
+    ("gpu_ms", "replay.gpu"),
+)
+
 
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
     """The offload MoE cache needs at least one slot per expert per layer. A too-small size
@@ -1115,6 +1124,7 @@ class Engine:
         *,
         draft_tokens: Sequence[int],
         draft_logits: torch.Tensor,
+        probe=None,
     ) -> SpecForwardOutput:
         """Forward one ``w = 1 + k`` row speculative batch and accept a prefix of the drafts.
 
@@ -1129,6 +1139,13 @@ class Engine:
           on this step's lengths; advancing here would double-count every rejected row.
         * **the speculative sampler.** ``SpecSampler`` divides the target's filtered ``p`` by
           the draft's filtered ``q``; the plain sampler would just argmax row 0.
+
+        ``probe`` is the scheduler's ``_SpecTimingProbe`` (anything with ``.mark(name)``), which
+        subdivides its own "verify+accept" stage. It device-syncs at every mark, so it is a
+        diagnosis tool only; ``None`` -- production -- must cost nothing. A probe also arms the
+        graph runner's replay split, which needs ``.add_ms(name, ms)``: the marks time the
+        forward as a whole, and only the runner can separate its host staging from the graph's
+        device duration. A probe without ``add_ms`` simply gets no split.
         """
         assert self.device.type != "cuda" or torch.cuda.current_stream() == self.stream
         if self.spec_sampler is None:
@@ -1136,9 +1153,15 @@ class Engine:
         if not batch.mtp_verify or batch.size != 1:
             raise RuntimeError("a speculative step forwards one mtp_verify batch")
         captured = None
-        if self.spec_graph_runner is not None:
+        graph_runner = self.spec_graph_runner
+        armed = probe is not None and graph_runner is not None
+        if graph_runner is not None:
+            if armed:
+                # the runner's own split of the replay, which the probe's marks cannot see:
+                # its host-side staging costs versus the graph's device duration
+                graph_runner.replay_timings = {}
             ladder = self.spec_state_ladder
-            captured = self.spec_graph_runner.forward(
+            captured = graph_runner.forward(
                 batch,
                 # capture's warm-up EXECUTES this forward against the live GDN slot; the
                 # ladder's own pre-step snapshot is the wind-back (spec_graph, spec_state_ladder)
@@ -1149,6 +1172,17 @@ class Engine:
                 logits, hidden, _ = self.model.forward_mtp_capture(all_row_logits=True)
         else:
             logits, hidden = captured
+        probe and probe.mark("verify.forward")
+        if armed:
+            timings = graph_runner.replay_timings or {}
+            # production stays disarmed even if the probe is dropped mid-run
+            graph_runner.replay_timings = None
+            add_ms = getattr(probe, "add_ms", None)
+            if add_ms is not None:
+                for key, name in _SPEC_REPLAY_TIMINGS:
+                    value = timings.get(key)
+                    if value is not None:
+                        add_ms(name, value)
         if self.cpu_moe_executor is not None:
             self.cpu_moe_executor.raise_if_unhealthy()
         decision = self.spec_sampler.step(
@@ -1158,9 +1192,11 @@ class Engine:
             target_logits=logits[: batch.emit_width],
             args=args,
         )
+        probe and probe.mark("verify.accept")
         next_tokens_gpu = torch.tensor(
             decision.tokens, dtype=torch.int32, device=logits.device
         )
+        probe and probe.mark("verify.pack")
         return SpecForwardOutput(decision, next_tokens_gpu, hidden)
 
     @torch.inference_mode()

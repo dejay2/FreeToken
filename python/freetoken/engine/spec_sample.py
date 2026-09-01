@@ -168,6 +168,12 @@ class MTPAcceptanceResult:
     required_synchronizations: int = 0
     instrumentation_wall_ms: float = field(default=0.0, compare=False)
     instrumentation_synchronizations: int = 0
+    # A three-way split of ``required_wall_ms``, for attributing a slow verify stage. Host-side
+    # wall time of asynchronous launches: only ``sync_wall_ms`` is device work, the other two are
+    # launch overhead. Timing only, so they stay out of the dataclass's equality like the rest.
+    filter_wall_ms: float = field(default=0.0, compare=False)
+    decide_wall_ms: float = field(default=0.0, compare=False)
+    sync_wall_ms: float = field(default=0.0, compare=False)
 
     @property
     def acceptance_ms(self) -> float:
@@ -229,6 +235,7 @@ def batched_speculative_accept(
         (p_selected / q_selected).clamp(max=1.0),
     )
     target_tokens_device = torch.argmax(target_logits[:depth], dim=-1)
+    filter_done = time.perf_counter()
 
     if greedy:
         accepted_rows = proposal_ids == target_tokens_device
@@ -253,11 +260,17 @@ def batched_speculative_accept(
             accepted_prefix_device.to(torch.int64)
         ]
 
+    decide_done = time.perf_counter()
+
     required_synchronizations = 0
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         required_synchronizations = 1
-    required_wall_ms = (time.perf_counter() - started) * 1000.0
+    sync_done = time.perf_counter()
+    required_wall_ms = (sync_done - started) * 1000.0
+    filter_wall_ms = (filter_done - started) * 1000.0
+    decide_wall_ms = (decide_done - filter_done) * 1000.0
+    sync_wall_ms = (sync_done - decide_done) * 1000.0
 
     instrumentation_started = time.perf_counter()
     accepted_prefix = int(accepted_prefix_device)
@@ -281,6 +294,9 @@ def batched_speculative_accept(
         required_synchronizations=required_synchronizations,
         instrumentation_wall_ms=instrumentation_wall_ms,
         instrumentation_synchronizations=0,
+        filter_wall_ms=filter_wall_ms,
+        decide_wall_ms=decide_wall_ms,
+        sync_wall_ms=sync_wall_ms,
     )
     return result
 
@@ -332,6 +348,10 @@ class SpecDecision:
     draft_probabilities: tuple[float, ...]
     target_probabilities: tuple[float, ...]
     acceptance_ms: float = field(default=0.0, compare=False)
+    # ``acceptance_ms`` split three ways (MTPAcceptanceResult.filter/decide/sync_wall_ms).
+    filter_ms: float = field(default=0.0, compare=False)
+    decide_ms: float = field(default=0.0, compare=False)
+    sync_ms: float = field(default=0.0, compare=False)
 
     @property
     def bonus_token(self) -> int:
@@ -358,6 +378,9 @@ class SpecDecision:
             draft_probabilities=self.draft_probabilities,
             target_probabilities=self.target_probabilities,
             acceptance_ms=self.acceptance_ms,
+            filter_ms=self.filter_ms,
+            decide_ms=self.decide_ms,
+            sync_ms=self.sync_ms,
         )
 
 
@@ -511,6 +534,9 @@ class SpecSampler:
             draft_probabilities=acceptance.draft_probabilities,
             target_probabilities=acceptance.target_probabilities,
             acceptance_ms=acceptance.acceptance_ms,
+            filter_ms=acceptance.filter_wall_ms,
+            decide_ms=acceptance.decide_wall_ms,
+            sync_ms=acceptance.sync_wall_ms,
         )
 
     def _accept(

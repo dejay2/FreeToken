@@ -1278,6 +1278,7 @@ class Scheduler(SchedulerIOMixin):
             sample_args,
             draft_tokens=proposal.tokens,
             draft_logits=proposal.logits,
+            probe=probe,
         )
         probe and probe.mark("verify+accept")
 
@@ -1311,6 +1312,8 @@ class Scheduler(SchedulerIOMixin):
             emitted=emitted,
             accepted=decision.accepted_rows,
             policy=self._spec_policy(req),
+            # the untruncated verdict: the acceptance timings are the step's, not the run's
+            decision=output.decision,
         )
         self.decode_manager.filter_reqs([req])
 
@@ -1545,7 +1548,13 @@ class _SpecAcceptance:
 
 
 class _SpecTimingProbe:
-    """Accumulates per-stage wall time across speculative cycles; logs every 32 cycles."""
+    """Accumulates per-stage wall time across speculative cycles; logs every 32 cycles.
+
+    Stage names are free-form and aggregated as they arrive, so a callee handed the probe can
+    subdivide the caller's stage. A DOTTED name ("verify.forward") is such a sub-stage: it is
+    timed against the last sub-mark instead of the last coarse mark, which leaves the enclosing
+    stage's span exactly what it was before the subdivision existed.
+    """
 
     def __init__(self, device: torch.device) -> None:
         self.device = device
@@ -1553,7 +1562,10 @@ class _SpecTimingProbe:
         self.cycles = 0
         self.emitted = 0
         self.accepted_rows = 0
+        self.acceptance: dict[str, float] = {}
+        self.extra: dict[str, float] = {}
         self._t0 = 0.0
+        self._sub = 0.0
 
     def _now(self) -> float:
         if self.device.type == "cuda":
@@ -1561,22 +1573,51 @@ class _SpecTimingProbe:
         return time.perf_counter()
 
     def start_cycle(self) -> None:
-        self._t0 = self._now()
+        self._t0 = self._sub = self._now()
 
     def mark(self, stage: str) -> None:
         now = self._now()
-        self.stages[stage] = self.stages.get(stage, 0.0) + (now - self._t0)
-        self._t0 = now
+        if "." in stage:
+            self.stages[stage] = self.stages.get(stage, 0.0) + (now - self._sub)
+        else:
+            self.stages[stage] = self.stages.get(stage, 0.0) + (now - self._t0)
+            self._t0 = now
+        self._sub = now
+
+    def add_ms(self, name: str, ms: float) -> None:
+        """A measurement the timed code took itself, accumulated beside the marked stages.
+
+        Not a mark: these spans are measured inside a callee (the graph replay's host/GPU
+        split), so they neither consume nor subdivide any stage this probe clocks.
+        """
+        self.extra[name] = self.extra.get(name, 0.0) + float(ms)
 
     def finish_cycle(
-        self, *, emitted: int, accepted: int, policy: "_SpecAcceptance | None" = None
+        self,
+        *,
+        emitted: int,
+        accepted: int,
+        policy: "_SpecAcceptance | None" = None,
+        decision=None,
     ) -> None:
         self.mark("tail")
         self.cycles += 1
         self.emitted += emitted
         self.accepted_rows += accepted
+        for name in ("filter_ms", "decide_ms", "sync_ms"):
+            value = getattr(decision, name, None)
+            if value is not None:
+                self.acceptance[name] = self.acceptance.get(name, 0.0) + float(value)
         if self.cycles % 32 == 0:
             per = {k: f"{1e3 * v / self.cycles:.1f}" for k, v in self.stages.items()}
+            # The acceptance split attributes "verify.accept": only sync_ms is device work, the
+            # other two are the host-side launch cost of the filter and the decision.
+            accept = {
+                k: f"{v / self.cycles:.1f}" for k, v in self.acceptance.items()
+            }
+            # The replay split attributes "verify.forward": everything before the launch is
+            # host-side staging, and only "replay.gpu" is the graph's own device duration.
+            replay = {k: f"{v / self.cycles:.1f}" for k, v in self.extra.items()}
             # The EMA and the spec/plain split are what a live tuning pass of
             # FREETOKEN_MTP_SPEC_MIN_EMITTED / _COOLDOWN reads.
             adaptive = (
@@ -1585,8 +1626,9 @@ class _SpecTimingProbe:
                 else f"{policy.ema:.2f} | spec/plain {policy.cycles}/{policy.plain_steps}"
             )
             logger.info(
-                "spec timing over %d cycles: ms/cycle %s | emitted/cycle %.2f | ema %s",
-                self.cycles, per, self.emitted / self.cycles, adaptive,
+                "spec timing over %d cycles: ms/cycle %s | accept %s | replay %s | "
+                "emitted/cycle %.2f | ema %s",
+                self.cycles, per, accept, replay, self.emitted / self.cycles, adaptive,
             )
 
 

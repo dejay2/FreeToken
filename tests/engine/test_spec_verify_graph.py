@@ -338,6 +338,37 @@ def test_destroy_releases_every_width():
     assert attention.reset_count == 1
 
 
+# ----------------------------------------------------------------- the replay timing seam
+
+
+def test_the_replay_timing_seam_is_disarmed_by_default():
+    assert _runner(torch.device("cpu")).replay_timings is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_an_armed_replay_splits_the_host_staging_from_the_gpu_duration():
+    device = torch.device("cuda")
+    runner = _runner(device)
+    assert runner.capture(_batch(2, 2, device)).status == "captured"
+
+    runner.replay(_batch(2, 70, device))
+    assert runner.replay_timings is None
+    # disarmed the replay must not create the timing events, and so never syncs on them
+    assert runner._replay_events_pair is None
+
+    runner.replay_timings = {}
+    logits, hidden = runner.replay(_batch(2, 71, device))
+
+    timings = runner.replay_timings
+    assert set(timings) == {"copy_ms", "attn_ms", "model_ms", "launch_ms", "gpu_ms"}
+    assert all(value >= 0.0 for value in timings.values())
+    assert runner._replay_events_pair is not None
+    # arming may not change what the replay produces
+    want_logits, want_hidden = _outputs(_batch(2, 71, device))
+    assert torch.equal(logits, want_logits)
+    assert torch.equal(hidden, want_hidden)
+
+
 # ------------------------------------------------------------------- the engine's dispatch
 
 
@@ -384,7 +415,7 @@ def _engine(runner, ladder, sampler, ctx, model):
     )
 
 
-def _step(engine, batch):
+def _step(engine, batch, probe=None):
     from freetoken.engine.engine import Engine
 
     return Engine.speculative_decode_batch(
@@ -393,6 +424,7 @@ def _step(engine, batch):
         None,
         draft_tokens=(1,),
         draft_logits=torch.zeros(1, VOCAB + 1),
+        probe=probe,
     )
 
 
@@ -424,6 +456,68 @@ def test_the_engine_step_falls_back_to_the_eager_forward_when_the_graph_declines
     want_logits, want_hidden = _outputs(_batch(3, 6, device))
     assert torch.equal(sampler.rows[0], want_logits[:3])
     assert torch.equal(output.hidden, want_hidden)
+
+
+class _TimedRunner(_Runner):
+    def forward(self, batch, *, restore_state=None):
+        assert self.replay_timings == {}, "the engine must arm the runner before the forward"
+        self.replay_timings.update(
+            copy_ms=1.0, attn_ms=2.0, model_ms=3.0, launch_ms=4.0, gpu_ms=5.0
+        )
+        return super().forward(batch, restore_state=restore_state)
+
+
+class _MarkOnlyProbe:
+    def __init__(self):
+        self.marks = []
+
+    def mark(self, name):
+        self.marks.append(name)
+
+
+class _FullProbe(_MarkOnlyProbe):
+    def __init__(self):
+        super().__init__()
+        self.added = {}
+
+    def add_ms(self, name, ms):
+        self.added[name] = self.added.get(name, 0.0) + float(ms)
+
+
+def test_a_probe_arms_the_runner_and_collects_the_replay_split():
+    device = torch.device("cpu")
+    ctx = _Context()
+    batch = _batch(2, 4, device)
+    runner = _TimedRunner(_outputs(batch))
+    probe = _FullProbe()
+
+    _step(_engine(runner, _Ladder(), _Sampler(), ctx, _Model(ctx)), batch, probe=probe)
+
+    assert probe.added == {
+        "replay.copy": 1.0,
+        "replay.attn": 2.0,
+        "replay.model": 3.0,
+        "replay.launch": 4.0,
+        "replay.gpu": 5.0,
+    }
+    # production must find the runner disarmed again
+    assert runner.replay_timings is None
+
+
+def test_a_probe_without_add_ms_still_steps():
+    """The fake probes in these suites carry only .mark; arming must not require more."""
+    device = torch.device("cpu")
+    ctx = _Context()
+    batch = _batch(2, 4, device)
+    probe = _MarkOnlyProbe()
+
+    _step(
+        _engine(_TimedRunner(_outputs(batch)), _Ladder(), _Sampler(), ctx, _Model(ctx)),
+        batch,
+        probe=probe,
+    )
+
+    assert probe.marks == ["verify.forward", "verify.accept", "verify.pack"]
 
 
 def test_without_a_graph_runner_the_step_is_the_eager_forward_it_always_was():
