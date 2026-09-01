@@ -49,11 +49,12 @@ def _bf16_head(vocab: int = 512, hidden: int = 256, *, seed: int = 3):
 # --------------------------------------------------------------------------- the placement
 
 
-def test_the_placement_defaults_to_the_validated_one_and_bf16_is_the_old_behaviour():
-    assert resolve_draft_lmhead_placement({}) == "int8"
+def test_the_placement_defaults_to_bf16_because_int8pack_mm_is_slower_on_this_box():
+    # measured 2026-09-02: _weight_int8pack_mm 1.56 ms vs bf16 GEMV 0.81 ms at M=1 (see module)
+    assert resolve_draft_lmhead_placement({}) == "bf16"
     assert resolve_draft_lmhead_placement({"FREETOKEN_MTP_SPEC_DRAFT_LMHEAD": "bf16"}) == "bf16"
     assert resolve_draft_lmhead_placement({"FREETOKEN_MTP_SPEC_DRAFT_LMHEAD": " INT8 "}) == "int8"
-    assert resolve_draft_lmhead_placement({"FREETOKEN_MTP_SPEC_DRAFT_LMHEAD": ""}) == "int8"
+    assert resolve_draft_lmhead_placement({"FREETOKEN_MTP_SPEC_DRAFT_LMHEAD": ""}) == "bf16"
 
 
 def test_an_unknown_placement_is_refused_by_name():

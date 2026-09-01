@@ -61,12 +61,17 @@ def resolve_draft_lmhead_placement(environ: Mapping[str, str] | None = None) -> 
     """Which LM head the DRAFT projects through (``FREETOKEN_MTP_SPEC_DRAFT_LMHEAD``).
 
     Parsed here rather than on ``EngineConfig`` for the same reason the expert placement is:
-    it is a private weight layout of this head, not a serving flag. The default is ``int8``
-    -- the placement measured against the bf16 head below; ``bf16`` is the previous behaviour,
-    byte for byte.
+    it is a private weight layout of this head, not a serving flag.
+
+    The default is ``bf16`` (the shared target head, byte for byte). ``int8`` halves the bytes
+    but LOSES time on this box: ``torch._weight_int8pack_mm``'s CUDA path is a naive kernel,
+    measured 2026-09-02 on the RTX 5090 at 1.56 ms per [1, 2560] x [248320, 2560] call against
+    0.81 ms for the bf16 cuBLAS GEMV, and it scales linearly with rows (4.6 ms at M=6). It
+    stays selectable for a box with a real W8A16 GEMV (or once one is written); fp8 row-wise
+    ``_scaled_mm`` is not supported on this device by torch 2.11, so it is not an alternative.
     """
     env = os.environ if environ is None else environ
-    placement = (env.get(_DRAFT_LMHEAD_ENV, "") or "int8").strip().lower() or "int8"
+    placement = (env.get(_DRAFT_LMHEAD_ENV, "") or "bf16").strip().lower() or "bf16"
     if placement not in _PLACEMENTS:
         raise ValueError(
             f"{_DRAFT_LMHEAD_ENV} must be one of {'|'.join(_PLACEMENTS)}, got {placement!r}"
