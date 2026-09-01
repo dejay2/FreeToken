@@ -31,6 +31,7 @@ from freetoken.server.api_server import FrontendManager
 from freetoken.tokenizer.server import (
     _error_reply,
     _prompt_admitted_reply,
+    _sampled_reply,
     _send_generation_replies,
     _tokenize_requests,
 )
@@ -87,6 +88,21 @@ def test_prompt_admitted_signal_uses_existing_frontend_usage_channel():
     assert reply.cached_tokens == 100
     assert reply.completion_tokens_delta == 0
     assert reply.finished is False
+
+
+def test_sampled_reply_counts_every_token_in_the_run():
+    """Usage is the run's length, not one per message: a step that emits several tokens
+    must bill all of them (a hard-coded 1 would under-count completion_tokens)."""
+    single = _sampled_reply(DetokenizeMsg(uid=4, next_tokens=(7,), finished=False), "hi")
+    assert single.completion_tokens_delta == 1
+
+    run = _sampled_reply(
+        DetokenizeMsg(uid=4, next_tokens=(7, 8, 9), finished=True, finish_reason="stop"),
+        "hi there",
+    )
+    assert run.completion_tokens_delta == 3
+    assert run.finished is True and run.finish_reason == "stop"
+    assert run.incremental_output == "hi there"
 
 
 def test_schedule_reports_admission_only_after_prepare_succeeds():
@@ -209,7 +225,7 @@ def test_normal_loop_sends_prior_sample_before_abort_terminal():
     scheduler._schedule_next_batch = lambda: None
     sent = []
     scheduler.send_result = lambda messages: sent.append(messages)
-    late_sample = DetokenizeMsg(uid=5, next_token=99, finished=False)
+    late_sample = DetokenizeMsg(uid=5, next_tokens=(99,), finished=False)
     scheduler._process_last_data = lambda _data: scheduler.send_result([late_sample])
 
     Scheduler.normal_loop(scheduler)

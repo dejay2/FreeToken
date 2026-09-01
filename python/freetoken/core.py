@@ -92,14 +92,21 @@ class Req:
         return self.device_len - self.cached_len
 
     def complete_one(self) -> None:
-        self.cached_len = self.device_len
-        self.device_len += 1
+        self.complete_many(1)
 
-    def append_host(self, next_token: torch.Tensor) -> None:
+    def complete_many(self, n: int) -> None:
+        """Advance the device length by a step that emitted ``n`` tokens. The rows this
+        forward wrote become the cached prefix, exactly as for a one-token step."""
+        assert n >= 1
+        self.cached_len = self.device_len
+        self.device_len += n
+
+    def append_host(self, tokens: torch.Tensor) -> None:
+        """Append a step's sampled tokens; already generic over the run's width."""
         n = self.input_ids.numel()
-        m = n + next_token.numel()
+        m = n + tokens.numel()
         assert m <= self.max_device_len
-        self._ids_buf[n:m] = next_token
+        self._ids_buf[n:m] = tokens
         self.input_ids = self._ids_buf[:m]
 
     @property
@@ -123,6 +130,9 @@ class Batch:
     # offloaded MoE reads only routed experts through its decode cache. Ordinary
     # scheduler batches leave this disabled.
     mtp_verify: bool = field(default=False, init=False)
+    # Tokens this step emits per request. Plain decode emits one; a wider step reserves
+    # emit_width sampled-token slots per request in the write mapping.
+    emit_width: int = field(default=1, init=False)
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)

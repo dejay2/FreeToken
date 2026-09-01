@@ -103,8 +103,14 @@ class DetokenizeManager:
                     sent_offset=0,
                 )
             s = self.decode_map[msg.uid]
-            if not (msg.finished and msg.next_token in self.eos_token_ids):
-                s.decoded_ids.append(msg.next_token)
+            # A step may emit several tokens; they belong to ONE message, appended in order,
+            # so the incremental slices below span the whole new suffix. Only a terminal EOS
+            # is suppressed -- the scheduler truncates the run at the token that finished it,
+            # so a finished run's EOS is always its last token.
+            run = msg.next_tokens
+            if msg.finished and run and run[-1] in self.eos_token_ids:
+                run = run[:-1]
+            s.decoded_ids.extend(run)
             read_ids.append(s.decoded_ids[s.surr_offset :])
             surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])
 

@@ -29,7 +29,7 @@ class ChunkedReq(Req):
     def _alloc_ids_buf(self) -> None:
         pass  # never sampled; keep input_ids a view of the pending prompt
 
-    def append_host(self, next_token: torch.Tensor) -> None:
+    def append_host(self, tokens: torch.Tensor) -> None:
         raise NotImplementedError("ChunkedReq should not be sampled")
 
     @property

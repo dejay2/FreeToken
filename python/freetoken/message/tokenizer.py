@@ -26,8 +26,17 @@ class BatchTokenizerMsg(BaseTokenizerMsg):
 
 @dataclass
 class DetokenizeMsg(BaseTokenizerMsg):
+    """One scheduler step's sampled tokens for one request -- exactly one message per uid
+    per step, whatever the step's width.
+
+    ``next_tokens`` is the run in generation order. The scheduler truncates it at the first
+    stop condition, so the terminal fields below stay per-message scalars: a finished run
+    ends at the token that finished it. Two messages for one uid in a step would corrupt the
+    detokenizer's incremental offsets, so a wider step widens this field instead.
+    """
+
     uid: int
-    next_token: int
+    next_tokens: tuple[int, ...]
     finished: bool
     finish_reason: str | None = None
     # The stop string that ended generation (if any), so the detokenizer can trim it
@@ -48,6 +57,10 @@ class DetokenizeMsg(BaseTokenizerMsg):
     swa_total_tokens: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        # msgpack has no tuple type: the run packs as an array and comes back a list.
+        self.next_tokens = tuple(self.next_tokens)
 
 
 @dataclass

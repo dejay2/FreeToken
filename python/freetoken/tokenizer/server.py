@@ -57,6 +57,25 @@ def _prompt_admitted_reply(msg: PromptAdmittedMsg) -> UserReply:
     )
 
 
+def _sampled_reply(msg: DetokenizeMsg, incremental_output: str) -> UserReply:
+    """Frontend reply for one step's sampled run. Usage bills every token in the run."""
+    return UserReply(
+        uid=msg.uid,
+        incremental_output=incremental_output,
+        finished=msg.finished,
+        finish_reason=msg.finish_reason,
+        matched_stop=msg.matched_stop,
+        completion_tokens_delta=len(msg.next_tokens),
+        kv_used_pages=msg.kv_used_pages,
+        kv_total_pages=msg.kv_total_pages,
+        mamba_used_slots=msg.mamba_used_slots,
+        mamba_total_slots=msg.mamba_total_slots,
+        swa_used_tokens=msg.swa_used_tokens,
+        swa_total_tokens=msg.swa_total_tokens,
+        gpu_mem_bytes=msg.gpu_mem_bytes,
+    )
+
+
 def _error_reply(msg: ErrorReplyMsg) -> UserReply:
     return UserReply(
         uid=msg.uid, incremental_output="", finished=True, error=msg.error, error_code=msg.code,
@@ -421,21 +440,7 @@ def tokenize_worker(
             if len(detokenize_msg) > 0:
                 replies = detokenize_manager.detokenize(detokenize_msg)
                 sampled_replies = [
-                    UserReply(
-                        uid=msg.uid,
-                        incremental_output=reply,
-                        finished=msg.finished,
-                        finish_reason=msg.finish_reason,
-                        matched_stop=msg.matched_stop,
-                        completion_tokens_delta=1,
-                        kv_used_pages=msg.kv_used_pages,
-                        kv_total_pages=msg.kv_total_pages,
-                        mamba_used_slots=msg.mamba_used_slots,
-                        mamba_total_slots=msg.mamba_total_slots,
-                        swa_used_tokens=msg.swa_used_tokens,
-                        swa_total_tokens=msg.swa_total_tokens,
-                        gpu_mem_bytes=msg.gpu_mem_bytes,
-                    )
+                    _sampled_reply(msg, reply)
                     for msg, reply in zip(detokenize_msg, replies, strict=True)
                 ]
 

@@ -337,42 +337,10 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
-                    )
-                )
+                # One row per request, whatever the step's width (a scalar row for decode).
+                msg = self._emit_step_tokens(req, next_tokens_cpu[i].reshape(-1))
+                finished = msg.finished
+                reply.append(msg)
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -417,8 +385,63 @@ class Scheduler(SchedulerIOMixin):
             page_size=self.config.page_size,
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
+            # One token per scheduled request, as ever, plus whatever a wider step added.
+            generated_tokens=len(batch.reqs) + sum(len(m.next_tokens) - 1 for m in reply),
         )
         self.send_result(reply)
+
+    def _emit_step_tokens(self, req: Req, tokens: torch.Tensor) -> DetokenizeMsg:
+        """Append this step's sampled tokens to the request and build its single reply.
+
+        The run is processed in order and the first stop condition truncates the rest --
+        the remaining tokens are neither appended nor shipped -- so the emitted ids and the
+        finish reason equal what the same tokens emitted one per step would have produced.
+        The output budget is a property of the step (the device already advanced past it),
+        so it terminates the run's last surviving token; EOS and stop strings win over it.
+        """
+        budget = req.max_device_len - req.input_ids.numel()
+        n = min(tokens.numel(), budget)
+        assert n >= 1
+        hit_length = not req.can_decode
+        emitted: List[int] = []
+        hit_eos = False
+        matched_stop: str | None = None
+        for i in range(n):
+            req.append_host(tokens[i : i + 1])
+            token = int(tokens[i].item())
+            emitted.append(token)
+            hit_eos = not req.sampling_params.ignore_eos and token in self.eos_token_ids
+            matched_stop = (
+                self._match_stop_str(req)
+                if not hit_eos and req.sampling_params.stop_strs
+                else None
+            )
+            stopped = hit_eos or matched_stop is not None
+            terminal = stopped or (i == n - 1 and hit_length)
+            if (
+                token == self.toolcall_anchor_id
+                and req.toolcall_anchor_len is None
+                and not terminal
+            ):
+                req.toolcall_anchor_len = req.input_ids.numel()
+            if stopped:
+                break
+        # EOS / stop-string -> "stop", output budget exhausted -> "length";
+        # EOS and stop strings win over length.
+        finished = hit_length or hit_eos or matched_stop is not None
+        finish_reason = (
+            ("stop" if (hit_eos or matched_stop is not None) else "length")
+            if finished
+            else None
+        )
+        return DetokenizeMsg(
+            uid=req.uid,
+            next_tokens=tuple(emitted),
+            finished=finished,
+            finish_reason=finish_reason,
+            matched_stop=matched_stop,
+            stop_strs=req.sampling_params.stop_strs or None,
+        )
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -1042,8 +1065,17 @@ def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
 
 
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_list = [req.table_idx for req in batch.reqs]
+    """Destination of each token this step samples, flattened request-major.
+
+    ``emit_width`` slots per request (one for plain decode). A slot past the request's
+    output budget writes to the token pool's -1 discard column, as it always has.
+    """
+    mapping_list = [req.table_idx for req in batch.reqs for _ in range(batch.emit_width)]
     mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
-    write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
+    write_list = [
+        (req.device_len + i if req.remain_len > i else -1)
+        for req in batch.reqs
+        for i in range(batch.emit_width)
+    ]
     write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
     return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
