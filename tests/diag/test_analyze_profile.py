@@ -54,11 +54,11 @@ def test_per_range_wall_and_kernel_time(analyze_profile, trace, capsys):
 
     assert "== diag.plain_decode_step" in out
     # two instances of 1 ms and 3 ms; 200+100+50+300 us of device work inside them
-    assert "count 2  mean wall 2.000 ms  mean gpu-kernel 0.325 ms" in out
+    assert "count 2  mean wall 2.000 ms  max wall 3.000 ms  mean gpu-kernel 0.325 ms" in out
     assert "mean kernels/instance 2.0" in out
     # the nested gather counts its own kernel; the columns are per stage, not a partition
     assert "== diag.ple_gather" in out
-    assert "count 1  mean wall 0.100 ms  mean gpu-kernel 0.300 ms" in out
+    assert "count 1  mean wall 0.100 ms  max wall 0.100 ms  mean gpu-kernel 0.300 ms" in out
 
 
 def test_top_kernels_and_memory_rows(analyze_profile, trace, capsys):

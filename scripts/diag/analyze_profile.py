@@ -86,6 +86,7 @@ def analyze(path: str, top: int) -> int:
     print()
 
     per_instance_kernels: dict[str, list] = {}
+    wall_stats: dict[str, tuple] = {}
     for name in sorted(ranges):
         spans = ranges[name]
         wall_us = sum(end - start for start, end in spans)
@@ -104,9 +105,15 @@ def analyze(path: str, top: int) -> int:
             counts.append(n)
         per_instance_kernels[name] = counts
         instances = len(spans)
+        # A prefill stage runs a handful of times against a decode stage's thousands, and the
+        # cold instance is the whole TTFT story -- a mean over the warm ones hides it, so the
+        # worst instance is printed next to the mean.
+        max_wall_us = max(end - start for start, end in spans)
+        wall_stats[name] = (instances, wall_us, max_wall_us)
         print(f"== {name}")
         print(
             f"   count {instances}  mean wall {wall_us / instances / 1e3:.3f} ms  "
+            f"max wall {max_wall_us / 1e3:.3f} ms  "
             f"mean gpu-kernel {gpu_us / instances / 1e3:.3f} ms  "
             f"mean kernels/instance {sum(counts) / instances:.1f}"
         )
@@ -117,6 +124,23 @@ def analyze(path: str, top: int) -> int:
             print(
                 f"   {kname[:70]:<70} {total / 1e3:>10.3f} {count:>8} "
                 f"{total / count:>10.1f}  {cat}"
+            )
+        print()
+
+    prefill = {n: s for n, s in wall_stats.items() if n.startswith("diag.prefill_")}
+    if prefill:
+        # The TTFT ledger: the stages a first token has to pass through, worst instance first.
+        # The cold prompt is the max column; these are per-STAGE, so they sum to the pipeline
+        # only where the stages do not nest (prefill_sample and prefill_prime_draft sit inside
+        # prefill_forward and are already subtracted from its self time).
+        print("== prefill TTFT accounting (per-stage wall)")
+        print(f"   {'stage':<32} {'count':>7} {'mean ms':>10} {'max ms':>10} {'total ms':>10}")
+        for name, (count, total_us, max_us) in sorted(
+            prefill.items(), key=lambda item: -item[1][2]
+        ):
+            print(
+                f"   {name:<32} {count:>7} {total_us / count / 1e3:>10.3f} "
+                f"{max_us / 1e3:>10.3f} {total_us / 1e3:>10.3f}"
             )
         print()
 

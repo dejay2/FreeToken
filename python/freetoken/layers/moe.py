@@ -9,6 +9,11 @@ from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_backend
 from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl, fused_topk
 from freetoken.moe.offload_cache import OffloadMoeCache
+
+# Imported as a module, not `from ... import PREFETCH`: the config is read through the
+# module attribute at every use so a test (or a future runtime re-arm) has ONE place to
+# swap it, shared with OffloadMoeCache._init_prefetch.
+from freetoken.moe import prefetch as _prefetch
 from freetoken.utils import div_even
 
 from .base import BaseOP
@@ -27,6 +32,33 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # engine config here would drag the model registry and the HF config loader into every MoE
 # layer. ``tests/moe/test_mtp_fast_verify_moe.py`` imports both and pins them equal.
 _MAX_MTP_VERIFY_ROWS = 6
+
+# The offload PREFILL path streams every expert of every layer (48 x 1.32 GiB ~ 1.25 s over
+# PCIe) whatever the prompt size, so a 26-token chat turn -- or a prefix-cache hit with three
+# new rows -- pays the whole 63 GiB bank. FREETOKEN_MOE_SMALL_PREFILL_ROWS=N sends a prefill
+# batch of at most N rows (summed over every request in it) through DECODE movement instead:
+# the LRU lookup plus a fetch of only the routed experts. Default 0 = off, byte-identical to
+# before. Read once at import (this is per-layer, per-forward) and referenced through the
+# module global, so a test swaps it with monkeypatch.setattr like _prefetch.PREFETCH.
+_SMALL_PREFILL_ROWS_ENV = "FREETOKEN_MOE_SMALL_PREFILL_ROWS"
+# Hard ceiling regardless of the env. The GPU decode GEMVs have no M limit of their own (the
+# marlin grid is (M*top_k, cdiv(N, BLOCK_N)), one program per route, masked epilogue), but
+# they are GEMV-shaped: past a few dozen rows the streamed grouped GEMM wins anyway, and the
+# cpu/hybrid decode target has its own width bound (checked separately, per cache).
+_MAX_SMALL_PREFILL_ROWS = 64
+
+
+def _read_small_prefill_rows() -> int:
+    raw = (os.getenv(_SMALL_PREFILL_ROWS_ENV) or "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, min(int(raw), _MAX_SMALL_PREFILL_ROWS))
+    except ValueError:
+        return 0
+
+
+_SMALL_PREFILL_ROWS = _read_small_prefill_rows()
 
 # Hybrid decode overlaps the CPU overflow GEMV behind the GPU PCIe fetch + GEMM by
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
@@ -131,8 +163,13 @@ def register_predict_router(layer_id, gate) -> None:
     It holds the MODULE (never a weight copy), so ``_predict_topk`` scores with the real
     router; and it is populated only while the study is armed, so an unarmed process
     keeps an empty dict and one ``is None`` test per model layer at construction.
+
+    The same registry now backs the PRODUCTION layer-ahead prefetch
+    (``FREETOKEN_MOE_PREFETCH=1``): the mechanism the study measured needs exactly the same
+    handle on the next layer's router, so it reads the same dict rather than growing a
+    second one that could drift out of sync with it.
     """
-    if _PREDICT_LOG_DIR is None or layer_id is None:
+    if layer_id is None or (_PREDICT_LOG_DIR is None and not _prefetch.PREFETCH.enabled):
         return
     _predict_routers[int(layer_id)] = gate
 
@@ -480,12 +517,13 @@ class OffloadMoELayer(MoELayer):
         self.layer_id = layer_id
         self.offload_cache: OffloadMoeCache | None = None
 
-    @staticmethod
-    def _use_decode_movement(hidden_states: torch.Tensor) -> bool:
+    def _use_decode_movement(self, hidden_states: torch.Tensor) -> bool:
         """Choose expert movement without changing the batch's causal phase."""
         batch = get_global_ctx().batch
         if not getattr(batch, "mtp_verify", False):
-            return batch.is_decode
+            return batch.is_decode or self._small_prefill_moves_like_decode(
+                hidden_states.shape[0]
+            )
         if (
             not batch.is_prefill
             or len(batch.reqs) != 1
@@ -495,6 +533,38 @@ class OffloadMoELayer(MoELayer):
                 "private MTP verification requires one prefill request and 2 to "
                 f"{_MAX_MTP_VERIFY_ROWS} rows"
             )
+        return True
+
+    def _small_prefill_moves_like_decode(self, rows: int) -> bool:
+        """Is this prefill batch narrow enough to fetch its routed experts instead of the bank?
+
+        ``rows`` is the batch's TOTAL row count (every request's extend concatenated), which is
+        exactly what the prefill streaming cost is independent of. Opt-in through
+        ``FREETOKEN_MOE_SMALL_PREFILL_ROWS``; at the default 0 this returns False before
+        touching anything, so the movement choice is byte-identical to before.
+
+        Everything the decode path needs is already true of a prefill batch: it reads nothing
+        off ``batch`` past this point (no phase flag reaches the fused kernels -- ``is_prefill``
+        is passed explicitly to ``_expert_gemm``), it only needs ``[M, H]`` hidden states with
+        an ``[M, top_k]`` int32 ``topk_ids`` it may rewrite in place, and it touches none of the
+        prefill double-buffer bookkeeping (``begin_prefill`` / ``prefetch_prefill_layer`` /
+        ``_invalidate_prefill_buffer`` / ``release_prefill_layer``). Skipping that bookkeeping
+        is safe in both directions: nothing is claimed, so nothing is left unreleased, and the
+        next streaming prefill re-establishes the whole thing at its layer 0. What it does do
+        is evict LRU residents like any decode step -- which is the trade being made.
+        """
+        limit = _SMALL_PREFILL_ROWS
+        if limit <= 0 or not 1 <= rows <= limit:
+            return False
+        cache = self.offload_cache
+        if cache is None:
+            return False
+        # The cpu/hybrid decode target sizes its C++ scratch and pinned IO sets once, from
+        # max(max_running_req, cuda_graph_max_bs, spec batch_width); a wider submit runs past
+        # them. The GPU target has no such bound.
+        executor = getattr(cache, "cpu_executor", None)
+        if executor is not None and rows > int(getattr(executor, "max_tokens", 0)):
+            return False
         return True
 
     def forward(
@@ -597,8 +667,18 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        # Layer-ahead expert prefetch. Join the previous layer's prefetch BEFORE this
+        # layer's ensure: after that edge the prefetched rows are ordinary resident slots,
+        # so ensure/copy_missing need no notion of an in-flight fill. One module-attribute
+        # read is the entire cost while unarmed -- and it keeps the whole feature off the
+        # slot-cache stand-ins other decode tests substitute here.
+        armed = _prefetch.PREFETCH.enabled
+        if armed and cache.prefetch_wait(self.layer_id):
+            cache.prefetch_note_actual(self.layer_id, topk_ids)  # raw ids, pre-rewrite
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
+        if armed:
+            self._prefetch_next_layer(cache, hidden_states)
         return self._expert_gemm(
             cache,
             hidden_states,
@@ -609,6 +689,37 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+
+    def _prefetch_next_layer(
+        self, cache: OffloadMoeCache, hidden_states: torch.Tensor
+    ) -> None:
+        """Start layer ``L+1``'s expert fetch now, on the side stream (prefetch armed only).
+
+        The predictor is layer ``L+1``'s OWN router scored on layer ``L``'s router input --
+        the cheapest thing that could work, and the one the offline study measured at
+        recall@10 = 0.62. Deliberately the real path: the registered gate module, then
+        ``fused_topk`` with this layer's ``renormalize``, so the prediction is produced by
+        the same scoring function the live router will run one layer later.
+
+        ``hidden_states`` must still be the router input, which is why this sits before
+        ``_expert_gemm`` (the fused MoE kernels may write it in place). Everything here is
+        fixed-shape and device-side, so it captures.
+        """
+        target = self.layer_id + 1
+        if not cache.prefetch_ready(target):
+            return
+        gate = _predict_routers.get(target)
+        if gate is None:
+            return  # e.g. a dense layer sits at L+1, or the model registers no routers
+        logits = gate.forward(hidden_states)
+        k = min(_prefetch.PREFETCH.topk, int(logits.shape[-1]))
+        _, pred_ids = fused_topk(
+            hidden_states=hidden_states,
+            gating_output=logits,
+            topk=k,
+            renormalize=self.renormalize,
+        )
+        cache.prefetch_experts(target, pred_ids)
 
     def _decode_hybrid(
         self,

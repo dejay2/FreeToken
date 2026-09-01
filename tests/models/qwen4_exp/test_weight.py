@@ -425,6 +425,36 @@ def test_mmap_staged_backend_matches_checkpoint_rows(checkpoint):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
+def test_mmap_staged_backend_reuses_pinned_staging_across_steps(checkpoint):
+    """A decode step must not re-``pin_memory`` its staging pair; a prefill's size is not pooled."""
+    import freetoken.models.qwen4_exp.ple as ple_module
+    from freetoken.models.qwen4_exp.ple import MmapStagedTable
+
+    folder, _raw = checkpoint
+    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
+    table = load_mmap_ple_table(folder, args)
+    backend = MmapStagedTable(table.storage, float(table.weight_scale))
+    ids = torch.tensor([[0, 6, 7, 17], [27, 20, 3, 14]], device="cuda")
+    try:
+        with torch.inference_mode():
+            for _ in range(2 * ple_module._MMAP_STAGING_SLOTS + 1):
+                backend.lookup(ids)
+            ring = backend._host_pool[ids.numel()]
+            assert len(ring) == ple_module._MMAP_STAGING_SLOTS
+            assert all(slot.rows.is_pinned() for slot in ring)
+            assert len({id(slot.rows) for slot in ring}) == ple_module._MMAP_STAGING_SLOTS
+
+            # A chunk-sized gather is allocated fresh: pooling every distinct prefill width
+            # would pin tens of MB per width for the life of the process.
+            wide = ple_module._MMAP_STAGING_MAX_ROWS + 1
+            assert backend._acquire_staging(wide) is not backend._acquire_staging(wide)
+            assert wide not in backend._host_pool
+    finally:
+        backend.close()
+        table.storage.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
 def test_mmap_staged_backend_cuda_graph_replay_stages_new_rows(checkpoint):
     from freetoken.models.qwen4_exp.ple import MmapStagedTable
 

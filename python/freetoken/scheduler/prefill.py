@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
+from freetoken import diag
 from freetoken.core import Batch, Req
 from freetoken.utils import align_down, div_ceil, init_logger
 
@@ -261,8 +262,12 @@ class PrefillManager:
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:
-            return None
+            return None  # BEFORE the range: an idle scheduler must not look like traffic
+        with diag.region("diag.prefill_admit"):
+            return self._admit_next_batch(prefill_budget)
 
+    def _admit_next_batch(self, prefill_budget: int) -> Batch | None:
+        """Prefix match, admission gates, page/GDN allocation and the prompt's H2D copies."""
         # estimated offset due to in-flight decode
         adder = PrefillAdder(
             token_budget=prefill_budget,

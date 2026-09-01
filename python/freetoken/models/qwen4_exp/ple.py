@@ -17,6 +17,7 @@ The FP8 n-gram store can use pinned host memory or mmap-backed safetensors.
 from __future__ import annotations
 
 import math
+import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Protocol, Sequence, Tuple
@@ -43,6 +44,18 @@ _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
 _PREFILL_INDEX_CACHE_SIZE = 64
+# Deep enough that reusing a slot never waits on the H2D that last read it.
+_MMAP_STAGING_SLOTS = 3
+# ... for the repeated (decode) sizes only; see MmapStagedTable._acquire_staging. 4096 rows
+# is 640 KiB of pinned bytes per slot, so the whole pool is bounded by roughly 30 MiB.
+_MMAP_STAGING_MAX_ROWS = 4096
+_MMAP_STAGING_SIZES = 16
+_FUSED_HASH_ENV = "FREETOKEN_PLE_FUSED_HASH"
+
+
+def _fused_row_ids_enabled() -> bool:
+    """The fused hash kernel, on unless ``FREETOKEN_PLE_FUSED_HASH=0`` takes it back to torch ops."""
+    return (os.getenv(_FUSED_HASH_ENV) or "1").strip() not in ("0", "false", "False")
 
 
 class PLETableBackend(Protocol):
@@ -211,9 +224,26 @@ class PinnedUVATable:
 
 
 @dataclass
+class _MmapStaging:
+    """One reusable pinned (row ids D2H, gathered rows H2D) pair.
+
+    Re-``pin_memory``ing per decode step is a ``cudaHostAlloc`` (or at best a caching-allocator
+    round trip) on the critical path of every step, so the sizes a step actually uses keep a
+    small ring instead. ``consumed`` is recorded after the H2D that reads ``rows``: the rows
+    buffer is handed to an async copy, so a slot is only free once that copy has run.
+    """
+
+    ids: torch.Tensor
+    rows: torch.Tensor
+    ready: torch.cuda.Event
+    consumed: torch.cuda.Event | None = None
+
+
+@dataclass
 class _MmapPending:
     row_ids: torch.Tensor
     future: Future[torch.Tensor]
+    staging: _MmapStaging
 
 
 class MmapStagedTable:
@@ -241,6 +271,55 @@ class MmapStagedTable:
         )
         self._pending: _MmapPending | None = None
         self._graph_staging: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._host_pool: dict[int, list[_MmapStaging]] = {}
+        self._host_turn: dict[int, int] = {}
+
+    def _new_staging(self, rows: int) -> _MmapStaging:
+        return _MmapStaging(
+            ids=torch.empty(rows, dtype=torch.int64, device="cpu", pin_memory=True),
+            rows=torch.empty(
+                (rows, self.head_dim), dtype=torch.uint8, device="cpu", pin_memory=True
+            ),
+            ready=torch.cuda.Event(),
+        )
+
+    def _acquire_staging(self, rows: int) -> _MmapStaging:
+        """A pinned staging pair for ``rows`` rows, from this size's ring.
+
+        Only the sizes a DECODE step repeats are pooled: a step's row count is
+        ``batch_size * num_ngram_heads``, so there are a handful of them and they come back
+        every step. A prefill's count follows the chunk length, which is neither small nor
+        repeated -- pooling those would pin tens of MB per distinct chunk size forever, so
+        they keep the old allocate-per-call behaviour.
+        """
+        if rows > _MMAP_STAGING_MAX_ROWS:
+            return self._new_staging(rows)
+        ring = self._host_pool.get(rows)
+        if ring is None:
+            if len(self._host_pool) >= _MMAP_STAGING_SIZES:
+                oldest = next(iter(self._host_pool))
+                self._host_pool.pop(oldest)
+                self._host_turn.pop(oldest, None)
+            ring = self._host_pool.setdefault(rows, [])
+        if len(ring) < _MMAP_STAGING_SLOTS:
+            slot = self._new_staging(rows)
+            ring.append(slot)
+            return slot
+        turn = self._host_turn.get(rows, 0)
+        slot = ring[turn % _MMAP_STAGING_SLOTS]
+        self._host_turn[rows] = turn + 1
+        if slot.consumed is not None:
+            # a ring this deep means this has already run; the wait is bookkeeping, not a stall
+            slot.consumed.synchronize()
+        return slot
+
+    def _release_staging(self, staging: _MmapStaging) -> None:
+        """Mark the H2D that reads ``staging.rows`` as the point the slot becomes reusable."""
+        event = staging.consumed
+        if event is None:
+            event = torch.cuda.Event()
+            staging.consumed = event
+        event.record(torch.cuda.current_stream(self._device))
 
     def _gather_after_copy(
         self,
@@ -253,34 +332,34 @@ class MmapStagedTable:
         with torch.inference_mode():
             return self.storage.gather(host_ids, host_rows)
 
-    def _schedule(self, row_ids: torch.Tensor) -> Future[torch.Tensor]:
+    def _schedule(self, row_ids: torch.Tensor) -> _MmapPending:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "MmapStagedTable cannot run in a CUDA graph; use --cuda-graph-max-bs 0"
             )
         flat = row_ids.reshape(-1)
-        host_ids = torch.empty(flat.numel(), dtype=torch.int64, device="cpu", pin_memory=True)
-        host_rows = torch.empty(
-            (flat.numel(), self.head_dim),
-            dtype=torch.uint8,
-            device="cpu",
-            pin_memory=True,
-        )
-        host_ids.copy_(flat, non_blocking=True)
-        ready = torch.cuda.Event()
-        ready.record(torch.cuda.current_stream(self._device))
+        staging = self._acquire_staging(flat.numel())
+        staging.ids.copy_(flat, non_blocking=True)
+        staging.ready.record(torch.cuda.current_stream(self._device))
         executor = self._executor
         if executor is None:
             raise RuntimeError("MmapStagedTable is closed")
-        return executor.submit(self._gather_after_copy, ready, host_ids, host_rows)
+        future = executor.submit(
+            self._gather_after_copy, staging.ready, staging.ids, staging.rows
+        )
+        return _MmapPending(row_ids=row_ids, future=future, staging=staging)
 
-    def _finish(self, row_ids: torch.Tensor) -> torch.Tensor:
+    def _finish(self, row_ids: torch.Tensor) -> _MmapStaging:
+        """Block until ``row_ids``' rows are in a pinned buffer; the caller must release it."""
         pending, self._pending = self._pending, None
         if pending is not None and pending.row_ids is row_ids:
-            return pending.future.result()
+            pending.future.result()
+            return pending.staging
         if pending is not None:
             pending.future.result()
-        return self._schedule(row_ids).result()
+        fresh = self._schedule(row_ids)
+        fresh.future.result()
+        return fresh.staging
 
     def prepare_cuda_graph_capture(self, num_rows: int) -> None:
         if num_rows in self._graph_staging:
@@ -293,9 +372,10 @@ class MmapStagedTable:
         staging = self._graph_staging.get(row_ids.numel())
         if staging is None:
             raise RuntimeError(f"no mmap PLE graph buffer for {row_ids.numel()} rows")
-        host_rows = self._finish(row_ids)
+        host = self._finish(row_ids)
         raw, rows = staging
-        raw.copy_(host_rows, non_blocking=True)
+        raw.copy_(host.rows, non_blocking=True)
+        self._release_staging(host)
         rows.copy_(raw.view(torch.float8_e4m3fn))
         if self.scale != 1.0:
             rows.mul_(self.scale)
@@ -323,7 +403,7 @@ class MmapStagedTable:
             return
         if self._pending is not None:
             self._pending.future.result()
-        self._pending = _MmapPending(row_ids=row_ids, future=self._schedule(row_ids))
+        self._pending = self._schedule(row_ids)
 
     def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         if torch.cuda.is_current_stream_capturing():
@@ -336,8 +416,9 @@ class MmapStagedTable:
             out.copy_(rows)
             return out
 
-        host_rows = self._finish(row_ids)
-        raw = host_rows.to(device=self._device, non_blocking=True)
+        host = self._finish(row_ids)
+        raw = host.rows.to(device=self._device, non_blocking=True)
+        self._release_staging(host)
         rows = raw.view(torch.float8_e4m3fn).to(self.dtype)
         if self.scale != 1.0:
             rows.mul_(self.scale)
@@ -572,6 +653,7 @@ class NGramEmbedding(BaseOP):
         self.ngram_heads_vocab_sizes = torch.empty(self.num_heads, dtype=torch.int64)
         self.ngram_heads_offsets = torch.empty(self.num_heads, dtype=torch.int64)
         self._table = table
+        self._token_index_cache: dict[tuple, Tuple[torch.Tensor, torch.Tensor]] = {}
 
     def attach_table(self, table: PLETableBackend) -> None:
         self._table = table
@@ -618,8 +700,92 @@ class NGramEmbedding(BaseOP):
             shifted.append(torch.where(valid, gathered, packed.new_full((), self.eos_token_id)))
         return shifted
 
-    def row_ids(self, meta: PLEMetadata) -> torch.Tensor:
-        """Global table row per (token, hash head): ``[T, num_ngram_heads]`` int64."""
+    def _token_index(self, meta: PLEMetadata) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(req[T], local[T])`` int32: each token's request, and its offset inside it.
+
+        The fused kernel addresses the hash window through these instead of materializing the
+        ``[B, ctx+max_len]`` packed window. Memoized on the shape (which is all they depend on)
+        so a captured replay reads a stable address instead of re-running the build; a build
+        that happens DURING capture is not cached, since its buffers live in the graph pool.
+        """
+        device = meta.input_ids.device
+        num_tokens = meta.input_ids.numel()
+        capturing = device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+        # is_decode is part of the key, not just the shape: a decode of B requests and a
+        # prefill of ONE B-token request are the same [T] and mean opposite things (one token
+        # per request at offset 0 vs B offsets inside one request).
+        key = (
+            meta.is_decode,
+            (num_tokens,) if meta.is_decode else tuple(meta.seq_lens),
+            str(device),
+        )
+        cached = self._token_index_cache.get(key)
+        if cached is not None:
+            return cached
+        if meta.is_decode:  # one token per request, each at offset 0
+            index = (
+                torch.arange(num_tokens, dtype=torch.int32, device=device),
+                torch.zeros(num_tokens, dtype=torch.int32, device=device),
+            )
+        else:
+            cu = meta.cu_seqlens.long()
+            flat_pos = torch.arange(num_tokens, device=device)
+            req = (torch.searchsorted(cu, flat_pos, right=True) - 1).clamp_(
+                max=len(meta.seq_lens) - 1
+            )
+            index = ((req).to(torch.int32), (flat_pos - cu[req]).to(torch.int32))
+        if not capturing:
+            if len(self._token_index_cache) >= _PREFILL_INDEX_CACHE_SIZE:
+                self._token_index_cache.pop(next(iter(self._token_index_cache)))
+            self._token_index_cache[key] = index
+        return index
+
+    def _use_fused_row_ids(self, meta: PLEMetadata) -> bool:
+        device = meta.input_ids.device
+        if device.type != "cuda":
+            return False
+        if not _fused_row_ids_enabled():
+            return False
+        return all(
+            t.device == device
+            for t in (
+                meta.ngram_context,
+                self.layer_multipliers,
+                self.ngram_heads_vocab_sizes,
+                self.ngram_heads_offsets,
+            )
+        )
+
+    def row_ids(self, meta: PLEMetadata, out: torch.Tensor | None = None) -> torch.Tensor:
+        """Global table row per (token, hash head): ``[T, num_ngram_heads]`` int64.
+
+        One Triton program per token on CUDA; ``row_ids_reference`` is the same arithmetic in
+        torch ops and stays the oracle (and the CPU path).
+        """
+        if self._use_fused_row_ids(meta):
+            from freetoken.kernel.triton.ple_hash import ple_row_ids
+
+            req, local = self._token_index(meta)
+            return ple_row_ids(
+                meta.input_ids.long(),
+                meta.ngram_context,
+                req,
+                local,
+                self.layer_multipliers,
+                self.ngram_heads_vocab_sizes,
+                self.ngram_heads_offsets,
+                eos_token_id=self.eos_token_id,
+                heads_per_ngram=self.heads_per_ngram,
+                out=out,
+            )
+        rows = self.row_ids_reference(meta)
+        if out is None:
+            return rows
+        out.copy_(rows)
+        return out
+
+    def row_ids_reference(self, meta: PLEMetadata) -> torch.Tensor:
+        """Torch-op transcription of the hash; the oracle the fused kernel is diffed against."""
         packed, select = self._window(meta)
         tokens = [select(s) for s in self._shift_ignore_eos(packed)]
         blocks = []

@@ -284,6 +284,211 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        self._init_prefetch()
+
+    # ------------------------------------------------------------------
+    # Layer-ahead expert prefetch (FREETOKEN_MOE_PREFETCH=1). See
+    # :mod:`freetoken.moe.prefetch` for the streams/events/protection argument.
+    # ------------------------------------------------------------------
+
+    def _init_prefetch(self) -> None:
+        """Allocate the prefetch plan buffers, side stream and per-target-layer events.
+
+        Everything is per-cache and fixed-shape, allocated before any capture, so the
+        fork/join the decode path emits is capturable. When the feature is off (the
+        default) this leaves ``prefetch_on`` False and allocates nothing -- the decode path
+        then costs one attribute read per layer and is byte-identical to the pre-prefetch
+        engine.
+        """
+        from freetoken.moe.prefetch import PREFETCH, N_PREFETCH_STATS
+
+        self.prefetch_config = PREFETCH
+        self.prefetch_on = PREFETCH.enabled and self.device.type == "cuda"
+        # True while the layer forward is inside a captured/eager step and a prefetch for
+        # that TARGET layer has been issued but not yet joined. Host-side only; the layer
+        # sequence is static, so capture records exactly the fork/join edges a replay needs.
+        self._prefetch_issued = [False] * self.num_layers
+        self._prefetch_waits = 0
+        if not self.prefetch_on:
+            return
+        plan = max(1, PREFETCH.max_misses)
+        self.prefetch_evict_slots = torch.empty((plan,), dtype=torch.int32, device=self.device)
+        self.prefetch_src_indices = torch.empty((plan,), dtype=torch.int32, device=self.device)
+        self.prefetch_num_indices = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        # Per (layer, expert): 2*step if the prefetch predicted it at that step, +1 if it
+        # also fetched it. Read back at the target layer to score the prediction.
+        self.prefetch_mark = torch.full(
+            (self.num_layers, self.num_experts), -1, dtype=torch.int64, device=self.device
+        )
+        self.prefetch_stats = torch.zeros(N_PREFETCH_STATS, dtype=torch.int64, device=self.device)
+        self.prefetch_stream = torch.cuda.Stream(device=self.device)
+        # One event pair per TARGET layer: reusing a single pair would make every join in a
+        # captured graph depend on the last fork recorded, collapsing the pipeline.
+        self.prefetch_fork_events = [torch.cuda.Event() for _ in range(self.num_layers)]
+        self.prefetch_done_events = [torch.cuda.Event() for _ in range(self.num_layers)]
+
+    def prefetch_ready(self, target_layer: int) -> bool:
+        """Whether a prefetch FOR ``target_layer`` would be issued (host-side, no GPU work).
+
+        Checked before the predictor runs so an unarmed or skipped layer never pays for the
+        router GEMM. A target that decodes on the CPU executor, or whose host banks have no
+        device alias, has no PCIe fetch to hide and is excluded.
+        """
+        return (
+            self.prefetch_on
+            and 0 <= target_layer < self.num_layers
+            and target_layer not in self.prefetch_config.skip_layers
+            and target_layer not in self.cpu_layer_ids
+            and target_layer not in self._unpinned_layers
+            and bool(self.banks)
+        )
+
+    def prefetch_experts(self, target_layer: int, pred_ids: torch.Tensor) -> None:
+        """Admit ``pred_ids`` for ``target_layer`` and copy the misses on the side stream.
+
+        Call site: the MoE layer forward for layer ``target_layer - 1``, AFTER that layer's
+        own ``ensure_experts``/``copy_missing`` and BEFORE its expert GEMV. The ensure
+        variant runs on the compute stream (it only touches the index); only the copy is
+        forked. See :mod:`freetoken.moe.prefetch` for why "protect ``usage == step``" is
+        the exact, minimal protection that makes this safe.
+
+        ``pred_ids`` is ``[rows, k']`` int32 raw expert ids in descending predicted score,
+        and is read-only here: the prefetch never rewrites a routing tensor. A cache with
+        fewer unprotected slots than predictions to admit is not an error -- the kernel
+        clamps the plan to what it may safely evict.
+        """
+        from freetoken.moe.prefetch import prefetch_ensure
+
+        if not self.prefetch_ready(target_layer):
+            return
+        prefetch_ensure(self, target_layer, pred_ids, self.prefetch_config.max_misses)
+        fork = self.prefetch_fork_events[target_layer]
+        fork.record(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(self.prefetch_stream):
+            # The fork is recorded after this layer's own copy_missing, so the prefetch copy
+            # does not contend with the blocking fetch for PCIe -- it starts when that one
+            # drains and runs under the GEMV.
+            self.prefetch_stream.wait_event(fork)
+            self._prefetch_copy(target_layer)
+            self.prefetch_done_events[target_layer].record(self.prefetch_stream)
+        self._prefetch_issued[target_layer] = True
+
+    def _prefetch_copy(self, target_layer: int) -> None:
+        """Move the prefetch plan's rows for ``target_layer`` on the CURRENT stream.
+
+        The mirror of :meth:`copy_missing` over the separate prefetch plan buffers; the
+        caller has already placed it on the side stream. Kept its own method so the copy is
+        one substitutable step (tests wrap it to make the copy artificially slow and prove
+        the join is real).
+        """
+        from freetoken.kernel.fast_index_copy import fast_index_copy_jit, fast_index_copy_multi_jit
+
+        if self._copy_fused_ok:
+            fast_index_copy_multi_jit(
+                self._copy_dst_ptrs,
+                self._copy_src_ptrs[target_layer],
+                self._copy_feat_bytes,
+                self.prefetch_evict_slots,
+                self.prefetch_src_indices,
+                self.prefetch_num_indices,
+            )
+            return
+        for per_layer, cache in self.banks:
+            fast_index_copy_jit(
+                cache,
+                self.prefetch_evict_slots,
+                per_layer[target_layer],
+                self.prefetch_src_indices,
+                self.prefetch_num_indices,
+            )
+
+    def prefetch_wait(self, layer_id: int) -> bool:
+        """Join the prefetch issued FOR ``layer_id``; True if there was one.
+
+        Must run before ``ensure_experts(layer_id)``. After this edge the prefetched bytes
+        have landed, so the layer's own ensure sees ordinary resident slots -- there is no
+        "present but still copying" state for it to reason about, and no way for its
+        ``copy_missing`` to race the prefetch copy into the same slot.
+        """
+        if not self.prefetch_on or not self._prefetch_issued[layer_id]:
+            return False
+        torch.cuda.current_stream(self.device).wait_event(self.prefetch_done_events[layer_id])
+        self._prefetch_issued[layer_id] = False
+        self._prefetch_waits += 1
+        self._maybe_log_prefetch()
+        return True
+
+    def prefetch_note_actual(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """Score the prediction made for ``layer_id`` against its real routing (stats only).
+
+        Needs the RAW expert ids, so it runs before ``ensure_experts``' in-place rewrite,
+        and while the clock still holds the step the prefetch stamped.
+        """
+        from freetoken.moe.prefetch import prefetch_score
+
+        if self.prefetch_on and self.collect_stats:
+            prefetch_score(self, layer_id, expert_ids.reshape(-1))
+
+    def _maybe_log_prefetch(self) -> None:
+        """One prefetch precision line every ``log_every`` joins (FREETOKEN_MOE_PREFETCH_LOG).
+
+        Host-side and therefore EAGER-ONLY: a captured decode graph replays without
+        re-entering python, so a graphed run reports through
+        :meth:`prefetch_stats_summary` instead (which the periodic cache report reads).
+        """
+        cfg = self.prefetch_config
+        if not cfg.log or not self.collect_stats:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return  # reading the accumulator is a host sync; never during capture
+        if self._prefetch_waits % max(1, cfg.log_every):
+            return
+        s = self.prefetch_stats_summary()
+        logger.info(
+            f"MoE prefetch: calls={s['calls']} predicted/call={s['predicted_per_call']:.1f} "
+            f"resident/call={s['hits_per_call']:.1f} fetched/call={s['fetched_per_call']:.1f} "
+            f"precision={s['precision']:.3f} recall={s['recall']:.3f} "
+            f"useful_fetch/call={s['useful_fetched_per_call']:.2f}"
+        )
+
+    def prefetch_stats_summary(self) -> dict:
+        """Realized prefetch quality since the last stats reset (one device read).
+
+        ``precision`` is how much of what was predicted the target layer really wanted;
+        ``recall`` is how much of what it wanted had been predicted -- i.e. the share of the
+        layer's experts whose fetch could have been started a layer early.
+        ``useful_fetched_per_call`` is the payoff: experts the prefetch actually moved over
+        PCIe that the target layer then routed to, i.e. synchronous misses removed.
+        """
+        from freetoken.moe.prefetch import (
+            STAT_ACTUAL,
+            STAT_CALLS,
+            STAT_FETCH,
+            STAT_HIT,
+            STAT_MISS,
+            STAT_PRED,
+            STAT_USED,
+            STAT_USED_FETCH,
+        )
+
+        if not self.prefetch_on:
+            return {}
+        v = self.prefetch_stats.tolist()
+        calls = v[STAT_CALLS]
+        pred = v[STAT_PRED]
+        actual = v[STAT_ACTUAL]
+        return {
+            "calls": calls,
+            "predicted_per_call": (pred / calls) if calls else 0.0,
+            "hits_per_call": (v[STAT_HIT] / calls) if calls else 0.0,
+            "fetched_per_call": (v[STAT_FETCH] / calls) if calls else 0.0,
+            "missing_per_call": (v[STAT_MISS] / calls) if calls else 0.0,
+            "capped_per_call": ((v[STAT_MISS] - v[STAT_FETCH]) / calls) if calls else 0.0,
+            "useful_per_call": (v[STAT_USED] / calls) if calls else 0.0,
+            "useful_fetched_per_call": (v[STAT_USED_FETCH] / calls) if calls else 0.0,
+            "precision": (v[STAT_USED] / pred) if pred else 0.0,
+            "recall": (v[STAT_USED] / actual) if actual else 0.0,
+        }
 
     def set_bank_sources(
         self,
@@ -489,6 +694,9 @@ class OffloadMoeCache:
         self.decode_freq.zero_()
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        # A rebuild is a cold start for the slot map, so every prefetch mark now names an
+        # expert that is no longer resident; keep the marks and the stats consistent with it.
+        self._reset_prefetch()
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
         # 5. Re-evaluate prefill overlap against the new size.
         if self.prefill_overlap and cache_size < 2 * self.num_experts:
@@ -854,10 +1062,22 @@ class OffloadMoeCache:
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
+        self._reset_prefetch()
+
+    def _reset_prefetch(self) -> None:
+        """Drop the prefetch marks and stats (the slot map just went cold)."""
+        self._prefetch_issued = [False] * self.num_layers
+        if not getattr(self, "prefetch_on", False):
+            return
+        self.prefetch_mark.fill_(-1)
+        self.prefetch_stats.zero_()
+        self.prefetch_num_indices.zero_()
 
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        if getattr(self, "prefetch_on", False):
+            self.prefetch_stats.zero_()
         self.lru_stats.zero_()
         self.stat_missing.zero_()
         self.stat_active.zero_()
@@ -966,11 +1186,15 @@ class OffloadMoeCache:
         (stationary) routing distribution -- i.e. an upper bound on hit rate that depends
         purely on how skewed routing is, independent of any LRU/LFU dynamics.
         """
+        # Prefetch quality rides along here: it is the same question (how predictable is
+        # this model's routing) measured on the live run instead of on the histogram, and a
+        # caller that reports routing concentration wants both. Empty when unarmed.
+        prefetch = {f"prefetch_{k}": v for k, v in self.prefetch_stats_summary().items()}
         freq = self.decode_freq.float()
         total = freq.sum(dim=1)
         valid = total > 0
         if int(valid.sum()) == 0:
-            return {}
+            return prefetch
         slots_per_layer = self.cache_size / self.num_layers
         C = max(1, int(round(slots_per_layer)))
         sorted_f, _ = torch.sort(freq, dim=1, descending=True)
@@ -988,6 +1212,7 @@ class OffloadMoeCache:
             "experts_for_90pct": cover90.mean().item(),
             "oracle_hit_at_slots": oracle_hit,
             "norm_entropy": norm_ent,
+            **prefetch,
         }
 
     def copy_missing(self) -> None:
