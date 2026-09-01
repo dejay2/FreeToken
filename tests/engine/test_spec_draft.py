@@ -64,6 +64,11 @@ class _FakeStaged:
         start = batch.reqs[0].cached_len
         for i in range(rows):
             self.kv_cache._pending_ring[0, 0, (start + i) % RING] = float(start + i + 1)
+        capture = getattr(batch, "mtp_qsa_capture_blocks", None)
+        if isinstance(capture, dict):
+            # QSA's shape: one selection row per committed row, of which _commit_pairs keeps
+            # the last -- the row a one-at-a-time run would have left behind
+            capture[0] = torch.arange(start, start + rows, dtype=torch.int32).reshape(rows, 1)
         sample = (embeds.sum(-1, keepdim=True) + hidden.sum(-1, keepdim=True)).expand(
             rows, HIDDEN
         ).contiguous()
@@ -119,6 +124,7 @@ def _head(*, depth=3, seed=1729, logits_for=None) -> SpecDraftHead:
     head._sample = None
     head._recursive = None
     head._saved_blocks = None
+    head._buffered = []
     head._sampler = None
     return head
 
@@ -140,14 +146,18 @@ def _req(uid=1, *, cached_len=0, temperature=0.0, top_k=-1, top_p=1.0) -> Req:
     return req
 
 
-def _capture(rows: int):
+def _capture(rows: int, *, base: float = 0.0):
     """``(logits, multi_stream, inputs_embeds)`` -- the engine's capture triple."""
-    hidden = torch.stack([torch.full((WIDTH,), float(i) + 1.0) for i in range(rows)])
-    embeds = torch.stack([torch.full((HIDDEN,), float(i) + 10.0) for i in range(rows)])
+    hidden = torch.stack(
+        [torch.full((WIDTH,), base + float(i) + 1.0) for i in range(rows)]
+    )
+    embeds = torch.stack(
+        [torch.full((HIDDEN,), base + float(i) + 10.0) for i in range(rows)]
+    )
     return None, hidden, embeds
 
 
-def _prefill_batch(rows: int, *, chunked: bool = False, uid: int = 1):
+def _prefill_batch(rows: int, *, chunked: bool = False, uid: int = 1, rope=None):
     cls = type("ChunkedReq", (Req,), {}) if chunked else Req
     req = cls(
         input_ids=torch.arange(1, rows + 1, dtype=torch.int32),
@@ -161,8 +171,42 @@ def _prefill_batch(rows: int, *, chunked: bool = False, uid: int = 1):
     batch = Batch(reqs=[req], phase="prefill")
     batch.padded_reqs = batch.reqs
     batch.input_ids = req.input_ids
-    batch.rope_positions = None
+    batch.rope_positions = rope
     return batch, req
+
+
+def _decode_batch(*, cached_len: int, uid: int = 1, rope=None):
+    req = Req(
+        input_ids=torch.arange(1, cached_len + 2, dtype=torch.int32),
+        table_idx=0,
+        cached_len=0,
+        output_len=8,
+        uid=uid,
+        sampling_params=SamplingParams(max_tokens=8),
+        cache_handle=None,
+    )
+    req.cached_len = cached_len
+    req.device_len = cached_len + 1
+    batch = Batch(reqs=[req], phase="decode")
+    batch.padded_reqs = batch.reqs
+    batch.input_ids = req.input_ids[-1:]
+    batch.rope_positions = rope
+    return batch, req
+
+
+def _decode_run(head, steps: int, *, start: int, eager: bool, rope_base: int | None = None):
+    """``steps`` fallback decode observations; ``eager`` flushes after each, as the head used
+    to commit."""
+    for step in range(steps):
+        rope = (
+            None
+            if rope_base is None
+            else torch.full((3, 1), rope_base + step, dtype=torch.int64)
+        )
+        batch, _ = _decode_batch(cached_len=start + step, rope=rope)
+        head.observe_forward(batch, _capture(1, base=100.0 * (step + 1)), torch.tensor(step + 2))
+        if eager:
+            head._flush_pairs()
 
 
 # ---------------------------------------------------------------------- the running context
@@ -228,6 +272,160 @@ def test_a_new_request_resets_the_context():
     head.observe_forward(second, _capture(3), torch.tensor(7))
     assert head.committed_len == 3  # not 8: the second request started from zero
     assert head._uid == 2
+
+
+# ------------------------------------------------------------- lazy decode observation
+
+
+def _hidden_sensitive_logits(hidden: torch.Tensor) -> torch.Tensor:
+    """A distribution the committed rows actually move, so equal proposals mean equal state."""
+    return torch.sin(hidden.sum() * 0.37 + torch.arange(VOCAB, dtype=torch.float32)) * 3.0
+
+
+def _primed(*, eager: bool, steps: int = 4) -> SpecDraftHead:
+    head = _head(logits_for=_hidden_sensitive_logits)
+    batch, _ = _prefill_batch(5)
+    head.observe_forward(batch, _capture(5), torch.tensor(7))
+    _decode_run(head, steps, start=5, eager=eager)
+    return head
+
+
+def test_buffered_decode_observations_land_the_state_committing_them_one_at_a_time_does():
+    """The whole point of deferring: K buffered pairs flushed as one K-row commit leave the
+    head exactly where K one-row commits left it -- same private KV, same sampled proposal."""
+    eager, lazy = _primed(eager=True), _primed(eager=False)
+
+    assert eager.committed_len == 9 and eager.staged_model.calls[1:] == [
+        (1, 5),
+        (1, 6),
+        (1, 7),
+        (1, 8),
+    ]
+    assert lazy.committed_len == 5 and lazy._buffered_rows == 4
+
+    before_flush = lazy.kv_cache._pending_ring.clone()
+    first = eager.propose(_req(cached_len=9, temperature=1.0), 3)
+    second = lazy.propose(_req(cached_len=9, temperature=1.0), 3)
+
+    assert lazy.staged_model.calls[1] == (4, 5)  # ONE four-row commit, not four one-row ones
+    assert not torch.equal(lazy.kv_cache._pending_ring, before_flush)
+    assert first.tokens == second.tokens
+    assert torch.equal(first.logits, second.logits)
+    assert eager.committed_len == lazy.committed_len == 9
+    assert lazy._buffered_rows == 0
+    assert torch.equal(eager._sample, lazy._sample)
+    assert torch.equal(eager._recursive, lazy._recursive)
+    assert torch.equal(eager._saved_blocks[0], lazy._saved_blocks[0])
+    assert torch.equal(eager.kv_cache._pending_ring, lazy.kv_cache._pending_ring)
+    assert torch.equal(
+        eager.kv_cache._pending_position_ring, lazy.kv_cache._pending_position_ring
+    )
+
+
+def test_a_buffer_mixing_roped_and_ropeless_rows_flushes_in_consecutive_runs():
+    """A vision boot mixes the two kinds inside one buffer: the decode observation that closes
+    a prompt's carried pair takes picture coordinates, the steps after it carry none.
+    ``rope=None`` and ``rope=<tensor>`` are each valid per commit and mean different things
+    downstream, so the flush splits at the seam instead of concatenating across it."""
+    ropes = [torch.full((3, 1), 5, dtype=torch.int64), None, None]
+    heads = {}
+    for eager in (True, False):
+        head = _head(logits_for=_hidden_sensitive_logits)
+        prompt, _ = _prefill_batch(5)
+        head.observe_forward(prompt, _capture(5), torch.tensor(7))
+        head.staged_model.calls.clear()
+        head.prepared.clear()
+        for step, rope in enumerate(ropes):
+            decode, _ = _decode_batch(cached_len=5 + step, rope=rope)
+            head.observe_forward(
+                decode, _capture(1, base=100.0 * (step + 1)), torch.tensor(step + 2)
+            )
+            if eager:
+                head._flush_pairs()
+        head._flush_pairs()
+        heads[eager] = head
+
+    eager, lazy = heads[True], heads[False]
+    assert eager.staged_model.calls == [(1, 5), (1, 6), (1, 7)]
+    # the seam costs ONE extra call; the two ropeless rows still share a commit
+    assert lazy.staged_model.calls == [(1, 5), (2, 6)]
+    assert torch.equal(lazy.prepared[0].rope_positions, ropes[0])
+    assert lazy.prepared[1].rope_positions is None  # never synthesized for the None rows
+
+    assert eager.committed_len == lazy.committed_len == 8
+    assert torch.equal(eager._sample, lazy._sample)
+    assert torch.equal(eager._recursive, lazy._recursive)
+    assert torch.equal(eager._saved_blocks[0], lazy._saved_blocks[0])
+    assert torch.equal(eager.kv_cache._pending_ring, lazy.kv_cache._pending_ring)
+
+    first = eager.propose(_req(cached_len=8, temperature=1.0), 3)
+    second = lazy.propose(_req(cached_len=8, temperature=1.0), 3)
+    assert first.tokens == second.tokens
+    assert torch.equal(first.logits, second.logits)
+
+
+def test_a_buffered_pair_counts_as_consumed_for_readiness():
+    head = _primed(eager=False, steps=3)
+    assert head.committed_len == 5
+    assert head.is_ready(_req(cached_len=8)) is True
+    assert head.is_ready(_req(cached_len=5)) is False  # the buffer is context, not a gap
+    assert head.is_ready(_req(cached_len=9)) is False
+    assert head.is_ready(_req(uid=2, cached_len=8)) is False
+
+
+def test_readiness_does_not_wait_for_a_flush_to_write_the_sample():
+    """``_sample`` is written only by a flush, and ``is_ready`` runs every scheduler iteration
+    and must not flush; a head holding only buffered pairs is nonetheless primed."""
+    head = _head()
+    _decode_run(head, 1, start=0, eager=False)
+    assert head._sample is None
+    assert head.is_ready(_req(cached_len=1)) is True
+    head._flush_pairs()
+    assert head._sample is not None
+    assert head.is_ready(_req(cached_len=1)) is True
+
+
+def test_buffered_mrope_segments_flush_to_the_positions_the_eager_commits_saw():
+    """The picture coordinates are the target's own rows, not derived from ``committed_len``,
+    so concatenating buffered segments must reproduce them column for column."""
+    prepared = {}
+    for eager in (True, False):
+        head = _head()
+        rope = torch.arange(5, dtype=torch.int64).expand(3, -1).contiguous()
+        batch, _ = _prefill_batch(5, rope=rope)
+        head.observe_forward(batch, _capture(5), torch.tensor(7))
+        head.prepared.clear()
+        _decode_run(head, 4, start=5, eager=eager, rope_base=5)
+        head._flush_pairs()
+        prepared[eager] = torch.cat([b.rope_positions for b in head.prepared], dim=1)
+
+    assert torch.equal(prepared[True], prepared[False])
+    assert torch.equal(prepared[True], torch.arange(5, 9, dtype=torch.int64).expand(3, -1))
+
+
+def test_a_reset_drops_the_buffer():
+    head = _primed(eager=False, steps=3)
+    assert head._buffered_rows == 3
+    head.reset_request(2)
+    assert head._buffered_rows == 0
+    assert head.committed_len == 0
+
+
+def test_a_prefill_observation_commits_the_buffer_before_its_own_rows():
+    head = _primed(eager=False, steps=2)
+    head.staged_model.calls.clear()
+    batch, _ = _prefill_batch(3, uid=1)
+    head.observe_forward(batch, _capture(3), torch.tensor(7))
+    assert head.staged_model.calls == [(2, 5), (3, 7)]
+
+
+def test_a_cycle_commit_pays_for_the_buffer_first():
+    """``commit`` reads its rope base off ``committed_len``, which buffered pairs have not
+    advanced."""
+    head = _primed(eager=False, steps=2)
+    head.staged_model.calls.clear()
+    head.commit(_req(cached_len=7), hidden=torch.zeros(2, WIDTH), token_ids=(11, 12))
+    assert head.staged_model.calls == [(2, 5), (2, 7)]
 
 
 # ---------------------------------------------------------------------------- the spec feed

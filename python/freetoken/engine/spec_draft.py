@@ -31,6 +31,12 @@ physical slot, no allocator), one ``QSAKVCache`` whose pending ring is widened t
 still-needed members -- silently wrong keys), one ``QSASparseAttnBackend``, and the scalars
 ``committed_len`` / ``pending_hidden``. No recurrent state, no PLE, no leases, no free list.
 
+Fallback-decode pairs are BUFFERED rather than committed. Committing one is a whole eager
+one-row draft forward, and an adaptive cooldown spends long stretches in which no proposal
+ever reads its result; the buffer is drained in a single multi-row commit when the head is
+next needed. ``committed_len`` plus the buffered rows is therefore what tracks the target's
+``cached_len``, and it is what ``is_ready`` compares.
+
 A PROPOSAL IS SPECULATIVE IN THE DRAFT'S OWN KV TOO
 --------------------------------------------------
 Drafting ``k`` tokens writes ``k - 1`` recursive rows into that KV. They are undone by
@@ -229,6 +235,7 @@ class SpecDraftHead:
         self._sample: torch.Tensor | None = None
         self._recursive: torch.Tensor | None = None
         self._saved_blocks: dict[int, torch.Tensor] | None = None
+        self._buffered: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = []
         self._sampler = None
 
     # ------------------------------------------------------------------------ construction
@@ -420,6 +427,7 @@ class SpecDraftHead:
         self._sample = None
         self._recursive = None
         self._saved_blocks = None
+        self._buffered = []
         self.kv_cache._kv_buffer.zero_()
         self.kv_cache._cmp_k_buffer.zero_()
         self.kv_cache._pending_ring.zero_()
@@ -433,12 +441,18 @@ class SpecDraftHead:
 
         A request admitted before speculation was enabled, or one still mid-chunked-prefill,
         is not ready and the loop falls back to a plain one-row decode for that step.
+
+        Buffered decode pairs count as consumed -- ``propose`` flushes before it reads
+        ``_sample``, so a buffered row is already this head's context. The scheduler calls this
+        every iteration, so it must not itself flush. ``_sample`` is written only by a flush,
+        hence the second arm: a head whose every pair is still buffered has no ``_sample`` yet
+        and would have one the moment a proposal asked for it.
         """
         return (
             self._uid == req.uid
-            and self._sample is not None
+            and (self._sample is not None or bool(self._buffered))
             and self._pending_hidden is None
-            and self.committed_len == req.cached_len
+            and self.committed_len + self._buffered_rows == req.cached_len
         )
 
     # ---------------------------------------------------------------- the engine capture seam
@@ -478,6 +492,15 @@ class SpecDraftHead:
         )
         if paired_hidden.shape[0] == 0:
             return
+        if batch.is_decode:
+            # A plain decode step's pair is BUFFERED, not committed. Committing it costs a
+            # whole eager draft forward per fallback token, and during an adaptive cooldown
+            # nothing reads the result before the buffer is flushed anyway.
+            self._buffered.append((paired_hidden, paired_embeds, paired_rope))
+            return
+        # prefill stays eager -- it is once per prompt, not per token -- and the flush comes
+        # first because any buffered pair sits at an EARLIER position than this batch's rows
+        self._flush_pairs()
         self._commit_pairs(paired_hidden, paired_embeds, paired_rope)
 
     def commit(self, req: "Req", *, hidden: torch.Tensor, token_ids: Sequence[int]) -> None:
@@ -489,6 +512,9 @@ class SpecDraftHead:
         token is NOT the draft token staged at that row, so the embeddings are looked up from
         the emitted ids rather than reused from the forward's own inputs.
         """
+        # the rope base below is read off ``committed_len``, which buffered pairs have not
+        # advanced yet (in the served order ``propose`` already emptied the buffer)
+        self._flush_pairs()
         n = len(token_ids)
         if hidden.shape[0] < n:
             # ``hidden`` is the whole step's ``w`` rows; the accepted prefix is sliced here,
@@ -511,6 +537,48 @@ class SpecDraftHead:
             )
         self._commit_pairs(hidden[:n], embeds, rope)
 
+    @property
+    def _buffered_rows(self) -> int:
+        return sum(int(hidden.shape[0]) for hidden, _, _ in self._buffered)
+
+    def _flush_pairs(self) -> None:
+        """Commit the buffered pairs, one call per CONSECUTIVE RUN of like-roped rows.
+
+        Batching them is identical in effect to committing them one at a time. The rows occupy
+        the same sequential positions either way, so their K/V, their closing groups'
+        compressed keys and the pending ring's final state all match: within one call a group's
+        earlier members are read from this call's raw rows rather than from the ring row they
+        would have been stored in first, and the ring's keep-mask drops exactly the rows a
+        row-at-a-time run would have overwritten. ``_commit_pairs`` already takes
+        ``_sample``/``_recursive``/``_saved_blocks`` from the LAST row, which is the only row
+        whose outputs survive a row-at-a-time run.
+
+        A buffer can MIX kinds: on a vision boot the decode observation that closes a prompt's
+        carried pair takes the prefill's picture coordinates, while the decode steps after it
+        carry none. ``rope=None`` and ``rope=<tensor>`` are each valid per call and mean
+        different things downstream, so they cannot be concatenated -- and no rope may be
+        synthesized for the None rows, because eager committed exactly None there. Splitting at
+        the seam costs one extra call and preserves order, which is what keeps the positions
+        sequential.
+        """
+        buffered = self._buffered
+        if not buffered:
+            return
+        self._buffered = []
+        runs: list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]] = []
+        for entry in buffered:
+            if not runs or (entry[2] is None) is not (runs[-1][0][2] is None):
+                runs.append([])
+            runs[-1].append(entry)
+        for run in runs:
+            self._commit_pairs(
+                torch.cat([hidden for hidden, _, _ in run]),
+                torch.cat([embeds for _, embeds, _ in run]),
+                None
+                if run[0][2] is None
+                else torch.cat([segment for _, _, segment in run], dim=1),
+            )
+
     def _commit_pairs(self, hidden, embeds, rope) -> None:
         capture: dict[int, torch.Tensor] = {}
         self._sample, self._recursive = self._run_rows(
@@ -531,6 +599,9 @@ class SpecDraftHead:
         """
         from freetoken.engine.spec_sample import request_filter_params
 
+        # the head is needed now, so the deferred decode-step observations are paid for here,
+        # in one batched commit, ahead of every read of ``_sample``/``_recursive``
+        self._flush_pairs()
         if self._sample is None or self._sampler is None:
             raise RuntimeError("the draft head has no primed context for this request")
         if not 1 <= depth <= self.depth:
@@ -546,20 +617,22 @@ class SpecDraftHead:
         position_ring = self.kv_cache._pending_position_ring.clone()
         mrope = getattr(req, "mrope_position_ids", None) is not None
         delta = int(getattr(req, "mrope_position_delta", 0))
-        tokens: list[int] = []
+        # the drafted ids stay on device for the whole chain: a per-step ``int()`` would
+        # sync the stream once per token, and only the returned tuple needs host ints
+        drafted: list[torch.Tensor] = []
         rows: list[torch.Tensor] = []
         try:
             for index in range(depth):
                 logits = self.target_model.lm_head.forward_all(sample)[0]
-                token = self._sampler.sample(
+                token = self._sampler.sample_device(
                     logits, temperature=temperature, top_k=top_k, top_p=top_p
                 )
                 rows.append(logits.detach().clone())
-                tokens.append(int(token))
+                drafted.append(token)
                 if index + 1 == depth:
                     break
                 embedding = self.target_model.model.embed_tokens.forward(
-                    torch.tensor([token], dtype=torch.int32, device=self.device)
+                    token.reshape(1).to(torch.int32)
                 )
                 self.committed_len = base_len + index
                 rope = (
@@ -579,7 +652,9 @@ class SpecDraftHead:
             self.kv_cache._pending_ring.copy_(ring)
             self.kv_cache._pending_position_ring.copy_(position_ring)
             self.committed_len = base_len
-        return DraftProposal(tokens=tuple(tokens), logits=torch.stack(rows))
+        # one readback for the whole chain
+        tokens = torch.cat([token.reshape(1) for token in drafted]).tolist()
+        return DraftProposal(tokens=tuple(int(t) for t in tokens), logits=torch.stack(rows))
 
     def close(self) -> None:
         runner = getattr(self, "expert_runner", None)
