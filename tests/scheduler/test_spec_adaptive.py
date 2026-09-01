@@ -27,7 +27,8 @@ CPU = torch.device("cpu")
 
 
 def _stub(
-    *, depth=3, min_emitted=2.0, probe_resume=2.0, cooldown=4, ema_alpha=0.5, ready=True
+    *, depth=3, min_emitted=2.0, probe_resume=2.0, cooldown=4, ema_alpha=0.5, ready=True,
+    cost_aware=True,
 ):
     stub = Scheduler.__new__(Scheduler)
     stub.config = SimpleNamespace(
@@ -38,6 +39,7 @@ def _stub(
             probe_resume=probe_resume,
             cooldown=cooldown,
             ema_alpha=ema_alpha,
+            cost_aware=cost_aware,
         )
     )
     stub.engine = SimpleNamespace(spec_draft=SimpleNamespace(is_ready=lambda req: ready))
@@ -318,6 +320,164 @@ def test_the_same_script_does_fall_back_at_the_default_threshold():
     assert decisions.count(False) > 0
 
 
+# ------------------------------------------------------------------- the cost-aware bar
+#
+# The static bar cannot be right at both ends of a long request. Measured on the live box: a
+# speculative cycle costs ~28-45 ms at short context and ~70-100+ ms at 8-11k (verify AND draft
+# both scale with the KV they read) while a plain step only goes ~15 -> ~20 ms, so the true
+# breakeven roughly DOUBLES over one request. A bar pinned at the short-context number spends
+# where cycles are dear: +11-13% at short context but -11..-24% at 8k on depth 5, ~-10% at 11k
+# on depth 3. So the policy divides its own measured cycle by its own measured plain step.
+#
+# The seam is deliberately a value, not a clock: ``record_plain_ms`` / ``record_cycle_ms`` take
+# the duration the caller measured, so nothing here monkeypatches time. That the loop feeds
+# them the RIGHT durations, at points that add no device sync, is test_spec_decode_loop.py's.
+
+
+def _warm(policy, *, plain_ms, cycle_ms, samples=3):
+    """The minimum evidence the measured bar is allowed to act on, of each kind. A constant
+    sample makes both EMAs equal that constant whatever alpha is."""
+    for _ in range(samples):
+        policy.record_plain_ms(plain_ms)
+        policy.record_cycle_ms(cycle_ms)
+    return policy
+
+
+def test_the_bar_is_what_a_cycle_costs_in_plain_steps():
+    stub = _stub(min_emitted=2.0, depth=3)
+    policy = _warm(stub._spec_policy(_req(stub)), plain_ms=20.0, cycle_ms=70.0)
+    assert policy.bar == pytest.approx(3.5)
+
+
+def test_the_bar_is_the_static_floor_until_both_clocks_are_warm():
+    """Two samples of each is not evidence; three is the bar this ships with."""
+    stub = _stub(min_emitted=2.0)
+    policy = _warm(stub._spec_policy(_req(stub)), plain_ms=20.0, cycle_ms=70.0, samples=2)
+    assert policy.bar == pytest.approx(2.0)
+    policy.record_plain_ms(20.0)
+    policy.record_cycle_ms(70.0)
+    assert policy.bar == pytest.approx(3.5)
+
+
+def test_a_request_that_never_decoded_plainly_keeps_the_static_bar():
+    """Speculating from the very first step leaves nothing to divide by."""
+    stub = _stub(min_emitted=2.0)
+    policy = stub._spec_policy(_req(stub))
+    for _ in range(8):
+        policy.record_cycle_ms(90.0)
+    assert policy.plain_samples == 0
+    assert policy.bar == pytest.approx(2.0)
+
+
+def test_a_zero_plain_time_never_divides():
+    """A coarse clock can hand back two identical timestamps; the bar is not infinity."""
+    stub = _stub(min_emitted=2.0)
+    policy = _warm(stub._spec_policy(_req(stub)), plain_ms=0.0, cycle_ms=70.0)
+    assert policy.bar == pytest.approx(2.0)
+
+
+def test_a_cheap_cycle_leaves_the_bar_on_the_static_floor():
+    """The measured ratio times wall clock only; ``min_emitted`` also carries what a cycle
+    costs the rest of the batch, so it stays the floor."""
+    stub = _stub(min_emitted=2.0)
+    policy = _warm(stub._spec_policy(_req(stub)), plain_ms=20.0, cycle_ms=30.0)
+    assert policy.bar == pytest.approx(2.0)
+
+
+def test_a_dear_cycle_cannot_raise_the_bar_past_what_a_cycle_could_emit():
+    """Above ``1 + depth`` no cycle could ever clear it -- that is "off", not "cost aware"."""
+    stub = _stub(min_emitted=2.0, depth=3)
+    policy = _warm(stub._spec_policy(_req(stub)), plain_ms=20.0, cycle_ms=200.0)
+    assert policy.bar == pytest.approx(4.0)
+
+
+def test_the_wall_time_emas_track_at_the_emission_alpha():
+    """Content and context shift together, so both sides move at the same rate."""
+    stub = _stub(ema_alpha=0.5)
+    policy = stub._spec_policy(_req(stub))
+    policy.record_plain_ms(20.0)
+    policy.record_plain_ms(40.0)
+    policy.record_cycle_ms(60.0)
+    policy.record_cycle_ms(100.0)
+    assert (policy.plain_ms, policy.cycle_ms) == (pytest.approx(30.0), pytest.approx(80.0))
+
+
+def test_a_dear_cycle_gates_off_an_ema_that_clears_the_static_bar():
+    """The regression this exists for: at 8k the same emitted-EMA that paid at short context
+    is a loss, and the static bar keeps spending on it."""
+    stub = _stub(min_emitted=2.0, ema_alpha=0.5, depth=3)
+    req = _req(stub)
+    _warm(stub._spec_policy(req), plain_ms=20.0, cycle_ms=80.0)  # a cycle costs 4 plain steps
+    assert stub._spec_policy(req).bar == pytest.approx(4.0)
+
+    stub._spec_record(req, 3)  # 4.0 -> 3.5: twice the static bar, under the measured one
+
+    assert stub._spec_candidate() is None
+
+
+def test_the_same_ema_keeps_speculating_while_the_cycle_stays_cheap():
+    """The paired half: identical emissions, cheap cycles, and the request stays hot."""
+    stub = _stub(min_emitted=2.0, ema_alpha=0.5, depth=3)
+    req = _req(stub)
+    _warm(stub._spec_policy(req), plain_ms=20.0, cycle_ms=30.0)
+
+    stub._spec_record(req, 3)
+
+    assert stub._spec_candidate() is req
+
+
+def test_plain_steps_during_a_cooldown_keep_moving_the_bar():
+    """A cold request still decodes -- and its context still grows. The bar has to keep
+    tracking that, or the probe at the end of the cooldown is judged by a stale price."""
+    stub = _stub(min_emitted=2.0, ema_alpha=0.5, cooldown=4)
+    req = _req(stub)
+    policy = _warm(stub._spec_policy(req), plain_ms=40.0, cycle_ms=80.0)
+    assert policy.bar == pytest.approx(2.0)
+    stub._spec_record(req, 1)
+    stub._spec_record(req, 1)  # cold
+
+    for _ in range(2):  # the loop decodes plainly and reports each step it settles
+        assert stub._spec_candidate() is None
+        policy.record_plain_ms(20.0)
+
+    assert policy.plain_ms == pytest.approx(25.0)
+    assert policy.bar == pytest.approx(3.2)
+
+
+# ------------------------------------------------------------ the cost-aware off switch
+
+
+def test_cost_aware_off_ignores_the_clocks_entirely():
+    stub = _stub(min_emitted=2.0, cost_aware=False)
+    policy = _warm(stub._spec_policy(_req(stub)), plain_ms=20.0, cycle_ms=200.0)
+    assert policy.bar == pytest.approx(2.0)
+
+
+def test_cost_aware_off_reproduces_the_static_policy_step_for_step():
+    """The A/B's control arm: fed the dearest cycles there are, the flat bar decides exactly
+    what a policy that was never told any of it decides."""
+    dear = _stub(min_emitted=2.0, ema_alpha=0.3, cooldown=4, cost_aware=False)
+    dear_req = _req(dear)
+    _warm(dear._spec_policy(dear_req), plain_ms=20.0, cycle_ms=200.0)
+    blind = _stub(min_emitted=2.0, ema_alpha=0.3, cooldown=4, cost_aware=False)
+
+    assert _dispatches(dear, dear_req, _SCRIPT) == _dispatches(blind, _req(blind), _SCRIPT)
+
+
+def test_the_same_script_under_the_measured_bar_does_fall_back_further():
+    """And the paired half again: cost-aware ON, the same dear cycles, and the policy spends
+    strictly less of the script speculating."""
+    dear = _stub(min_emitted=2.0, ema_alpha=0.3, cooldown=4)
+    dear_req = _req(dear)
+    _warm(dear._spec_policy(dear_req), plain_ms=20.0, cycle_ms=200.0)
+    flat = _stub(min_emitted=2.0, ema_alpha=0.3, cooldown=4, cost_aware=False)
+
+    measured = _dispatches(dear, dear_req, _SCRIPT)
+    static = _dispatches(flat, _req(flat), _SCRIPT)
+
+    assert measured.count(False) > static.count(False)
+
+
 # ------------------------------------------------------------------------ stats visibility
 
 
@@ -335,6 +495,24 @@ def test_the_timing_probe_reports_the_ema_and_the_step_counts(caplog):
     message = record.getMessage()
     assert "ema 3.00" in message
     assert "spec/plain 32/0" in message
+
+
+def test_the_timing_probe_reports_the_measured_bar_and_both_clocks(caplog):
+    """A bar that has climbed away from ``min_emitted`` is the report saying "this request's
+    cycles got dear", which is a different diagnosis from "this draft got worse"."""
+    stub = _stub(cooldown=2, ema_alpha=0.5, min_emitted=2.0)
+    req = _req(stub)
+    policy = _warm(stub._spec_policy(req), plain_ms=20.0, cycle_ms=60.0)
+    probe = _SpecTimingProbe(CPU)
+    with caplog.at_level(logging.INFO):
+        for _ in range(32):
+            probe.start_cycle()
+            stub._spec_record(req, 3)
+            probe.finish_cycle(emitted=3, accepted=2, policy=policy)
+    (record,) = [r for r in caplog.records if "spec timing" in r.getMessage()]
+    message = record.getMessage()
+    assert "bar 3.00" in message
+    assert "cycle 60.0ms / plain 20.0ms" in message
 
 
 def test_the_probe_survives_a_disabled_fallback(caplog):

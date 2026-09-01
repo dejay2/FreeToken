@@ -345,6 +345,8 @@ class Scheduler(SchedulerIOMixin):
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
+        # The step is host-settled exactly here, on a sync this path already owned.
+        self._spec_record_plain(batch)
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -1214,6 +1216,50 @@ class Scheduler(SchedulerIOMixin):
         if policy is not None:
             policy.record(emitted)
 
+    def _spec_live_policy(self, uid: int) -> "_SpecAcceptance | None":
+        """This uid's policy IF it already has one -- never constructing, never pruning.
+
+        The timing hooks run at points where the request may already have finished (the drain
+        frees it; the cycle's tail can too), and ``_spec_policy`` would both resurrect a state
+        for a dead uid and evict live ones against a ``running_reqs`` that no longer holds it.
+        """
+        if not self.config.spec_decode.cost_aware:
+            return None
+        states = getattr(self, "_spec_policies", None)
+        return None if not states else states.get(uid)
+
+    def _spec_record_plain(self, batch: Batch) -> None:
+        """Time one PLAIN decode step for the cost-aware bar, at the drain that settles it.
+
+        Under overlap a decode step spans a whole loop iteration -- batch N is launched in the
+        iteration that drains batch N-1 -- so the step's wall time is the INTERVAL between
+        consecutive drains, not the duration of one. Hence a mark rather than a span, dropped
+        (``_spec_drop_plain_mark``) whenever anything that is not a plain decode step lands
+        between two drains: a prefill, a wider batch, or a speculative cycle. An interval that
+        straddled one of those would price a plain step at something no plain step costs.
+
+        Sync-free by placement: ``_process_last_data`` has already run ``copy_done``'s wait by
+        the time this is called, so the timestamp is taken on a host that is by construction
+        caught up with the batch it is timing -- two ``perf_counter`` calls per step and not
+        one byte of device work added.
+        """
+        spec = self.config.spec_decode
+        if not (spec.enabled and spec.adaptive and spec.cost_aware):
+            return
+        now = time.perf_counter()
+        mark = getattr(self, "_plain_step_mark", None)
+        self._plain_step_mark = now
+        if not (batch.is_decode and len(batch.reqs) == 1):
+            self._plain_step_mark = None
+            return
+        policy = self._spec_live_policy(batch.reqs[0].uid)
+        if policy is not None and mark is not None:
+            policy.record_plain_ms(1e3 * (now - mark))
+
+    def _spec_drop_plain_mark(self) -> None:
+        """Forget the last drain's timestamp: the next interval would not be a plain step."""
+        self._plain_step_mark = None
+
     def _spec_dispatch_ready(self) -> bool:
         """Whether this iteration should try a speculative step instead of a plain decode.
 
@@ -1278,6 +1324,11 @@ class Scheduler(SchedulerIOMixin):
         radix guard refuses a commit under in-flight speculative rows.
         """
         engine = self.engine
+        # One pair of perf_counter calls around the whole cycle, and no sync of its own: the
+        # cycle is host-synced start to end by construction (above), so the closing timestamp
+        # already describes finished device work. The probe's per-stage marks DO sync, which
+        # is why this span is taken here rather than read back off the probe.
+        started = time.perf_counter()
         probe = self._spec_timing_probe()
         conf_log = self._spec_conf_log()
         # read before the cycle settles it: what a confidence cut has to be judged against is
@@ -1355,6 +1406,13 @@ class Scheduler(SchedulerIOMixin):
             finished_now.add(req)
         self.finished_reqs = finished_now
         self._ship_replies(batch, [msg], generated_tokens=emitted)
+        # After the ship, so the span is the whole of what a cycle displaces from the loop --
+        # the same thing the plain-step interval measures. The next cycle's `record` is what
+        # reads it; a cycle cannot be judged against its own not-yet-known cost.
+        self._spec_drop_plain_mark()
+        policy = self._spec_live_policy(req.uid)
+        if policy is not None:
+            policy.record_cycle_ms(1e3 * (time.perf_counter() - started))
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Gather only the picture feature rows used by this prefill step.
@@ -1530,10 +1588,24 @@ class _SpecAcceptance:
     time -- with doubling backoff behind it, that is how a request that should speculate
     throughout ended up decoding 16, then 32, then 64 steps plainly. Hence ``probe_resume``
     (a sample's bar, not a mean's) and a pair of consecutive probes before any re-cool.
+
+    AND THE BAR ITSELF IS MEASURED, not fixed (``cost_aware``). "A cycle costs about
+    ``min_emitted`` plain steps" is true only at the context it was tuned at: live, a cycle
+    costs ~28-45 ms at short context and ~70-100 ms at 8-11k -- verify and draft both scale
+    with the KV it reads -- while a plain step only goes ~15 -> ~20 ms. The breakeven
+    therefore roughly DOUBLES over one long request, and a bar fixed at the short-context
+    number keeps spending at the long end where cycles are dear (measured -11..-24% at 8k on
+    depth 5). So the policy times both sides of that ratio on the request itself and holds
+    the EMA to ``cycle_ms / plain_ms``: exactly the number of plain steps this cycle is
+    costing, right now, at this context. ``min_emitted`` becomes its FLOOR and ``1 + depth``
+    -- what a cycle could at most emit -- its ceiling.
     """
 
     #: consecutive failing probes before the request cools down again
     PROBE_CYCLES = 2
+
+    #: wall-time samples of EACH kind before the measured bar is trusted over the static one
+    MIN_TIMING_SAMPLES = 3
 
     def __init__(self, spec) -> None:  # SpecDecodeConfig
         self.ema = spec.ema_seed
@@ -1547,6 +1619,35 @@ class _SpecAcceptance:
         self.probes_left = 0      # probe cycles still owed before a re-cool
         self.cycles = 0
         self.plain_steps = 0
+        self.cost_aware = spec.cost_aware
+        # The ceiling: no cycle can emit more than its own width, so a bar above it would mean
+        # "never speculate" rather than "speculate only when it pays".
+        self.max_bar = float(spec.batch_width)
+        # Same alpha as the emission EMA on purpose: content and context shift TOGETHER
+        # mid-request, so a bar that tracked slower than the emission it judges would be
+        # comparing this paragraph's acceptance against the last one's cost.
+        self.plain_ms = 0.0
+        self.cycle_ms = 0.0
+        self.plain_samples = 0
+        self.cycle_samples = 0
+
+    @property
+    def bar(self) -> float:
+        """The emitted-per-cycle this request must clear for a cycle to pay for itself.
+
+        Falls back to the static ``min_emitted`` until BOTH sides of the ratio have real
+        samples -- a request that speculated from its very first step has no plain step to
+        divide by, and one whose first cycles are still warming caches would divide by a
+        number it will never see again. The static value is the floor even when the measured
+        ratio comes in under it: the ratio times only wall clock, while ``min_emitted``
+        carries what a cycle costs the REST of the batch too.
+        """
+        if not self.cost_aware:
+            return self.min_emitted
+        warm = min(self.plain_samples, self.cycle_samples) >= self.MIN_TIMING_SAMPLES
+        if not warm or self.plain_ms <= 0.0:
+            return self.min_emitted
+        return max(self.min_emitted, min(self.cycle_ms / self.plain_ms, self.max_bar))
 
     def should_speculate(self) -> bool:
         if self.remaining > 0:
@@ -1568,8 +1669,27 @@ class _SpecAcceptance:
             # else: the next iteration is the second probe, with no cooldown between them
             return
         self.ema += self.alpha * (emitted - self.ema)
-        if self.ema < self.min_emitted:
+        # The mean's bar is read HERE and only here, so a bar that moved while the request was
+        # cooling down (plain steps keep arriving, and their cost keeps growing with context)
+        # is applied to the next cycle the request actually spends -- never retroactively to
+        # a probe, which answers to ``probe_resume`` as a single sample always has.
+        if self.ema < self.bar:
             self._cool_down()
+
+    def record_plain_ms(self, ms: float) -> None:
+        """One plain decode step's wall time. Fed during cooldowns too -- that is how the bar
+        keeps tracking a growing context while speculation is switched off."""
+        self.plain_ms = ms if not self.plain_samples else self.plain_ms + self.alpha * (
+            ms - self.plain_ms
+        )
+        self.plain_samples += 1
+
+    def record_cycle_ms(self, ms: float) -> None:
+        """One speculative cycle's wall time, draft through ship."""
+        self.cycle_ms = ms if not self.cycle_samples else self.cycle_ms + self.alpha * (
+            ms - self.cycle_ms
+        )
+        self.cycle_samples += 1
 
     def _cool_down(self) -> None:
         self.remaining = self.next_cooldown
@@ -1649,11 +1769,18 @@ class _SpecTimingProbe:
             # host-side staging, and only "replay.gpu" is the graph's own device duration.
             replay = {k: f"{v / self.cycles:.1f}" for k, v in self.extra.items()}
             # The EMA and the spec/plain split are what a live tuning pass of
-            # FREETOKEN_MTP_SPEC_MIN_EMITTED / _COOLDOWN reads.
+            # FREETOKEN_MTP_SPEC_MIN_EMITTED / _COOLDOWN reads. The bar and the two wall-time
+            # EMAs beside it are what says WHY the fallback fired: a bar that has climbed away
+            # from min_emitted is a request whose cycles got dear as its context grew, not a
+            # draft that got worse.
             adaptive = (
                 "off"
                 if policy is None
-                else f"{policy.ema:.2f} | spec/plain {policy.cycles}/{policy.plain_steps}"
+                else (
+                    f"{policy.ema:.2f} | bar {policy.bar:.2f} "
+                    f"(cycle {policy.cycle_ms:.1f}ms / plain {policy.plain_ms:.1f}ms) "
+                    f"| spec/plain {policy.cycles}/{policy.plain_steps}"
+                )
             )
             logger.info(
                 "spec timing over %d cycles: ms/cycle %s | accept %s | replay %s | "

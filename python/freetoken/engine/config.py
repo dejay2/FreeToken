@@ -62,7 +62,19 @@ class SpecDecodeConfig:
     conf_cut: float = 0.8
     # --- the adaptive fallback (see ``adaptive``) ---
     ema_alpha: float = 0.3
+    # With ``cost_aware`` on (the default) this is the FLOOR of a bar the request MEASURES,
+    # not the bar itself: the policy divides its own speculative cycle's wall time by its own
+    # plain decode step's and holds the emitted-EMA to that ratio, never dropping below this
+    # value nor rising above the ``1 + depth`` a cycle could emit. With ``cost_aware`` off it
+    # is the bar, flat, exactly as it was before the ratio existed.
     min_emitted: float = 3.2
+    # Whether the bar tracks measured wall time (see ``_SpecAcceptance.bar``). A static bar
+    # cannot be right at both ends of a context: measured live, a spec cycle costs ~28-45 ms
+    # at short context and ~70-100 ms at 8-11k while a plain step goes ~15 -> ~20 ms, so the
+    # true breakeven roughly DOUBLES over a long request. A bar fixed at the short-context
+    # breakeven overspends at the long end -- measured -11..-24% at 8k on depth 5, ~-10% at
+    # 11k on depth 3, against +11-13% at short context.
+    cost_aware: bool = True
     # A probe is ONE integer sample from the distribution ``min_emitted`` bounds the mean of,
     # so it is judged against its own -- lower -- bar. Holding a single sample to the mean's
     # threshold rejects roughly half of content that is comfortably worth speculating on.
@@ -133,7 +145,7 @@ def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfi
     """Read ``FREETOKEN_MTP_SPECULATE`` / ``FREETOKEN_MTP_SPEC_DEPTH`` / ``..._SPEC_GRAPH``,
     the drafting cut's ``..._SPEC_CONF_CUT``, plus the adaptive fallback's
     ``..._SPEC_EMA_ALPHA`` / ``..._SPEC_MIN_EMITTED`` / ``..._SPEC_PROBE_RESUME`` /
-    ``..._SPEC_COOLDOWN``."""
+    ``..._SPEC_COOLDOWN`` / ``..._SPEC_COST_AWARE``."""
     env = os.environ if env is None else env
     raw = env.get("FREETOKEN_MTP_SPECULATE", "0").strip()
     if raw not in ("0", "1"):
@@ -209,6 +221,12 @@ def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfi
         raise ValueError(
             f"FREETOKEN_MTP_SPEC_COOLDOWN must be >= 1, got {cooldown_raw!r}"
         )
+    # On by default: the static bar is measurably wrong at one end of a long request whichever
+    # end it was tuned for. "0" restores the flat bar byte for byte -- the policy then never
+    # reads a clock at all -- which is what a like-for-like A/B of the two is run with.
+    cost_raw = env.get("FREETOKEN_MTP_SPEC_COST_AWARE", "1").strip()
+    if cost_raw not in ("0", "1"):
+        raise ValueError("FREETOKEN_MTP_SPEC_COST_AWARE must be 0 or 1")
     return SpecDecodeConfig(
         enabled=enabled,
         depth=depth,
@@ -218,6 +236,7 @@ def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfi
         min_emitted=min_emitted,
         probe_resume=probe_resume,
         cooldown=cooldown,
+        cost_aware=cost_raw == "1",
     )
 
 

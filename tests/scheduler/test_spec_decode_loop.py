@@ -767,6 +767,153 @@ def test_a_perfect_draft_never_falls_back():
     assert all(dispatches)
 
 
+# --------------------------------------------------------- the cost-aware bar's two clocks
+#
+# The policy's arithmetic is tests/scheduler/test_spec_adaptive.py's. What is owed HERE is that
+# the loop feeds it the two wall times it divides -- a real cycle's, and a real plain decode
+# step's -- from points that add no device sync of their own, and that an interval which
+# straddled something other than a plain step is thrown away rather than priced.
+
+
+class _Clock:
+    """A ``perf_counter`` that advances a fixed amount per READING, so any span the code under
+    test measures with one pair of calls is exactly ``step_ms`` -- and a span that took an
+    extra reading is visibly not."""
+
+    def __init__(self, step_ms: float) -> None:
+        self.step_ms = step_ms
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        reading, self.now = self.now, self.now + self.step_ms / 1e3
+        return reading
+
+
+def _fake_clock(monkeypatch, step_ms: float) -> _Clock:
+    """Rebind the scheduler module's own ``time``, not the stdlib's: nothing else in the
+    process is timing anything with this."""
+    from freetoken.scheduler import scheduler as sched_mod
+
+    clock = _Clock(step_ms)
+    monkeypatch.setattr(sched_mod, "time", SimpleNamespace(perf_counter=clock))
+    return clock
+
+
+def _timed_stub(monkeypatch, *, step_ms=30.0, cost_aware=True, min_emitted=2.0):
+    target = _FakeTarget()
+    stub = _scheduler(target, _FakeDraft(target))
+    stub.config.spec_decode = SpecDecodeConfig(
+        enabled=True, depth=3, min_emitted=min_emitted, cost_aware=cost_aware
+    )
+    # pin the two diagnosis flags off, so the cycle's readings are the timing hook's alone
+    stub._spec_probe = None
+    stub._spec_conf = None
+    _fake_clock(monkeypatch, step_ms)
+    req = _decode_req(stub, prompt_len=8, output_len=40)
+    return stub, req, stub._spec_policy(req)
+
+
+def test_a_cycle_reports_its_whole_wall_time_to_the_policy(monkeypatch):
+    stub, req, policy = _timed_stub(monkeypatch, step_ms=30.0)
+
+    stub._speculative_decode_step(req)
+
+    assert policy.cycle_samples == 1
+    assert policy.cycle_ms == pytest.approx(30.0)
+
+
+def test_a_plain_decode_step_is_priced_as_the_interval_between_drains(monkeypatch):
+    """Under overlap a decode step spans a whole loop iteration -- batch N is launched in the
+    iteration that drains batch N-1 -- so the step's cost is the gap between drains, and the
+    first drain can only mark."""
+    stub, req, policy = _timed_stub(monkeypatch, step_ms=18.0)
+    batch = Batch(reqs=[req], phase="decode")
+
+    stub._spec_record_plain(batch)
+    assert policy.plain_samples == 0
+
+    stub._spec_record_plain(batch)
+    assert policy.plain_samples == 1
+    assert policy.plain_ms == pytest.approx(18.0)
+
+
+def test_a_speculative_cycle_between_two_drains_voids_the_interval(monkeypatch):
+    """Otherwise the plain step the bar divides by would be priced at a plain step PLUS a
+    cycle -- which would drive the measured bar toward 1 exactly when cycles got dear."""
+    stub, req, policy = _timed_stub(monkeypatch, step_ms=18.0)
+    batch = Batch(reqs=[req], phase="decode")
+
+    stub._spec_record_plain(batch)
+    stub._speculative_decode_step(req)
+    stub._spec_record_plain(batch)
+
+    assert policy.plain_samples == 0
+    # ... and the drain after the cycle marks again, so the next interval is priced
+    stub._spec_record_plain(batch)
+    assert policy.plain_ms == pytest.approx(18.0)
+
+
+@pytest.mark.parametrize("phase,extra", [("prefill", 0), ("decode", 1)])
+def test_only_a_single_request_decode_drain_prices_a_plain_step(monkeypatch, phase, extra):
+    """A prefill, or a batch with another request in it, is not a plain decode step."""
+    stub, req, policy = _timed_stub(monkeypatch, step_ms=18.0)
+    other = Req(
+        input_ids=torch.arange(1, 5, dtype=torch.int32), table_idx=1, cached_len=0,
+        output_len=8, uid=99, sampling_params=SamplingParams(max_tokens=8), cache_handle=None,
+    )
+    decode = Batch(reqs=[req], phase="decode")
+    intruder = Batch(reqs=[req] + [other] * extra, phase=phase)
+
+    stub._spec_record_plain(decode)
+    stub._spec_record_plain(intruder)
+    stub._spec_record_plain(decode)
+
+    assert policy.plain_samples == 0
+
+
+def test_cost_aware_off_reads_no_clock_into_the_policy(monkeypatch):
+    stub, req, policy = _timed_stub(monkeypatch, step_ms=30.0, cost_aware=False)
+    batch = Batch(reqs=[req], phase="decode")
+
+    stub._speculative_decode_step(req)
+    stub._spec_record_plain(batch)
+    stub._spec_record_plain(batch)
+
+    assert (policy.cycle_samples, policy.plain_samples) == (0, 0)
+    assert policy.bar == pytest.approx(2.0)
+
+
+def test_a_disabled_fallback_prices_nothing_either(monkeypatch):
+    """``FREETOKEN_MTP_SPEC_MIN_EMITTED=0`` constructs no policy at all; the plain hook must
+    not construct one behind it."""
+    stub, req, _policy = _timed_stub(monkeypatch, step_ms=30.0, min_emitted=0.0)
+
+    stub._spec_record_plain(Batch(reqs=[req], phase="decode"))
+    stub._spec_record_plain(Batch(reqs=[req], phase="decode"))
+
+    assert getattr(stub, "_spec_policies", None) in (None, {})
+
+
+def test_the_plain_step_mark_is_taken_on_the_drains_own_sync(monkeypatch):
+    """Sync-free by placement: the drain has already waited for ``copy_done`` by the time the
+    timestamp is taken, so the hook adds a ``perf_counter`` and no device work whatsoever."""
+    from contextlib import nullcontext
+
+    order: list[str] = []
+    stub = Scheduler.__new__(Scheduler)
+    stub.finished_reqs = set()
+    stub.cache_manager = SimpleNamespace(lazy_free_region=nullcontext)
+    stub._spec_record_plain = lambda batch: order.append("mark")
+    stub._ship_replies = lambda *a, **k: order.append("ship")
+    batch = Batch(reqs=[], phase="decode")
+    copy_done = SimpleNamespace(synchronize=lambda: order.append("sync"))
+    last_data = (SimpleNamespace(batch=batch), (None, None, copy_done))
+
+    Scheduler._process_last_data(stub, last_data)
+
+    assert order == ["sync", "mark", "ship"]
+
+
 # ------------------------------------------------------------ finishing under an inflight step
 
 

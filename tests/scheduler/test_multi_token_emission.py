@@ -244,6 +244,8 @@ def _drain_stub(sent: list):
         status_reporter=SimpleNamespace(report_batch=lambda *_a, **kw: sent.append(kw)),
         send_result=sent.append,
         _free_req_resources=lambda _req: None,
+        # the cost-aware bar's plain-step clock; inert here (this stub has no spec config)
+        _spec_record_plain=lambda _batch: None,
         _kv_usage_pages=lambda: (1, 2),
         _mamba_slot_usage=lambda: None,
         _swa_token_usage=lambda: None,

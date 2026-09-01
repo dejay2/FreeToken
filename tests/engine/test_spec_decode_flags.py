@@ -406,6 +406,41 @@ def test_the_cooldown_backoff_is_bounded():
     assert spec.cooldown_cap == 64
 
 
+def test_the_bar_is_cost_aware_by_default():
+    """A static bar is measurably wrong at one end of a long request whichever end it was
+    tuned for: cycles roughly double in cost from short context to 8-11k while a plain step
+    barely moves, so the breakeven doubles with them."""
+    spec = resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"})
+    assert spec.cost_aware is True
+    assert spec.min_emitted == pytest.approx(2.4)  # now the FLOOR of a measured bar
+
+
+def test_the_cost_aware_bar_has_its_own_off_switch():
+    spec = resolve_spec_decode(
+        {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_COST_AWARE": "0"}
+    )
+    assert spec.cost_aware is False
+    # the fallback itself is untouched: min_emitted is simply the bar again, flat
+    assert spec.adaptive is True
+    assert spec.min_emitted == pytest.approx(2.4)
+
+
+@pytest.mark.parametrize("raw", ["", "yes", "2", "true"])
+def test_a_non_binary_cost_aware_flag_is_rejected(raw):
+    with pytest.raises(ValueError, match="COST_AWARE"):
+        resolve_spec_decode({"FREETOKEN_MTP_SPEC_COST_AWARE": raw})
+
+
+def test_the_min_emitted_doc_says_it_is_the_floor_of_a_measured_bar():
+    """The knob's MEANING changed with the cut-over -- a tuning pass that still reads it as a
+    flat bar will mis-tune it -- so the comment that a tuner reads has to say so."""
+    import inspect
+
+    source = inspect.getsource(SpecDecodeConfig)
+    note = source.split("min_emitted:")[0].rsplit("ema_alpha:", 1)[-1]
+    assert "FLOOR" in note and "cost_aware" in note
+
+
 def test_the_probe_is_judged_on_its_own_threshold_not_the_averages():
     """``min_emitted`` is a bar for a MEAN; a probe is one integer sample from the
     distribution that mean describes, so it gets its own -- lower -- bar."""
