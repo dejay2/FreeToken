@@ -13,12 +13,15 @@ is explicitly enabled.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 import json
 import mmap
 import os
 import re
 import struct
+import threading
 from dataclasses import dataclass
 from typing import BinaryIO, Iterator
 
@@ -250,6 +253,66 @@ class PleLayout:
     head_dim: int
 
 
+# A gather splits into _PLE_GATHER_WORKERS chunks, one per NVMe queue slot. Measured on this
+# box (47.7 GiB table, uniformly random ids) 4 is the peak at every batch size -- 1/2/4/8/16
+# chunks cost 8.8/4.9/3.3/3.6/4.2 ms for 64 rows -- past 4 the fault path stops scaling and
+# the extra dispatch is pure loss.
+_PLE_GATHER_WORKERS = 4
+_PLE_MIN_GATHER_CHUNK = 4  # below this the pool round-trip costs more than the faults it hides
+_PLE_ROW_CACHE_ENV = "FREETOKEN_PLE_ROW_CACHE"
+_PLE_ROW_CACHE_DEFAULT = 65536  # rows; 10 MiB at the checkpoint's 160 B head_dim
+
+_gather_pool: ThreadPoolExecutor | None = None
+_gather_pool_lock = threading.Lock()
+
+
+def _ple_gather_pool() -> ThreadPoolExecutor:
+    """The process-wide pool that fans random row faults out over the NVMe queue."""
+    global _gather_pool
+    with _gather_pool_lock:
+        if _gather_pool is None:
+            _gather_pool = ThreadPoolExecutor(
+                max_workers=_PLE_GATHER_WORKERS, thread_name_prefix="ple-gather"
+            )
+        return _gather_pool
+
+
+class _PleRowCache:
+    """Bounded LRU of table rows.
+
+    Only the thread coordinating a gather touches it -- hits are served before the parallel
+    dispatch and insertions happen after the join -- so it needs no lock.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self._rows: OrderedDict[int, torch.Tensor] = OrderedDict()
+
+    def take_hits(
+        self, valid_ids: list[int], positions: list[int], out: torch.Tensor
+    ) -> tuple[list[int], list[int]]:
+        """Copy cached rows into ``out``; return the (ids, positions) still to be faulted."""
+        miss_ids: list[int] = []
+        miss_positions: list[int] = []
+        for row_id, position in zip(valid_ids, positions):
+            row = self._rows.get(row_id)
+            if row is None:
+                miss_ids.append(row_id)
+                miss_positions.append(position)
+                continue
+            self._rows.move_to_end(row_id)
+            out[position].copy_(row)
+        return miss_ids, miss_positions
+
+    def insert(self, row_ids: list[int], positions: list[int], out: torch.Tensor) -> None:
+        for row_id, position in zip(row_ids, positions):
+            if row_id in self._rows:
+                continue
+            self._rows[row_id] = out[position].clone()  # clone: never retain an mmap view
+            if len(self._rows) > self.capacity:
+                self._rows.popitem(last=False)
+
+
 class MmapPleStorage:
     """Memory-map PLE safetensor ranges and gather selected rows."""
 
@@ -261,6 +324,8 @@ class MmapPleStorage:
         self._files: dict[str, BinaryIO] = {}
         self._maps: dict[str, mmap.mmap] = {}
         self._shards: list[torch.Tensor] = []
+        capacity = int(os.environ.get(_PLE_ROW_CACHE_ENV, _PLE_ROW_CACHE_DEFAULT))
+        self._row_cache = _PleRowCache(capacity) if capacity > 0 else None
         try:
             for shard in layout.shards:
                 mapping = self._maps.get(shard.path)
@@ -302,6 +367,61 @@ class MmapPleStorage:
         if positions.numel() == 0:
             return out
         valid_ids = ids.index_select(0, positions)
+
+        cache = self._row_cache
+        if cache is None:
+            self._fault(valid_ids, positions, out)
+            return out
+        miss_ids, miss_positions = cache.take_hits(
+            valid_ids.tolist(), positions.tolist(), out
+        )
+        if not miss_ids:
+            return out
+        self._fault(
+            torch.tensor(miss_ids, dtype=torch.int64),
+            torch.tensor(miss_positions, dtype=torch.int64),
+            out,
+        )
+        cache.insert(miss_ids, miss_positions, out)
+        return out
+
+    def _fault(
+        self, valid_ids: torch.Tensor, positions: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """Read rows from the maps, spreading the page faults over the gather pool."""
+        n = valid_ids.numel()
+        chunk = max(_PLE_MIN_GATHER_CHUNK, -(-n // _PLE_GATHER_WORKERS))
+        if chunk >= n:
+            self._read_rows(valid_ids, positions, out)
+            return
+        pool = _ple_gather_pool()
+        futures = [
+            pool.submit(
+                self._read_rows_in_worker,
+                valid_ids[start : start + chunk],
+                positions[start : start + chunk],
+                out,
+            )
+            for start in range(chunk, n, chunk)
+        ]
+        try:
+            self._read_rows(valid_ids[:chunk], positions[:chunk], out)
+        finally:
+            # the workers write into ``out``: join them all before returning or propagating
+            for future in futures:
+                future.result()
+
+    def _read_rows_in_worker(
+        self, valid_ids: torch.Tensor, positions: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        # Inference mode is thread-local; the staging tensors were created under it.
+        with torch.inference_mode():
+            self._read_rows(valid_ids, positions, out)
+
+    def _read_rows(
+        self, valid_ids: torch.Tensor, positions: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """Rows go to disjoint ``out`` positions, so concurrent calls need no lock."""
         shard_ids = torch.div(valid_ids, self.rows_per_shard, rounding_mode="floor")
         for shard_id in torch.unique(shard_ids).tolist():
             in_shard = (shard_ids == shard_id).nonzero().reshape(-1)
@@ -309,9 +429,9 @@ class MmapPleStorage:
             local_ids = valid_ids.index_select(0, in_shard).remainder(self.rows_per_shard)
             rows = self._shards[shard_id].index_select(0, local_ids)
             out.index_copy_(0, dst_positions, rows)
-        return out
 
     def close(self) -> None:
+        self._row_cache = None
         self._shards.clear()
         for mapping in self._maps.values():
             mapping.close()

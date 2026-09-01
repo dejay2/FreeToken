@@ -471,6 +471,132 @@ def test_mmap_staged_backend_cuda_graph_replay_stages_new_rows(checkpoint):
 
 
 # ======================================================================================
+# MmapPleStorage.gather: parallel row faults behind a bounded host row cache
+# ======================================================================================
+
+
+def _ngram_reference(raw) -> torch.Tensor:
+    """The whole synthetic n-gram table as one ``[num_rows, head_dim]`` uint8 tensor."""
+    prefix = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
+    return torch.cat(
+        [raw[f"{prefix}.shard_{i}.weight"] for i in range(NGRAM_SHARDS)]
+    ).view(torch.uint8)
+
+
+def _serial_gather(table: torch.Tensor, ids: list[int]) -> torch.Tensor:
+    """Reference: one row at a time, zeros for out-of-range ids."""
+    out = torch.zeros(len(ids), NGRAM_DIM, dtype=torch.uint8)
+    for i, row_id in enumerate(ids):
+        if 0 <= row_id < table.shape[0]:
+            out[i] = table[row_id]
+    return out
+
+
+def _open_mmap_ple(folder: str):
+    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
+    return load_mmap_ple_table(folder, args)
+
+
+def _gather(storage, ids: list[int]) -> torch.Tensor:
+    out = torch.empty(len(ids), NGRAM_DIM, dtype=torch.uint8)
+    return storage.gather(torch.tensor(ids, dtype=torch.int64), out)
+
+
+ALL_ROWS = NGRAM_SHARDS * NGRAM_ROWS
+
+
+@pytest.mark.parametrize("ids", [
+    pytest.param([], id="empty"),
+    pytest.param([5], id="single"),
+    pytest.param([0, -1, 3, ALL_ROWS, ALL_ROWS - 1, -1000], id="mixed-invalid"),
+    pytest.param([9, 9, 9, 2, 9, 2], id="duplicates"),
+    pytest.param(list(range(ALL_ROWS)), id="every-shard"),
+    pytest.param([r % ALL_ROWS for r in range(0, 3 * ALL_ROWS, 3)], id="strided"),
+])
+@pytest.mark.parametrize("cache", ["0", "65536"])
+def test_parallel_gather_matches_a_serial_reference(checkpoint, monkeypatch, ids, cache):
+    folder, raw = checkpoint
+    monkeypatch.setenv("FREETOKEN_PLE_ROW_CACHE", cache)
+    table = _open_mmap_ple(folder)
+    try:
+        assert torch.equal(_gather(table.storage, ids), _serial_gather(_ngram_reference(raw), ids))
+    finally:
+        table.storage.close()
+
+
+def test_row_cache_disabled_by_env_zero(checkpoint, monkeypatch):
+    folder, raw = checkpoint
+    monkeypatch.setenv("FREETOKEN_PLE_ROW_CACHE", "0")
+    table = _open_mmap_ple(folder)
+    ids = [0, 13, 27, -1]
+    try:
+        assert table.storage._row_cache is None
+        assert torch.equal(_gather(table.storage, ids), _serial_gather(_ngram_reference(raw), ids))
+    finally:
+        table.storage.close()
+
+
+def test_row_cache_serves_a_repeated_gather_byte_identically(checkpoint, monkeypatch):
+    folder, raw = checkpoint
+    monkeypatch.setenv("FREETOKEN_PLE_ROW_CACHE", "65536")
+    table = _open_mmap_ple(folder)
+    ids = [3, 10, 17, 24, -1, 6, ALL_ROWS + 2]
+    want = _serial_gather(_ngram_reference(raw), ids)
+    try:
+        assert table.storage._row_cache is not None
+        assert torch.equal(_gather(table.storage, ids), want)
+        assert torch.equal(_gather(table.storage, ids), want)  # every row now a cache hit
+        assert torch.equal(_gather(table.storage, ids[::-1]), _serial_gather(
+            _ngram_reference(raw), ids[::-1]
+        ))
+    finally:
+        table.storage.close()
+
+
+def test_row_cache_stays_correct_across_evictions(checkpoint, monkeypatch):
+    folder, raw = checkpoint
+    monkeypatch.setenv("FREETOKEN_PLE_ROW_CACHE", "2")  # far below the working set
+    table = _open_mmap_ple(folder)
+    reference = _ngram_reference(raw)
+    try:
+        for _ in range(4):
+            for start in range(0, ALL_ROWS, 3):
+                ids = [(start + k) % ALL_ROWS for k in range(5)]
+                assert torch.equal(_gather(table.storage, ids), _serial_gather(reference, ids))
+    finally:
+        table.storage.close()
+
+
+def test_gather_of_many_duplicates_is_deterministic(checkpoint, monkeypatch):
+    """Enough rows to fan out over the pool, few enough ids that workers share source rows."""
+    folder, raw = checkpoint
+    monkeypatch.setenv("FREETOKEN_PLE_ROW_CACHE", "65536")
+    table = _open_mmap_ple(folder)
+    ids = [(i % 3) * 9 for i in range(256)]
+    want = _serial_gather(_ngram_reference(raw), ids)
+    try:
+        for _ in range(8):
+            assert torch.equal(_gather(table.storage, ids), want)
+    finally:
+        table.storage.close()
+
+
+def test_gather_runs_under_inference_mode_like_the_staged_table(checkpoint, monkeypatch):
+    folder, raw = checkpoint
+    monkeypatch.setenv("FREETOKEN_PLE_ROW_CACHE", "65536")
+    table = _open_mmap_ple(folder)
+    ids = list(range(ALL_ROWS))
+    want = _serial_gather(_ngram_reference(raw), ids)
+    try:
+        with torch.inference_mode():
+            got = _gather(table.storage, ids)
+            assert torch.equal(got, want)
+            assert torch.equal(_gather(table.storage, ids), want)
+    finally:
+        table.storage.close()
+
+
+# ======================================================================================
 # read_range_into: the O_DIRECT byte-range read the PLE table load is built on
 # ======================================================================================
 
