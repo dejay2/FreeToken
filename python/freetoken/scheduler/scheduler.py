@@ -243,6 +243,23 @@ class Scheduler(SchedulerIOMixin):
         # still-pending output write -- corrupting tokens (e.g. dropping an image
         # placeholder, which the multimodal merge then rejects).
         self.stream.wait_stream(self.engine.stream)
+
+        if self._spec_dispatch_ready():
+            # Design 6.2: a speculative cycle is serial (draft -> verify -> accept), so it
+            # runs SYNCHRONOUSLY -- drain the previous batch first, in this iteration, which
+            # is what makes the host ids caught up and removes the input_ids-lags-device_len
+            # skew entirely. Prefill and the non-speculative fallback keep the overlap below.
+            self._process_last_data(last_data)
+            self._flush_abort_acks()
+            self._last_data = last_data = None
+            spec_req = self._spec_candidate()
+            if spec_req is not None:
+                with self.engine_stream_ctx:
+                    self.engine.stream.wait_stream(self.stream)
+                    self._speculative_decode_step(spec_req)
+                self.stream.wait_stream(self.engine.stream)
+                return None
+
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
@@ -280,6 +297,15 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_rebuild()
+
+        # Non-overlap mode already drains what it launches, so the speculative step needs no
+        # early drain here -- only the same dispatch.
+        if self._spec_dispatch_ready():
+            spec_req = self._spec_candidate()
+            if spec_req is not None:
+                self._speculative_decode_step(spec_req)
+                self._flush_abort_acks()
+                return
 
         forward_input = self._schedule_next_batch()
         ongoing_data = None
@@ -370,6 +396,18 @@ class Scheduler(SchedulerIOMixin):
                     self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
+        self._ship_replies(
+            batch,
+            reply,
+            # One token per scheduled request, as ever, plus whatever a wider step added.
+            generated_tokens=len(batch.reqs) + sum(len(m.next_tokens) - 1 for m in reply),
+        )
+
+    def _ship_replies(
+        self, batch: Batch, reply: List[DetokenizeMsg], *, generated_tokens: int
+    ) -> None:
+        """Stamp, report and send one step's replies. Shared by the drain and the
+        speculative step, which produces the same one-message-per-uid shape."""
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
         # status bar) can show live KV usage without a separate query.
         used, total = self._kv_usage_pages()
@@ -396,12 +434,13 @@ class Scheduler(SchedulerIOMixin):
             page_size=self.config.page_size,
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
-            # One token per scheduled request, as ever, plus whatever a wider step added.
-            generated_tokens=len(batch.reqs) + sum(len(m.next_tokens) - 1 for m in reply),
+            generated_tokens=generated_tokens,
         )
         self.send_result(reply)
 
-    def _emit_step_tokens(self, req: Req, tokens: torch.Tensor) -> DetokenizeMsg:
+    def _emit_step_tokens(
+        self, req: Req, tokens: torch.Tensor, *, settled: bool = False
+    ) -> DetokenizeMsg:
         """Append this step's sampled tokens to the request and build its single reply.
 
         The run is processed in order and the first stop condition truncates the rest --
@@ -409,11 +448,18 @@ class Scheduler(SchedulerIOMixin):
         finish reason equal what the same tokens emitted one per step would have produced.
         The output budget is a property of the step (the device already advanced past it),
         so it terminates the run's last surviving token; EOS and stop strings win over it.
+
+        ``settled`` says the device length does NOT describe this run. A speculative step
+        leaves ``device_len`` at the last DRAFT row -- past every rejected token -- so
+        ``can_decode`` would answer about a length the request will never keep, and the run's
+        own exhaustion of the host budget is the only honest reading. Plain decode leaves it
+        False and keeps reading ``can_decode``, which under overlap counts the token already
+        in flight; that is the behaviour every existing client sees, and it is untouched.
         """
         budget = req.max_device_len - req.input_ids.numel()
         n = min(tokens.numel(), budget)
         assert n >= 1
-        hit_length = not req.can_decode
+        hit_length = n == budget if settled else not req.can_decode
         emitted: List[int] = []
         hit_eos = False
         matched_stop: str | None = None
@@ -1103,6 +1149,117 @@ class Scheduler(SchedulerIOMixin):
         req.spec_inflight = None
         if state_rollback is not None:
             state_rollback(req, accepted)
+
+    # -------------------------------------------------------------- integrated speculation
+
+    def _spec_dispatch_ready(self) -> bool:
+        """Whether this iteration should try a speculative step instead of a plain decode.
+
+        Deliberately request-independent: what it gates is draining the previous batch EARLY,
+        and the per-request predicate can only be evaluated after that drain has caught the
+        host ids up. Prefill wins, exactly as ``_schedule_next_batch`` has always ordered it.
+        """
+        return (
+            self.config.spec_decode.enabled
+            and self.engine.spec_draft is not None
+            and not self.prefill_manager.runnable
+            and self.decode_manager.runnable
+        )
+
+    def _spec_candidate(self) -> Req | None:
+        """The running request a speculative step can serve, or None to decode plainly.
+
+        The predicate is the REQUEST's shape, never a batch's phase: the speculative batch is
+        itself prefill-phase (that is what gives the ``w`` rows causal semantics and the MoE
+        its decode-movement path), so ``batch.is_decode`` would be false for every step.
+
+        Every miss below falls back to an ordinary one-row decode for this step, never to an
+        error: an unprimed head (a request admitted before speculation, or one still walking
+        through chunked prefill) and a request with no room for a multi-token run are normal.
+        """
+        running = self.decode_manager.running_reqs
+        if len(running) != 1:
+            return None
+        req = next(iter(running))
+        if req.aborted or req.table_idx == -1 or req in self.finished_reqs:
+            return None
+        if req.extend_len != 1:
+            return None
+        if req.input_ids.numel() != req.device_len:
+            # the previous batch has not drained; a draft would be staged over a position
+            # whose accepted token is not on the host yet
+            return None
+        if req.remain_len < 2:
+            return None
+        if not self.engine.spec_draft.is_ready(req):
+            return None
+        return req
+
+    def _speculative_decode_step(self, req: Req) -> None:
+        """One draft -> verify -> accept -> emit -> settle cycle, start to finish.
+
+        Synchronous by construction (design 6.2): the cycle is a serial chain -- the draft for
+        the next cycle consumes the target hidden state of the row this one just accepted, and
+        acceptance already forces a device sync -- so nothing is left in flight. That is what
+        keeps ``_prepare_spec_batch``'s host-ids guard true on the next iteration.
+
+        The order of the tail is the whole of design 6.4: emit (which truncates the run at the
+        first stop condition), then shrink the verdict to what was emitted, then settle the
+        lengths / pages / linear state to that, then free. Settling before the free is what
+        keeps the finish path legal -- ``_free_req_resources`` commits the prefix, and the
+        radix guard refuses a commit under in-flight speculative rows.
+        """
+        engine = self.engine
+        depth = min(self.config.spec_decode.depth, req.remain_len)
+        proposal = engine.spec_draft.propose(req, depth)
+
+        forward_input = self._prepare_spec_batch(req, proposal.tokens)
+        batch, sample_args, input_mapping, write_mapping = forward_input
+        batch.input_ids = self.token_pool[input_mapping]
+        ladder = engine.spec_state_ladder
+        if ladder is not None:
+            ladder.begin(req, batch)
+        output = engine.speculative_decode_batch(
+            batch,
+            sample_args,
+            draft_tokens=proposal.tokens,
+            draft_logits=proposal.logits,
+        )
+
+        msg = self._emit_step_tokens(
+            req, torch.tensor(output.decision.tokens, dtype=torch.int32), settled=True
+        )
+        emitted = len(msg.next_tokens)
+        decision = output.decision.truncated(emitted)
+        # Only the emitted run reaches the token pool; a rejected row's sampled token would
+        # become the next step's row 0.
+        self.token_pool[write_mapping[0][:emitted], write_mapping[1][:emitted]] = (
+            output.next_tokens_gpu[:emitted]
+        )
+        self._rollback_spec_tokens(
+            req,
+            decision.accepted_rows,
+            state_rollback=None if ladder is None else ladder.rollback,
+        )
+
+        if msg.finished:
+            engine.spec_draft.reset_request(req.uid)
+        else:
+            # The draft's context is the shifted pairs (target hidden i, embedding of token
+            # i+1); this cycle contributed exactly `emitted` of them.
+            engine.spec_draft.commit(
+                req, hidden=output.hidden, token_ids=msg.next_tokens
+            )
+        self.decode_manager.filter_reqs([req])
+
+        finished_now: Set[Req] = set()
+        if msg.finished and req not in self.finished_reqs:
+            with self.cache_manager.lazy_free_region():
+                self.decode_manager.remove_req(req)
+                self._free_req_resources(req)
+            finished_now.add(req)
+        self.finished_reqs = finished_now
+        self._ship_replies(batch, [msg], generated_tokens=emitted)
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Gather only the picture feature rows used by this prefill step.

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from freetoken.engine.config import SpecDecodeConfig
 
 from freetoken.core import SamplingParams
 from freetoken.message import (
@@ -217,6 +218,8 @@ def test_abort_before_cross_worker_user_message_cannot_resurrect_request():
 
 def test_normal_loop_sends_prior_sample_before_abort_terminal():
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SimpleNamespace(spec_decode=SpecDecodeConfig())  # speculation off
+    scheduler.engine = SimpleNamespace(spec_draft=None)
     scheduler.prefill_manager = SimpleNamespace(runnable=False, abort_req=lambda uid: None)
     scheduler.decode_manager = SimpleNamespace(runnable=False, abort_req=lambda uid: None)
     scheduler._pending_abort_acks = set()

@@ -67,6 +67,22 @@ def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfi
     return SpecDecodeConfig(enabled=enabled, depth=depth)
 
 
+def require_speculation_supported(config) -> None:
+    """Fail at boot if this configuration cannot support integrated speculation.
+
+    The draft head keeps ONE running context, the state ladder ONE snapshot slot, and the
+    sampler one acceptance stream per step. A batch that happens to carry two requests must
+    not be where that is discovered.
+    """
+    if not config.spec_decode.enabled:
+        return
+    if config.max_running_req != 1:
+        raise ValueError(
+            "FREETOKEN_MTP_SPECULATE=1 requires --max-running-requests 1, got "
+            f"{config.max_running_req}"
+        )
+
+
 @dataclass(frozen=True)
 class EngineConfig:
     model_path: str

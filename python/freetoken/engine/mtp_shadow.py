@@ -40,6 +40,7 @@ from freetoken.models.qwen4_exp.mtp_spike import (
     build_mtp_weight_plan,
     derive_mtp_model_config,
 )
+from freetoken.engine.spec_draft import build_shifted_pairs, build_shifted_rope_positions
 from freetoken.utils.torch_utils import torch_dtype
 
 _APPROVED_PRIVATE_ROOT = Path(r"D:\FreeToken-ple-mmap-vision\.local\mtp-spike")
@@ -191,57 +192,10 @@ def greedy_acceptance(
     return accepted, corrected
 
 
-def build_shifted_pairs(
-    pending_hidden: torch.Tensor | None,
-    hidden: torch.Tensor,
-    inputs_embeds: torch.Tensor,
-    *,
-    next_embedding: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Build exact hidden[i]/following-embedding pairs across target prefill chunks."""
-    if hidden.ndim != 2 or inputs_embeds.ndim != 2 or hidden.shape[0] != inputs_embeds.shape[0]:
-        raise ValueError("target hidden and embeddings must have the same row count")
-    pair_hidden = []
-    pair_embeds = []
-    if pending_hidden is not None:
-        pair_hidden.append(pending_hidden)
-        pair_embeds.append(inputs_embeds[:1])
-    if hidden.shape[0] > 1:
-        pair_hidden.append(hidden[:-1])
-        pair_embeds.append(inputs_embeds[1:])
-    pending = hidden[-1:].clone()
-    if next_embedding is not None:
-        pair_hidden.append(pending)
-        pair_embeds.append(next_embedding)
-        pending = None
-    if not pair_hidden:
-        return hidden[:0], inputs_embeds[:0], pending
-    return torch.cat(pair_hidden), torch.cat(pair_embeds), pending
-
-
-def build_shifted_rope_positions(
-    pending_rope: torch.Tensor | None,
-    current_rope: torch.Tensor | None,
-    *,
-    had_pending_hidden: bool,
-    final_chunk: bool,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    """Mirror shifted hidden rows for Qwen three-axis picture positions."""
-    if current_rope is None:
-        if pending_rope is not None:
-            raise RuntimeError("MTP picture positions disappeared within one request")
-        return None, None
-    parts = []
-    if had_pending_hidden:
-        if pending_rope is None:
-            raise RuntimeError("MTP picture position state is incomplete")
-        parts.append(pending_rope)
-    current_rows = current_rope.shape[1] if final_chunk else max(current_rope.shape[1] - 1, 0)
-    if current_rows:
-        parts.append(current_rope[:, :current_rows])
-    paired = torch.cat(parts, dim=1) if parts else current_rope[:, :0]
-    pending = None if final_chunk else current_rope[:, -1:]
-    return paired, pending
+# The shifted-pair builders live in ``spec_draft`` -- the integrated decode path needs them
+# and must not import the observer to get them. Re-exported here so the observer's own
+# import surface is unchanged (the same shape ``mtp_fast_verify`` uses for the acceptance
+# core it handed to ``spec_sample``).
 
 
 @dataclass

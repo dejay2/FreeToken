@@ -7,6 +7,7 @@ on top lives in tests/server/test_rebuild_maintenance.py."""
 from __future__ import annotations
 
 import torch
+from freetoken.engine.config import SpecDecodeConfig
 
 
 def _page_table(max_running_reqs: int, width: int) -> torch.Tensor:
@@ -68,6 +69,8 @@ def _stub_scheduler(*, prefill_runnable: bool, decode_runnable: bool, pending: o
     from freetoken.scheduler.scheduler import Scheduler
 
     sched = Scheduler.__new__(Scheduler)
+    sched.config = SimpleNamespace(spec_decode=SpecDecodeConfig())  # speculation off
+    sched.engine = SimpleNamespace(spec_draft=None)
     sched.prefill_manager = SimpleNamespace(runnable=prefill_runnable)
     sched.decode_manager = SimpleNamespace(runnable=decode_runnable)
     sched._pending_rebuild = pending

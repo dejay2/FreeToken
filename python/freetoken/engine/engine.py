@@ -4,7 +4,7 @@ import gc
 import math
 import os
 from datetime import timedelta
-from typing import Any, Callable, Dict, Iterable, NamedTuple, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, NamedTuple, Sequence, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
@@ -18,8 +18,11 @@ from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
-from .config import EngineConfig
+from .config import EngineConfig, require_speculation_supported
 from .graph import GraphRunner, get_free_memory
+
+if TYPE_CHECKING:
+    from .spec_sample import SpecDecision
 from .sample import BatchSamplingArgs, Sampler
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
@@ -292,12 +295,33 @@ class ForwardOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
 
 
+class SpecForwardOutput(NamedTuple):
+    """One speculative step's verdict, plus what the next cycle needs.
+
+    ``next_tokens_gpu`` carries only the emitted run (``len(decision.tokens)`` ids), because
+    the rejected rows' sampled tokens must never reach the token pool. ``hidden`` is all ``w``
+    rows of the target's pre-mix stream: the draft head consumes the accepted prefix of it,
+    and which prefix that is is not known until the scheduler's stop scan has run.
+    """
+
+    decision: "SpecDecision"
+    next_tokens_gpu: torch.Tensor
+    hidden: torch.Tensor
+
+
 class Engine:
     def __init__(self, config: EngineConfig):
         from .mtp_shadow import MTPShadowConfig
 
         self._mtp_shadow_config = MTPShadowConfig.from_env(config)
+        require_speculation_supported(config)
         self.mtp_shadow_observer = None
+        # Integrated speculation's three pieces. None -- and costing nothing, byte-identically
+        # -- while FREETOKEN_MTP_SPECULATE is off. The ladder is sized beside the linear state
+        # pool below; the head and the sampler are built last, after graphs and warmup.
+        self.spec_draft = None
+        self.spec_sampler = None
+        self.spec_state_ladder = None
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
@@ -387,7 +411,6 @@ class Engine:
         # Integrated speculation's linear-state rollback (design section 4, Strategy R). Sized
         # once here so the spare pool slot and the activation arena are charged at boot rather
         # than at the first speculative cycle; None -- and costing nothing -- when the flag is off.
-        self.spec_state_ladder = None
         if config.spec_decode.enabled and self.linear_state_pool is not None:
             from freetoken.engine.spec_state_ladder import SpecStateLadder
 
@@ -458,6 +481,19 @@ class Engine:
             from .mtp_shadow import MTPShadowObserver
 
             self.mtp_shadow_observer = MTPShadowObserver(self, self._mtp_shadow_config)
+        if config.spec_decode.enabled:
+            # Same placement as the observer's, and for the same reason: the target's weights,
+            # pools, graphs and warmup are all settled before the draft head takes memory.
+            from .spec_draft import SpecDraftHead
+            from .spec_sample import SpecSampler
+
+            self.spec_draft = SpecDraftHead(self, config.spec_decode)
+            self.spec_sampler = SpecSampler.from_config(config.spec_decode, self.device)
+            logger.info_rank0(
+                "Integrated MTP speculation enabled: depth "
+                f"{config.spec_decode.depth}, draft head "
+                f"{mem_GB(self.spec_draft.resident_bytes)} resident"
+            )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -961,8 +997,13 @@ class Engine:
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         mtp_capture = None
+        # Integrated speculation feeds its draft head the same (hidden, embeddings) pair the
+        # observer captures, so a spec-enabled boot takes the eager capture path too -- but
+        # only for the ordinary forwards it still runs (prefill, and the decode fallback);
+        # the speculative step itself goes through speculative_decode_batch.
+        wants_capture = self.mtp_shadow_observer is not None or self.spec_draft is not None
         with self.ctx.forward_batch(batch):
-            if self.mtp_shadow_observer is not None:
+            if wants_capture:
                 # Capture is private/eager; normal serving keeps its original graph path.
                 captured = self.model.forward_mtp_capture(all_row_logits=False)
                 logits, mtp_hidden, mtp_embeddings = captured
@@ -988,10 +1029,55 @@ class Engine:
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         if self.mtp_shadow_observer is not None:
             self.mtp_shadow_observer.observe(observer_capture, next_tokens_gpu[0])
+        if self.spec_draft is not None:
+            self.spec_draft.observe_forward(batch, mtp_capture, next_tokens_gpu[0])
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def speculative_decode_batch(
+        self,
+        batch: Batch,
+        args: BatchSamplingArgs,
+        *,
+        draft_tokens: Sequence[int],
+        draft_logits: torch.Tensor,
+    ) -> SpecForwardOutput:
+        """Forward one ``w = 1 + k`` row speculative batch and accept a prefix of the drafts.
+
+        Three things separate this from ``forward_batch``, and each is load-bearing:
+
+        * **all-row logits.** Acceptance needs row ``i``'s distribution for every draft, and
+          the bonus token comes from row ``k``. The ordinary LM head slices a prefill batch to
+          its last row (``layers/embedding.py``), so the step goes through
+          ``forward_mtp_capture(all_row_logits=True)`` -- which also hands back the hidden
+          rows the draft head consumes next cycle, in one pass.
+        * **no ``complete_one``.** ``Scheduler._rollback_spec_tokens`` is the single authority
+          on this step's lengths; advancing here would double-count every rejected row.
+        * **the speculative sampler.** ``SpecSampler`` divides the target's filtered ``p`` by
+          the draft's filtered ``q``; the plain sampler would just argmax row 0.
+        """
+        assert self.device.type != "cuda" or torch.cuda.current_stream() == self.stream
+        if self.spec_sampler is None:
+            raise RuntimeError("speculative decode is not enabled on this engine")
+        if not batch.mtp_verify or batch.size != 1:
+            raise RuntimeError("a speculative step forwards one mtp_verify batch")
+        with self.ctx.forward_batch(batch):
+            logits, hidden, _ = self.model.forward_mtp_capture(all_row_logits=True)
+        if self.cpu_moe_executor is not None:
+            self.cpu_moe_executor.raise_if_unhealthy()
+        decision = self.spec_sampler.step(
+            uid=batch.reqs[0].uid,
+            draft_tokens=draft_tokens,
+            draft_logits=draft_logits,
+            target_logits=logits[: batch.emit_width],
+            args=args,
+        )
+        next_tokens_gpu = torch.tensor(
+            decision.tokens, dtype=torch.int32, device=logits.device
+        )
+        return SpecForwardOutput(decision, next_tokens_gpu, hidden)
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
@@ -1054,6 +1140,9 @@ class Engine:
         if self.mtp_shadow_observer is not None:
             self.mtp_shadow_observer.close()
             self.mtp_shadow_observer = None
+        if self.spec_draft is not None:
+            self.spec_draft.close()
+            self.spec_draft = None
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()

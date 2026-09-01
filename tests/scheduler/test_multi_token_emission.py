@@ -254,6 +254,7 @@ def _drain_stub(sent: list):
 def test_the_drain_ships_one_message_per_uid_for_a_multi_token_step():
     sent: list = []
     stub = _drain_stub(sent)
+    stub._ship_replies = lambda *a, **k: Scheduler._ship_replies(stub, *a, **k)
     stub._emit_step_tokens = lambda req, tokens: Scheduler._emit_step_tokens(
         stub, req, tokens
     )

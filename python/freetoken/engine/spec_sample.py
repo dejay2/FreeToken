@@ -122,6 +122,26 @@ def spec_filter_params(
     return temperature, top_k, top_p
 
 
+def request_filter_params(params) -> tuple[float, int, float]:
+    """The same triple, read off a request's ``SamplingParams`` instead of a prepared batch.
+
+    The draft head has to choose its filter BEFORE the speculative batch (and so the batch's
+    ``BatchSamplingArgs``) exists, and reading the raw params would silently disagree with
+    acceptance: ``Sampler.prepare`` floors a non-greedy request's temperature at 1e-6, so a
+    ``temperature=0, top_p<1`` request is SAMPLED by the server while its raw temperature says
+    argmax. Speculation serves one request per step, which is exactly when ``prepare``'s
+    whole-batch greedy fast path and its per-request path agree, so this reproduction is
+    total; ``tests/engine/test_spec_draft.py`` pins it against the real ``Sampler``.
+    """
+    if params.is_greedy:
+        return 0.0, -1, 1.0
+    return (
+        max(params.temperature, 1e-6),
+        params.top_k if params.top_k >= 1 else -1,
+        min(max(params.top_p, 1e-6), 1.0),
+    )
+
+
 def filtered_probs(
     logits: torch.Tensor, args: "BatchSamplingArgs", *, row: int = 0
 ) -> torch.Tensor:
@@ -515,6 +535,7 @@ __all__ = [
     "batched_speculative_accept",
     "default_rng_guard",
     "filtered_probs",
+    "request_filter_params",
     "resolve_spec_seed",
     "spec_filter_params",
 ]

@@ -14,7 +14,13 @@ from __future__ import annotations
 
 import pytest
 
+import torch
+from types import SimpleNamespace
+
+from freetoken.core import Batch
 from freetoken.engine.config import SpecDecodeConfig, resolve_spec_decode
+
+_CUDA = torch.cuda.is_available()
 
 
 def test_speculation_is_off_and_costs_nothing_by_default():
@@ -98,3 +104,111 @@ def test_an_unset_environment_leaves_the_engine_config_at_zero(monkeypatch):
     )
     assert config.num_speculative_tokens == 0
     assert config.spec_decode.enabled is False
+
+
+# ------------------------------------------------------------------ the engine's capture path
+#
+# Integrated speculation feeds its draft head the same (hidden, embeddings) pair the shadow
+# observer captures, so a spec-enabled boot has to take the eager capture path for the ordinary
+# forwards it still runs -- and, just as importantly, must not take it otherwise. With the flag
+# off nothing here has a consumer, so ``forward_batch`` keeps its graph path byte for byte.
+
+
+def _forward_engine(*, spec_draft=None):
+    import torch
+
+    from freetoken.core import Context, Req, SamplingParams, set_global_ctx
+    from freetoken.engine.engine import Engine
+    from freetoken.engine.sample import Sampler
+    import freetoken.core as core
+
+    core._GLOBAL_CTX = None
+    ctx = Context(page_size=64)
+    set_global_ctx(ctx)
+    device = torch.device("cuda")
+    engine = object.__new__(Engine)
+    engine.ctx = ctx
+    engine.device = device
+    engine.stream = torch.cuda.current_stream()
+    engine.mtp_shadow_observer = None
+    engine.spec_draft = spec_draft
+    engine.spec_sampler = None
+    engine.cpu_moe_executor = None
+    engine.sampler = Sampler(device=device, vocab_size=4)
+    engine.graph_runner = SimpleNamespace(can_use_cuda_graph=lambda batch: False)
+
+    calls: list[str] = []
+
+    def _forward():
+        calls.append("forward")
+        return torch.zeros(1, 4, device=device)
+
+    def _capture(*, all_row_logits=False):
+        calls.append("capture")
+        return (
+            torch.zeros(1, 4, device=device),
+            torch.zeros(1, 8, device=device),
+            torch.zeros(1, 2, device=device),
+        )
+
+    engine.model = SimpleNamespace(forward=_forward, forward_mtp_capture=_capture)
+
+    req = Req(
+        input_ids=torch.arange(4, dtype=torch.int32),
+        table_idx=0,
+        cached_len=0,
+        output_len=4,
+        uid=1,
+        sampling_params=SamplingParams(max_tokens=4),
+        cache_handle=None,
+    )
+    batch = Batch(reqs=[req], phase="prefill")
+    batch.padded_reqs = batch.reqs
+    batch.input_ids = req.input_ids.to(device)
+    return engine, batch, req, calls
+
+
+@pytest.mark.skipif(not _CUDA, reason="CUDA is required")
+def test_the_flag_off_forward_keeps_the_ordinary_path():
+    engine, batch, _req, calls = _forward_engine()
+    engine.forward_batch(batch, engine.sampler.prepare(batch))
+    assert calls == ["forward"]
+
+
+@pytest.mark.skipif(not _CUDA, reason="CUDA is required")
+def test_a_spec_enabled_forward_captures_and_feeds_the_draft_head():
+    seen: list = []
+    draft = SimpleNamespace(
+        observe_forward=lambda batch, capture, token: seen.append(
+            (batch, tuple(t.shape for t in capture), int(token))
+        )
+    )
+    engine, batch, _req, calls = _forward_engine(spec_draft=draft)
+
+    engine.forward_batch(batch, engine.sampler.prepare(batch))
+
+    assert calls == ["capture"]
+    (observed_batch, shapes, token), = seen
+    assert observed_batch is batch
+    # (logits, multi_stream, inputs_embeds) -- exactly the observer's triple
+    import torch
+
+    assert shapes == (torch.Size([1, 4]), torch.Size([1, 8]), torch.Size([1, 2]))
+    assert token == 0
+
+
+def test_speculation_refuses_more_than_one_running_request_at_boot():
+    """One running context in the draft head, one snapshot slot in the ladder, one stream per
+    step in the sampler. A batch carrying two requests must not be where that is discovered."""
+    from freetoken.engine.config import require_speculation_supported
+
+    enabled = SpecDecodeConfig(enabled=True, depth=3)
+    require_speculation_supported(SimpleNamespace(max_running_req=1, spec_decode=enabled))
+    with pytest.raises(ValueError, match="max-running-requests 1"):
+        require_speculation_supported(
+            SimpleNamespace(max_running_req=2, spec_decode=enabled)
+        )
+    # off: any concurrency, no opinion
+    require_speculation_supported(
+        SimpleNamespace(max_running_req=4, spec_decode=SpecDecodeConfig())
+    )
