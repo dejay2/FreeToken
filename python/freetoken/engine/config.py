@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
 import os
@@ -38,7 +38,7 @@ class SpecDecodeConfig:
     graph: bool = False
     # --- the adaptive fallback (see ``adaptive``) ---
     ema_alpha: float = 0.3
-    min_emitted: float = 2.0
+    min_emitted: float = 3.2
     # A probe is ONE integer sample from the distribution ``min_emitted`` bounds the mean of,
     # so it is judged against its own -- lower -- bar. Holding a single sample to the mean's
     # threshold rejects roughly half of content that is comfortably worth speculating on.
@@ -129,7 +129,11 @@ def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfi
         raise ValueError(
             f"FREETOKEN_MTP_SPEC_EMA_ALPHA must be in (0, 1], got {alpha!r}"
         )
-    min_emitted = _float_env(env, "FREETOKEN_MTP_SPEC_MIN_EMITTED", "2.0")
+    # 3.2 is the live graphs-on breakeven (cycle ~74 ms vs 22 ms plain steps); at shallow
+    # depths the ceiling below binds first, so the unset default clamps to it.
+    min_emitted = _float_env(
+        env, "FREETOKEN_MTP_SPEC_MIN_EMITTED", str(min(3.2, float(1 + depth)))
+    )
     if not 0.0 <= min_emitted <= 1 + depth:
         # Above the full width no cycle could ever clear the bar, so speculation would go
         # cold and never return -- a configuration that silently means "off".

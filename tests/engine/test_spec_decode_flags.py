@@ -1,4 +1,4 @@
-"""Integrated speculative decode is one resolved value, read off the shared config object.
+﻿"""Integrated speculative decode is one resolved value, read off the shared config object.
 
 ``FREETOKEN_MTP_SPECULATE`` / ``FREETOKEN_MTP_SPEC_DEPTH`` resolve on ``EngineConfig``, which
 ``SchedulerConfig`` (and so ``ServerArgs``) inherits -- the Engine and the Scheduler hold the
@@ -85,7 +85,8 @@ def test_the_engine_config_resolves_the_flags_once_for_engine_and_scheduler(monk
     config = SchedulerConfig(
         model_path="unused", tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16
     )
-    assert config.spec_decode == SpecDecodeConfig(enabled=True, depth=2)
+    # the unset MIN_EMITTED default clamps to the 1+depth ceiling at shallow depths
+    assert config.spec_decode == SpecDecodeConfig(enabled=True, depth=2, min_emitted=3.0)
     assert config.num_speculative_tokens == 2
     # memoized: the engine and the scheduler read the same object, never the env twice
     monkeypatch.setenv("FREETOKEN_MTP_SPEC_DEPTH", "3")
@@ -270,7 +271,7 @@ def test_the_graph_flag_alone_captures_nothing_while_speculation_is_off():
 def test_the_fallback_defaults_are_the_measured_breakeven():
     spec = resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"})
     assert spec.ema_alpha == pytest.approx(0.3)
-    assert spec.min_emitted == pytest.approx(2.0)
+    assert spec.min_emitted == pytest.approx(3.2)
     assert spec.cooldown == 16
     assert spec.adaptive is True
 
@@ -278,7 +279,7 @@ def test_the_fallback_defaults_are_the_measured_breakeven():
 def test_the_fallback_is_inert_while_speculation_is_off():
     spec = resolve_spec_decode({})
     assert spec.adaptive is False
-    assert spec.min_emitted == pytest.approx(2.0)  # parsed, but nothing consults it
+    assert spec.min_emitted == pytest.approx(3.2)  # parsed, but nothing consults it
 
 
 def test_a_zero_threshold_restores_always_speculate():
