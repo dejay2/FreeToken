@@ -13,6 +13,12 @@ half of ``MTPShadowObserver.__init__`` out of the same pieces and nothing else:
     runner drops the host bank copy once it has uploaded, which is what keeps the ~5 GB
     transient from becoming a ~5 GB resident.
 
+The chain also gets its OWN LM head (``engine/spec_lmhead.py``,
+``FREETOKEN_MTP_SPEC_DRAFT_LMHEAD``): the target's is bf16 and 1.27 GB, which a depth-5 chain
+would stream out of HBM five times for five one-row projections. The default is a weight-only
+int8 copy; ``bf16`` shares the target's head exactly as before. The TARGET's own logits are
+untouched either way -- this is a separate object over a separate copy of the weight.
+
 ``FREETOKEN_MTP_SPEC_EXPERT_FORMAT=nvfp4`` (with ``FREETOKEN_MTP_SPEC_NVFP4_MANIFEST``) swaps
 that last piece for ``MTPNVFP4GPUExpertRunner``: the same 512 experts held quantized (~1.42 GB
 plus a fixed dequant scratch) instead of exact (5.03 GB), returning ~3.2 GB to the TARGET's
@@ -110,6 +116,20 @@ def resolve_spec_expert_placement(
     if not manifest.is_file():
         raise ValueError(f"{_NVFP4_MANIFEST_ENV} is not a manifest file: {manifest}")
     return "nvfp4", manifest.resolve()
+
+
+def resolve_draft_cut_mode(spec_decode) -> str:
+    """Which cut strategy the chain runs (``SpecDecodeConfig.draft_cut_mode``).
+
+    A ``getattr`` with a default, exactly as ``conf_cut`` is read: a hand-built stub config
+    (tests, the shadow tooling) that predates the field gets the shipped mode. Validated here
+    rather than trusted -- an unrecognized value would otherwise silently mean ``chain``, and
+    the point of the flag is that an operator can tell which arm of an A/B they are on.
+    """
+    mode = str(getattr(spec_decode, "draft_cut_mode", "chain"))
+    if mode not in ("chain", "step"):
+        raise ValueError(f"the draft cut mode must be chain or step, got {mode!r}")
+    return mode
 
 
 def spec_expert_runner_type(placement: str):
@@ -226,6 +246,10 @@ class SpecDraftHead:
         seed: int | None = None,
         num_pages: int | None = None,
     ) -> None:
+        from freetoken.engine.spec_lmhead import (
+            build_draft_lm_head,
+            resolve_draft_lmhead_placement,
+        )
         from freetoken.engine.spec_sample import resolve_spec_seed
         from freetoken.models.qwen4_exp.mtp_spike import (
             Qwen4ExpMTPModel,
@@ -241,10 +265,30 @@ class SpecDraftHead:
         # getattr keeps a hand-built stub config (tests, the shadow tooling) working: a config
         # that predates the field simply drafts the full depth, which is the old behaviour.
         self.conf_cut = float(getattr(spec_decode, "conf_cut", 0.0))
+        # ...and so does WHEN the cut is applied. Same getattr rule, same reason: a config
+        # that predates the field drafts the whole chain and truncates once, which is the
+        # default. See ``SpecDecodeConfig.draft_cut_mode`` for the cost either mode pays.
+        self.draft_cut_mode = resolve_draft_cut_mode(spec_decode)
         self.seed = resolve_spec_seed() if seed is None else int(seed)
         self.target_ctx = engine.ctx
         self.target_model = engine.model
         self.mtp_config = derive_mtp_model_config(engine.config.model_config)
+        # The chain's own LM head: a private quantized copy of the target's, or the target's
+        # own object under ``FREETOKEN_MTP_SPEC_DRAFT_LMHEAD=bf16``. The TARGET's logits go on
+        # coming out of ``engine.model.lm_head``, untouched either way.
+        self.lmhead_placement = resolve_draft_lmhead_placement()
+        self.draft_lm_head = build_draft_lm_head(
+            self.target_model.lm_head,
+            placement=self.lmhead_placement,
+            device=self.device,
+        )
+        # ...and the widest flush that must stay off the expert-major loop: a cold request
+        # buffers a whole backed-off cooldown of plain decode observations, then commits them
+        # in one multi-row forward at the head of the next ``propose``.
+        self._max_flush_rows = min(
+            _MAX_DRAFT_ROWS,
+            int(getattr(spec_decode, "cooldown_cap", 64)) + self.depth + 8,
+        )
 
         page_size = 64  # pinned by QSA, exactly as the target's pool is
         self.num_pages = (
@@ -290,11 +334,17 @@ class SpecDraftHead:
             self.model, cpu_weights, device=self.device, resident=True
         )
         extra = (
-            {}
+            # ``max_gather_rows`` is the widest CALL that stays on the (chunked) gather path,
+            # so a buffered flush never pays the expert-major loop's host round trip; the
+            # gather WORKSPACE is unchanged by it. The quantized gather's scratch is resident,
+            # so its pass width is the widest per-cycle call -- the accepted run, ``1 + depth``
+            # rows -- and nothing wider.
+            {"max_gather_rows": self._max_flush_rows}
             if self.expert_placement == "bf16"
-            # the quantized gather's scratch is resident, so it is sized for the widest
-            # per-cycle call -- the accepted run, ``1 + depth`` rows -- and nothing wider
-            else {"max_gather_tokens": self.depth + 1}
+            else {
+                "max_gather_tokens": self.depth + 1,
+                "max_gather_rows": self._max_flush_rows,
+            }
         )
         self.expert_runner = spec_expert_runner_type(self.expert_placement)(
             banks,
@@ -333,10 +383,19 @@ class SpecDraftHead:
         self.kv_cache.attach_page_table(self.page_table)
         with self._private_context_fields():
             self.attn_backend = QSASparseAttnBackend(self.mtp_config)
+            # The chain is ungraphed, so nothing else would ever give this backend static
+            # buffers: without this every step took the fully allocating eager path (three
+            # pinned host tensors and ~5 device transients per forward). Armed inside the
+            # private context so the workspace is sized from THIS head's page table.
+            self.attn_backend.enable_step_workspace()
 
     @property
     def resident_bytes(self) -> int:
-        """Everything the head charges the card: dense weights, both expert banks, its KV."""
+        """Everything the head charges the card: dense weights, expert banks, KV, LM head.
+
+        The private LM head copy counts only when there IS one: ``bf16`` hands back the
+        target's own object, whose bytes the target already paid for.
+        """
         pool = sum(
             tensor.numel() * tensor.element_size()
             for tensor in (
@@ -347,10 +406,17 @@ class SpecDraftHead:
                 self.page_table,
             )
         )
+        head = getattr(self, "draft_lm_head", None)
+        private_head = (
+            0
+            if head is None or head is self.target_model.lm_head
+            else int(head.resident_bytes)
+        )
         return (
             int(self.staged_model.resident_bytes)
             + int(self.expert_runner.resident_bytes)
             + int(pool)
+            + private_head
         )
 
     # ------------------------------------------------------------------ private context
@@ -394,6 +460,28 @@ class SpecDraftHead:
 
         return _swap()
 
+    def _step_tensors(self, rows: int):
+        """This head's reusable per-row-count ``(positions, out_loc, active_table_idx)``.
+
+        A chain step used to allocate all three on the device every forward (an ``arange``, a
+        ``contiguous()`` of a page-table slice and a ``zeros``). They are pure functions of
+        the row count and the committed length, so one buffer per row count is enough: both
+        refills below are stream-ordered kernels, so a buffer cannot be rewritten out from
+        under the forward that is still reading it. Built lazily -- the row counts a request
+        actually uses are 1 (a draft step) and whatever its flushes come to.
+        """
+        cache = getattr(self, "_step_cache", None)
+        if cache is None:
+            cache = self._step_cache = {}
+        buffers = cache.get(rows)
+        if buffers is None:
+            buffers = cache[rows] = (
+                torch.empty(rows, dtype=torch.int32, device=self.device),
+                torch.empty(rows, dtype=torch.int32, device=self.device),
+                torch.zeros(1, dtype=torch.int32, device=self.device),
+            )
+        return buffers
+
     def _batch(self, rows: int, *, rope_positions=None, capture=None, saved=None):
         from types import SimpleNamespace
 
@@ -401,9 +489,9 @@ class SpecDraftHead:
         req = SimpleNamespace(
             table_idx=0, cached_len=start, device_len=start + rows, extend_len=rows
         )
-        positions = torch.arange(
-            start, start + rows, dtype=torch.int32, device=self.device
-        )
+        positions, out_loc, active_table_idx = self._step_tensors(rows)
+        torch.arange(start, start + rows, out=positions)
+        out_loc.copy_(self.page_table[0, start : start + rows])
         batch = SimpleNamespace(
             reqs=[req],
             padded_reqs=[req],
@@ -414,15 +502,19 @@ class SpecDraftHead:
             is_decode=rows == 1,
             positions=positions,
             rope_positions=rope_positions,
-            out_loc=self.page_table[0, start : start + rows].contiguous(),
+            out_loc=out_loc,
             attn_metadata=None,
-            active_table_idx=torch.zeros(1, dtype=torch.int32, device=self.device),
+            active_table_idx=active_table_idx,
         )
         if capture is not None:
             batch.mtp_qsa_capture_blocks = capture
         if saved is not None:
             batch.mtp_qsa_saved_blocks = saved
-        self.attn_backend.prepare_metadata(batch)
+        # Under the head's OWN context: ``prepare_metadata``'s non-decode arm gathers the page
+        # row through ``get_global_ctx().page_table``, which outside this swap is the TARGET's
+        # table -- a different (and for a private pool, out-of-range) set of physical pages.
+        with self._private_context_fields():
+            self.attn_backend.prepare_metadata(batch)
         return batch
 
     def _run_rows(self, embeddings, hidden, *, rope_positions=None, capture=None, saved=None):
@@ -628,10 +720,10 @@ class SpecDraftHead:
 
         THE CONFIDENCE CUT
         ------------------
-        With ``conf_cut > 0`` the chain stops before the first token whose raw softmax top-1
-        probability falls under the bar, and the proposal comes back SHORT (``k < depth``).
-        That is not an error anywhere downstream: ``_prepare_spec_batch`` accepts 1..depth
-        drafts, verify width is ``1 + k``, and every width in that range is graph-capturable.
+        With ``conf_cut > 0`` the proposal comes back SHORT (``k < depth``): it is truncated
+        before the first token whose raw softmax top-1 probability falls under the bar. That is
+        not an error anywhere downstream: ``_prepare_spec_batch`` accepts 1..depth drafts,
+        verify width is ``1 + k``, and every width in that range is graph-capturable.
 
         The cut gates CONTINUING, never STARTING: row 0 is drafted and proposed whatever its
         confidence. A cycle exists to verify at least one draft -- refusing to propose would
@@ -639,9 +731,25 @@ class SpecDraftHead:
         the jump from w=1 to w=2, which is the cheapest row a cycle can buy. Every row after it
         is priced against a chain that has already shown it is guessing.
 
-        Cost of the cut: ONE small device readback per drafted token (never for the last one,
-        whose confidence could not change anything), and none at all while it is disabled --
-        the zero-sync chain below stays byte for byte what it was.
+        WHEN THE CUT IS APPLIED (``draft_cut_mode``)
+        -------------------------------------------
+        The two modes propose exactly the same thing; they differ only in what the chain
+        spends getting there, and the flag exists so a live A/B can price them on one boot.
+
+        ``step`` breaks out of the loop the moment a row comes back doubtful, which means
+        reading that row's confidence back to the host -- a device synchronization inside the
+        chain, once per drafted token. Each one drains the queue: the host cannot enqueue step
+        i+1's dozen-odd kernels until step i's have all retired, so a five-step chain pays five
+        launch ramps instead of one, and no draft step can ever be graph-captured.
+
+        ``chain`` (the default) runs the FULL depth with every step's confidence written into a
+        device buffer, and applies the cut after the single readback below -- truncating to the
+        prefix before the first sub-cut row, which is the prefix the breaking loop produced.
+        The rows after the cut are computed and thrown away (draft forwards, the cheap side)
+        in exchange for the whole chain issuing as one uninterrupted stream.
+
+        Neither mode changes the verify width, which is ``1 + k`` rows of the TARGET and the
+        expensive side by an order of magnitude.
         """
         from freetoken.engine.spec_sample import request_filter_params
 
@@ -668,19 +776,25 @@ class SpecDraftHead:
         drafted: list[torch.Tensor] = []
         rows: list[torch.Tensor] = []
         cut = self.conf_cut
+        stepwise = cut > 0.0 and self.draft_cut_mode == "step"
+        # the cut's evidence, accumulated on the DEVICE: one scalar store per step, no sync.
+        # ``step`` mode does not want it -- it has already decided, row by row, on the host.
+        conf = self._confidence_buffer(depth) if cut > 0.0 and not stepwise else None
         try:
             for index in range(depth):
-                logits = self.target_model.lm_head.forward_all(sample)[0]
+                logits = self.draft_lm_head.forward_all(sample)[0]
                 token = self._sampler.sample_device(
                     logits, temperature=temperature, top_k=top_k, top_p=top_p
                 )
                 rows.append(logits.detach().clone())
                 drafted.append(token)
+                if conf is not None:
+                    _record_row_top1(logits, conf, index)
                 if index + 1 == depth:
                     break
-                # the one sync the cut costs, and it is taken only where it can save a verify
-                # row: after the LAST token there is nothing left to stop
-                if cut > 0.0 and _row_top1(logits) < cut:
+                # ``step``: the readback is taken only where it can save a draft forward --
+                # after the LAST token there is nothing left to stop
+                if stepwise and _row_top1(logits) < cut:
                     break
                 embedding = self.target_model.model.embed_tokens.forward(
                     token.reshape(1).to(torch.int32)
@@ -703,16 +817,39 @@ class SpecDraftHead:
             self.kv_cache._pending_ring.copy_(ring)
             self.kv_cache._pending_position_ring.copy_(position_ring)
             self.committed_len = base_len
-        # one readback for the whole chain
-        tokens = torch.cat([token.reshape(1) for token in drafted]).tolist()
-        stacked = torch.stack(rows)
+        # THE one readback of the drafted ids -- and, in ``chain`` mode, the only point at
+        # which the host waits for the device at all. The ids and the cut's confidences travel
+        # together in one float64 tensor rather than in two calls: a float64 holds an int64
+        # token id exactly to 2^53, so the pack is free and ``chain`` synchronizes exactly once
+        # whether the cut is armed or not. In ``step`` mode the loop already truncated itself,
+        # so there is nothing left to decide and no confidence to carry.
+        packed = [token.reshape(1).to(torch.float64) for token in drafted]
+        if conf is not None:
+            packed.append(conf.to(torch.float64))
+        values = torch.cat(packed).tolist()
+        drawn = len(drafted)
+        keep = drawn if conf is None else _confidence_prefix(values[drawn:], cut)
+        stacked = torch.stack(rows[:keep])
         top1, gap = _draft_confidence(stacked)
         return DraftProposal(
-            tokens=tuple(int(t) for t in tokens),
+            tokens=tuple(int(value) for value in values[:keep]),
             logits=stacked,
             draft_top1=top1,
             draft_top1_gap=gap,
         )
+
+    def _confidence_buffer(self, depth: int) -> torch.Tensor:
+        """The chain's ``[depth]`` device slots for per-step top-1 probabilities.
+
+        Preallocated at the configured ceiling and reused, so an armed cut adds no allocation
+        to a proposal -- only ``depth`` scalar stores and one slice.
+        """
+        buffer = getattr(self, "_conf_buffer", None)
+        if buffer is None or buffer.numel() < depth:
+            buffer = self._conf_buffer = torch.zeros(
+                max(depth, self.depth), dtype=torch.float32, device=self.device
+            )
+        return buffer[:depth]
 
     def close(self) -> None:
         runner = getattr(self, "expert_runner", None)
@@ -728,10 +865,38 @@ def _row_top1(logits: torch.Tensor) -> float:
     that row are the same number. Raw, not filtered: under a greedy request's filter ``q`` is
     1.0 for every draft, sure or not, which is exactly the signal the cut needs to keep.
 
+    The readback ``draft_cut_mode="step"`` takes per drafted token, and the reference the
+    diagnosis log is compared against. ``chain`` mode writes the same number straight to the
+    device instead (:func:`_record_row_top1`) so that no step has to wait for it.
+
     Deliberately a module-level function rather than an inlined expression: it is the single
-    place the cut's one device readback happens, so a test can count it.
+    place ``step`` mode's readback happens, so a test can count it.
     """
     return float(torch.softmax(logits.detach().float(), dim=-1).max().item())
+
+
+def _record_row_top1(logits: torch.Tensor, out: torch.Tensor, index: int) -> None:
+    """Write one row's raw softmax top-1 probability into a device slot -- no readback.
+
+    Same expression as :func:`_row_top1` minus the ``.item()``: the store is a device-to-device
+    copy into a preallocated buffer, so the chain never stops to look at it. Module level for
+    the same reason ``_row_top1`` is -- it is the single place the confidence is produced, so a
+    test can count the productions independently of the readbacks.
+    """
+    out[index] = torch.softmax(logits.detach().float(), dim=-1).max()
+
+
+def _confidence_prefix(top1: Sequence[float], cut: float) -> int:
+    """How many of a full-depth chain's drafts survive the cut.
+
+    Row 0 is always kept (the cut gates continuing, never starting) and the LAST row's
+    confidence is never consulted -- after the final draft there is no further row for it to
+    stop. Both are the pre-existing semantics; only the moment the decision is taken moved.
+    """
+    keep = 1
+    while keep < len(top1) and top1[keep - 1] >= cut:
+        keep += 1
+    return keep
 
 
 def _draft_confidence(
@@ -771,6 +936,7 @@ __all__ = [
     "build_shifted_pairs",
     "build_shifted_rope_positions",
     "load_spec_expert_banks",
+    "resolve_draft_cut_mode",
     "resolve_spec_expert_placement",
     "spec_conf_log_enabled",
     "spec_expert_runner_type",

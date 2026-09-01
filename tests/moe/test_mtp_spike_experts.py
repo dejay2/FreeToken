@@ -515,3 +515,84 @@ def test_the_gather_path_covers_the_widest_speculative_step_whatever_the_banks_c
     runner = _resident_runner(banks, device=torch.device("cpu"), max_tokens=8)
 
     assert runner.gather_max_tokens >= 4
+
+
+# ------------------------------------------------ buffered flushes stay off the loop (cost d)
+
+
+def test_a_24_row_flush_never_enters_the_expert_major_path(monkeypatch):
+    """``SpecDraftHead.propose`` opens with ``_flush_pairs()``, and a cold request under the
+    cost-aware policy buffers a whole cooldown of plain decode observations before the head is
+    next needed -- ~29 rows committed in ONE forward. At the shipping geometry (512 experts,
+    top_k 10, 9.83 MB an expert) the gathered path's byte budget is five rows, so those
+    flushes used to land in ``_run_expert_major``: a full ``route_ids.tolist()`` sync plus a
+    Python-loop GEMM per routed expert (~190 of them for 24 rows). They are chunked now.
+    """
+    banks, hidden_size, _ = _banks(seed=1000)
+    # the shipping bank is far past the byte budget, so ONE gathered pass is the four-row floor
+    banks.bytes_per_expert = 1 << 40
+    runner = _resident_runner(banks, device=torch.device("cpu"), max_tokens=64)
+    assert runner.gather_chunk_tokens == 4  # ...six passes for the flush below
+    assert runner.gather_max_tokens >= 24
+
+    def refuse(*args, **kwargs):
+        pytest.fail("a 24-row flush reached the expert-major loop")
+
+    monkeypatch.setattr(type(runner), "_run_expert_major", refuse)
+    generator = torch.Generator().manual_seed(1001)
+    hidden = (torch.randn(24, hidden_size, generator=generator) * 0.5).to(torch.bfloat16)
+    weights, ids = _routes(24, banks.num_experts, 2, seed=1002)
+
+    _SyncTrap(monkeypatch)
+    got = runner.run_routed(hidden, weights, ids)
+
+    assert got.shape == hidden.shape
+
+
+def test_chunking_the_gather_is_bit_for_bit_the_one_pass_gather():
+    """Each token's output reads only its own routes, so splitting the rows is the same
+    arithmetic on the same operands -- which is what lets the pass width and the call width be
+    different numbers at all."""
+    banks, hidden_size, _ = _banks(seed=1100)
+    one_pass = _resident_runner(banks, device=torch.device("cpu"), max_tokens=64)
+    one_pass.gather_chunk_tokens = 24
+    chunked = _resident_runner(banks, device=torch.device("cpu"), max_tokens=64)
+    chunked.gather_chunk_tokens = 5
+    generator = torch.Generator().manual_seed(1101)
+    hidden = (torch.randn(24, hidden_size, generator=generator) * 0.5).to(torch.bfloat16)
+    weights, ids = _routes(24, banks.num_experts, 2, seed=1102)
+
+    assert torch.equal(
+        one_pass.run_routed(hidden, weights, ids), chunked.run_routed(hidden, weights, ids)
+    )
+
+
+def test_prompt_priming_still_takes_the_expert_major_loop(monkeypatch):
+    """The chunked gather reads a weight once per ROUTE; beyond the flush width -- a 128-row
+    priming chunk, once per request -- reading each unique expert once really is cheaper, and
+    that call is free to synchronize."""
+    banks, hidden_size, _ = _banks(seed=1200)
+    runner = _resident_runner(banks, device=torch.device("cpu"), max_tokens=128)
+    # the toy banks are small enough that the byte budget alone allows >1000 gathered rows;
+    # a real priming chunk sits above the cap, which is what this lowers it to model
+    runner.gather_max_tokens = 8
+    generator = torch.Generator().manual_seed(1201)
+    rows = runner.gather_max_tokens + 1
+    hidden = (torch.randn(rows, hidden_size, generator=generator) * 0.5).to(torch.bfloat16)
+    weights, ids = _routes(rows, banks.num_experts, 2, seed=1202)
+
+    seen: list[int] = []
+    real = type(runner)._run_expert_major
+    monkeypatch.setattr(
+        type(runner),
+        "_run_expert_major",
+        lambda self, *args, **kwargs: (
+            seen.append(1) or real(self, *args, **kwargs)
+        ),
+    )
+
+    got = runner.run_routed(hidden, weights, ids)
+
+    assert seen == [1]
+    expected = _expert_major_reference(runner, hidden, weights, ids)
+    torch.testing.assert_close(got.float(), expected.float(), rtol=0, atol=1e-2)

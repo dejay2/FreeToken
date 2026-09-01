@@ -139,7 +139,7 @@ def test_dequantized_scratch_is_preallocated_and_bounded_by_the_routed_width():
     )
 
     assert runner.max_gather_pairs == 8
-    assert runner.gather_max_tokens == 4
+    assert runner.gather_chunk_tokens == 4  # the scratch is sized for ONE gathered pass
     gate_up, down = runner.dequantize_experts(torch.zeros(8, dtype=torch.int64))
     assert gate_up.shape == (8, 2 * INTERMEDIATE, HIDDEN)
     assert down.shape == (8, HIDDEN, INTERMEDIATE)
@@ -230,6 +230,9 @@ def test_quantized_runner_falls_back_to_the_expert_major_loop_beyond_the_gather_
     generator = torch.Generator().manual_seed(71)
     hidden = (torch.randn(6, HIDDEN, generator=generator) * 0.5).to(torch.bfloat16)
     weights, ids = _routes(6, EXPERTS, 2, seed=72)
+    # a real prompt-priming chunk is wider than _ROUTED_GATHER_MAX_TOKENS; six rows is not, so
+    # the row cap is lowered here rather than growing the fixture to 33 rows
+    runner.gather_max_tokens = 2
     assert 6 > runner.gather_max_tokens
 
     got = runner.run_routed(hidden, weights, ids)
@@ -380,8 +383,11 @@ def test_the_quantized_gather_covers_the_widest_speculative_step():
     quantized, _ = _paired_banks(seed=200)
     runner = _quantized_runner(quantized, device=torch.device("cpu"), max_gather_tokens=4)
 
-    assert runner.gather_max_tokens == 4
+    assert runner.gather_chunk_tokens == 4
     assert runner.max_gather_pairs == 4 * runner.top_k
+    # ...and a WIDER call (a buffered flush) still stays on the gather path, in passes of
+    # that same scratch, rather than dropping to the synchronizing loop
+    assert runner.gather_max_tokens > runner.gather_chunk_tokens
 
 
 def _independent_expert_major(gate_up, down, hidden, weights, ids):

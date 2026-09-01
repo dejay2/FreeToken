@@ -135,7 +135,29 @@ class QSASparseMetadata(BaseAttnMetadata):
         return self.last_indices[:bs]
 
 
+@dataclass
+class _QSAStepWorkspace:
+    """Reusable staging for ONE fixed single-request forward shape.
+
+    Everything a forward of ``rows`` query rows needs, allocated once: the pinned host
+    tensors ``prepare_metadata`` used to build per call, their device counterparts, and the
+    two-buffer page-table gather. Only the lengths, the ring slot and the page row move
+    between forwards of one shape, and each of those is a copy into these buffers.
+    """
+
+    md: QSASparseMetadata
+    table_idx: torch.Tensor  # device int64 [1], the index_select operand
+    page_bases: torch.Tensor  # device int32 [1, pages], the gathered per-page base slots
+    block_table: torch.Tensor  # device int32 [1, pages]
+
+
 class QSASparseAttnBackend(BaseAttnBackend):
+    # Class-level defaults so the reusable-staging arms read false on a bare instance too
+    # (the shadow tooling and several tests build one with ``object.__new__``).
+    _step_ws: dict[int, "_QSAStepWorkspace"] | None = None
+    _step_scratch: dict[str, torch.Tensor] | None = None
+    _step_active: "_QSAStepWorkspace | None" = None
+
     def __init__(self, config: ModelConfig) -> None:
         from freetoken.kvcache.qsa_pool import QSAKVCache
 
@@ -178,6 +200,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._mtp_verify_graph: dict[int, QSASparseMetadata] = {}
         self._mtp_verify_scratch: dict[int, dict[str, torch.Tensor]] = {}
         self._mtp_verify_active_width: int | None = None
+        # Reusable per-forward staging, off unless a private ungraphed head arms it.
+        self._step_ws: dict[int, _QSAStepWorkspace] | None = None
+        self._step_scratch: dict[str, torch.Tensor] | None = None
+        self._step_active: _QSAStepWorkspace | None = None
         self.capture_bs: List[int] = []
 
     @staticmethod
@@ -220,12 +246,89 @@ class QSASparseAttnBackend(BaseAttnBackend):
             self._index_cos_sin = rope._cos_sin_cache.to(self.device)
         return self._index_cos_sin
 
+    # ----- reusable per-forward staging (private, ungraphed heads) --------------------------
+    def enable_step_workspace(self) -> None:
+        """Arm reusable per-forward staging on this backend instance.
+
+        For the private MTP draft head only. That head runs an UNGRAPHED chain of tiny
+        forwards whose shapes repeat exactly -- one row per recursive draft step, N rows per
+        buffered flush -- and, having no ``init_capture_graph``, it took the fully allocating
+        path every time: ``prepare_metadata`` built two pinned host tensors and
+        ``_snapshot_decode`` a third, plus half a dozen ``torch.empty`` transients in
+        ``_scratch``. Pinned allocation is the expensive one -- a miss in the caching host
+        allocator is a ``cudaHostAlloc``, which synchronizes the device. Armed, each shape is
+        built once and overwritten in place afterwards, so a steady-state chain step performs
+        no host allocation at all. Nothing on the target's path arms this, and unarmed the
+        cost is one ``is None`` test per forward.
+        """
+        if self._step_ws is None:
+            self._step_ws = {}
+            self._step_scratch = {}
+
+    def _step_workspace(self, rows: int) -> _QSAStepWorkspace:
+        ws = self._step_ws.get(rows)
+        if ws is None:
+            ws = self._build_step_workspace(rows)
+            self._step_ws[rows] = ws
+        return ws
+
+    def _build_step_workspace(self, rows: int) -> _QSAStepWorkspace:
+        pages = -(-get_global_ctx().page_table.shape[1] // self.page_size)
+        device = self.device
+        md = QSASparseMetadata(
+            is_decode=rows == 1,
+            last_indices=torch.tensor([rows - 1], dtype=torch.int32, device=device),
+            qo_indptr_cpu=torch.tensor([0, rows], **_CPU_PINNED),
+            kv_len_cpu=torch.zeros(1, **_CPU_PINNED),
+            # With one request the ragged prefill plan and ``_snapshot_decode``'s decode plan
+            # coincide: ``token_to_req`` is all zeros and ``cu_seqlens`` is ``[0, rows]``
+            # (``arange(bs + 1)`` at rows == 1). Both are therefore constants of the shape.
+            token_to_req=torch.zeros(rows, dtype=torch.int32, device=device),
+            cu_seqlens=torch.tensor([0, rows], dtype=torch.int32, device=device),
+            seq_lens=torch.zeros(1, dtype=torch.int32, device=device),
+            ring_slots=torch.zeros(1, dtype=torch.int32, device=device),
+        )
+        return _QSAStepWorkspace(
+            md=md,
+            table_idx=torch.zeros(1, dtype=torch.int64, device=device),
+            page_bases=torch.zeros((1, pages), dtype=torch.int32, device=device),
+            block_table=torch.zeros((1, pages), dtype=torch.int32, device=device),
+        )
+
+    def _stage_step_block_table(self, ws: _QSAStepWorkspace) -> torch.Tensor:
+        """Gather this forward's page row into the workspace, allocating nothing."""
+        torch.index_select(self._block_base_view(), 0, ws.table_idx, out=ws.page_bases)
+        return torch.floor_divide(ws.page_bases, self.page_size, out=ws.block_table)
+
+    def _stage_step(self, ws, reqs, seqlens_k, is_decode: bool) -> QSASparseMetadata:
+        md = ws.md
+        md.is_decode = is_decode
+        length, table_idx = int(seqlens_k[0]), int(reqs[0].table_idx)
+        # ``fill_``, not a copy out of a REUSED pinned staging tensor: a reused pinned buffer
+        # with a non-blocking H2D is a race (the host can overwrite the value before the copy
+        # runs) and a blocking one is a device synchronization. A fill bakes the scalar into
+        # the launch, so it is stream-ordered, allocation-free and neither of those.
+        md.seq_lens.fill_(length)
+        md.ring_slots.fill_(table_idx)
+        ws.table_idx.fill_(table_idx)
+        md.kv_len_cpu[0] = length  # the host-side mirror; nothing asynchronous reads it
+        # Decode addressing stays DEFERRED exactly as the allocating path leaves it (the page
+        # row is gathered at the first QSA layer); only the allocations are gone.
+        md.block_table = None if is_decode else self._stage_step_block_table(ws)
+        self._step_active = ws
+        return md
+
     # ----- metadata -----------------------------------------------------------------------
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs if hasattr(batch, "padded_reqs") else batch.reqs
         seqlens_q = [r.extend_len for r in reqs]
         seqlens_k = [r.device_len for r in reqs]
         is_decode = getattr(batch, "phase", None) == "decode"
+        if self._step_ws is not None and len(reqs) == 1:
+            batch.attn_metadata = self._stage_step(
+                self._step_workspace(int(seqlens_q[0])), reqs, seqlens_k, is_decode
+            )
+            return
         qo_indptr = torch.tensor([0] + seqlens_q, **_CPU_PINNED).cumsum_(0).to(torch.int32)
         kv_len = torch.tensor(seqlens_k, **_CPU_PINNED)
         last = (qo_indptr[1:].to(torch.int32) - 1).to(self.device, non_blocking=True)
@@ -277,6 +380,13 @@ class QSASparseAttnBackend(BaseAttnBackend):
     def _snapshot_decode(self, md: QSASparseMetadata, batch: Batch) -> None:
         """Eager decode (not graph-staged): this step's rows, once per forward. The live
         page-table row may mutate for the next batch while this one runs, so gather now."""
+        ws = self._step_active
+        if ws is not None and ws.md is md:
+            # Armed: prepare_metadata staged everything but this gather, which is deliberately
+            # still taken here -- for a private head this is the first point at which its OWN
+            # page table is the one installed on the context.
+            md.block_table = self._stage_step_block_table(ws)
+            return
         reqs = batch.padded_reqs if hasattr(batch, "padded_reqs") else batch.reqs
         bs = len(reqs)
         table_idx = torch.tensor([r.table_idx for r in reqs], **_CPU_PINNED)
@@ -554,10 +664,20 @@ class QSASparseAttnBackend(BaseAttnBackend):
         buffers = self._graph
         if self._mtp_verify_active_width is not None:
             buffers = self._mtp_verify_scratch[self._mtp_verify_active_width]
+        elif self._step_scratch is not None:
+            buffers = self._step_scratch
         buffer = buffers.get(name)
         if buffer is not None and rows <= buffer.shape[0] and buffer.shape[1:] == shape:
             return buffer[:rows]
-        return torch.empty((rows, *shape), dtype=dtype, device=self.device)
+        buffer = torch.empty((rows, *shape), dtype=dtype, device=self.device)
+        if buffers is self._step_scratch:
+            # An armed backend keeps its transients at the high-water mark instead of
+            # reallocating them every forward: the draft chain runs a handful of shapes over
+            # and over, so after the first forward of each shape this allocates nothing. The
+            # mark is bounded by the widest call the head makes (``_MAX_DRAFT_ROWS`` rows of a
+            # priming chunk), which at the shipping geometry is ~34 MB of transients held.
+            buffers[name] = buffer
+        return buffer
 
     # ----- CUDA graph (decode) --------------------------------------------------------------
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:

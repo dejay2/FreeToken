@@ -521,6 +521,42 @@ def test_a_cut_outside_a_probability_is_rejected(raw):
         resolve_spec_decode({"FREETOKEN_MTP_SPEC_CONF_CUT": raw})
 
 
+def test_the_cut_is_applied_over_the_whole_chain_by_default():
+    """``chain`` is the shipped mode: the chain drafts its full depth and truncates after ONE
+    device readback, which is also what makes the draft steps graph-capturable. ``step`` is
+    the pre-existing per-token early exit, kept so the two can be measured against each other
+    on one boot."""
+    assert resolve_spec_decode({}).draft_cut_mode == "chain"
+    assert resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"}).draft_cut_mode == "chain"
+    assert SpecDecodeConfig().draft_cut_mode == "chain"
+
+
+@pytest.mark.parametrize("raw,expected", [("step", "step"), (" CHAIN ", "chain"), ("", "chain")])
+def test_the_cut_mode_reads_its_own_variable(raw, expected):
+    spec = resolve_spec_decode(
+        {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_DRAFT_CUT_MODE": raw}
+    )
+    assert spec.draft_cut_mode == expected
+
+
+@pytest.mark.parametrize("raw", ["eager", "1", "off", "chain,step"])
+def test_an_unknown_cut_mode_is_rejected(raw):
+    """Silently falling back to the default would make an A/B report the wrong arm."""
+    with pytest.raises(ValueError, match="FREETOKEN_MTP_SPEC_DRAFT_CUT_MODE"):
+        resolve_spec_decode({"FREETOKEN_MTP_SPEC_DRAFT_CUT_MODE": raw})
+
+
+def test_the_cut_mode_is_orthogonal_to_the_bar_it_applies():
+    """It decides WHEN the cut is taken, never whether: ``conf_cut`` alone arms it, and the
+    emission bar (which prices a cycle's verify width) must not move with the mode."""
+    step = resolve_spec_decode(
+        {"FREETOKEN_MTP_SPECULATE": "1", "FREETOKEN_MTP_SPEC_DRAFT_CUT_MODE": "step"}
+    )
+    chain = resolve_spec_decode({"FREETOKEN_MTP_SPECULATE": "1"})
+    assert step.conf_cut == chain.conf_cut == pytest.approx(0.8)
+    assert step.min_emitted == chain.min_emitted
+
+
 def test_the_unset_emission_bar_follows_whether_the_cut_is_armed():
     """A cut cycle verifies fewer rows, so it is cheaper, so the bar it has to clear to be
     worth taking is lower: ~2.0 modelled, 2.4 chosen conservatively, against 3.6 uncut."""

@@ -93,7 +93,9 @@ class _FakeTargetModel:
         )
 
 
-def _head(*, depth=3, seed=1729, logits_for=None, conf_cut=0.0) -> SpecDraftHead:
+def _head(
+    *, depth=3, seed=1729, logits_for=None, conf_cut=0.0, cut_mode="chain"
+) -> SpecDraftHead:
     import freetoken.core as core
 
     core._GLOBAL_CTX = None
@@ -109,10 +111,15 @@ def _head(*, depth=3, seed=1729, logits_for=None, conf_cut=0.0) -> SpecDraftHead
     # off unless a test arms it: the cut is a policy on top of the chain, and everything
     # below pins the chain itself
     head.conf_cut = conf_cut
+    head.draft_cut_mode = cut_mode
     head.seed = seed
     head.num_pages = PAGES
     head.target_ctx = ctx
     head.target_model = _FakeTargetModel(logits_for=logits_for)
+    # the real head projects the chain through its OWN (quantized) copy; the fakes above are
+    # the target's head, so pointing the draft at it keeps every assertion below about the
+    # chain rather than about the copy (which tests/engine/test_spec_lmhead.py owns)
+    head.draft_lm_head = head.target_model.lm_head
     head.page_table = torch.arange(
         2 * PAGES * PAGE_SIZE, dtype=torch.int32
     ).reshape(2, PAGES * PAGE_SIZE)
@@ -516,6 +523,44 @@ def test_a_proposal_writes_its_recursive_rows_at_the_committed_length():
     assert head.staged_model.calls == [(1, 5), (1, 6)]
 
 
+def test_a_chain_step_reuses_its_addressing_buffers_instead_of_allocating_them():
+    """Every step used to allocate three device tensors of its own -- an ``arange`` of
+    positions, a ``contiguous()`` copy of a page-table slice, and a ``zeros`` -- on a path that
+    has no CUDA graph to amortize them. They are pure functions of the row count and the
+    committed length, so one set per row count is enough, refilled by stream-ordered kernels.
+    """
+    head = _head()
+    batch, _ = _prefill_batch(5)
+    head.observe_forward(batch, _capture(5), torch.tensor(7))
+    head.prepared.clear()
+
+    head.propose(_req(cached_len=5), 3)
+
+    steps = [b for b in head.prepared if b.positions.numel() == 1]
+    assert len(steps) == 2  # depth 3 = two recursive rows
+    for name in ("positions", "out_loc", "active_table_idx"):
+        assert getattr(steps[0], name).data_ptr() == getattr(steps[1], name).data_ptr(), name
+    # the last refill is the one still in the buffer, and it is the row the step actually read
+    assert steps[-1].positions.tolist() == [6]
+    assert steps[-1].out_loc.tolist() == head.page_table[0, 6:7].tolist()
+
+
+def test_a_flush_and_a_chain_step_do_not_share_a_buffer():
+    """The workspace is keyed by row count; a 4-row flush and a 1-row draft step are different
+    shapes and must not be handed the same tensor."""
+    head = _head()
+    batch, _ = _prefill_batch(5)
+    head.observe_forward(batch, _capture(5), torch.tensor(7))
+    _decode_run(head, 4, start=5, eager=False)
+    head.prepared.clear()
+
+    head.propose(_req(cached_len=9), 3)
+
+    widths = {b.positions.numel(): b.positions.data_ptr() for b in head.prepared}
+    assert set(widths) == {4, 1}
+    assert widths[4] != widths[1]
+
+
 def test_a_proposal_deeper_than_the_configured_depth_is_refused():
     head = _head(depth=2)
     batch, _ = _prefill_batch(5)
@@ -555,7 +600,11 @@ def test_the_private_qsa_ring_is_sized_from_the_configured_depth(monkeypatch, de
     head.mtp_config = derive_mtp_model_config(parsed_config())
     # the real pool, the real arithmetic; only the attention backend (which wants a device) is
     # stood in for
-    monkeypatch.setattr(qsa, "QSASparseAttnBackend", lambda config: SimpleNamespace())
+    monkeypatch.setattr(
+        qsa,
+        "QSASparseAttnBackend",
+        lambda config: SimpleNamespace(enable_step_workspace=lambda: None),
+    )
 
     head._init_private_state(PAGE_SIZE)
 
@@ -596,8 +645,31 @@ def _stepwise(confidences):
     return logits_for
 
 
-def _primed_head(*, conf_cut, confidences=()) -> SpecDraftHead:
-    head = _head(conf_cut=conf_cut, logits_for=_stepwise(confidences))
+def _scripted(top1: "tuple[float, ...]"):
+    """A ``logits_for`` whose i-th CALL has raw softmax top-1 exactly ``top1[i]``.
+
+    ``_stepwise`` above places an arbitrary peak; here the peak is SOLVED for, so a test can
+    say "row 1 is 0.5 confident" and mean it against a bar of 0.8. A row of zeros with
+    ``ln(p (V-1) / (1-p))`` on one class softmaxes to exactly ``p`` there, and the class moves
+    with the call index so each row proposes a different token.
+    """
+    import math
+
+    calls = {"n": 0}
+
+    def logits_for(_hidden: torch.Tensor) -> torch.Tensor:
+        index = calls["n"]
+        calls["n"] += 1
+        peak = top1[index] if index < len(top1) else top1[-1]
+        row = torch.zeros(VOCAB)
+        row[index % VOCAB] = math.log(peak * (VOCAB - 1) / (1.0 - peak))
+        return row
+
+    return logits_for
+
+
+def _primed_head(*, conf_cut, confidences=(), cut_mode="chain") -> SpecDraftHead:
+    head = _head(conf_cut=conf_cut, cut_mode=cut_mode, logits_for=_stepwise(confidences))
     batch, _ = _prefill_batch(5)
     head.observe_forward(batch, _capture(5), torch.tensor(7))
     head.staged_model.calls.clear()
@@ -627,8 +699,10 @@ def test_a_doubtful_first_row_stops_the_chain_at_one_token():
 
     assert len(proposal.tokens) == 1
     assert proposal.logits.shape == (1, VOCAB)
-    # the rows the chain never reached were never run either: that is the whole saving
-    assert head.staged_model.calls == []
+    # The chain itself runs its full depth -- stopping early would mean reading a confidence
+    # back per step, and that sync costs more than the draft rows it saves. What the cut buys
+    # is the TARGET's verify width, which is what a cycle actually pays for.
+    assert head.staged_model.calls == [(1, 5), (1, 6)]
 
 
 def test_a_doubtful_later_row_keeps_the_prefix_and_stops_there():
@@ -639,7 +713,21 @@ def test_a_doubtful_later_row_keeps_the_prefix_and_stops_there():
     proposal = head.propose(_req(cached_len=5), 3)
 
     assert len(proposal.tokens) == 2
-    assert head.staged_model.calls == [(1, 5)]
+    assert proposal.logits.shape == (2, VOCAB)
+    assert head.staged_model.calls == [(1, 5), (1, 6)]
+
+
+def test_the_truncated_proposal_is_the_prefix_the_breaking_chain_used_to_return():
+    """Same tokens, same logit rows, same private state as a chain that had stopped at the
+    doubt -- the cut moved from a break in the loop to a slice after it, and nothing else."""
+    cut = _primed_head(conf_cut=0.8, confidences=(_SURE, _DOUBTFUL, _SURE))
+    short = _primed_head(conf_cut=0.8, confidences=(_SURE, _DOUBTFUL, _SURE))
+
+    proposal = cut.propose(_req(cached_len=5), 3)
+    reference = short.propose(_req(cached_len=5), 2)  # the depth the break would have reached
+
+    assert proposal.tokens == reference.tokens
+    assert torch.equal(proposal.logits, reference.logits)
 
 
 def test_a_cut_proposal_undoes_its_private_state_exactly_as_a_full_one_does():
@@ -669,25 +757,42 @@ def test_the_cut_gates_continuing_not_starting():
     assert len(proposal.tokens) == 1
 
 
-def _counted_top1(monkeypatch) -> list[float]:
+def _counted_confidence(monkeypatch) -> list[int]:
     from freetoken.engine import spec_draft as module
 
-    seen: list[float] = []
-    real = module._row_top1
+    seen: list[int] = []
+    real = module._record_row_top1
 
-    def counting(logits):
-        value = real(logits)
-        seen.append(value)
-        return value
+    def counting(logits, out, index):
+        seen.append(index)
+        return real(logits, out, index)
 
-    monkeypatch.setattr(module, "_row_top1", counting)
+    monkeypatch.setattr(module, "_record_row_top1", counting)
+    return seen
+
+
+def _counted_syncs(monkeypatch) -> list[str]:
+    """Every host readback of a device tensor the chain takes, in order.
+
+    The same handles ``tests/moe``'s ``_SyncTrap`` guards, but counting rather than failing:
+    the chain is allowed exactly one, and this is what says so.
+    """
+    seen: list[str] = []
+    for name in ("tolist", "item", "__int__", "__float__", "__bool__"):
+        real = getattr(torch.Tensor, name)
+
+        def counting(self, *args, _name=name, _real=real, **kwargs):
+            seen.append(_name)
+            return _real(self, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, name, counting, raising=True)
     return seen
 
 
 def test_a_disabled_cut_computes_no_confidence_at_all(monkeypatch):
-    """The zero-sync chain is a deliberate optimization: unarmed, the cut must not cost even
-    one readback, so the confidence is not merely ignored -- it is never computed."""
-    seen = _counted_top1(monkeypatch)
+    """Unarmed, the cut must not cost even the softmax, so the confidence is not merely
+    ignored -- it is never computed."""
+    seen = _counted_confidence(monkeypatch)
     head = _primed_head(conf_cut=0.0, confidences=(_DOUBTFUL, _DOUBTFUL, _DOUBTFUL))
 
     proposal = head.propose(_req(cached_len=5), 3)
@@ -696,15 +801,149 @@ def test_a_disabled_cut_computes_no_confidence_at_all(monkeypatch):
     assert seen == []
 
 
-def test_an_armed_cut_never_reads_back_the_last_rows_confidence(monkeypatch):
-    """One readback per drafted token EXCEPT the last: after the final draft there is no
-    further row for the confidence to stop, so the sync would buy nothing."""
-    seen = _counted_top1(monkeypatch)
+def test_an_armed_cut_records_every_rows_confidence_on_the_device(monkeypatch):
+    """Recording is a device store, so there is no reason to skip any row -- including the
+    last, whose value the cut then never consults (``_confidence_prefix``)."""
+    seen = _counted_confidence(monkeypatch)
     head = _primed_head(conf_cut=0.8, confidences=(_SURE, _SURE, _SURE))
 
     head.propose(_req(cached_len=5), 3)
 
-    assert len(seen) == 2  # depth 3, rows 0 and 1 only
+    assert seen == [0, 1, 2]
+
+
+def _sync_free_embeddings(head) -> None:
+    """The real embedding is a device gather; the fake spells the ids out on the host, which
+    a sync count would otherwise charge to the chain."""
+    head.target_model.model.embed_tokens.forward = lambda ids: torch.zeros(
+        ids.numel(), HIDDEN
+    )
+
+
+@pytest.mark.parametrize("depth,cut", [(1, 0.8), (3, 0.8), (5, 0.8), (5, 0.0)])
+def test_a_chain_mode_proposal_synchronizes_with_the_device_exactly_once(
+    monkeypatch, depth, cut
+):
+    """The point of the restructure. A chain that read a confidence back per step drained the
+    launch queue once per drafted token; in ``chain`` mode the drafted ids and the confidences
+    come back together in ONE call, so the count is 1 whatever the depth and whether or not the
+    cut is armed. Counted through
+    ``Tensor.tolist``/``item``/``__int__``/``__float__``/``__bool__``, which is every way this
+    code could reach into a device tensor.
+    """
+    head = _head(depth=5, conf_cut=cut, logits_for=_stepwise((_SURE,) * 5))
+    batch, _ = _prefill_batch(5)
+    head.observe_forward(batch, _capture(5), torch.tensor(7))
+    _sync_free_embeddings(head)
+
+    seen = _counted_syncs(monkeypatch)
+    proposal = head.propose(_req(cached_len=5), depth)
+
+    assert seen == ["tolist"]
+    assert len(proposal.tokens) == depth
+
+
+# ------------------------------------------------------------------- the two cut modes
+#
+# Same proposal, different cost. ``step`` saves the draft forwards after the cut and pays a
+# queue drain per token; ``chain`` computes them and pays one readback. Which wins is a live
+# measurement, so both are kept and FREETOKEN_MTP_SPEC_DRAFT_CUT_MODE picks between them --
+# what is pinned here is that the choice cannot change what is proposed.
+
+_SCRIPT = (0.95, 0.5, 0.9, 0.99, 0.99)  # row 1 is the only one under a 0.8 bar
+
+
+def _scripted_head(*, cut_mode, cut=0.8, depth=5) -> SpecDraftHead:
+    head = _head(depth=depth, conf_cut=cut, cut_mode=cut_mode, logits_for=_scripted(_SCRIPT))
+    batch, _ = _prefill_batch(5)
+    head.observe_forward(batch, _capture(5), torch.tensor(7))
+    head.staged_model.calls.clear()
+    return head
+
+
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_the_two_cut_modes_propose_exactly_the_same_thing(temperature):
+    """The whole justification for making the mode a flag: it is a cost knob, not a policy
+    one. Both keep rows 0 and 1 -- row 0 clears the bar so the chain continues, row 1 does not
+    so nothing is built on it -- and both return the same tokens drawn from the same rows."""
+    chain = _scripted_head(cut_mode="chain")
+    step = _scripted_head(cut_mode="step")
+    req = _req(cached_len=5, temperature=temperature)
+
+    first = chain.propose(req, 5)
+    second = step.propose(_req(cached_len=5, temperature=temperature), 5)
+
+    assert len(first.tokens) == 2
+    assert first.tokens == second.tokens
+    assert torch.equal(first.logits, second.logits)
+
+
+def test_only_chain_mode_pays_for_the_rows_the_cut_discards():
+    """...and that is the trade the flag exists to price: ``step`` never runs the forwards
+    after the cut, ``chain`` runs all four and throws three away."""
+    chain = _scripted_head(cut_mode="chain")
+    step = _scripted_head(cut_mode="step")
+
+    chain.propose(_req(cached_len=5), 5)
+    step.propose(_req(cached_len=5), 5)
+
+    assert chain.staged_model.calls == [(1, 5), (1, 6), (1, 7), (1, 8)]
+    assert step.staged_model.calls == [(1, 5)]
+
+
+def test_step_mode_synchronizes_once_per_consulted_confidence_plus_the_readback(monkeypatch):
+    """``step``'s cost, stated: one ``item()`` per drafted token whose confidence can still
+    stop the chain, plus the same single ``tolist`` of the drafted ids. Two rows are drafted
+    here, and only row 0's confidence is consulted before row 1 ends the chain."""
+    head = _scripted_head(cut_mode="step")
+    _sync_free_embeddings(head)
+
+    seen = _counted_syncs(monkeypatch)
+    proposal = head.propose(_req(cached_len=5), 5)
+
+    assert len(proposal.tokens) == 2
+    assert seen == ["item", "item", "tolist"]
+
+
+def test_step_mode_never_reads_back_the_last_rows_confidence(monkeypatch):
+    """After the final draft there is no further row for a confidence to stop, so the sync
+    would buy nothing -- the same last-row rule ``_confidence_prefix`` keeps in chain mode."""
+    head = _head(depth=3, conf_cut=0.8, cut_mode="step", logits_for=_scripted((0.99,) * 3))
+    batch, _ = _prefill_batch(5)
+    head.observe_forward(batch, _capture(5), torch.tensor(7))
+    _sync_free_embeddings(head)
+
+    seen = _counted_syncs(monkeypatch)
+    head.propose(_req(cached_len=5), 3)
+
+    assert seen == ["item", "item", "tolist"]  # rows 0 and 1 only
+
+
+def test_step_mode_with_the_cut_disabled_takes_no_per_step_readback(monkeypatch):
+    """``conf_cut=0`` is "never cut" in either mode, so the mode has nothing to decide and
+    must not spend a sync deciding it."""
+    head = _head(depth=3, conf_cut=0.0, cut_mode="step", logits_for=_scripted((0.5,) * 3))
+    batch, _ = _prefill_batch(5)
+    head.observe_forward(batch, _capture(5), torch.tensor(7))
+    _sync_free_embeddings(head)
+
+    seen = _counted_syncs(monkeypatch)
+    proposal = head.propose(_req(cached_len=5), 3)
+
+    assert seen == ["tolist"]
+    assert len(proposal.tokens) == 3
+
+
+def test_the_cut_mode_is_read_off_the_resolved_config_and_validated():
+    """Read the way ``conf_cut`` is -- a getattr with a default, so a stub config that predates
+    the field still works -- but not TRUSTED: a typo silently meaning ``chain`` would make an
+    A/B report the wrong arm."""
+    from freetoken.engine.spec_draft import resolve_draft_cut_mode
+
+    assert resolve_draft_cut_mode(SimpleNamespace()) == "chain"
+    assert resolve_draft_cut_mode(SimpleNamespace(draft_cut_mode="step")) == "step"
+    with pytest.raises(ValueError, match="chain or step"):
+        resolve_draft_cut_mode(SimpleNamespace(draft_cut_mode="eager"))
 
 
 def test_the_cut_reads_the_same_raw_confidence_the_diagnosis_records(monkeypatch):

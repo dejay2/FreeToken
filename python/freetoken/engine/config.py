@@ -62,6 +62,20 @@ class SpecDecodeConfig:
     # which models out at 1.18x on prose because verify width is what a cycle actually costs
     # here (~6.5 ms/row of expert fetch). 0 disables the cut and restores always-full-depth.
     conf_cut: float = 0.8
+    # WHEN the cut is applied, which is a pure cost question -- the proposal is the same
+    # either way (``tests/engine/test_spec_draft.py`` pins the two modes token for token).
+    #   "chain" (default): draft the full depth, read every row's confidence back in ONE
+    #     device synchronization at the end, truncate to the prefix before the first doubtful
+    #     row. The chain issues as one uninterrupted stream of launches -- and it is what
+    #     makes the draft steps graph-capturable at all -- at the price of computing the rows
+    #     after the cut and throwing them away.
+    #   "step": the pre-existing early exit -- one small readback per drafted token (never the
+    #     last), break at the first doubtful row. Saves those draft forwards; pays a queue
+    #     drain per token, so the host cannot run ahead of the device inside a chain.
+    # Which wins is measurable and not obvious: a cut chain averaged 1.5 drafts of a possible
+    # 5, so "chain" spends ~3.5 extra draft forwards (~1.6-4.2 ms each here) to recover ~5
+    # launch-ramp bubbles. This flag exists so that A/B can be run paired on one boot.
+    draft_cut_mode: str = "chain"
     # --- the adaptive fallback (see ``adaptive``) ---
     ema_alpha: float = 0.3
     # With ``cost_aware`` on (the default) this is the FLOOR of a bar the request MEASURES,
@@ -145,7 +159,8 @@ class SpecDecodeConfig:
 
 def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfig:
     """Read ``FREETOKEN_MTP_SPECULATE`` / ``FREETOKEN_MTP_SPEC_DEPTH`` / ``..._SPEC_GRAPH``,
-    the drafting cut's ``..._SPEC_CONF_CUT``, plus the adaptive fallback's
+    the drafting cut's ``..._SPEC_CONF_CUT`` / ``..._SPEC_DRAFT_CUT_MODE``, plus the adaptive
+    fallback's
     ``..._SPEC_EMA_ALPHA`` / ``..._SPEC_MIN_EMITTED`` / ``..._SPEC_PROBE_RESUME`` /
     ``..._SPEC_COOLDOWN`` / ``..._SPEC_COST_AWARE``."""
     env = os.environ if env is None else env
@@ -177,6 +192,12 @@ def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfi
             f"FREETOKEN_MTP_SPEC_EMA_ALPHA must be in (0, 1], got {alpha!r}"
         )
     conf_cut = _float_env(env, "FREETOKEN_MTP_SPEC_CONF_CUT", "0.8")
+    cut_mode = (env.get("FREETOKEN_MTP_SPEC_DRAFT_CUT_MODE", "") or "chain").strip().lower()
+    if cut_mode not in ("chain", "step"):
+        raise ValueError(
+            "FREETOKEN_MTP_SPEC_DRAFT_CUT_MODE must be chain or step, got "
+            f"{env.get('FREETOKEN_MTP_SPEC_DRAFT_CUT_MODE')!r}"
+        )
     if not 0.0 <= conf_cut <= 1.0:
         # It is a softmax probability, so anything outside 0..1 is either a typo or a bar no
         # row could ever clear -- which would silently mean "always draft exactly 1 token".
@@ -234,6 +255,7 @@ def resolve_spec_decode(env: Mapping[str, str] | None = None) -> SpecDecodeConfi
         depth=depth,
         graph=graph_raw == "1",
         conf_cut=conf_cut,
+        draft_cut_mode=cut_mode,
         ema_alpha=alpha,
         min_emitted=min_emitted,
         probe_resume=probe_resume,

@@ -533,7 +533,9 @@ class Engine:
             logger.info_rank0(
                 "Integrated MTP speculation enabled: depth "
                 f"{config.spec_decode.depth}, draft head "
-                f"{mem_GB(self.spec_draft.resident_bytes)} resident"
+                f"{mem_GB(self.spec_draft.resident_bytes)} resident "
+                f"(experts {self.spec_draft.expert_placement}, "
+                f"lm_head {self.spec_draft.lmhead_placement})"
             )
         if config.spec_decode.graph_widths:
             # With FREETOKEN_MTP_SPEC_GRAPH unset the runner does not exist and the step is eager.

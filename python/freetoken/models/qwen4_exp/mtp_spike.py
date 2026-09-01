@@ -26,14 +26,32 @@ from .hc import GatedResidual, GroupedPlusOneRMSNorm
 from .model import Qwen4ExpDecoderLayer
 
 
-# HBM the resident runner will spend gathering routed expert weights before it switches to the
-# expert-major loop.
+# HBM the resident runner will spend gathering routed expert weights in ONE gathered pass
+# before it splits the call into several.
 _ROUTED_GATHER_BUDGET_BYTES = 512 << 20
 # ...and a floor the budget cannot argue with. Every call on the per-cycle speculative path is
 # at most the widest step -- one row per draft step, and the accepted run (<= 1 + depth) when
 # the head commits it -- so those must never reach the loop, whose per-expert host round trip
 # is both a stall and capture-illegal. Their traffic is bounded by this row count either way.
 _ROUTED_GATHER_MIN_TOKENS = 4
+# Rows a single call may carry on the gathered path ALTOGETHER, in passes of
+# ``gather_chunk_tokens`` each. The per-cycle speculative path is not only the 1-row draft
+# steps: ``SpecDraftHead.propose`` opens with ``_flush_pairs()``, and under the cost-aware
+# policy a cold request buffers a whole cooldown of plain decode observations before the head
+# is next needed -- ``cooldown`` (16) + ``depth`` (5) + slack, so ~29 rows in one commit, and
+# ~77 once the cooldown has backed off to its cap. This is the DEFAULT; the draft head passes
+# its own ``max_gather_rows`` computed from the resolved ``cooldown_cap``, so a configured
+# cooldown moves it without a second edit here. At
+# the shipping geometry (512 experts, top_k 10, 9.83 MB/expert) the byte budget above puts a
+# single gathered pass at FIVE rows, so those flushes used to land in ``_run_expert_major``:
+# ``route_ids.tolist()`` (a full device sync) plus a Python-loop GEMM per routed expert --
+# ~190 unique experts for 24 rows, i.e. ~5 ms of pure launch overhead against ~1.6 ms of
+# gathered weight traffic. Chunking the gather instead keeps the whole flush device-side and
+# sync-free at NO extra memory: each pass materializes exactly what one budget-sized pass
+# always did (bf16: a ~490 MB transient; NVFP4: the same fixed resident dequant scratch).
+# Above this a call is prompt priming (up to _MAX_DRAFT_ROWS a chunk, once per request), where
+# reading each unique expert once really is cheaper than reading it once per route.
+_ROUTED_GATHER_MAX_TOKENS = 32
 
 _EXPERT_MODEL_NAMES = frozenset(
     {
@@ -525,6 +543,7 @@ class MTPGPUExpertRunner:
         max_tokens: int,
         num_threads: int,
         device: torch.device,
+        max_gather_rows: int | None = None,
     ) -> None:
         if getattr(banks, "quant_format", None) != "bf16":
             raise ValueError(
@@ -560,13 +579,19 @@ class MTPGPUExpertRunner:
             tensor.numel() * tensor.element_size()
             for tensor in (self.gate_up, self.down)
         )
-        # Rows the routed gather may materialize before the expert-major loop takes over.
-        # The gathered path costs tokens * top_k * bytes_per_expert of pure HBM traffic, which
-        # is a rounding error at a speculative width and ~8 GB over a 128-row priming chunk.
-        self.gather_max_tokens = max(
+        # Rows ONE gathered pass may materialize. The gathered path costs
+        # tokens * top_k * bytes_per_expert of pure HBM traffic, which is a rounding error at a
+        # speculative width and ~8 GB over a 128-row priming chunk.
+        self.gather_chunk_tokens = max(
             _ROUTED_GATHER_MIN_TOKENS,
             _ROUTED_GATHER_BUDGET_BYTES
             // (self.top_k * max(self.banks.bytes_per_expert, 1)),
+        )
+        # ...and rows a whole CALL may carry on that path, in as many passes as it takes,
+        # before the expert-major loop takes over. See _ROUTED_GATHER_MAX_TOKENS.
+        self.gather_max_tokens = max(
+            self.gather_chunk_tokens,
+            _ROUTED_GATHER_MAX_TOKENS if max_gather_rows is None else int(max_gather_rows),
         )
 
     def route(
@@ -614,7 +639,7 @@ class MTPGPUExpertRunner:
         route_ids = topk_ids.reshape(-1).to(torch.int64)
         route_weights = topk_weights.reshape(-1).to(torch.float32)
         if tokens <= self.gather_max_tokens:
-            result = self._run_gathered(hidden_states, route_ids, route_weights)
+            result = self._run_gathered_chunked(hidden_states, route_ids, route_weights)
         else:
             result = self._run_expert_major(hidden_states, route_ids, route_weights)
 
@@ -624,6 +649,37 @@ class MTPGPUExpertRunner:
             tokens * self.top_k * self.banks.bytes_per_expert
         )
         return result.to(hidden_states.dtype)
+
+    def _run_gathered_chunked(
+        self,
+        hidden_states: torch.Tensor,
+        route_ids: torch.Tensor,
+        route_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """The gathered path in ``gather_chunk_tokens``-row passes.
+
+        A token's output is the weighted sum over ITS OWN ``top_k`` routes and reads no other
+        row, so splitting the rows is the same arithmetic on the same operands in the same
+        order -- bit for bit, which the row-split test pins. What it buys is that the widest
+        gathered CALL and the widest gathered PASS stop being the same number: a whole
+        buffered flush stays device-side and sync-free while the workspace one pass needs
+        stays exactly what the byte budget (bf16) or the resident dequant scratch (NVFP4)
+        already sized. The one-pass case is spelled out so the per-cycle 1..1+depth-row calls
+        keep their previous single fixed sequence of kernels, capture and all.
+        """
+        tokens = int(hidden_states.shape[0])
+        chunk = self.gather_chunk_tokens
+        if tokens <= chunk:
+            return self._run_gathered(hidden_states, route_ids, route_weights)
+        parts = [
+            self._run_gathered(
+                hidden_states[lo : lo + chunk],
+                route_ids[lo * self.top_k : (lo + chunk) * self.top_k],
+                route_weights[lo * self.top_k : (lo + chunk) * self.top_k],
+            )
+            for lo in range(0, tokens, chunk)
+        ]
+        return torch.cat(parts)
 
     def _run_gathered(
         self,
@@ -727,8 +783,9 @@ class MTPNVFP4GPUExpertRunner(MTPGPUExpertRunner):
     a replay allocates nothing and the placement's cost is a fixed, declarable number.  That
     width is the per-cycle speculative step (``1 + depth``), NOT the BF16 path's traffic
     budget: here a wider gather would be a wider RESIDENT buffer, which is the very thing
-    this placement exists to shrink.  Anything wider -- prompt priming -- takes the
-    expert-major loop, exactly as the BF16 path already does at the real geometry.
+    this placement exists to shrink.  A wider CALL -- a buffered flush -- is therefore run as
+    several passes through that same scratch (:meth:`_run_gathered_chunked`), not by widening
+    it; only prompt priming, wider still, takes the expert-major loop.
     """
 
     def __init__(
@@ -742,6 +799,7 @@ class MTPNVFP4GPUExpertRunner(MTPGPUExpertRunner):
         num_threads: int,
         device: torch.device,
         max_gather_tokens: int = _ROUTED_GATHER_MIN_TOKENS,
+        max_gather_rows: int | None = None,
     ) -> None:
         if getattr(banks, "quant_format", None) != "nvfp4":
             raise ValueError(
@@ -776,8 +834,15 @@ class MTPNVFP4GPUExpertRunner(MTPGPUExpertRunner):
             intermediate_size=int(banks.intermediate_size),
             bytes_per_expert=int(banks.bytes_per_expert),
         )
-        self.gather_max_tokens = int(max_gather_tokens)
-        self.max_gather_pairs = self.gather_max_tokens * self.top_k
+        # ``max_gather_tokens`` sizes the RESIDENT dequant scratch, so it is the width of one
+        # gathered pass; a wider CALL is chunked into passes of it (``_run_gathered_chunked``)
+        # rather than pushed onto the synchronizing loop.
+        self.gather_chunk_tokens = int(max_gather_tokens)
+        self.gather_max_tokens = max(
+            self.gather_chunk_tokens,
+            _ROUTED_GATHER_MAX_TOKENS if max_gather_rows is None else int(max_gather_rows),
+        )
+        self.max_gather_pairs = self.gather_chunk_tokens * self.top_k
         self._gate_up_scratch = torch.empty(
             self.max_gather_pairs,
             2 * self.banks.intermediate_size,
