@@ -30,6 +30,31 @@ class Nvfp4ExpertSourceSpec:
     global_reciprocal: bool = False
 
 
+_WHOLE_SHARD_LIMIT = 4 << 30  # above this, read per tensor rather than hold a whole shard
+
+
+def _open_shard(path: str, *, whole: bool):
+    """``safe_open``-style shard handle that does not populate the OS file cache.
+
+    safetensors' own reader mmaps the shard, which on Windows hands every page it touches
+    to the cache manager -- 63 GiB of standby pages while the same 63 GiB is being pinned
+    into banks. Where the unbuffered reader is available (Windows, unless
+    ``FREETOKEN_WIN_UNBUFFERED_IO=0``) the shards come through it instead; everywhere else
+    this is exactly the previous ``safetensors.safe_open`` call. ``whole`` picks
+    slurp-the-shard (the bulk weight pass) vs read-only-what-is-asked-for (the tiny
+    ``weight_scale_2`` globals) -- see :class:`freetoken.models.weight.DirectShard`.
+    A slurp is capped at :data:`_WHOLE_SHARD_LIMIT`: the mmap it holds is anonymous (not
+    reclaimable), so a checkpoint packed into a few huge shards drops back to per-tensor
+    reads rather than parking several GiB next to the banks."""
+    from freetoken.moe import win_io
+
+    if win_io.enabled():
+        from freetoken.models.weight import DirectShard
+
+        return DirectShard(path, whole=whole and os.path.getsize(path) <= _WHOLE_SHARD_LIMIT)
+    return safetensors.safe_open(path, framework="pt", device="cpu")
+
+
 def _canon_kind(spec: "Nvfp4ExpertSourceSpec", kind: str) -> str:
     return spec.kind_map.get(kind, kind) if spec.kind_map else kind
 
@@ -139,7 +164,7 @@ def load_nvfp4_expert_source_banks(
     globals_map: dict[tuple[int, int, str], torch.Tensor] = {}
     for shard in sorted(global_shards):
         path = os.path.join(folder, shard)
-        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+        with _open_shard(path, whole=False) as f:  # a few 4-byte scalars: read ranges, not the shard
             for name, match, _bank_layer_id in global_shards[shard]:
                 key = (
                     int(match.group("layer")),
@@ -164,7 +189,7 @@ def load_nvfp4_expert_source_banks(
         placed = 0
         for shard in tqdm(sorted(weight_shards), desc=f"Loading {spec.desc}", disable=not primary):
             path = os.path.join(folder, shard)
-            with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+            with _open_shard(path, whole=True) as f:  # bulk pass: the whole shard, once
                 for name, match, bank_layer_id in weight_shards[shard]:
                     layer = int(match.group("layer"))
                     expert = int(match.group("expert"))
@@ -265,7 +290,7 @@ def load_nvfp4_expert_source_banks_parallel(
     for shard in sorted(global_names_by_shard):
         path = os.path.join(folder, shard)
         drop_page_cache(path)
-        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+        with _open_shard(path, whole=False) as f:  # a few 4-byte scalars: read ranges, not the shard
             for name in global_names_by_shard[shard]:
                 m = spec.key_pattern.match(name)
                 globals_map[(int(m.group("layer")), int(m.group("expert")), m.group("proj"))] = (

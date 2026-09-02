@@ -54,7 +54,14 @@ def iter_weight_files(model_path: str) -> list[str]:
 
 
 def drop_page_cache(path: str) -> None:
-    """drop a file's page cache: banks + full checkpoint cache don't both fit in host RAM (OOM)."""
+    """drop a file's page cache: banks + full checkpoint cache don't both fit in host RAM (OOM).
+
+    No-op on Windows, deliberately: there is no reliable retroactive purge there
+    (``FILE_FLAG_NO_BUFFERING`` is an *open-mode* flag), so the shard readers avoid the
+    cache at open time instead -- see :mod:`freetoken.moe.win_io`. Also a no-op wherever
+    ``posix_fadvise`` is missing, so callers never have to platform-check."""
+    if os.name == "nt" or not hasattr(os, "posix_fadvise"):
+        return
     try:
         fd = os.open(path, os.O_RDONLY)
         try:

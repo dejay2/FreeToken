@@ -24,8 +24,9 @@ from typing import Callable, Iterator, Tuple
 import torch
 from freetoken.distributed import get_tp_info
 from freetoken.kernel.pinned import alloc_pinned_tensor, copy_to_pinned_tensor
-from freetoken.models.loader import stream_moe_expert_sources
-from freetoken.utils import cached_load_hf_config, div_even
+from freetoken.models.loader import drop_page_cache, stream_moe_expert_sources
+from freetoken.moe import win_io
+from freetoken.utils import cached_load_hf_config, div_even, init_logger
 
 from .register import _load_attr, get_model_spec
 
@@ -37,6 +38,8 @@ _ST_DTYPE = {
     "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2, "F8_E8M0": torch.float8_e8m0fnu,
 }
 _ODIRECT_BLK = 4096
+
+logger = init_logger(__name__)
 
 
 def _read_shard_odirect_parallel(path: str, workers: int, chunk: int) -> mmap.mmap:
@@ -66,6 +69,139 @@ def _read_shard_odirect_parallel(path: str, workers: int, chunk: int) -> mmap.mm
     finally:
         os.close(fd)
     return buf
+
+
+_win_fallback_warned = False
+
+
+def _read_shard_buffered(buf: mmap.mmap, path: str) -> None:
+    """Last-resort plain (cached) read of a whole shard into ``buf``."""
+    mv = memoryview(buf)
+    with open(path, "rb", buffering=0) as f:
+        pos = 0
+        while True:
+            n = f.readinto(mv[pos:pos + (1 << 24)])
+            if not n:
+                break
+            pos += n
+
+
+def read_shard_direct(path: str, workers: int = 8, chunk: int = 8 << 20) -> mmap.mmap:
+    """Whole shard into a page-aligned anonymous mmap **without going through the OS
+    file cache**: chunked multi-threaded ``O_DIRECT`` on POSIX, the equivalent
+    ``FILE_FLAG_NO_BUFFERING`` reader on Windows (:mod:`freetoken.moe.win_io`).
+
+    Why it matters: the caller copies the shard into pinned banks that stay resident for
+    the process lifetime, so a cached second copy of every shard is pure memory pressure
+    (63 GiB of banks + 63 GiB of standby pages on a 96 GiB box). A volume that refuses
+    unbuffered IO (network shares, some virtual filesystems) falls back to a buffered
+    read with a one-time warning -- correct, just cached."""
+    if hasattr(os, "O_DIRECT") and hasattr(os, "preadv"):
+        return _read_shard_odirect_parallel(path, workers, chunk)
+    size = os.path.getsize(path)
+    buf = mmap.mmap(-1, ((size + _ODIRECT_BLK - 1) // _ODIRECT_BLK) * _ODIRECT_BLK)
+    if win_io.enabled():
+        try:
+            win_io.read_file_into(buf, path, workers=workers, chunk=chunk)
+            return buf
+        except OSError as exc:
+            global _win_fallback_warned
+            if not _win_fallback_warned:
+                _win_fallback_warned = True
+                logger.warning(
+                    f"unbuffered read unavailable for {path} ({exc}); falling back to "
+                    f"buffered reads -- shard pages will populate the system file cache"
+                )
+    _read_shard_buffered(buf, path)
+    return buf
+
+
+class DirectShard:
+    """``safetensors.safe_open``-compatible shard reader that bypasses the OS file cache.
+
+    Exists for the Windows expert load, where ``safe_open``'s mmap hands every shard page
+    to the cache manager (see :mod:`freetoken.moe.win_io`). Two modes, because the two
+    passes over a shard want opposite things:
+
+    * ``whole=True`` -- pull the shard through :func:`read_shard_direct` once (chunked,
+      multi-threaded) and serve each tensor as a view of that buffer. For the bulk weight
+      pass, which reads essentially the whole shard anyway.
+    * ``whole=False`` -- read only the bytes of each requested tensor. For a pass that
+      touches a handful of tiny tensors per shard (the nvfp4 ``weight_scale_2`` globals),
+      where slurping the shard would be 700x read amplification.
+
+    Tensors are views over buffers this object owns, so they must be consumed (copied
+    into the banks) before :meth:`close`.
+    """
+
+    __slots__ = ("path", "_hdr", "_base", "_buf", "_mv", "_reader", "_alive")
+
+    def __init__(self, path: str, *, whole: bool = True, workers: int = 8,
+                 chunk: int = 8 << 20) -> None:
+        self.path = path
+        self._buf = None
+        self._mv = None
+        self._reader = None
+        self._alive: list = []
+        if whole:
+            self._buf = read_shard_direct(path, workers, chunk)
+            self._mv = memoryview(self._buf)
+            n = struct.unpack("<Q", bytes(self._mv[:8]))[0]
+            self._hdr = json.loads(bytes(self._mv[8:8 + n]))
+        else:
+            if win_io.enabled():
+                try:
+                    self._reader = win_io.UnbufferedReader(path)
+                except OSError:
+                    self._reader = None
+            n = struct.unpack("<Q", self._read(0, 8))[0]
+            self._hdr = json.loads(self._read(8, n))
+        self._base = 8 + n
+        self._hdr.pop("__metadata__", None)
+
+    def _read(self, offset: int, nbytes: int) -> bytes:
+        if self._reader is not None:
+            return self._reader.read(offset, nbytes)
+        with open(self.path, "rb") as f:
+            f.seek(offset)
+            return f.read(nbytes)
+
+    def keys(self):
+        return self._hdr.keys()
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        meta = self._hdr[name]
+        dtype = _ST_DTYPE[meta["dtype"]]
+        begin, end = meta["data_offsets"]
+        nbytes = end - begin
+        if nbytes == 0:
+            return torch.empty(meta["shape"], dtype=dtype)
+        if self._mv is not None:
+            raw = self._mv[self._base + begin:self._base + end]
+        else:
+            buf = mmap.mmap(-1, nbytes)  # page aligned: the unbuffered reader's fast path
+            self._alive.append(buf)
+            raw = memoryview(buf)[:nbytes]
+            if self._reader is not None:
+                self._reader.read_into(raw, self._base + begin, nbytes)
+            else:
+                with open(self.path, "rb") as f:
+                    f.seek(self._base + begin)
+                    f.readinto(raw)
+        # exact shape, 0-d scalars included: this stands in for safe_open, not for the
+        # parallel reader's "() -> flat" convention
+        return torch.frombuffer(raw, dtype=dtype).view(meta["shape"])
+
+    def close(self) -> None:
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+
+    def __enter__(self) -> "DirectShard":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
 
 def iter_expert_tensors_parallel(
@@ -121,13 +257,8 @@ def iter_expert_tensors_parallel(
             for shard in shard_list:
                 path = os.path.join(model_path, shard)
                 if drop_cache:
-                    try:
-                        fd = os.open(path, os.O_RDONLY)
-                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                        os.close(fd)
-                    except OSError:
-                        pass
-                buf = _read_shard_odirect_parallel(path, workers, chunk)  # overlaps placement
+                    drop_page_cache(path)  # no-op where the read never caches (Windows)
+                buf = read_shard_direct(path, workers, chunk)  # overlaps placement
                 n = struct.unpack("<Q", bytes(buf[:8]))[0]
                 hdr = json.loads(bytes(buf[8:8 + n]))
                 q.put((buf, hdr, 8 + n, shards[shard], os.path.getsize(path)))
@@ -404,6 +535,8 @@ def dummy_nvfp4_expert_sources(config) -> dict[str, list[torch.Tensor]]:
 
 
 __all__ = [
+    "DirectShard",
+    "read_shard_direct",
     "load_weight",
     "load_moe_expert_sources",
     "load_nvfp4_moe_expert_sources",

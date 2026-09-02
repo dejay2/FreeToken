@@ -28,8 +28,22 @@ from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
 
 logger = init_logger(__name__)
 
-# the parallel expert-bank reader needs POSIX O_DIRECT + preadv; without them the serial (safetensors/mmap) build is the only option
-_PARALLEL_READER_SUPPORTED = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
+
+def _parallel_reader_supported() -> bool:
+    """Can the parallel expert-bank reader run here?
+
+    It needs whole-shard reads that bypass the OS file cache: POSIX ``O_DIRECT`` +
+    ``preadv``, or -- on Windows -- the ``FILE_FLAG_NO_BUFFERING`` reader in
+    :mod:`freetoken.moe.win_io` (disabled by ``FREETOKEN_WIN_UNBUFFERED_IO=0``, which
+    puts Windows back on the serial safetensors/mmap build)."""
+    if hasattr(os, "O_DIRECT") and hasattr(os, "preadv"):
+        return True
+    from freetoken.moe import win_io
+
+    return win_io.enabled()
+
+
+_PARALLEL_READER_SUPPORTED = _parallel_reader_supported()
 
 
 @dataclass(frozen=True)
@@ -452,8 +466,8 @@ def load_expert_banks(
 
     if parallel and not _PARALLEL_READER_SUPPORTED:
         logger.warning_rank0(
-            "expert banks: parallel O_DIRECT reader unsupported on this platform "
-            "(no os.O_DIRECT/preadv) -> serial build"
+            "expert banks: parallel cache-bypassing reader unsupported on this platform "
+            "(no os.O_DIRECT/preadv, no Windows unbuffered IO) -> serial build"
         )
         parallel = False
 

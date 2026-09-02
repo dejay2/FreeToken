@@ -31,9 +31,19 @@ import torch
 
 from freetoken.utils import init_logger
 
+from . import win_io
+
 logger = init_logger(__name__)
 
 _BLK = 4096  # O_DIRECT alignment (page size)
+
+
+def _win_unbuffered() -> bool:
+    """Route the readers below through the Windows ``FILE_FLAG_NO_BUFFERING`` backend.
+
+    False on POSIX (O_DIRECT is already there) and whenever ``FREETOKEN_WIN_UNBUFFERED_IO=0``
+    asks for the old buffered behaviour, so the Linux paths stay byte-identical."""
+    return not hasattr(os, "O_DIRECT") and win_io.enabled()
 
 
 class HostResidency(str, Enum):
@@ -380,7 +390,13 @@ class LayerCompletionTracker:
 def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
                    chunk: int = _DEFAULT_CHUNK, drop_cache: bool = True) -> int:
     """Chunked multi-threaded O_DIRECT read of the whole file ``path`` into ``buf``
-    (page-aligned). Returns the file size. The buffer must be >= the rounded-up file size."""
+    (page-aligned). Returns the file size. The buffer must be >= the rounded-up file size.
+
+    On Windows the same read runs through the ``FILE_FLAG_NO_BUFFERING`` reader
+    (:mod:`freetoken.moe.win_io`), which bypasses the cache the same way; ``drop_cache``
+    is then moot (nothing was cached to drop)."""
+    if _win_unbuffered():
+        return win_io.read_file_into(buf, path, workers=workers, chunk=chunk)
     size = os.path.getsize(path)
     if drop_cache:
         try:
@@ -428,7 +444,13 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
     """Chunked multi-threaded O_DIRECT read of ``path[file_offset : file_offset + nbytes]`` into ``buf`` at ``dest_offset``. Returns ``nbytes``.
 
     Byte-range counterpart of :func:`read_file_into`, for one tensor inside a shard. O_DIRECT needs the file offset AND the destination address block-aligned at the same time, which only holds when the two share their offset mod 4096 -- a safetensors data offset practically never lines up with the tensor's slot in the bank. Chunks that do line up DMA straight into ``buf``; the rest DMA into a page-aligned bounce (source window rounded out to whole blocks) and are copied into place, which also covers the unaligned head and tail.
+
+    On Windows the same read (and the same bounce arithmetic, against the volume's sector
+    size) runs through :mod:`freetoken.moe.win_io`.
     """
+    if _win_unbuffered():
+        return win_io.read_range_into(buf, path, file_offset=file_offset, nbytes=nbytes,
+                                      dest_offset=dest_offset, workers=workers, chunk=chunk)
     mv = (buf if isinstance(buf, memoryview) else memoryview(buf)).cast("B")
     if dest_offset + nbytes > len(mv):
         raise ValueError(f"destination holds {len(mv)} bytes, need {dest_offset + nbytes}")

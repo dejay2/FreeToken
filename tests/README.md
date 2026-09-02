@@ -52,6 +52,7 @@ checkpoint is set:
 | `FREETOKEN_TEST_MEM_RATIO` | `e2e/test_aime.py` — offload-mode memory_ratio (default `0.9`) |
 | `FREETOKEN_REBUILD_TEST_MODEL` | `e2e/test_cache_rebuild.py` — a SMALL local model dir; boots a real server (falls back to `FREETOKEN_TEST_MODEL`) |
 | `FREETOKEN_GEMMA4_GGUF_GLOB` | `models/test_gemma4_gguf_rope.py` — glob matching a local gemma-4 GGUF file |
+| `FREETOKEN_TEST_WIN_IO_MODEL` | `moe/test_win_io.py` — checkpoint dir for the Windows unbuffered-reader integration tests (reads its smallest expert shard; add `FREETOKEN_TEST_WIN_CACHE=1` for the system-standby-cache assertion) |
 
 `test_aime.py` takes its sampling protocol from the checkpoint's own
 `generation_config.json` (pass@N at the recommended temperature, or a single greedy
