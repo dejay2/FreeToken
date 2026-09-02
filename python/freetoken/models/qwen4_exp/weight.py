@@ -303,6 +303,7 @@ def _resolve_prefetch_virtual_memory():
 
 _prefetch_virtual_memory, _current_process = _resolve_prefetch_virtual_memory()
 _prefetch_failed = False  # set once if the call ever returns FALSE; then never retried
+_advise_failed = False  # the POSIX twin: set once if madvise(WILLNEED) ever raises
 
 
 def _ple_gather_pool() -> ThreadPoolExecutor:
@@ -415,6 +416,9 @@ class MmapPleStorage:
         self._files: dict[str, BinaryIO] = {}
         self._maps: dict[str, mmap.mmap] = {}
         self._shards: list[torch.Tensor] = []
+        # (mapping, byte offset of the shard's row 0 inside it), per shard: what the POSIX
+        # madvise path addresses rows by (_advise_rows); the Windows path uses _shard_bases.
+        self._shard_maps: list[tuple[mmap.mmap, int]] = []
         capacity = int(os.environ.get(_PLE_ROW_CACHE_ENV, _PLE_ROW_CACHE_DEFAULT))
         self._row_cache = _PleRowCache(capacity, self.head_dim) if capacity > 0 else None
         try:
@@ -434,6 +438,7 @@ class MmapPleStorage:
                     offset=shard.offset,
                 ).reshape(shard.rows, shard.cols)
                 self._shards.append(tensor)
+                self._shard_maps.append((mapping, shard.offset))
         except Exception:
             self.close()
             raise
@@ -553,12 +558,57 @@ class MmapPleStorage:
         )
         return False
 
+    def _advise_rows(self, valid_ids: torch.Tensor) -> bool:
+        """The POSIX twin of ``_prefetch_rows``: ``madvise(MADV_WILLNEED)`` on every row's page
+        range, so the kernel issues the reads together and the serial copy behind them finds
+        resident pages; False where the platform mmap cannot advise (Windows).
+
+        UNMEASURED on a real table -- this branch has only ever run on Windows -- so the shape
+        simply follows the measured Windows path: one advice per row, no coalescing (the ids
+        are near-uniform over 320 M rows), skipped below ``_PLE_MIN_PREFETCH_ROWS`` where the
+        syscall costs more than the fault it hides. Unlike PrefetchVirtualMemory this is one
+        syscall per row rather than one per batch, so a 100k-row prefill pays ~100k calls;
+        still far under the serial-fault cost it replaces, but a coalescing pass is the first
+        thing to try if a Linux profile shows it. An OSError disables the path for the
+        process, like the Windows FALSE return.
+        """
+        global _advise_failed
+        willneed = getattr(mmap, "MADV_WILLNEED", None)
+        if willneed is None or _advise_failed:
+            return False
+        n = valid_ids.numel()
+        if n < _PLE_MIN_PREFETCH_ROWS:
+            return False
+        maps = self._shard_maps
+        if not maps or not hasattr(maps[0][0], "madvise"):
+            return False
+        page = mmap.PAGESIZE
+        dim = self.head_dim
+        shard_ids = torch.div(valid_ids, self.rows_per_shard, rounding_mode="floor")
+        offsets = (valid_ids - shard_ids * self.rows_per_shard) * dim
+        try:
+            for shard_id, offset in zip(shard_ids.tolist(), offsets.tolist()):
+                mapping, base = maps[shard_id]
+                start = base + offset
+                aligned = start - start % page
+                mapping.madvise(willneed, aligned, start + dim - aligned)
+        except OSError as exc:
+            _advise_failed = True
+            logger.warning(
+                "madvise(MADV_WILLNEED) failed for PLE rows (%s); falling back to "
+                "thread-fanned page faults for the rest of this process",
+                exc,
+            )
+            return False
+        return True
+
     def _fault(
         self, valid_ids: torch.Tensor, positions: torch.Tensor, out: torch.Tensor
     ) -> None:
-        """Read rows from the maps: one prefetch syscall where Windows offers it, otherwise
-        by spreading the page faults over the gather pool."""
-        if self._prefetch_rows(valid_ids):
+        """Read rows from the maps: one prefetch syscall where Windows offers it, a batch of
+        madvise(WILLNEED) where POSIX does, otherwise by spreading the page faults over the
+        gather pool."""
+        if self._prefetch_rows(valid_ids) or self._advise_rows(valid_ids):
             self._read_rows(valid_ids, positions, out)  # pages are resident: copy serially
             return
         n = valid_ids.numel()
@@ -605,6 +655,7 @@ class MmapPleStorage:
     def close(self) -> None:
         self._row_cache = None
         self._shards.clear()
+        self._shard_maps.clear()
         for mapping in self._maps.values():
             mapping.close()
         self._maps.clear()

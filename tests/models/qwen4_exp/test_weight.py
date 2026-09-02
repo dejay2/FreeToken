@@ -970,3 +970,122 @@ def test_fusion_pad_rides_the_tensor_device():
     key, fused = _try_fuse("model.layers.0.attn_hyper_connection.block_inject_weight.weight", inject, buf)
     assert fused.device.type == "cuda" and fused.shape[0] == 336
     assert torch.equal(fused[324:], torch.zeros(12, 64, device="cuda", dtype=torch.bfloat16))
+
+
+# ======================================================================================
+# The POSIX madvise(MADV_WILLNEED) path
+# ======================================================================================
+#
+# Off Windows there is no PrefetchVirtualMemory. The equivalent -- ask the kernel to fault a
+# set of ranges in one go, then copy serially -- is madvise(WILLNEED) on each row's page
+# range. Unmeasured on a real table (this branch has only ever run on Windows), so what is
+# pinned here is the contract: page-aligned advice covering every requested row, then the
+# same bytes as the serial reference, and a clean fall-through when the mapping cannot
+# advise.
+
+
+class _AdvisingMap:
+    """Stands in for an ``mmap.mmap``: records ``madvise`` calls, never faults anything."""
+
+    def __init__(self, calls: list[tuple[int, int, int]]) -> None:
+        self.calls = calls
+
+    def madvise(self, option: int, start: int, length: int) -> None:
+        self.calls.append((int(option), int(start), int(length)))
+
+
+class _PlainMap:
+    """A mapping without ``madvise`` at all (what Windows' ``mmap.mmap`` looks like)."""
+
+
+@pytest.fixture
+def posix_advice(monkeypatch):
+    """No Windows prefetch symbol, but the platform mmap knows MADV_WILLNEED."""
+    monkeypatch.setattr(weight_mod, "_prefetch_virtual_memory", None)
+    monkeypatch.setattr(weight_mod, "_prefetch_failed", False)
+    monkeypatch.setattr(weight_mod.mmap, "MADV_WILLNEED", 3, raising=False)
+    monkeypatch.setattr(weight_mod.mmap, "PAGESIZE", 4096, raising=False)
+
+
+@pytest.mark.parametrize("cache", ["0", "1048576"])
+def test_willneed_advice_covers_every_row_and_the_gather_still_matches(
+    checkpoint, monkeypatch, posix_advice, cache
+):
+    monkeypatch.setenv(weight_mod._PLE_ROW_CACHE_ENV, cache)
+    folder, raw = checkpoint
+    reference = _ngram_reference(raw)
+    table = _open_mmap_ple(folder)
+    storage = table.storage
+    calls: list[tuple[int, int, int]] = []
+    try:
+        bases = [base for _mapping, base in storage._shard_maps]
+        storage._shard_maps = [(_AdvisingMap(calls), base) for base in bases]
+        ids = [0, NGRAM_ROWS - 1, NGRAM_ROWS, 2 * NGRAM_ROWS + 3, ALL_ROWS - 1, 5, 5, -1, ALL_ROWS]
+        assert torch.equal(_gather(storage, ids), _serial_gather(reference, ids))
+        valid = [row for row in ids if 0 <= row < ALL_ROWS]
+        assert len(calls) == len(valid)
+        for row, (option, start, length) in zip(valid, calls):
+            assert option == 3
+            assert start % 4096 == 0
+            row_start = bases[row // NGRAM_ROWS] + (row % NGRAM_ROWS) * NGRAM_DIM
+            assert start <= row_start
+            assert start + length >= row_start + NGRAM_DIM
+        # a second gather of the same ids: with the cache on, nothing is advised again
+        calls.clear()
+        assert torch.equal(_gather(storage, ids), _serial_gather(reference, ids))
+        assert len(calls) == (0 if cache != "0" else len(valid))
+    finally:
+        storage.close()
+
+
+def test_a_mapping_without_madvise_falls_through_to_the_fan_out(
+    checkpoint, monkeypatch, posix_advice
+):
+    monkeypatch.setenv(weight_mod._PLE_ROW_CACHE_ENV, "0")
+    folder, raw = checkpoint
+    reference = _ngram_reference(raw)
+    table = _open_mmap_ple(folder)
+    storage = table.storage
+    try:
+        storage._shard_maps = [(_PlainMap(), base) for _m, base in storage._shard_maps]
+        ids = list(range(ALL_ROWS))
+        assert storage._advise_rows(torch.tensor(ids[:4], dtype=torch.int64)) is False
+        assert torch.equal(_gather(storage, ids), _serial_gather(reference, ids))
+    finally:
+        storage.close()
+
+
+def test_a_single_row_is_not_worth_an_advice_syscall(checkpoint, monkeypatch, posix_advice):
+    """Mirrors ``_PLE_MIN_PREFETCH_ROWS``: below two rows the syscall costs more than the
+    fault it hides, so one row takes the plain copy."""
+    monkeypatch.setenv(weight_mod._PLE_ROW_CACHE_ENV, "0")
+    folder, raw = checkpoint
+    table = _open_mmap_ple(folder)
+    storage = table.storage
+    calls: list[tuple[int, int, int]] = []
+    try:
+        storage._shard_maps = [(_AdvisingMap(calls), base) for _m, base in storage._shard_maps]
+        assert torch.equal(_gather(storage, [3]), _serial_gather(_ngram_reference(raw), [3]))
+        assert calls == []
+    finally:
+        storage.close()
+
+
+def test_the_windows_prefetch_takes_precedence_over_advice(
+    checkpoint, monkeypatch, prefetch_enabled
+):
+    """Where both exist (never in practice, but the order must be deliberate) the single
+    PrefetchVirtualMemory call wins and no per-row madvise is issued."""
+    monkeypatch.setattr(weight_mod.mmap, "MADV_WILLNEED", 3, raising=False)
+    monkeypatch.setenv(weight_mod._PLE_ROW_CACHE_ENV, "0")
+    folder, _raw = checkpoint
+    table = _open_mmap_ple(folder)
+    storage = table.storage
+    calls: list[tuple[int, int, int]] = []
+    try:
+        storage._shard_maps = [(_AdvisingMap(calls), base) for _m, base in storage._shard_maps]
+        _gather(storage, [1, 2, 3])
+        assert prefetch_enabled == [(3, 0)]
+        assert calls == []
+    finally:
+        storage.close()

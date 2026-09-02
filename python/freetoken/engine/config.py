@@ -286,6 +286,15 @@ def require_speculation_supported(config) -> None:
     """
     if not config.spec_decode.enabled:
         return
+    # The draft head is the qwen4_exp MTP block (``derive_mtp_model_config`` rebuilds it from
+    # ``qwen4_args``); no other model class has one. Without this check the flag survives
+    # boot and dies inside that helper with ``dataclasses.replace(None)``.
+    model_type = getattr(getattr(config, "model_config", None), "model_type", None)
+    if model_type != "qwen4_exp":
+        raise ValueError(
+            "FREETOKEN_MTP_SPECULATE=1 needs the qwen4_exp MTP draft head; this checkpoint's "
+            f"model type is {model_type!r}"
+        )
     if config.max_running_req != 1:
         raise ValueError(
             "FREETOKEN_MTP_SPECULATE=1 requires --max-running-requests 1, got "

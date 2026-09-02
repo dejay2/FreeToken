@@ -122,13 +122,23 @@ def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
-    return int(raw.strip())
+    try:
+        return int(raw.strip())
+    except ValueError:
+        # resolved at import of the MoE module, feature on or off: the message has to name
+        # the knob, not surface as a bare int() traceback out of an unrelated boot
+        raise ValueError(f"{name}={raw!r} is not an integer") from None
 
 
 def _env_layers(name: str, default: str) -> frozenset[int]:
     raw = os.getenv(name)
     raw = default if raw is None else raw
-    return frozenset(int(p) for p in raw.replace(" ", "").split(",") if p)
+    try:
+        return frozenset(int(p) for p in raw.replace(" ", "").split(",") if p)
+    except ValueError:
+        raise ValueError(
+            f"{name}={raw!r} is not a comma-separated list of layer ids"
+        ) from None
 
 
 @dataclass(frozen=True)
