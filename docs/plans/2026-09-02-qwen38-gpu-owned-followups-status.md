@@ -7,9 +7,12 @@ the three live runs.
 
 Branch: `gpu-owned-followups`, worktree `D:\FreeToken-gpu-owned-followups`, cut from
 `mtp-upstream-merge` @ `0964145` (the merge of the feature). **Not pushed, no PR opened.**
-Nothing here was run against the GPU: a live server owned the card throughout, and every
-test ran with `CUDA_VISIBLE_DEVICES=-1`. What needs the device is in the
-[operator live checklist](#operator-live-checklist) below and was not attempted.
+The code here was not run against the GPU while it was written: a live server owned the
+card throughout, and every test ran with `CUDA_VISIBLE_DEVICES=-1`. What needs the device
+is in the [operator live checklist](#operator-live-checklist) below, which was **run live
+on 2026-09-02** -- see `docs/research/measurements-gpu-owned-followups-live-2026-09-02.md`.
+Ten of the twelve checks pass; **L4 fails** (the headroom refusal names a size that cannot
+be typed) and L12 is inconclusive.
 
 ## Commits
 
@@ -254,23 +257,25 @@ signals or enumerates a real process, and nothing here needs a GPU.
 
 ## Operator live checklist
 
-None of this was attempted: a live server owned the card. Run each on a **fresh** boot, one
-server at a time, and settle 45-60 s between servers.
+**Run live on 2026-09-02** (five candidate boots on port 2030 plus the restore) — results in
+[`docs/research/measurements-gpu-owned-followups-live-2026-09-02.md`](../research/measurements-gpu-owned-followups-live-2026-09-02.md),
+evidence in `<scratch>\gpu-owned-live\run4\`. Run each on a **fresh** boot, one server at a
+time, and settle 45-60 s between servers.
 
-| # | Check | How | Expected |
-|---|---|---|---|
-| L1 | The VRAM ledger block appears once, after the KV pool | boot with `-GpuOwnedLayers auto -MoECacheSize 6750`, grep the log for `VRAM ledger` | one block; weights / KV / GDN / owned / LRU / reserve / headroom / unaccounted / named total, KV row NOT 0.00 GiB |
-| L2 | The ledger's numbers are the real ones | compare the ledger against `nvidia-smi` at `state: serving` and against `/v1/cache/status` | `unaccounted` positive and small (allocator slack + activations); if it is negative the plan is over the card |
-| L3 | The auto reserve is the right size on this box | boot `-MoECacheSize 0` (i.e. `--moe-cache-auto`) with speculation on, note the resolved slot count; check free VRAM at decode peak | >= ~1.5 GiB free at decode peak; no throughput cliff |
-| L4 | The headroom refusal fires and names a size that works | boot with an `-MoECacheSize` deliberately ~1000 slots too large | refuses at boot naming the largest slot count that fits; that number then boots |
-| L5 | `-MoEVramReserveBytes 0 -MoECacheHeadroomBytes 0` restores the old sizing | boot with both zeroed | boots at the pre-2026-09 slot count |
-| L6 | `/v1/cache/status` shows the reservation | `curl /v1/cache/status` with and without `-GpuOwnedLayers auto` | `gpu_owned_reserved_bytes` ~8.5e9 with, 0 without; `limits.moe_experts.max` lower with |
-| L7 | The placement report is one block and names the owned layers | grep the boot log | one block containing `Expert placement: ... gpu_owned_layers=[0, 1, 2, 6, 7, 22] ... streaming_layers=42`, plus the PLE line with `backend=mmap`; the dedicated `MoE GPU-owned layers:` line still present |
-| L8 | The non-NVFP4 refusal | not testable here without another checkpoint | a non-NVFP4 MoE checkpoint + `--moe-gpu-owned-layers` refuses before the expert load |
-| L9 | The stop script against real processes | boot, then `stop-qwen38-flash-next-windows.ps1 -Port 2020 -DryRun`, read the two headings, then run it for real | the server tree listed under "server processes", orphans under their own heading, `ft.exe` (port 1900) absent from both; after the kill it reports settled and the Desktop daemon is still alive |
-| L10 | The stop script clears the ZMQ-port orphan | reproduce the orphan (kill the launcher from the console, leave the children), then run the script, then boot | no `ZMQError: Address in use`; the boot proceeds |
-| L11 | Speed at the corrected budget | `-GpuOwnedLayers auto -MoECacheSize 6750` vs no owned layers at 6750 | the run-3 fix's ~63 tok/s vs the 70.4 baseline, i.e. the ~-10 % trade, not run 2's -50.9 % |
-| L12 | The corrected RAM criterion | scheduler **working set** and whole-system physical in use, not private bytes | working set -7.9 +/- 0.5 GiB |
+| # | Check | How | Expected | Result |
+|---|---|---|---|---|
+| L1 | The VRAM ledger block appears once, after the KV pool | boot with `-GpuOwnedLayers auto -MoECacheSize 6750`, grep the log for `VRAM ledger` | one block; weights / KV / GDN / owned / LRU / reserve / headroom / unaccounted / named total, KV row NOT 0.00 GiB | **PASS** (at 5781; 6750 is refused, see L4) — one block right after `Allocating 65536 tokens for KV cache`, KV row 1.55 GiB |
+| L2 | The ledger's numbers are the real ones | compare the ledger against `nvidia-smi` at `state: serving` and against `/v1/cache/status` | `unaccounted` positive and small (allocator slack + activations); if it is negative the plan is over the card | **PASS** — owned/LRU/KV rows reconcile to the byte with the geometry; `unaccounted` +3.03 GiB = exactly `(1-memory_ratio) x 30.25 GiB` |
+| L3 | The auto reserve is the right size on this box | boot `-MoECacheSize 0` (i.e. `--moe-cache-auto`) with speculation on, note the resolved slot count; check free VRAM at decode peak | >= ~1.5 GiB free at decode peak; no throughput cliff | **PASS** — 3,029 MiB free at decode peak with the reserve on; 1,112 MiB with it zeroed, and 9 % slower |
+| L4 | The headroom refusal fires and names a size that works | boot with an `-MoECacheSize` deliberately ~1000 slots too large | refuses at boot naming the largest slot count that fits; that number then boots | **FAIL** — it refuses (correctly, and already at 6750), but quotes the post-charge LRU as `--moe-cache-size` and names 2709, which is then refused by the 4096 floor; the size that works is 2709+3072=5781 |
+| L5 | `-MoEVramReserveBytes 0 -MoECacheHeadroomBytes 0` restores the old sizing | boot with both zeroed | boots at the pre-2026-09 slot count | **PASS** — auto resolves 4452 LRU + 3072 owned = 7,524 slot-equivalents = the whole 19.43 GiB MoE budget; free after init 3.14 GiB |
+| L6 | `/v1/cache/status` shows the reservation | `curl /v1/cache/status` with and without `-GpuOwnedLayers auto` | `gpu_owned_reserved_bytes` ~8.5e9 with, 0 without; `limits.moe_experts.max` lower with | **PASS** — 8,517,058,560 with (field absent on the pre-feature baseline); `moe_experts.max` 5427 vs 8499 |
+| L7 | The placement report is one block and names the owned layers | grep the boot log | one block containing `Expert placement: ... gpu_owned_layers=[0, 1, 2, 6, 7, 22] ... streaming_layers=42`, plus the PLE line with `backend=mmap`; the dedicated `MoE GPU-owned layers:` line still present | **PASS** — all five lines in one record, `PLE table: backend=mmap, mapped_bytes=51200245760`; dedicated line still one line above |
+| L8 | The non-NVFP4 refusal | not testable here without another checkpoint | a non-NVFP4 MoE checkpoint + `--moe-gpu-owned-layers` refuses before the expert load | **NOT TESTABLE** — `D:\Models` holds only the NVFP4 checkpoint |
+| L9 | The stop script against real processes | boot, then `stop-qwen38-flash-next-windows.ps1 -Port 2020 -DryRun`, read the two headings, then run it for real | the server tree listed under "server processes", orphans under their own heading, `ft.exe` (port 1900) absent from both; after the kill it reports settled and the Desktop daemon is still alive | **PASS** — exactly the four serve pythons listed, no `ft.exe`, no unrelated python; settled at 1618 MB, daemon still listening on 1900 |
+| L10 | The stop script clears the ZMQ-port orphan | reproduce the orphan (kill the launcher from the console, leave the children), then run the script, then boot | no `ZMQError: Address in use`; the boot proceeds | **PASS** — a real orphan occurred twice on its own (a refused boot leaves one holding 2033); listed under the orphan heading, killed, next boot clean |
+| L11 | Speed at the corrected budget | `-GpuOwnedLayers auto -MoECacheSize 6750` vs no owned layers at 6750 | the run-3 fix's ~63 tok/s vs the 70.4 baseline, i.e. the ~-10 % trade, not run 2's -50.9 % | **PASS with a caveat** — 6750 is refused; at the largest allowed size (5781) the candidate runs 60.0 tok/s against the same-session no-owned baseline's 58.5, i.e. parity. Forcing 6750 with the knobs zeroed gives 55.5 |
+| L12 | The corrected RAM criterion | scheduler **working set** and whole-system physical in use, not private bytes | working set -7.9 +/- 0.5 GiB | **INCONCLUSIVE** — measured -4.98 GiB working set / -5.49 GiB physical in use. The candidate's absolutes match run 3's post-fix boot; today's baseline read 3.6 GiB lower than run 3's because it had been trimmed after 75 minutes idle |
 
 Hazards, unchanged from the feature's status doc: only ever kill `python.exe` from
 `nvidia-smi --query-compute-apps` (or use L9's script); settle 45-60 s between servers or
