@@ -1356,7 +1356,7 @@ Claude-Session: https://claude.ai/code/session_01Hnf1bGBLU4HLq9uHPtNjwU
 - Consumes: `cache.is_gpu_owned_layer`, `cache.resident_views`, `cache.alphas_for_layer`, `cache.prefetch_prefill_layer`, `cache.begin_prefill`, `self._expert_gemm(..., views=, n=, alphas=, is_prefill=)`.
 - Produces: no new public names. The owned branch of `_decode_routed` is the SINGLE entry point both real decode and the `FREETOKEN_MOE_SMALL_PREFILL_ROWS` narrow-prefill path reach (`forward`/`routed_forward` -> `_use_decode_movement` -> `_decode_routed`), so one branch covers both. `_wait_prefill_overlap` needs no owned branch: it is only reachable from `_prefill_routed`, which returns before it.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/moe/test_offload.py`:
 
@@ -1501,7 +1501,7 @@ def test_prefill_overlap_skips_a_gpu_owned_layer_and_still_alternates_buffers(mo
     assert cache._prefill_buffer_layer == [2, None]  # buffer 1 was never claimed
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -1517,7 +1517,7 @@ fails with `AssertionError: assert 139... == 139...` on
 `fused_calls[1]["w1_ptr"] == sources["gate_up"][1].data_ptr()` (layer 1 was copied into
 double buffer 1 instead of read in place).
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/freetoken/layers/moe.py` -- `_decode_routed`, inserting the owned branch after the CPU-layer branch (line 714) and before the hybrid branch:
 
@@ -1583,7 +1583,7 @@ Also extend the method docstring's final paragraph (line 704-708) with one sente
         if cache.prefill_overlap:
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -1591,7 +1591,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 & "$env:LOCALAPPDATA\FreeToken\venv\Scripts\python.exe" -m pytest tests/moe/test_offload.py tests/moe/test_small_prefill_movement.py tests/moe/test_moe_prefetch_config.py -q -p no:cacheprovider
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add python/freetoken/layers/moe.py tests/moe/test_offload.py

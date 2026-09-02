@@ -1130,3 +1130,143 @@ def test_per_layer_rows_report_gpu_owned_layers_as_resident_with_no_miss_rate():
     assert rows[1]["resident"] is True
     assert rows[1]["miss_rate"] is None
     assert rows[1]["missing_per_step"] == 0.0
+
+
+def _make_owned_layer_and_cache(layer_id=1, num_layers=3, owned=(1,), prefill_overlap=False):
+    from freetoken.layers.moe import OffloadMoELayer
+
+    cache, sources = _make_owned_cache(
+        num_layers=num_layers, owned=owned, prefill_overlap=prefill_overlap
+    )
+    layer = OffloadMoELayer(
+        layer_id=layer_id, num_experts=4, top_k=2, hidden_size=8, intermediate_size=16
+    )
+    layer.offload_cache = cache
+    return layer, cache, sources
+
+
+def test_decode_forward_on_a_gpu_owned_layer_uses_raw_ids_and_resident_views(monkeypatch):
+    layer, cache, sources = _make_owned_layer_and_cache()
+    topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
+    topk_ids = torch.tensor([[2, 1]], dtype=torch.int32)
+    hidden_states = torch.randn(1, 8)
+    router_logits = torch.randn(1, 4)
+    calls = {}
+
+    monkeypatch.setattr(
+        "freetoken.layers.moe.fused_topk",
+        lambda *, hidden_states, gating_output, topk, renormalize: (topk_weights, topk_ids),
+    )
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("a GPU-owned layer must not touch the LRU")
+
+    monkeypatch.setattr(cache, "ensure_experts", unexpected)
+    monkeypatch.setattr(cache, "copy_missing", unexpected)
+    monkeypatch.setattr(cache, "materialize_layer", unexpected)
+
+    def fake_fused_decode(
+        hidden_states, w1, w2, got_topk_weights, got_topk_ids, activation,
+        apply_router_weight_on_input,
+    ):
+        calls["w1"] = w1
+        calls["w2"] = w2
+        calls["topk_ids"] = got_topk_ids.clone()
+        return hidden_states
+
+    monkeypatch.setattr("freetoken.layers.moe.fused_experts_decode_impl", fake_fused_decode)
+
+    out = layer.decode_forward(hidden_states, router_logits)
+
+    assert out is hidden_states
+    # position == expert id on a fully resident layer: the ids pass through UNMAPPED
+    assert calls["topk_ids"].tolist() == [[2, 1]]
+    assert calls["w1"] is sources["gate_up"][1]
+    assert calls["w2"] is sources["down"][1]
+    assert calls["w1"] is not cache.bank_caches["gate_up"]
+    # and the routing histogram still counts the layer
+    cache.collect_decode_freq = True
+    layer.decode_forward(hidden_states, router_logits)
+    assert cache.decode_freq[1].tolist() == [0, 1, 1, 0]
+
+
+def test_a_narrow_prefill_on_a_gpu_owned_layer_takes_the_same_owned_branch(monkeypatch):
+    # FREETOKEN_MOE_SMALL_PREFILL_ROWS routes narrow prefills through _decode_routed; the
+    # owned branch has to be correct there too. (The admission conditions themselves are
+    # covered by tests/moe/test_small_prefill_movement.py.)
+    layer, cache, sources = _make_owned_layer_and_cache()
+    topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
+    topk_ids = torch.tensor([[2, 1]], dtype=torch.int32)
+    hidden_states = torch.randn(1, 8)
+    calls = {}
+
+    monkeypatch.setattr(layer, "_use_decode_movement", lambda _hidden: True)
+    monkeypatch.setattr(cache, "materialize_layer", lambda *a, **k: pytest.fail("streamed"))
+
+    def fake_fused_decode(
+        hidden_states, w1, w2, got_topk_weights, got_topk_ids, activation,
+        apply_router_weight_on_input,
+    ):
+        calls["w1"] = w1
+        calls["topk_ids"] = got_topk_ids.clone()
+        return hidden_states
+
+    monkeypatch.setattr("freetoken.layers.moe.fused_experts_decode_impl", fake_fused_decode)
+
+    layer.routed_forward(hidden_states, topk_weights, topk_ids)
+
+    assert calls["w1"] is sources["gate_up"][1]
+    assert calls["topk_ids"].tolist() == [[2, 1]]
+
+
+def test_prefill_overlap_skips_a_gpu_owned_layer_and_still_alternates_buffers(monkeypatch):
+    # layers 0 and 2 stream (both land in buffer 0, layer_id % 2), layer 1 is resident.
+    # The owned layer borrows no buffer but must still pre-issue layer 2's copy, or the
+    # pipeline stalls one layer every time an owned layer sits in the middle.
+    from freetoken.layers.moe import OffloadMoELayer
+
+    cache, sources = _make_owned_cache(num_layers=3, owned=(1,), prefill_overlap=True)
+    layers = [
+        OffloadMoELayer(
+            layer_id=layer_id, num_experts=4, top_k=2, hidden_size=8, intermediate_size=16
+        )
+        for layer_id in range(3)
+    ]
+    for layer in layers:
+        layer.offload_cache = cache
+
+    topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
+    topk_ids = torch.tensor([[2, 1]], dtype=torch.int32)
+    hidden_states = torch.randn(1, 8)
+    router_logits = torch.randn(1, 4)
+    fused_calls = []
+
+    monkeypatch.setattr(
+        "freetoken.layers.moe.fused_topk",
+        lambda *, hidden_states, gating_output, topk, renormalize: (
+            topk_weights, topk_ids.clone()
+        ),
+    )
+
+    def fake_fused(
+        hidden_states, w1, w2, got_topk_weights, got_topk_ids, activation,
+        apply_router_weight_on_input,
+    ):
+        fused_calls.append({"w1_ptr": w1.data_ptr(), "w1": w1.clone(), "ids": got_topk_ids.clone()})
+        return hidden_states
+
+    monkeypatch.setattr("freetoken.layers.moe.fused_experts_impl", fake_fused)
+
+    out = hidden_states
+    for layer in layers:
+        out = layer.prefill_forward(out, router_logits)
+
+    # every layer computed against its OWN weights, ids unmapped throughout
+    for layer_id in range(3):
+        assert torch.equal(fused_calls[layer_id]["w1"], sources["gate_up"][layer_id])
+        assert fused_calls[layer_id]["ids"].tolist() == [[2, 1]]
+    # layers 0 and 2 share double buffer 0 (0 % 2 == 2 % 2), the owned layer reads its
+    # resident bank and never enters the buffers at all
+    assert fused_calls[0]["w1_ptr"] == fused_calls[2]["w1_ptr"]
+    assert fused_calls[1]["w1_ptr"] == sources["gate_up"][1].data_ptr()
+    assert cache._prefill_buffer_layer == [2, None]  # buffer 1 was never claimed

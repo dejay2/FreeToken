@@ -705,13 +705,33 @@ class OffloadMoELayer(MoELayer):
         (high RAM bandwidth) straight from the host banks: ship hidden/routing to
         pinned host memory, run the GEMV on the worker pool via host nodes, ship the
         result back. The GPU slot cache is untouched (topk_ids keep their raw expert
-        ids), so no ``ensure_experts``/``copy_missing`` here."""
+        ids), so no ``ensure_experts``/``copy_missing`` here.
+
+        For a GPU-owned layer (``--moe-gpu-owned-layers``) the experts are already resident
+        at position == expert id, so the ids pass through unmapped and no LRU state is
+        touched; ``alphas_for_layer`` is the matching (position == expert id) scale lookup."""
         cache = self.offload_cache
         assert cache is not None
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
+        if cache.is_gpu_owned_layer(self.layer_id):
+            # Every expert of this layer is already in VRAM at position == expert id, so
+            # there is nothing to predict, fetch, evict or remap: hand the kernel the RAW
+            # topk_ids and the resident banks. Fixed shapes over fixed addresses -- strictly
+            # simpler than the streaming path, so CUDA-graph capture is unaffected.
+            cache._note_decode_routing(self.layer_id, topk_ids)
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.resident_views(self.layer_id),
+                n=None,
+                alphas=cache.alphas_for_layer(self.layer_id),
+                is_prefill=False,
+            )
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         # Layer-ahead expert prefetch. Join the previous layer's prefetch BEFORE this
@@ -827,6 +847,25 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if cache.is_gpu_owned_layer(self.layer_id):
+            # No overlap buffer, no materialize, no release: the layer is already resident.
+            # Keep the double-buffer pipeline moving anyway -- the next streaming layer's
+            # copy still has to start one layer early, and prefetch_prefill_layer is a quiet
+            # no-op for an owned target.
+            if cache.prefill_overlap:
+                if self.layer_id == 0:
+                    cache.begin_prefill()
+                cache.prefetch_prefill_layer(self.layer_id + 1)
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.resident_views(self.layer_id),
+                n=self.num_experts,
+                alphas=cache.alphas_for_layer(self.layer_id),
+                is_prefill=True,
+            )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
