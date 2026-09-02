@@ -130,20 +130,25 @@ included only as an upper bound:
 |---|---|---|---|---|
 | 42 | 0.605 | **0.065** | 0.281 | 0.135 |
 | 70 | 0.732 | **0.129** | 0.405 | 0.221 |
-| 94 | 0.804 | **0.185** | 0.286* | 0.286 |
-
-\* `chat8k` at K=94 is 0.488; the 0.286 column is `toolcall`.
+| 94 | 0.804 | **0.185** | 0.488 | 0.286 |
 
 Now the comparison that matters. The **dynamic LRU already running on those same 140.6
-slots** achieved a per-layer decode miss rate of **0.152-0.359** in this boot
-(`per_layer` in the JSONs) — a **64-85 % hit rate**, mean ~75 %. The server's own
-`oracle_hit_at_slots` (the best any stationary cache could do at 140.6 slots) is
-**0.86-0.91** per workload.
+slots** was measured in the same windows (`per_layer` in each JSON):
 
-So a static hot set at K=94 — giving up a third of the slot budget, which is the *point* of
-strategy A — captures 48-66 % of traffic where today's LRU captures 64-85 %. At K=42 it
-captures 27-45 %. And under strategy A those are not slow misses but **unservable** ones:
-the design removes the host rows the miss path would stream from.
+| | `code` | `prose` | `chat8k` | `toolcall` |
+|---|---|---|---|---|
+| decode steps | 219 | 441 | 372 | 102 |
+| per-layer miss rate (min-max) | 0.093-0.180 | 0.055-0.138 | 0.097-0.250 | 0.193-0.360 |
+| **mean hit rate** | **0.862** | **0.899** | **0.839** | **0.715** |
+
+So the live cache delivers a **72-90 % hit rate** on the full slot budget, while a static
+hot set at K=94 — giving up a third of that budget, which is the *point* of strategy A —
+captures 48-66 %, and at K=42 only 27-45 %. Even the oracle static set, fit to the workload
+it is then scored on, tops out at 75-81 %: below what the dynamic cache already achieves
+without knowing the workload in advance.
+
+And under strategy A those are not slow misses but **unservable** ones: the design removes
+the host rows the miss path would stream from.
 
 ## Verdict
 
@@ -157,14 +162,16 @@ Strategy A is not worth building for Qwen3.8-Flash-Next-NVFP4.
 3. **The workloads disagree about which experts are hot.** Mean top-70 Jaccard 0.134, only
    1.7x chance. A hot set tuned on code serves prose at a 6-19 % hit rate.
 4. **It is strictly worse than what already runs.** Static K=94: 48-66 %. Dynamic LRU on the
-   full budget: 64-85 %. Giving up adaptivity buys nothing here.
+   full budget: 72-90 %. Even an oracle static set fit to the workload it is scored on
+   (75-81 %) loses to the dynamic cache. Giving up adaptivity buys nothing here.
 
 What the data *does* support, in rough order of expected value:
 
-- **Keep the dynamic cache and spend effort on the miss path.** The realized miss rate is
-  already 15-36 % per layer against an 9-14 % floor (`oracle_hit_at_slots` 0.86-0.91), so
-  there is roughly 2x of achievable headroom inside the *existing* design — policy work
-  (LFU/2Q, or admission control), not residency work.
+- **Keep the dynamic cache; the remaining headroom is in policy, not residency.** Realized
+  hit is 0.86 / 0.90 / 0.84 / 0.72 against a stationary-oracle ceiling of 0.89 / 0.91 / 0.87
+  / 0.86 at the same slot count. Three of four workloads are already within 3 points of the
+  ceiling; only `toolcall` leaves ~14 points on the table, and that is a policy question
+  (LFU/2Q, admission control), not a reason to change where experts live.
 - **Layer-selective, not expert-selective.** The concentration is strongly depth-shaped
   (experts for 90 %: 275 at layer 0 down to 50 at layer 15). Layers 15, 31 and 39 are ~3x
   narrower than layers 0-2, so a *per-layer* slot budget that follows the measured curve —
