@@ -427,6 +427,9 @@ class Engine:
             self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
+        # After the host tables AND the offload cache: the block names the PLE backing one
+        # decided and the GPU-owned / CPU / streaming split the other did.
+        self._log_weight_placement_report(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
 
@@ -615,11 +618,33 @@ class Engine:
         adopt = getattr(self.model, "adopt_weight_sources", None)
         if callable(adopt):
             adopt(config)
+
+    def _log_weight_placement_report(self, config: EngineConfig) -> None:
+        """Log ONE placement block: the model's own lines plus the expert placement.
+
+        Emitted from ``__init__`` rather than from ``_install_model_weights`` because half
+        of what it describes does not exist yet when the weights land: ``load_host_tables``
+        decides the PLE table's backing, and ``_init_offload_moe_cache`` decides which MoE
+        layers are GPU-owned, which stream and which decode on the CPU. The report used to
+        run twenty lines before either, so it could never name a GPU-owned layer -- the same
+        ordering bug the picture-weight backing had (977ec62), fixed the same way.
+
+        The dedicated ``MoE GPU-owned layers: ...`` boot line stays where it is: it is the
+        line an operator greps for, and it carries the resident GiB this block does not.
+        """
         placement_report = getattr(self.model, "weight_placement_report", None)
+        lines = []
         if callable(placement_report):
-            report = placement_report()
-            if report:
-                logger.info_rank0(report)
+            lines += [line for line in (placement_report() or "").splitlines() if line.strip()]
+        lines += _expert_placement_lines(
+            config,
+            gpu_owned_layers=getattr(self, "_gpu_owned_layer_ids", frozenset()),
+            cpu_layer_ids=getattr(
+                getattr(self, "moe_offload_cache", None), "cpu_layer_ids", frozenset()
+            ),
+        )
+        if lines:
+            logger.info_rank0("\n".join(lines))
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
@@ -2076,6 +2101,39 @@ def _gpu_owned_lru_slots(config: EngineConfig, owned_layers: int) -> int:
         num_experts=num_experts,
         floor=2 * num_experts if config.moe_prefill_overlap else num_experts,
     )
+
+
+def _expert_placement_lines(
+    config: EngineConfig,
+    *,
+    gpu_owned_layers: "frozenset[int]",
+    cpu_layer_ids: "frozenset[int]",
+) -> list[str]:
+    """The engine-owned half of the weight placement report.
+
+    Pure over the config and the two resolved layer sets, so the block can be pinned without
+    a device. ``streaming_layers`` is what is left once the GPU-owned and CPU layers are
+    taken out -- the layer count the LRU slots are actually shared between.
+    """
+    model_config = config.model_config
+    lines = []
+    # Only when there is something to say: "quant=none" on every bf16 boot would be noise,
+    # and a model with no MoE and no dense quantization keeps the block silent entirely.
+    dense_quant = getattr(model_config, "dense_quant", "none")
+    if dense_quant and dense_quant != "none":
+        lines.append(f"Dense weights: quant={dense_quant}")
+    num_moe_layers = int(getattr(model_config, "num_moe_layers", 0) or 0)
+    if not num_moe_layers or not is_offload_moe_backend(config.moe_backend):
+        return lines
+    owned = sorted(gpu_owned_layers or ())
+    cpu = sorted(cpu_layer_ids or ())
+    lines.append(
+        f"Expert placement: backend={config.moe_backend}, moe_layers={num_moe_layers}, "
+        f"experts={getattr(model_config, 'num_experts', 0)}, gpu_owned_layers={owned}, "
+        f"cpu_layers={cpu}, streaming_layers={num_moe_layers - len(owned) - len(cpu)}, "
+        f"lru_slots={config.moe_cache_size}"
+    )
+    return lines
 
 
 def _post_cache_reserved_bytes(config: EngineConfig, *, mtp_resident: bool) -> int:

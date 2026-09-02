@@ -209,6 +209,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
         self._config = config
         self._mmap_ple = False
+        self._ple_placement = None
         self._vision_execution = vision_execution_mode() if config.is_multimodal else "gpu"
         # A tied lm_head projects against the SAME matrix every step, so the full-vocab GEMV
         # would drag all 1.27 GB over PCIe per token: host residency is only a win untied.
@@ -255,7 +256,16 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         return engine_device
 
     def weight_placement_report(self) -> str:
+        """The model's own lines of the engine's placement block.
+
+        Read after ``load_host_tables``, so ``_ple_placement`` (47.7 GiB of host residency
+        on this checkpoint) is settled by the time it is reported; the engine appends the
+        dense and expert placement it owns.
+        """
         lines = []
+        ple = getattr(self, "_ple_placement", None)
+        if ple:
+            lines.append(f"PLE table: {ple}")
         if getattr(self, "_embed_host", False):
             embed = self.model.embed_tokens.weight
             lines.append(
@@ -381,6 +391,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.ngram_heads_vocab_sizes.copy_(torch.tensor(sizes, dtype=torch.int64))
                 emb.ngram_heads_offsets.copy_(torch.tensor(offsets, dtype=torch.int64))
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
+            self._ple_placement = f"backend=dummy-zero, resident_bytes=0, layers={len(ple_layers)}"
             return host_bytes
 
         ple_backend = getattr(engine_config, "ple_backend", "pinned")
@@ -395,6 +406,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 ple.ple_embedding.attach_table(
                     MmapStagedTable(table.storage, float(table.weight_scale))
                 )
+            self._ple_placement = (
+                f"backend=mmap, mapped_bytes={table.storage.nbytes}, layers={len(ple_layers)}"
+            )
             return host_bytes
 
         if engine_config.ple_backend == "disk":
@@ -425,6 +439,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 ple.ple_embedding.attach_table(disk_table)
             # engine enters this around every dispatch; the graph itself never waits on the disk
             self.forward_host_ctx = disk_table.forward_host_ctx
+            self._ple_placement = f"backend=disk, resident_bytes=0, layers={len(ple_layers)}"
             return 0
 
         if ple_backend != "pinned":
@@ -438,6 +453,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             ple.ple_embedding.attach_table(
                 PinnedUVATable(table.bank.tensor, float(table.weight_scale))
             )
+        self._ple_placement = (
+            f"backend=pinned, resident_bytes={table.bank.nbytes}, layers={len(ple_layers)}"
+        )
         return host_bytes + table.bank.nbytes
 
     def forward_mtp_capture(
