@@ -127,6 +127,30 @@ no parallel provider; the boot log always names the build it took:
 INFO expert banks: slow path (serial build)
 ```
 
+### Expert routing statistics
+
+`-CollectRoutingStats` boots with `--moe-collect-decode-freq`, which accumulates a
+per-(MoE layer, expert) decode routing histogram and serves it at
+`GET /v1/cache/routing`. It is boot-time only: the counters are device-side
+`scatter_add_`s that must exist before CUDA graph capture so graph replay re-runs
+them, and arming them afterwards would only ever see eager steps. There is no need
+to disable CUDA graphs.
+
+```powershell
+curl.exe "http://127.0.0.1:2020/v1/cache/routing"
+curl.exe "http://127.0.0.1:2020/v1/cache/routing?reset=true"   # window the next workload
+```
+
+The response carries `summary` (working set, `experts_for_90pct`, normalized
+entropy, the oracle hit rate at the current slot count), `per_layer` realized miss
+rates, and `decode_freq` — the raw `[num_layers, num_experts]` histogram.
+`reset=true` zeroes the counters after reading. Without the boot flag the route
+answers 409 rather than a page of zeros.
+
+Two caveats when reading the numbers: graph capture contributes a handful of
+warm-up counts before the first real token, and under MTP speculation the
+histogram also counts the routing of draft tokens that were later rejected.
+
 ## Wait until it is serving
 
 `GET /health` answers 200 from the moment uvicorn binds the port, which is

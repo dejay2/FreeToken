@@ -29,6 +29,8 @@ from freetoken.message import (
     ErrorReplyMsg,
     ExitMsg,
     PromptAdmittedMsg,
+    RoutingStatsBackendMsg,
+    RoutingStatsResultMsg,
     UserMsg,
 )
 from freetoken.utils import (
@@ -774,6 +776,10 @@ class Scheduler(SchedulerIOMixin):
                 self._reply_rebuild(msg.request_id, "busy")
             else:
                 self._pending_rebuild = msg
+        elif isinstance(msg, RoutingStatsBackendMsg):
+            # A read of counters the decode path already maintains: answer inline, whether or
+            # not the scheduler is idle. Only rank 0 owns the reply link.
+            self._reply_routing_stats(msg)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
@@ -821,6 +827,43 @@ class Scheduler(SchedulerIOMixin):
                     error=error,
                 )
             ]
+        )
+
+    def _reply_routing_stats(self, msg: RoutingStatsBackendMsg) -> None:
+        """Answer GET /v1/cache/routing from the live offload cache's decode counters."""
+        cache = getattr(self.engine, "moe_offload_cache", None)
+        stats: dict = {}
+        error: str | None = None
+        if cache is None:
+            error = "this model has no MoE offload cache"
+        elif not getattr(cache, "collect_stats", False):
+            error = (
+                "decode counters are off; boot with --moe-collect-decode-freq "
+                "(or FREETOKEN_MOE_COLLECT_DECODE_FREQ=1)"
+            )
+        else:
+            try:
+                stats = {
+                    "collect_decode_freq": bool(cache.collect_decode_freq),
+                    "num_layers": cache.num_layers,
+                    "num_experts": cache.num_experts,
+                    "cache_size": cache.cache_size,
+                    "summary": cache.decode_routing_stats(),
+                    "per_layer": cache.decode_miss_stats_per_layer()["per_layer"],
+                    # raw [layers, experts] histogram: the input every offline skew study
+                    # (static hot set sizing, overlap across workloads) actually needs.
+                    "decode_freq": (
+                        cache.decode_freq.tolist() if cache.collect_decode_freq else []
+                    ),
+                }
+                if msg.reset:
+                    # Window the next workload: zero the same counters decode_routing_stats
+                    # and decode_miss_stats_per_layer read.
+                    cache.reset_stats()
+            except Exception as e:  # noqa: BLE001
+                error = f"failed to read routing stats: {e!r}"
+        self.send_result(
+            [RoutingStatsResultMsg(request_id=msg.request_id, stats=stats, error=error)]
         )
 
     def _execute_pending_rebuild(self) -> None:

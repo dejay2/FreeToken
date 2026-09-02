@@ -116,6 +116,21 @@ class CacheRebuildResultMsg(BaseTokenizerMsg):
 
 
 @dataclass
+class RoutingStatsMsg(BaseTokenizerMsg):
+    # api server -> tokenizer worker (pure passthrough to RoutingStatsBackendMsg).
+    request_id: str
+    reset: bool = False
+
+
+@dataclass
+class RoutingStatsResultMsg(BaseTokenizerMsg):
+    # scheduler -> detokenizer worker (passthrough to RoutingStatsReply).
+    request_id: str
+    stats: dict
+    error: str | None = None
+
+
+@dataclass
 class ErrorReplyMsg(BaseTokenizerMsg):
     # scheduler -> tokenizer/detokenizer worker -> frontend: a request the scheduler cannot
     # serve (e.g. its prompt exceeds the KV budget). The worker translates it into a terminal

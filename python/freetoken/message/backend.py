@@ -61,3 +61,15 @@ class CacheRebuildBackendMsg(BaseBackendMsg):
     num_mamba_slots: int | None = None
     num_swa_pages: int | None = None
     mode: str = "if_idle"  # only "if_idle" is supported; "drain" is deferred (rejected)
+
+
+@dataclass
+class RoutingStatsBackendMsg(BaseBackendMsg):
+    """tokenizer worker -> scheduler: read the MoE decode routing histogram.
+
+    A pure read of device counters the decode path already accumulates, so unlike a cache
+    rebuild it needs no idle scheduler and never touches the maintenance gate."""
+
+    request_id: str
+    reset: bool = False  # zero the histogram after reading, to window the next workload
+

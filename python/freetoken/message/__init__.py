@@ -4,9 +4,16 @@ from .backend import (
     BatchBackendMsg,
     CacheRebuildBackendMsg,
     ExitMsg,
+    RoutingStatsBackendMsg,
     UserMsg,
 )
-from .frontend import BaseFrontendMsg, BatchFrontendMsg, CacheRebuildReply, UserReply
+from .frontend import (
+    BaseFrontendMsg,
+    BatchFrontendMsg,
+    CacheRebuildReply,
+    RoutingStatsReply,
+    UserReply,
+)
 from .tokenizer import (
     AbortMsg,
     BaseTokenizerMsg,
@@ -16,6 +23,8 @@ from .tokenizer import (
     DetokenizeMsg,
     ErrorReplyMsg,
     PromptAdmittedMsg,
+    RoutingStatsMsg,
+    RoutingStatsResultMsg,
     TokenizeMsg,
 )
 
@@ -25,6 +34,7 @@ __all__ = [
     "BaseBackendMsg",
     "BatchBackendMsg",
     "CacheRebuildBackendMsg",
+    "RoutingStatsBackendMsg",
     "ExitMsg",
     "UserMsg",
     "BaseTokenizerMsg",
@@ -34,9 +44,12 @@ __all__ = [
     "DetokenizeMsg",
     "ErrorReplyMsg",
     "PromptAdmittedMsg",
+    "RoutingStatsMsg",
+    "RoutingStatsResultMsg",
     "TokenizeMsg",
     "BaseFrontendMsg",
     "BatchFrontendMsg",
     "CacheRebuildReply",
+    "RoutingStatsReply",
     "UserReply",
 ]

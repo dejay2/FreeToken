@@ -236,8 +236,12 @@ class OffloadMoeCache:
         self.stat_steps_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
         # Opt-in decode routing histogram (per layer, per expert) for cache-skew
         # analysis. Accumulated in ``ensure_experts`` from the raw expert ids before the
-        # kernel rewrites them to slots. Only accurate with CUDA graphs disabled (the
-        # captured graph would not re-run this host-side scatter on replay).
+        # kernel rewrites them to slots. Graph-safe on the same terms as collect_stats
+        # above: the scatter_add_ runs on device tensors, so it is captured into the decode
+        # graph and re-executes against each replay's REAL routing -- provided the flag is
+        # armed BEFORE capture (engine.py does this at cache build; --moe-collect-decode-freq
+        # is boot-time only for exactly that reason). Flipped after capture it would only
+        # ever see eager steps. Same one-off warm-up increment at capture time.
         self.collect_decode_freq = False
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
@@ -1097,6 +1101,10 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
+        # The routing histogram shares this window: decode_routing_stats() merges the
+        # reset-delimited prefetch counters into the histogram's own numbers, so leaving
+        # decode_freq monotonic here would report two different time spans in one dict.
+        self.decode_freq.zero_()
 
     def record_decode_stats(self, layer_id: int) -> None:
         """No-op: ``ensure_experts`` accumulates into ``lru_stats`` inside its own launch.

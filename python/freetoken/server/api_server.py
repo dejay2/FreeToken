@@ -24,6 +24,8 @@ from freetoken.message import (
     BatchFrontendMsg,
     CacheRebuildMsg,
     CacheRebuildReply,
+    RoutingStatsMsg,
+    RoutingStatsReply,
     TokenizeMsg,
     UserReply,
 )
@@ -143,6 +145,9 @@ class FrontendManager:
     # Runtime cache-rebuild control plane (correlated by uuid request_id, separate from
     # the int-uid generation ack machinery).
     rebuild_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
+    # Read-only MoE routing-stats round trip (GET /v1/cache/routing). Same correlation
+    # scheme as rebuild_futures, but it never touches the maintenance gate.
+    routing_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
     # Lifecycle gate. Starts "loading" (uvicorn binds before weights finish; the three
     # API adapters 503 until this flips) -> "serving" once all workers ack ready ->
     # "rebuilding"/"failed" for runtime cache rebuilds.
@@ -246,6 +251,11 @@ class FrontendManager:
             if isinstance(msg, CacheRebuildReply):
                 self._resolve_rebuild(msg)
                 continue
+            if isinstance(msg, RoutingStatsReply):
+                fut = self.routing_futures.pop(msg.request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result({"stats": msg.stats, "error": msg.error})
+                continue
             for msg in _unwrap_msg(msg):
                 # Global accounting follows actual admitted/sampled work even after the HTTP
                 # client disconnects and abort_user removes its ack queue. Delivery to a live
@@ -305,6 +315,11 @@ class FrontendManager:
                 fut = self.rebuild_futures.pop(request_id, None)
                 if fut is not None and not fut.done():
                     fut.set_result(dict(result))
+            # No RoutingStatsReply will arrive from a dead backend either.
+            for request_id in list(self.routing_futures):
+                fut = self.routing_futures.pop(request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result({"stats": {}, "error": message})
 
         try:
             loop.call_soon_threadsafe(_resolve_all)
@@ -815,6 +830,44 @@ async def cache_status():
         "last_rebuild": state.last_rebuild,
         "geometry": cache_geometry(state),
     }
+
+
+@app.get("/v1/cache/routing")
+async def cache_routing(reset: bool = False, timeout: float = 30.0):
+    """MoE decode routing counters, for cache-skew analysis.
+
+    Off by default: the histogram is only accumulated when the server was booted with
+    --moe-collect-decode-freq (or FREETOKEN_MOE_COLLECT_DECODE_FREQ=1), because the
+    counters are device-side ops that have to exist before CUDA graph capture. Without it
+    this answers 409 rather than a silent page of zeros.
+
+    ``reset=true`` zeroes the counters after reading, so a caller can window one workload
+    at a time. ``decode_freq`` is the raw [num_layers, num_experts] histogram.
+    """
+    state = get_global_state()
+    if state.maintenance_state != "serving":
+        return JSONResponse(
+            {"error": f"engine is {state.maintenance_state}, not serving"},
+            status_code=503,
+        )
+    request_id = str(uuid.uuid4())
+    fut = asyncio.get_running_loop().create_future()
+    state.routing_futures[request_id] = fut
+    try:
+        await state.send_one(RoutingStatsMsg(request_id=request_id, reset=reset))
+    except Exception as e:  # noqa: BLE001
+        state.routing_futures.pop(request_id, None)
+        return JSONResponse(
+            {"error": f"failed to dispatch routing-stats request: {e!r}"}, status_code=503
+        )
+    try:
+        result = await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        state.routing_futures.pop(request_id, None)
+        return JSONResponse({"error": "routing-stats request timed out"}, status_code=504)
+    if result["error"]:
+        return JSONResponse({"error": result["error"]}, status_code=409)
+    return result["stats"]
 
 
 @app.post("/generate")

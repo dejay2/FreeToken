@@ -776,7 +776,19 @@ class Engine:
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
-        cache.collect_stats = config.moe_collect_stats
+        collect_decode_freq = config.moe_collect_decode_freq or _env_flag(
+            "FREETOKEN_MOE_COLLECT_DECODE_FREQ"
+        )
+        cache.collect_stats = config.moe_collect_stats or collect_decode_freq
+        # The routing histogram is a per-layer scatter_add_ over device tensors, so a
+        # captured decode graph replays it like any other decode op -- but only if it is
+        # armed here, before capture. Arming it later leaves the graph without the scatter.
+        cache.collect_decode_freq = collect_decode_freq
+        if collect_decode_freq:
+            logger.info_rank0(
+                "MoE decode routing histogram armed (GET /v1/cache/routing); the capture "
+                "warm-up contributes a handful of counts before the first real token"
+            )
         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
@@ -1766,6 +1778,11 @@ def _cpu_moe_executor_viable(model_config) -> bool:
     return fmt == "mxfp4" or fmt in _WFMT_IDS
 
 
+def _env_flag(name: str) -> bool:
+    """A FREETOKEN_* boolean knob, in the spelling the rest of the MoE path accepts."""
+    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _pin_budget_bytes(reserved: int = 0) -> int | None:
     """Bytes this process can still safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
 
@@ -1820,6 +1837,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
+    "moe_collect_decode_freq": False,
     "expert_load": "auto",
 }
 

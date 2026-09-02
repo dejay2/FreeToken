@@ -333,6 +333,12 @@ class EngineConfig:
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
+    # Per-(layer, expert) decode routing histogram for cache-skew analysis, exposed at
+    # GET /v1/cache/routing. Implies moe_collect_stats. Like it, the accumulation is a
+    # device-side scatter_add_ that has to be armed BEFORE graph capture to be replayed,
+    # so this is boot-time only (--moe-collect-decode-freq /
+    # FREETOKEN_MOE_COLLECT_DECODE_FREQ=1), never a runtime toggle.
+    moe_collect_decode_freq: bool = False
     # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0

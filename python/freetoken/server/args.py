@@ -631,6 +631,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-decode-freq",
+        action="store_true",
+        dest="moe_collect_decode_freq",
+        default=ServerArgs.moe_collect_decode_freq,
+        help=(
+            "Accumulate the per-(MoE layer, expert) decode routing histogram and serve it "
+            "at GET /v1/cache/routing. Implies the decode miss-rate counters. Boot-time "
+            "only -- the counters are device-side ops that must exist before CUDA graph "
+            "capture. Also settable with FREETOKEN_MOE_COLLECT_DECODE_FREQ=1."
+        ),
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",

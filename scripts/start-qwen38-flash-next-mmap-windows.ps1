@@ -51,7 +51,13 @@ param(
     # cache-bypassing multi-threaded reader (FILE_FLAG_NO_BUFFERING on Windows); 'auto'
     # lets the loader pick (parallel for scattered expert tensors).
     [ValidateSet('auto', 'serial', 'parallel')]
-    [string]$ExpertLoad = 'serial'
+    [string]$ExpertLoad = 'serial',
+
+    # Accumulate the per-(MoE layer, expert) decode routing histogram and serve it at
+    # GET /v1/cache/routing (--moe-collect-decode-freq). Boot-time only: the counters are
+    # device-side ops that have to exist before CUDA graph capture. Research knob -- it
+    # adds one scatter_add_ per MoE layer per decode step.
+    [switch]$CollectRoutingStats
 )
 
 $ErrorActionPreference = 'Stop'
@@ -159,6 +165,9 @@ $serveArgs = @(
 )
 if ($EnableCacheReport) {
     $serveArgs += '--enable-cache-report'
+}
+if ($CollectRoutingStats) {
+    $serveArgs += '--moe-collect-decode-freq'
 }
 if ($CudaGraphMaxBS -ge 0) {
     $serveArgs += @('--cuda-graph-max-bs', "$CudaGraphMaxBS")

@@ -27,6 +27,10 @@ from freetoken.message import (
     DetokenizeMsg,
     ErrorReplyMsg,
     PromptAdmittedMsg,
+    RoutingStatsBackendMsg,
+    RoutingStatsMsg,
+    RoutingStatsReply,
+    RoutingStatsResultMsg,
     TokenizeMsg,
     UserMsg,
     UserReply,
@@ -399,8 +403,8 @@ def tokenize_worker(
             abort_msg = [m for m in pending_msg if isinstance(m, AbortMsg)]
             prompt_admitted_msg = [m for m in pending_msg if isinstance(m, PromptAdmittedMsg)]
             error_reply_msg = [m for m in pending_msg if isinstance(m, ErrorReplyMsg)]
-            # Cache-rebuild control messages are pure passthrough (no tokenization):
-            # CacheRebuildMsg (api -> scheduler) and CacheRebuildResultMsg (scheduler -> api).
+            # Control messages are pure passthrough (no tokenization): CacheRebuildMsg /
+            # RoutingStatsMsg (api -> scheduler) and their *ResultMsg replies (scheduler -> api).
             for m in pending_msg:
                 if isinstance(m, CacheRebuildMsg):
                     send_backend.put(
@@ -411,6 +415,16 @@ def tokenize_worker(
                             num_mamba_slots=m.num_mamba_slots,
                             num_swa_pages=m.num_swa_pages,
                             mode=m.mode,
+                        )
+                    )
+                elif isinstance(m, RoutingStatsMsg):
+                    send_backend.put(
+                        RoutingStatsBackendMsg(request_id=m.request_id, reset=m.reset)
+                    )
+                elif isinstance(m, RoutingStatsResultMsg):
+                    send_frontend.put(
+                        RoutingStatsReply(
+                            request_id=m.request_id, stats=m.stats, error=m.error
                         )
                     )
                 elif isinstance(m, CacheRebuildResultMsg):
@@ -428,7 +442,14 @@ def tokenize_worker(
             n_control = sum(
                 isinstance(
                     m,
-                    (CacheRebuildMsg, CacheRebuildResultMsg, ErrorReplyMsg, PromptAdmittedMsg),
+                    (
+                        CacheRebuildMsg,
+                        CacheRebuildResultMsg,
+                        ErrorReplyMsg,
+                        PromptAdmittedMsg,
+                        RoutingStatsMsg,
+                        RoutingStatsResultMsg,
+                    ),
                 )
                 for m in pending_msg
             )
