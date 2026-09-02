@@ -22,9 +22,11 @@ import os
 import re
 import struct
 import threading
+import warnings
 from dataclasses import dataclass
 from typing import BinaryIO, Iterator
 
+import numpy as np
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
@@ -184,7 +186,7 @@ def iter_weights(
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
     include_vision = vision_load_enabled()
     stream_vision = include_vision and vision_execution_mode() == "layer-stream"
-    # ``mmap``: install the picture tensors as zero-copy views over a copy-on-write mapping
+    # ``mmap``: install the picture tensors as zero-copy views over a read-only mapping
     # of their shard extent instead of reading 856 MiB into process RAM. ``None`` means
     # today's resident behaviour -- either the flag says ``ram`` or the mapping was refused.
     mapped_vision = (
@@ -813,16 +815,21 @@ def load_mmap_ple_table(model_path: str, qwen4_args) -> MmapPleTable:
 #
 # With FREETOKEN_VISION_WEIGHTS=mmap the 333 picture tensors (897,862,112 B of bf16, one
 # unbroken extent at the end of model-bf16-00001.safetensors) are never read into process
-# memory. Their extent is mapped copy-on-write and each tensor becomes a zero-copy
-# torch.frombuffer view installed exactly where the resident tensor used to go, so the
-# ~856 MiB stays on the SSD until a picture request faults it in -- and goes back to the
-# standby list that feeds the 47.7 GiB mapped PLE table when the OS wants it.
+# memory. Their extent is mapped READ-ONLY and each tensor becomes a zero-copy view
+# installed exactly where the resident tensor used to go, so the ~856 MiB stays on the SSD
+# until a picture request faults it in, costs no commit charge, and is reclaimable with no
+# pagefile write.
 #
-# This reuses MmapPleStorage's mechanics (header-derived ranges, ACCESS_COPY, frombuffer
-# views, batched PrefetchVirtualMemory / madvise(WILLNEED)) but none of its caching or
-# fault fan-out: PLE gathers a few random rows out of 320 M per decoded token, while a
-# picture reads 100% of its tensors, in the same order, once. The only cache it wants is
-# the OS page cache, and one prefetch over one sequential extent beats any fan-out.
+# Read-only rather than copy-on-write because copy-on-write measured badly: Windows charges
+# commit for the whole reservation even though a live boot never converted one byte of the
+# window away from PAGE_WRITECOPY, so the saving came out at 347 MiB instead of 856.
+#
+# This reuses MmapPleStorage's mechanics (header-derived ranges, mapped byte-range views,
+# batched PrefetchVirtualMemory / madvise(WILLNEED)) but none of its caching or fault
+# fan-out, and not its ACCESS_COPY: PLE gathers a few random rows out of 320 M per decoded
+# token behind a row cache, while a picture reads 100% of its tensors, in the same order,
+# once. The only cache it wants is the OS page cache, and one prefetch over one sequential
+# extent beats any fan-out.
 
 _VISION_RAW_PREFIXES = ("model.visual.", "visual.")
 # ``visual.pos_embed.weight`` (5,308,416 B) is the one picture tensor the streamed encode
@@ -981,21 +988,45 @@ _vision_prefetch_failed = False
 _vision_advise_failed = False
 
 
+def _read_only_uint8_view(mapping: mmap.mmap, *, count: int, offset: int) -> torch.Tensor:
+    """Zero-copy ``uint8`` tensor over a byte range of a READ-ONLY mapping.
+
+    ``torch.frombuffer`` refuses a non-writable buffer, so go through numpy the way
+    ``models/gguf/reader.py`` already does for its read-only memory-mapped blocks:
+    ``np.frombuffer`` produces a ``writeable=False`` array and ``torch.from_numpy`` accepts
+    it, warning once that it cannot represent non-writability. Torch has no read-only
+    tensor, so the returned tensor claims to be writable and only the OS enforces the
+    truth -- which is the point: a write hits PAGE_READONLY and dies loudly instead of
+    silently privatising a page. These are only ever ``copy_`` sources.
+
+    The warning is silenced rather than left to fire 333 times at boot; non-writability is
+    exactly what is being asked for here, so the warning carries no information.
+    """
+    array = np.frombuffer(mapping, dtype=np.uint8, count=count, offset=offset)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*not writable.*", category=UserWarning)
+        return torch.from_numpy(array)
+
+
 class MmapVisionWeights:
-    """The picture weights as zero-copy views over a copy-on-write mapping of their shard.
+    """The picture weights as zero-copy views over a read-only mapping of their shard.
 
     One mapping per shard that carries picture tensors, starting at the extent rounded down
-    to ``mmap.ALLOCATIONGRANULARITY`` and only as long as the extent needs, so the commit
-    charge is the extent (~857 MiB here) rather than the whole 1.27 GiB file.
+    to ``mmap.ALLOCATIONGRANULARITY`` and only as long as the extent needs, so the mapping
+    covers the extent (~857 MiB here) rather than the whole 1.27 GiB file.
 
-    ``ACCESS_COPY``, not ``ACCESS_READ``: over a read-only buffer ``torch.frombuffer`` warns
-    on every call and then hands back a tensor it believes is writable, while copy-on-write
-    is silent and correct. Clean copy-on-write pages are still file-backed and still
-    reclaimable with no pagefile write.
+    ``ACCESS_READ``, not ``ACCESS_COPY``. Copy-on-write was the first implementation and it
+    measured badly: Windows charges commit for the whole reservation whether or not a page
+    is ever written, so a live boot showed only 347 MiB of private-bytes saving against the
+    856 MiB the extent costs resident -- while the address-space probe found the window 100%
+    ``PAGE_WRITECOPY`` and 0 bytes ``PAGE_READWRITE`` after four encodes, i.e. nothing ever
+    wrote through a view in the first place. ``ACCESS_READ`` is ``PAGE_READONLY``, charges no
+    commit, and gives up nothing the streamed encode uses: every picture tensor is a memcpy
+    source, and ``visual.pos_embed.weight`` -- the one CPU compute operand -- is already
+    carved out as an ordinary resident tensor.
 
-    NEVER write through one of these views. The copy-on-write fault would make the page
-    private and dirty and silently hand back the RAM this mode exists to save. They are only
-    ever ``copy_`` sources (``vision._copy_component_state_``).
+    Writing through a view is now an access violation rather than a silent private page. It
+    was already forbidden; it is no longer silent.
     """
 
     def __init__(self, layout: VisionLayout) -> None:
@@ -1023,10 +1054,10 @@ class MmapVisionWeights:
                 aligned = shard.start - shard.start % mmap.ALLOCATIONGRANULARITY
                 span = shard.end - aligned
                 mapping = mmap.mmap(
-                    fh.fileno(), length=span, access=mmap.ACCESS_COPY, offset=aligned
+                    fh.fileno(), length=span, access=mmap.ACCESS_READ, offset=aligned
                 )
                 self._maps[shard.path] = mapping
-                window = torch.frombuffer(mapping, dtype=torch.uint8, count=span)
+                window = _read_only_uint8_view(mapping, count=span, offset=0)
                 self._window_views.append(window)
                 windows.append(
                     MappedVisionWindow(
@@ -1041,11 +1072,8 @@ class MmapVisionWeights:
                         self._views[spec.name] = self._read_resident(fh, spec)
                         continue
                     self._views[spec.name] = (
-                        torch.frombuffer(
-                            mapping,
-                            dtype=torch.uint8,
-                            count=spec.nbytes,
-                            offset=spec.offset - aligned,
+                        _read_only_uint8_view(
+                            mapping, count=spec.nbytes, offset=spec.offset - aligned
                         )
                         .view(spec.dtype)
                         .reshape(spec.shape)
@@ -1185,6 +1213,16 @@ class MmapVisionWeights:
         return True
 
     def close(self) -> None:
+        """Unmap the extent and release the file handles.
+
+        Raises ``BufferError`` if a view is still reachable from outside this holder. The
+        numpy array each view sits on holds an exported buffer over the mapping, so Python
+        refuses to unmap bytes a live tensor still points at -- which is the safe answer,
+        because unmapping under a live view would leave it dangling and the next read would
+        be an access violation. Drop the tensors, then close; a refused close can be
+        retried. The same reference chain is why a garbage-collected holder cannot pull the
+        mapping out from under the tower.
+        """
         self._views.clear()
         self._window_views.clear()
         self._windows = ()

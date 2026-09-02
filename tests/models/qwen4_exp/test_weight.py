@@ -10,6 +10,7 @@ import ctypes
 import json
 import mmap
 import random
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -1301,6 +1302,81 @@ def test_an_unknown_picture_key_is_a_named_error(picture_source):
         source.tensor("visual.blocks.9.attn.qkv.weight")
 
 
+# The mapping is READ-ONLY, not copy-on-write. Live measurement (live-results section 3.2)
+# showed ACCESS_COPY charging Windows commit for the whole 856 MiB window even though the
+# address-space probe found 100% PAGE_WRITECOPY and zero PAGE_READWRITE after four encodes:
+# the reservation costs commit whether or not a page is ever written, so the private-bytes
+# saving netted out at 347 MiB against a criterion of 800. ACCESS_READ is PAGE_READONLY and
+# charges none. The views are only ever ``copy_`` sources, so nothing is given up.
+
+
+def test_the_picture_extent_is_mapped_read_only(picture_checkpoint, monkeypatch):
+    calls: list[int] = []
+    real = weight_mod.mmap.mmap
+
+    def spy(fileno, **kwargs):
+        calls.append(kwargs["access"])
+        return real(fileno, **kwargs)
+
+    monkeypatch.setattr(weight_mod.mmap, "mmap", spy)
+    folder, _picture, _shard, _base = picture_checkpoint
+    source = weight_mod.MmapVisionWeights(weight_mod._vision_layout(folder))
+    try:
+        assert calls and set(calls) == {mmap.ACCESS_READ}
+        assert mmap.ACCESS_COPY not in calls
+    finally:
+        source.close()
+
+
+def test_a_write_to_the_mapped_extent_is_refused(picture_source):
+    """The buffer-level guarantee. Torch has no read-only tensor, so a view still *claims*
+    to be writable; what changes is that a write now hits PAGE_READONLY and dies loudly
+    instead of silently privatising a page and costing the saving. Asserted against the
+    mapping rather than through a view precisely because a write through the view would take
+    the process down with an access violation, not raise."""
+    source, _picture, _shard = picture_source
+    assert source._maps
+    for mapping in source._maps.values():
+        view = memoryview(mapping)
+        try:
+            assert view.readonly is True
+        finally:
+            view.release()  # an exported pointer would block mapping.close()
+        with pytest.raises(TypeError, match="readonly"):
+            mapping[0:1] = b"\x00"
+
+
+def test_building_the_views_emits_no_warnings(picture_checkpoint):
+    """``torch.from_numpy`` over a non-writable array warns once per call. 333 of those at
+    boot would be pure noise, so the reader silences that one warning deliberately."""
+    folder, _picture, _shard, _base = picture_checkpoint
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        source = weight_mod.MmapVisionWeights(weight_mod._vision_layout(folder))
+        source.close()
+    assert [str(w.message) for w in caught] == []
+
+
+def test_the_ple_mapping_is_still_copy_on_write(checkpoint, monkeypatch):
+    """The n-gram table is a different workload -- random rows, per decoded token, behind a
+    row cache that writes into its own slab -- and its mapping was measured and accepted as
+    it is. Changing the picture reader must not have touched it."""
+    calls: list[int] = []
+    real = weight_mod.mmap.mmap
+
+    def spy(fileno, **kwargs):
+        calls.append(kwargs["access"])
+        return real(fileno, **kwargs)
+
+    monkeypatch.setattr(weight_mod.mmap, "mmap", spy)
+    folder, _raw = checkpoint
+    table = _open_mmap_ple(folder)
+    try:
+        assert calls and set(calls) == {mmap.ACCESS_COPY}
+    finally:
+        table.storage.close()
+
+
 @pytest.fixture
 def picture_prefetch_enabled(monkeypatch):
     """Force the Windows prefetch on with a stub that records ``(entries, count)``."""
@@ -1446,6 +1522,9 @@ def test_iter_weights_installs_mapped_views_for_the_picture_keys(
         assert values["lm_head.weight"].device.type == "cpu"
         assert not source.contains(values["lm_head.weight"].data_ptr())
     finally:
+        # The views hold an exported buffer over the mapping, so borrowed tensors have to
+        # go before it can be unmapped. See MmapVisionWeights.close.
+        del values, source
         weight_mod.close_mmap_vision_weights()
 
 
@@ -1464,6 +1543,7 @@ def test_mapped_and_resident_picture_weights_are_the_same_bytes(
                 mapped[name].view(torch.int16), resident[name].view(torch.int16)
             ), name
     finally:
+        del mapped
         weight_mod.close_mmap_vision_weights()
 
 

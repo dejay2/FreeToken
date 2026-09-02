@@ -369,12 +369,39 @@ def _mapped_tower(tmp_path, config: Qwen4VisionConfig, resident: Qwen4VisionMode
     return mapped, source
 
 
+def _assert_component_copies(config, resident, mapped, source) -> None:
+    """Every component of ``mapped`` copies into a fresh workspace bit-identically to
+    ``resident``'s, and no source view leaves the mapping. Its own frame, so every borrowed
+    view is unreachable by the time the caller unmaps."""
+    pairs = [
+        ("patch_embed", resident.patch_embed, mapped.patch_embed),
+        ("merger", resident.merger, mapped.merger),
+    ]
+    pairs += [
+        (f"blocks.{i}", resident.blocks.op_list[i], mapped.blocks.op_list[i])
+        for i in range(config.depth)
+    ]
+    for label, want, got in pairs:
+        before = {key: tensor.data_ptr() for key, tensor in got.state_dict().items()}
+        with torch.device("cpu"), torch_dtype(torch.bfloat16):
+            target = type(want)(config)
+        _copy_component_state_(target, got)
+
+        for key, tensor in target.state_dict().items():
+            expected = want.state_dict()[key]
+            assert torch.equal(
+                tensor.view(torch.int16), expected.view(torch.int16)
+            ), f"{label}.{key}"
+        for key, tensor in got.state_dict().items():
+            assert tensor.data_ptr() == before[key], f"{label}.{key} moved"
+            assert source.contains(tensor.data_ptr()), f"{label}.{key} left the mapping"
+
+
 def test_component_copies_from_mapped_weights_are_bit_identical(tmp_path):
     """The streamed encode's only real operation on a picture weight is
     ``target.copy_(source)``, and in mmap mode every source is a 2-byte-misaligned bf16 view
-    of a file page. Prove the copy lands the exact bytes for every component, and that
-    copying did not write THROUGH the view -- a copy-on-write fault there would make the
-    page private and silently give back the RAM this mode exists to save.
+    of a read-only file page. Prove the copy lands the exact bytes for every component, and
+    that copying did not write THROUGH the view.
 
     The device is CPU here so this runs without a GPU; production copies into a CUDA
     workspace, which is the same ``copy_`` with a different target device.
@@ -384,32 +411,21 @@ def test_component_copies_from_mapped_weights_are_bit_identical(tmp_path):
     resident = _cpu_stream_source(config)
     mapped, source = _mapped_tower(tmp_path, config, resident)
     try:
-        pairs = [
-            ("patch_embed", resident.patch_embed, mapped.patch_embed),
-            ("merger", resident.merger, mapped.merger),
-        ]
-        pairs += [
-            (f"blocks.{i}", resident.blocks.op_list[i], mapped.blocks.op_list[i])
-            for i in range(config.depth)
-        ]
-        for label, want, got in pairs:
-            before = {
-                key: tensor.data_ptr() for key, tensor in got.state_dict().items()
-            }
-            with torch.device("cpu"), torch_dtype(torch.bfloat16):
-                target = type(want)(config)
-            _copy_component_state_(target, got)
-
-            for key, tensor in target.state_dict().items():
-                expected = want.state_dict()[key]
-                assert torch.equal(
-                    tensor.view(torch.int16), expected.view(torch.int16)
-                ), f"{label}.{key}"
-            for key, tensor in got.state_dict().items():
-                assert tensor.data_ptr() == before[key], f"{label}.{key} moved"
-                assert source.contains(tensor.data_ptr()), f"{label}.{key} left the mapping"
+        _assert_component_copies(config, resident, mapped, source)
     finally:
+        # A live view holds an exported buffer over the mapping, so the tower has to go
+        # before it can be unmapped. See MmapVisionWeights.close.
+        del mapped
         source.close()
+
+
+def _assert_tower_state(resident, mapped, source) -> None:
+    state = mapped.state_dict()
+    assert set(state) == set(resident.state_dict())
+    assert {tensor.device.type for tensor in state.values()} == {"cpu"}
+    assert mapped.weight_backing() == "mmap"
+    outside = [key for key, tensor in state.items() if not source.contains(tensor.data_ptr())]
+    assert outside == ["pos_embed.weight"]
 
 
 def test_mapped_weights_reach_the_tower_where_the_resident_ones_did(tmp_path):
@@ -420,15 +436,9 @@ def test_mapped_weights_reach_the_tower_where_the_resident_ones_did(tmp_path):
     resident = _cpu_stream_source(config)
     mapped, source = _mapped_tower(tmp_path, config, resident)
     try:
-        state = mapped.state_dict()
-        assert set(state) == set(resident.state_dict())
-        assert {tensor.device.type for tensor in state.values()} == {"cpu"}
-        assert mapped.weight_backing() == "mmap"
-        outside = [
-            key for key, tensor in state.items() if not source.contains(tensor.data_ptr())
-        ]
-        assert outside == ["pos_embed.weight"]
+        _assert_tower_state(resident, mapped, source)
     finally:
+        del mapped
         source.close()
 
 

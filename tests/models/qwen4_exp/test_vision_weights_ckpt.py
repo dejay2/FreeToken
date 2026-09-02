@@ -160,6 +160,28 @@ def test_every_mapped_view_is_a_valid_copy_source(source, layout):
                 assert source.contains(view.data_ptr()), f"{spec.name} left the mapping"
 
 
+def test_the_real_extent_is_mapped_read_only(source):
+    """Read-only, not copy-on-write: on Windows that is PAGE_READONLY, which charges no
+    commit, where the ACCESS_COPY reservation charged the full 856 MiB and left the live
+    saving at 347 MiB instead of the 800 the design asked for (live-results section 3.2).
+
+    Asserted against the mapping, not through a view: torch has no read-only tensor, so a
+    write through a view would take the process down with an access violation rather than
+    raise. The views are only ever ``copy_`` sources -- proved for all 333 of them by
+    ``test_every_mapped_view_is_a_valid_copy_source`` above, which runs over this same
+    read-only mapping.
+    """
+    assert len(source._maps) == 1
+    mapping = next(iter(source._maps.values()))
+    view = memoryview(mapping)
+    try:
+        assert view.readonly is True
+    finally:
+        view.release()  # an exported pointer would block mapping.close()
+    with pytest.raises(TypeError, match="readonly"):
+        mapping[0:1] = b"\x00"
+
+
 def test_a_prefetch_over_the_real_extent_succeeds_and_is_not_reissued(source):
     """The real syscall over the real 856 MiB, no GPU involved. Asynchronous: it returns
     while the reads continue, which is the whole basis of the overlap argument."""
