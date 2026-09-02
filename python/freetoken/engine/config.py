@@ -2,6 +2,7 @@
 
 import math
 import os
+import sys
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Mapping
@@ -303,12 +304,15 @@ class EngineConfig:
     moe_backend: str = "auto"
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
     nvfp4_backend: str = "triton"
+    # PLE table backend: "disk" reads rows from the checkpoint files per fill via the Linux
+    # io_uring row store (Linux-only); "mmap" demand-pages the safetensors table (the Windows
+    # option); "pinned" preloads the whole table into page-locked host RAM.
+    ple_backend: str = "disk" if sys.platform == "linux" else "pinned"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
     # low-memory reclaimable read; "parallel" forces the fast read.
     expert_load: str = "auto"
-    ple_backend: str = "pinned"
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False

@@ -478,6 +478,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--ple-backend",
+        default=ServerArgs.ple_backend,
+        choices=["pinned", "mmap", "disk"],
+        help=(
+            "Where a PLE n-gram table lives. 'disk' reads rows straight from the checkpoint "
+            "files via the Linux io_uring row store; 'mmap' demand-pages the safetensors "
+            "table and works on Windows; 'pinned' preloads the whole table into page-locked "
+            "host RAM."
+        ),
+    )
+
+    parser.add_argument(
         "--nvfp4-backend",
         default=ServerArgs.nvfp4_backend,
         choices=["auto", "marlin", "flashinfer", "triton"],
@@ -498,13 +510,6 @@ def parse_args(
             "the banks + the parallel reader's extra whole-shard buffer; 'serial' forces the "
             "low-memory reclaimable read (slower); 'parallel' forces the fast read."
         ),
-    )
-
-    parser.add_argument(
-        "--ple-backend",
-        default=ServerArgs.ple_backend,
-        choices=["pinned", "mmap"],
-        help="Qwen3.8 PLE storage backend; mmap demand-pages safetensors.",
     )
 
     moe_cache_group = parser.add_mutually_exclusive_group()

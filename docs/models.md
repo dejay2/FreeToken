@@ -7,6 +7,7 @@ for them; other checkpoints of the same architectures work too.
 | Model | HF checkpoints |
 |---|---|
 | DeepSeek-V4 | [deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) |
+| GLM-5.3-Flash | [RedHatAI/GLM-5.3-Flash-NVFP4](https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4) |
 | GLM-5.2 | [nvidia/GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4) |
 | GLM-4.7 | [nvidia/GLM-4.7-NVFP4](https://huggingface.co/nvidia/GLM-4.7-NVFP4) |
 | Qwen3.8-Flash-Next | [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8), [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) |
@@ -38,8 +39,11 @@ for them; other checkpoints of the same architectures work too.
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
-- Qwen3.8-Flash-Next supports `--ple-backend mmap` for demand-paging its PLE table
-  from the original safetensors while retaining decode CUDA graphs. An unofficial,
+- Qwen3.8-Flash-Next reads its PLE table via `--ple-backend {disk,mmap,pinned}`:
+  `disk` (default on Linux) streams rows from the checkpoint through the io_uring
+  row store; `mmap` demand-pages the original safetensors table while retaining
+  decode CUDA graphs and is the default on Windows; `pinned` preloads the whole
+  table into page-locked host RAM and works everywhere. An unofficial,
   Desktop-assisted native-Windows setup and measured RTX 5090 results are in the
   [Windows PLE mmap guide](windows-qwen38-flash-next-mmap.md).
 - Multimodal checkpoints are served text-only.

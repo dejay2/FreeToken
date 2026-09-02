@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 from freetoken.layers import (
@@ -24,6 +25,11 @@ if TYPE_CHECKING:
 class BaseLLMModel(ABC, BaseOP):
     @abstractmethod
     def forward(self) -> torch.Tensor: ...
+
+    @contextmanager
+    def forward_host_ctx(self, batch: Batch, use_graph: bool):
+        """Around one forward dispatch: enter before it is enqueued, exit right after. A backend that feeds the forward from host memory overrides this."""
+        yield
 
     def prepare_cuda_graph_capture(self, batch: Batch) -> None:
         pass

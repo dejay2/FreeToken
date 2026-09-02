@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+import sys
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, NamedTuple, Sequence, Tuple
 
@@ -259,13 +260,19 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 "Use --attention-backend fi (or triton) instead."
             )
 
-    if required & {AttnType.MLA, AttnType.DSA} and config.page_size != 1:
-        # The MLA backend's row addressing (latent scatter, DSA index keys, sparse
-        # top-k page indices) assumes page_size == 1 throughout; reject explicitly
-        # like the SWA models do rather than corrupting addressing silently.
-        raise ValueError(
-            f"latent-KV MLA models require --page-size 1, got {config.page_size}."
+    if required & {AttnType.MLA, AttnType.DSA}:
+        # Plain MLA/DSA runs on page_size 1; the kpool indexer layout needs 64.
+        _kpool_ratio = max(
+            (s.index_ratio for s in model_config.kv_cache_group_specs() if s.mla),
+            default=1,
         )
+        want_page = 64 if _kpool_ratio > 1 else 1
+        if config.page_size != want_page:
+            logger.warning_rank0(
+                f"Page size {config.page_size} is auto-adjusted to {want_page} "
+                f"for latent-KV attention."
+            )
+            override("page_size", want_page)
 
     for part in backend_parts:
         info = attention_backend_info(part)
@@ -1395,12 +1402,13 @@ class Engine:
         if mtp_capture is not None:
             logits = mtp_capture[0]
         else:
-            with self.ctx.forward_batch(batch):
+            use_graph = (not wants_capture) and self.graph_runner.can_use_cuda_graph(batch)
+            with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
                 if wants_capture:
                     # Capture is private; normal serving keeps its original graph path.
                     mtp_capture = self.model.forward_mtp_capture(all_row_logits=False)
                     logits = mtp_capture[0]
-                elif self.graph_runner.can_use_cuda_graph(batch):
+                elif use_graph:
                     logits = self.graph_runner.replay(batch)
                 else:
                     logits = self.model.forward()
@@ -1733,6 +1741,7 @@ def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[
 # expert activations the CPU MoE executor supports (csrc ActKind)
 _CPU_MOE_ACTS = (
     "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
+    "swiglu_clamp",
 )
 
 
@@ -1817,16 +1826,32 @@ _DENSE_MOE_SETTINGS = {
 
 def _validate_ple_backend(config: EngineConfig, model_config) -> None:
     ple_backend = getattr(config, "ple_backend", "pinned")
-    if ple_backend not in ("pinned", "mmap"):
-        raise ValueError(f"ple_backend must be 'pinned' or 'mmap', got {ple_backend!r}")
+    if ple_backend not in ("pinned", "mmap", "disk"):
+        raise ValueError(f"ple_backend must be 'pinned', 'mmap' or 'disk', got {ple_backend!r}")
     if ple_backend == "pinned":
         return
 
     qwen4_args = getattr(model_config, "qwen4_args", None)
-    if qwen4_args is None or not getattr(qwen4_args, "ple_layer_ids", ()):
+    has_ple_layers = qwen4_args is not None and bool(getattr(qwen4_args, "ple_layer_ids", ()))
+
+    if ple_backend == "mmap" and not has_ple_layers:
         raise ValueError(
             "--ple-backend mmap is currently supported only for "
             "Qwen3.8-Flash-Next checkpoints with a PLE table"
+        )
+    if ple_backend == "disk" and sys.platform != "linux" and has_ple_layers:
+        raise ValueError(
+            "--ple-backend disk needs the Linux io_uring row store; "
+            "use --ple-backend mmap on Windows"
+        )
+
+    if ple_backend == "disk" and (
+        os.environ.get("FREETOKEN_MTP_SHADOW", "0") == "1"
+        or os.environ.get("FREETOKEN_MTP_SPECULATE", "0") == "1"
+    ):
+        raise ValueError(
+            "the MTP capture path does not enter forward_host_ctx; "
+            "use --ple-backend mmap or pinned with MTP"
         )
 
 
