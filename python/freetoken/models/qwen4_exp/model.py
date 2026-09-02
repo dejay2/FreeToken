@@ -338,13 +338,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         pinned = copy_to_pinned_tensor(embed.weight.contiguous())
         return embed.attach_host_table(pinned, torch.device("cuda", torch.cuda.current_device()))
 
-    def _attach_picture_weight_source(self, engine_config) -> None:
-        """Hand the tower the mapping the loader built, so it can prefetch its pages.
+    def adopt_weight_sources(self, engine_config) -> None:
+        """Engine hook, straight after the weights load: hand the tower the mapping the
+        loader built, so it can prefetch its extent.
 
-        The same holder ``iter_weights`` used to install the views: it is cached per
-        checkpoint folder, so this is a lookup, not a second mapping. Nothing to do when the
-        picture weights are resident -- that includes ``ram`` mode, an FTW checkpoint, and a
-        mapping the OS refused.
+        The same holder ``iter_weights`` used to install the views -- cached per checkpoint
+        folder, so this is a lookup, not a second mapping. Nothing to do when the picture
+        weights are resident: that covers ``ram`` mode, an FTW checkpoint, and a mapping the
+        OS refused. Runs before ``weight_placement_report``, which reports what it decided.
         """
         visual = getattr(self, "visual", None)
         if visual is None:
@@ -358,7 +359,6 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE table (and any host-resident embedding) and return pinned bytes."""
         host_bytes = self._load_host_embedding()
-        self._attach_picture_weight_source(engine_config)
         ple_layers = self.model.ple_layers
         if not ple_layers:
             return host_bytes
