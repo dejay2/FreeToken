@@ -127,6 +127,31 @@ no parallel provider; the boot log always names the build it took:
 INFO expert banks: slow path (serial build)
 ```
 
+## Wait until it is serving
+
+`GET /health` answers 200 from the moment uvicorn binds the port, which is
+long before the weights are in memory — it reports the load in its *body*
+(`{"status": "loading", "phase": "expert_banks", "progress": {...}}`), not in
+its status code. Do not treat a 200 from `/health` as readiness.
+
+The readiness signal is `GET /v1/cache/status` reporting `state == "serving"`.
+On this box the expert banks alone take ~45 s, so allow a 15-minute timeout:
+
+```powershell
+$deadline = (Get-Date).AddMinutes(15)
+while ((Get-Date) -lt $deadline) {
+  try {
+    $state = (Invoke-RestMethod http://127.0.0.1:2020/v1/cache/status).state
+    if ($state -eq 'serving') { "serving"; break }
+  } catch { }
+  Start-Sleep -Seconds 2
+}
+```
+
+The other `state` values are `loading`, `rebuilding` (a live pool resize),
+`stopping` and `failed`. While the state is not `serving` the chat routes
+answer 503, so a request fired off a bare `/health` 200 will be rejected.
+
 ## Check the API
 
 In a second PowerShell window:

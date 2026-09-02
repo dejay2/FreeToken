@@ -123,6 +123,12 @@ ft ctl [--base-url http://127.0.0.1:1919] [--timeout 10] [--json] <subcommand>
 | `cache --moe N \| --kv N \| --mamba N \| --swa N [--wait 300]` | `POST /v1/cache/rebuild` | Live pool resizing without a restart (`k`/`m` suffixes; `--kv`/`--swa` in tokens) |
 | `requests [--since N] [--limit N]` | `GET /v1/requests` | Recent request ring |
 
+`GET /health` is a liveness probe, not a readiness one: it answers 200 as soon
+as the port is bound and reports the load in its body (`status` is `loading`
+with a `phase` and byte `progress` until the weights are in). Readiness is
+`GET /v1/cache/status` reporting `state == "serving"` — every other state
+(`loading`, `rebuilding`, `stopping`, `failed`) makes the chat routes 503.
+
 ## ft launch
 
 ```bash
