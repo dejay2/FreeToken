@@ -354,6 +354,17 @@ class EngineConfig:
     # plus "auto" (the measured six hungriest layers) and "auto:N". None = off.
     # Each owned layer costs num_experts LRU slots of VRAM and returns one host bank of RAM.
     moe_gpu_owned_layers: str | None = None
+    # VRAM the MoE cache must NOT spend because something allocated AFTER it was sized
+    # already owns those bytes: the integrated MTP resident draft head (2.17 GiB measured),
+    # the decode/spec/draft CUDA-graph pools, and the vision layer-stream workspace. Joins
+    # fixed_cache_size before the MoE-vs-KV split, exactly like the GDN state pool, so both
+    # --moe-cache-auto and an explicit --moe-cache-size respect it.
+    # (--moe-vram-reserve-bytes; see cache_budget.DEFAULT_MOE_VRAM_RESERVE_BYTES.)
+    moe_vram_reserve_bytes: int = 3 << 30
+    # Free-VRAM headroom the MoE cache must leave after every known reservation. An explicit
+    # --moe-cache-size that leaves less fails loudly at boot naming the largest slot count
+    # that fits (--moe-cache-headroom-bytes; 1.5 GiB default).
+    moe_cache_headroom_bytes: int = 3 << 29
     # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's

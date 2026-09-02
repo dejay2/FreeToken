@@ -319,6 +319,10 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         swa_full_tokens_ratio = 0.2
         swa_num_pages_override = None
         model_config = StubModelConfig()
+        # Exercised by test_engine_auto_sizing_charges_the_declared_post_cache_reserve; 0
+        # here so this test stays about the kwarg mapping.
+        moe_vram_reserve_bytes = 0
+        moe_cache_headroom_bytes = 0
 
         class tp_info:
             size = 1
@@ -678,3 +682,193 @@ def test_the_charge_is_reported_against_the_owned_reservation_bytes():
         moe_cache_size=6750, owned_layers=6, num_experts=_E, floor=2 * _E
     )
     assert (6750 - lru) * _PER_EXPERT == gpu_owned_reservation_bytes(6, _E, _PER_EXPERT)
+
+
+# ------------------------------------- post-cache VRAM reservations (--moe-vram-reserve-bytes)
+
+
+def test_post_cache_reserved_bytes_sums_the_reserve_and_the_headroom():
+    from freetoken.engine.cache_budget import (
+        DEFAULT_MOE_CACHE_HEADROOM_BYTES,
+        DEFAULT_MOE_VRAM_RESERVE_BYTES,
+        post_cache_reserved_bytes,
+    )
+
+    # The default reserve covers the resident MTP draft head (2.17 GiB measured on the
+    # RTX 5090) plus the CUDA-graph pool and the vision layer-stream workspace.
+    assert DEFAULT_MOE_VRAM_RESERVE_BYTES == 3 << 30
+    assert DEFAULT_MOE_CACHE_HEADROOM_BYTES == 3 << 29  # 1.5 GiB
+    assert post_cache_reserved_bytes(vram_reserve_bytes=0, headroom_bytes=0) == 0
+    assert post_cache_reserved_bytes(
+        vram_reserve_bytes=3 << 30, headroom_bytes=3 << 29
+    ) == (3 << 30) + (3 << 29)
+    with pytest.raises(ValueError):
+        post_cache_reserved_bytes(vram_reserve_bytes=-1, headroom_bytes=0)
+    with pytest.raises(ValueError):
+        post_cache_reserved_bytes(vram_reserve_bytes=0, headroom_bytes=-1)
+
+
+def test_the_reserve_removes_exactly_its_bytes_worth_of_auto_slots():
+    """--moe-cache-auto must not spend the bytes the MTP draft head takes after sizing."""
+    from freetoken.engine.cache_budget import post_cache_reserved_bytes
+
+    def auto(reserve: int, headroom: int):
+        return resolve_moe_cache_auto(
+            baseline_free=40 << 30,
+            weights_bytes=8 << 30,
+            memory_ratio=0.9,
+            cache_per_page=1 << 20,
+            fixed_cache_size=post_cache_reserved_bytes(
+                vram_reserve_bytes=reserve, headroom_bytes=headroom
+            ),
+            per_expert_bytes=_PER_EXPERT,
+            num_experts=_E,
+            total_experts=_L * _E,
+            prefill_overlap=True,
+            kv_reserve_tokens=0,
+            page_size=1,
+            quant_format="nvfp4",
+        )
+
+    bare, _, _ = auto(0, 0)
+    reserved, _, _ = auto(3 << 30, 3 << 29)
+    # The reservation buys no expert slots, and costs at most one slot of rounding.
+    dropped = ((3 << 30) + (3 << 29)) // _PER_EXPERT
+    assert dropped <= bare - reserved <= dropped + 1
+
+
+def test_an_explicit_cache_size_that_eats_the_reserve_is_refused_naming_the_largest_fit():
+    """Operator decision: fail loudly, never silently shrink. The message must name the
+    largest slot count that fits after every known reservation."""
+    from freetoken.engine.cache_budget import check_explicit_moe_cache_fits
+
+    budget = 8000 * _PER_EXPERT
+    reserved = 1000 * _PER_EXPERT  # reserve + headroom, in slot-equivalents
+    # 6 owned layers charge 3072 slots; 8000 - 1000 - 3072 = 3928 remain for the LRU.
+    check_explicit_moe_cache_fits(
+        moe_cache_size=3928, per_expert_bytes=_PER_EXPERT, budget_bytes=budget,
+        owned_layers=6, num_experts=_E, reserved_bytes=reserved,
+    )  # exactly fits
+    with pytest.raises(ValueError) as excinfo:
+        check_explicit_moe_cache_fits(
+            moe_cache_size=3929, per_expert_bytes=_PER_EXPERT, budget_bytes=budget,
+            owned_layers=6, num_experts=_E, reserved_bytes=reserved,
+        )
+    message = str(excinfo.value)
+    assert "3928" in message  # the largest slot count that fits
+    assert str(reserved) in message  # the reservation is named, not hidden
+
+
+def test_the_reserve_is_refused_for_a_no_owned_configuration_too():
+    """The post-cache reservation bug is general: it bites --moe-cache-size with or without
+    --moe-gpu-owned-layers."""
+    from freetoken.engine.cache_budget import check_explicit_moe_cache_fits
+
+    budget = 8000 * _PER_EXPERT
+    reserved = 1000 * _PER_EXPERT
+    check_explicit_moe_cache_fits(
+        moe_cache_size=7000, per_expert_bytes=_PER_EXPERT, budget_bytes=budget,
+        owned_layers=0, num_experts=_E, reserved_bytes=reserved,
+    )
+    with pytest.raises(ValueError) as excinfo:
+        check_explicit_moe_cache_fits(
+            moe_cache_size=7001, per_expert_bytes=_PER_EXPERT, budget_bytes=budget,
+            owned_layers=0, num_experts=_E, reserved_bytes=reserved,
+        )
+    assert "7000" in str(excinfo.value)
+
+
+def test_the_vram_ledger_lists_every_term_in_one_block():
+    from freetoken.engine.cache_budget import format_vram_ledger
+
+    block = format_vram_ledger(
+        total_bytes=32 << 30,
+        weights_bytes=8 << 30,
+        kv_bytes=1 << 30,
+        gdn_state_bytes=2 << 30,
+        gpu_owned_bytes=6 * _E * _PER_EXPERT,
+        gpu_owned_layers=(0, 1, 2, 6, 7, 22),
+        lru_slots=3678,
+        lru_bytes=3678 * _PER_EXPERT,
+        vram_reserve_bytes=3 << 30,
+        headroom_bytes=3 << 29,
+    )
+    for label in (
+        "VRAM ledger",
+        "weights",
+        "KV cache",
+        "GDN state pool",
+        "GPU-owned MoE layers",
+        "MoE LRU cache",
+        "post-cache reserve",
+        "headroom",
+        "unaccounted",
+    ):
+        assert label in block, label
+    assert "[0, 1, 2, 6, 7, 22]" in block
+    assert "3678 slots" in block
+    # one line per term, no wall of text
+    assert len(block.splitlines()) == 10
+
+
+def test_engine_auto_sizing_charges_the_declared_post_cache_reserve():
+    """Engine._resolve_auto_moe_cache_size must fold the declared reserve into
+    fixed_cache_size, exactly as it folds the GDN state pool and the owned reservation."""
+    import torch
+
+    from freetoken.engine.engine import Engine
+    from freetoken.kvcache.mha_pool import MHAKVCache
+    from freetoken.models.config import KVCacheGroupSpec
+
+    class StubModelConfig:
+        has_swa_attention = False
+        num_experts = 64
+        num_moe_layers = 4
+
+        def kv_cache_group_specs(self):
+            return [KVCacheGroupSpec(
+                name="full", layer_ids=(0, 1, 2), num_kv_heads=8, head_dim=64,
+                sliding_window=None,
+            )]
+
+        def linear_attention_group(self):
+            return None
+
+    class StubConfig:
+        dtype = torch.float16
+        page_size = 16
+        max_running_req = 4
+        hybrid_swa_cache_mode = "auto"
+        memory_ratio = 0.9
+        moe_prefill_overlap = True
+        kv_reserve_tokens = 32
+        max_seq_len = 1 << 20
+        swa_full_tokens_ratio = 0.2
+        swa_num_pages_override = None
+        moe_vram_reserve_bytes = 0
+        moe_cache_headroom_bytes = 0
+        model_config = StubModelConfig()
+
+        class tp_info:
+            size = 1
+
+    class StubBanks:
+        quant_format = "bf16"
+        sources = {
+            "gate_up": [torch.zeros(64, 32, 8, dtype=torch.float16)] * 4,  # row = 512 B
+            "down": [torch.zeros(64, 8, 16, dtype=torch.float16)] * 4,     # row = 256 B
+        }
+
+    def resolve(reserve: int, headroom: int) -> int:
+        config = StubConfig()
+        config.moe_vram_reserve_bytes = reserve
+        config.moe_cache_headroom_bytes = headroom
+        engine = Engine.__new__(Engine)
+        engine._baseline_free = 500_000
+        engine._weights_bytes = 0
+        engine._pool_cls = MHAKVCache
+        size, _, _ = engine._resolve_auto_moe_cache_size(config, StubBanks())
+        return size
+
+    per_slot = 512 + 256
+    assert resolve(0, 0) - resolve(4 * per_slot, 2 * per_slot) == 6

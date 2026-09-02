@@ -86,6 +86,95 @@ def gpu_owned_reservation_slots(owned_layers: int, num_experts: int) -> int:
     return owned_layers * num_experts
 
 
+#: Default post-cache VRAM reservation, in bytes: everything the engine allocates on the card
+#: AFTER the MoE slot cache has been sized, and which therefore no budget term used to know
+#: about. Measured on an RTX 5090 32 GB with Qwen3.8-Flash-Next-NVFP4 (2026-09-02):
+#:   * the integrated MTP resident draft head -- 2.17 GiB (``FREETOKEN_MTP_RESIDENT=1``; boot
+#:     logs it as ``draft head 2.17 GiB resident``), built after ``_init_offload_moe_cache``
+#:     on purpose, so its bytes cannot be measured before the cache exists;
+#:   * the MTP spec/draft CUDA-graph pools and the decode graph pool;
+#:   * the vision layer-stream encoder's transient workspace.
+#: 3 GiB covers the measured draft head with room for the graph pools; boots without
+#: speculation or vision simply leave it unspent (it is not allocated, only not spent on
+#: expert slots). Override with ``--moe-vram-reserve-bytes``.
+DEFAULT_MOE_VRAM_RESERVE_BYTES = 3 << 30
+
+#: Default free-VRAM headroom the MoE cache must leave after every known reservation, in
+#: bytes. 1.5 GiB: every healthy configuration measured on this box peaked at 1.3-1.4 GiB
+#: free during decode, while the 569 MiB-free run halved decode throughput because the
+#: Windows video-memory manager began demoting live allocations to system memory. See
+#: ``docs/research/gpu-owned-layers-speed-diagnosis-2026-09-02.md``. Override with
+#: ``--moe-cache-headroom-bytes``.
+DEFAULT_MOE_CACHE_HEADROOM_BYTES = 3 << 29
+
+
+def post_cache_reserved_bytes(*, vram_reserve_bytes: int, headroom_bytes: int) -> int:
+    """The single place post-cache reservations are declared before the cache is sized.
+
+    Joins ``fixed_cache_size`` exactly like ``state_pool_bytes`` and the GPU-owned
+    reservation, so neither ``--moe-cache-auto``'s greedy slot fill nor an explicit
+    ``--moe-cache-size`` can spend bytes a later allocation already owns.
+    """
+    if vram_reserve_bytes < 0:
+        raise ValueError(f"--moe-vram-reserve-bytes must be >= 0, got {vram_reserve_bytes}")
+    if headroom_bytes < 0:
+        raise ValueError(f"--moe-cache-headroom-bytes must be >= 0, got {headroom_bytes}")
+    return vram_reserve_bytes + headroom_bytes
+
+
+def format_vram_ledger(
+    *,
+    total_bytes: int,
+    weights_bytes: int,
+    kv_bytes: int,
+    gdn_state_bytes: int,
+    gpu_owned_bytes: int,
+    gpu_owned_layers: "tuple[int, ...]",
+    lru_slots: int,
+    lru_bytes: int,
+    vram_reserve_bytes: int,
+    headroom_bytes: int,
+) -> str:
+    """One block naming every VRAM term the boot budget knows about, largest first.
+
+    ``unaccounted`` is what the ledger cannot name: allocator slack, activations, and
+    anything a model allocates outside the budgeted pools. A negative value means the plan
+    is over the card -- which is the number to look at when a boot starts paging.
+    """
+    named = (
+        weights_bytes
+        + kv_bytes
+        + gdn_state_bytes
+        + gpu_owned_bytes
+        + lru_bytes
+        + vram_reserve_bytes
+        + headroom_bytes
+    )
+    owned_note = f" {list(gpu_owned_layers)}" if gpu_owned_layers else ""
+    rows = (
+        ("weights", f"{_gib(weights_bytes)}"),
+        ("KV cache", f"{_gib(kv_bytes)}"),
+        ("GDN state pool", f"{_gib(gdn_state_bytes)}"),
+        (
+            "GPU-owned MoE layers",
+            f"{_gib(gpu_owned_bytes)} ({len(gpu_owned_layers)} layers{owned_note})",
+        ),
+        ("MoE LRU cache", f"{_gib(lru_bytes)} ({lru_slots} slots)"),
+        ("post-cache reserve", f"{_gib(vram_reserve_bytes)} (MTP draft head, graphs, vision)"),
+        ("headroom", f"{_gib(headroom_bytes)}"),
+        ("unaccounted", f"{_gib(total_bytes - named)}"),
+    )
+    width = max(len(label) for label, _ in rows)
+    lines = [f"VRAM ledger ({_gib(total_bytes)} on the card):"]
+    lines += [f"  {label:<{width}}  {value}" for label, value in rows]
+    lines.append(f"  {'named total':<{width}}  {_gib(named)}")
+    return "\n".join(lines)
+
+
+def _gib(nbytes: int) -> str:
+    return f"{nbytes / 2**30:.2f} GiB"
+
+
 def check_explicit_moe_cache_fits(
     *,
     moe_cache_size: int,
@@ -93,23 +182,35 @@ def check_explicit_moe_cache_fits(
     budget_bytes: int,
     owned_layers: int,
     num_experts: int,
+    reserved_bytes: int = 0,
 ) -> None:
-    """Raise when an explicit ``--moe-cache-size`` plus the GPU-owned reservation exceeds the
-    net MoE budget. Operator decision: fail loudly naming both sizes that would fit, never
-    silently shrink the cache the operator asked for."""
+    """Raise when an explicit ``--moe-cache-size`` plus the GPU-owned reservation plus the
+    post-cache reservations exceed the net MoE budget. Operator decision: fail loudly naming
+    the largest slot count that fits, never silently shrink the cache the operator asked for.
+    """
     owned_bytes = gpu_owned_reservation_bytes(owned_layers, num_experts, per_expert_bytes)
-    need = moe_cache_size * per_expert_bytes + owned_bytes
+    need = moe_cache_size * per_expert_bytes + owned_bytes + reserved_bytes
     if need <= budget_bytes:
         return
-    fits_slots = max(0, (budget_bytes - owned_bytes) // per_expert_bytes)
+    fits_slots = max(0, (budget_bytes - owned_bytes - reserved_bytes) // per_expert_bytes)
     fits_owned = max(
-        0, (budget_bytes - moe_cache_size * per_expert_bytes) // (num_experts * per_expert_bytes)
+        0,
+        (budget_bytes - moe_cache_size * per_expert_bytes - reserved_bytes)
+        // (num_experts * per_expert_bytes),
+    )
+    owned_clause = (
+        f" plus {owned_layers} GPU-owned MoE layers ({owned_bytes} B resident)"
+        if owned_layers
+        else ""
+    )
+    owned_advice = (
+        f", or own at most {fits_owned} layer(s) at this cache size" if owned_layers else ""
     )
     raise ValueError(
-        f"--moe-cache-size {moe_cache_size} plus {owned_layers} GPU-owned MoE layers "
-        f"({owned_bytes} B resident) needs {need} B of the {budget_bytes} B MoE budget. "
-        f"Either lower --moe-cache-size to {fits_slots} slots at this owned set, or "
-        f"own at most {fits_owned} layer(s) at this cache size."
+        f"--moe-cache-size {moe_cache_size}{owned_clause} plus {reserved_bytes} B of "
+        f"post-cache reservations (--moe-vram-reserve-bytes + --moe-cache-headroom-bytes) "
+        f"needs {need} B of the {budget_bytes} B MoE budget. "
+        f"Either lower --moe-cache-size to {fits_slots} slots{owned_advice}."
     )
 
 

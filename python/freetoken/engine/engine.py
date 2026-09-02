@@ -656,6 +656,11 @@ class Engine:
         # GPU-owned layers hold a full expert layer of VRAM forever and leave the slot cache
         # entirely, exactly as state_pool_bytes accounts for the GDN pool.
         fixed_cache_size += gpu_owned_reservation_bytes(len(owned), num_experts, per_expert_bytes)
+        # ...and so does everything allocated AFTER the cache is sized (MTP resident draft
+        # head, graph pools, vision workspace) plus the free-VRAM headroom. Without this the
+        # greedy slot fill spends bytes the draft head is about to take, and the card starts
+        # paging at decode peak: measured 2x slowdown at 569 MiB free.
+        fixed_cache_size += _post_cache_reserved_bytes(config)
         total_experts = (config.model_config.num_moe_layers - len(owned)) * num_experts
         moe_cache_size, num_pages, overlap = resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
@@ -700,9 +705,14 @@ class Engine:
             f"leaving {lru} for the streaming-layer LRU"
         )
 
-    def _check_gpu_owned_cache_fits(self, config: EngineConfig, banks) -> None:
-        """Explicit --moe-cache-size + the owned reservation must fit the same budget the
-        auto path solves against. Fails loudly (never shrinks) -- see spec section 6."""
+    def _check_explicit_cache_fits(self, config: EngineConfig, banks) -> None:
+        """An explicit --moe-cache-size plus the owned reservation plus everything allocated
+        after the cache must fit the same budget the auto path solves against. Fails loudly
+        (never shrinks) -- see spec section 6 and the 2026-09-02 speed diagnosis.
+
+        Runs for every explicit size, with or without --moe-gpu-owned-layers: the post-cache
+        reservation bug is general (the resident MTP draft head is 2.17 GiB on any boot).
+        """
         from freetoken.engine.cache_budget import (
             check_explicit_moe_cache_fits,
             expert_bytes_per_slot,
@@ -711,7 +721,7 @@ class Engine:
         from freetoken.utils import div_ceil
 
         owned = self._gpu_owned_layer_ids
-        if not owned or config.moe_cache_auto:
+        if config.moe_cache_auto or not config.moe_cache_size:
             return
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)
@@ -727,6 +737,40 @@ class Engine:
             budget_bytes=budget - kv_reserve_pages * cache_per_page,
             owned_layers=len(owned),
             num_experts=config.model_config.num_experts,
+            reserved_bytes=_post_cache_reserved_bytes(config),
+        )
+
+    def _log_vram_ledger(
+        self, config: EngineConfig, banks, gpu_owned_layer_ids: "frozenset[int]"
+    ) -> None:
+        """Print the whole VRAM plan as one block, so a boot that will page is visible in the
+        log instead of only in ``nvidia-smi`` at decode peak."""
+        from freetoken.engine.cache_budget import (
+            expert_bytes_per_slot,
+            format_vram_ledger,
+            gpu_owned_reservation_bytes,
+        )
+
+        per_expert_bytes = expert_bytes_per_slot(banks.sources, gpu_owned_layer_ids)
+        cache_per_page, kv_fixed, page_tokens, _ = self._pool_cls.kv_cost(config)
+        pages = config.num_page_override or 0
+        logger.info_rank0(
+            format_vram_ledger(
+                total_bytes=int(self._baseline_free),
+                weights_bytes=int(self._weights_bytes),
+                kv_bytes=kv_fixed + pages * cache_per_page,
+                gdn_state_bytes=state_pool_bytes(config),
+                gpu_owned_bytes=gpu_owned_reservation_bytes(
+                    len(gpu_owned_layer_ids),
+                    config.model_config.num_experts,
+                    per_expert_bytes,
+                ),
+                gpu_owned_layers=tuple(sorted(gpu_owned_layer_ids)),
+                lru_slots=config.moe_cache_size,
+                lru_bytes=config.moe_cache_size * per_expert_bytes,
+                vram_reserve_bytes=int(getattr(config, "moe_vram_reserve_bytes", 0) or 0),
+                headroom_bytes=int(getattr(config, "moe_cache_headroom_bytes", 0) or 0),
+            )
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
@@ -851,7 +895,7 @@ class Engine:
                     f"num_pages={pages} (prefill_overlap={overlap})"
                 )
             else:
-                self._check_gpu_owned_cache_fits(config, banks)
+                self._check_explicit_cache_fits(config, banks)
             _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
             cache = OffloadMoeCache(
                 # Models with leading dense layers (GLM-4) only have experts on the MoE
@@ -888,6 +932,7 @@ class Engine:
                         config.moe_cache_size,
                     )
                 )
+            self._log_vram_ledger(config, banks, gpu_owned_layer_ids)
         else:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
@@ -1972,6 +2017,31 @@ def _gpu_owned_lru_slots(config: EngineConfig, owned_layers: int) -> int:
         owned_layers=owned_layers,
         num_experts=num_experts,
         floor=2 * num_experts if config.moe_prefill_overlap else num_experts,
+    )
+
+
+def _post_cache_reserved_bytes(config: EngineConfig) -> int:
+    """The declared post-cache VRAM reservation plus the required headroom.
+
+    The single place reservations made AFTER the MoE cache is sized are declared: the
+    integrated MTP resident draft head (2.17 GiB measured; built after
+    ``_init_offload_moe_cache`` on purpose), the decode/spec/draft CUDA-graph pools and the
+    vision layer-stream workspace. Read through ``getattr`` so a hand-built stub config
+    (tests, the shadow tooling) that predates the fields keeps the old behaviour.
+    """
+    from freetoken.engine.cache_budget import (
+        DEFAULT_MOE_CACHE_HEADROOM_BYTES,
+        DEFAULT_MOE_VRAM_RESERVE_BYTES,
+        post_cache_reserved_bytes,
+    )
+
+    return post_cache_reserved_bytes(
+        vram_reserve_bytes=int(
+            getattr(config, "moe_vram_reserve_bytes", DEFAULT_MOE_VRAM_RESERVE_BYTES) or 0
+        ),
+        headroom_bytes=int(
+            getattr(config, "moe_cache_headroom_bytes", DEFAULT_MOE_CACHE_HEADROOM_BYTES) or 0
+        ),
     )
 
 
