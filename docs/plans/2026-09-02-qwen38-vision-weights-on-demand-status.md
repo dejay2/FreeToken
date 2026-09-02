@@ -2,14 +2,19 @@
 
 Implements option (a) of `docs/design/2026-09-02-qwen38-vision-weights-on-demand-design.md`
 on branch `vision-on-demand` (from `mtp-upstream-merge` at `750d83d`), worktree
-`D:\FreeToken-vision-on-demand`. Nothing pushed, no PR, the GPU untouched, the server never
-launched, `D:\Models` never written.
+`D:\FreeToken-vision-on-demand`. Nothing pushed, no PR, `D:\Models` never written. No GPU was
+used and no server launched for the implementation work; the live GPU run is recorded
+separately in `2026-09-02-qwen38-vision-weights-on-demand-live-results.md`.
 
 New mode `FREETOKEN_VISION_WEIGHTS=mmap` (launcher `-VisionWeights mmap`), default `ram`
 (today's behaviour, byte for byte). In `mmap` mode the 333 picture tensors are not read into
 process memory at boot: their 897,862,112-byte extent of `model-bf16-00001.safetensors` is
-mapped copy-on-write and each tensor is installed as a zero-copy `torch.frombuffer` view,
-with one `PrefetchVirtualMemory` over the extent issued when a picture is admitted.
+mapped read-only and each tensor is installed as a zero-copy view, with one
+`PrefetchVirtualMemory` over the extent issued when a picture is admitted.
+
+Revised after live verification (`...-live-results.md`): the mapping was copy-on-write in the
+first five commits and the boot log reported the wrong backing. Both are fixed; see
+"Post-live revisions" below.
 
 ## What was implemented
 
@@ -30,9 +35,11 @@ with one `PrefetchVirtualMemory` over the extent issued when a picture is admitt
   mixed-dtype extent. Contiguity is never assumed; the window per shard is
   `[min offset, max end)`.
 - `MappedVisionWindow` — `(path, aligned file offset, span, virtual address)` per mapping.
-- `MmapVisionWeights` — one `mmap.mmap(..., ACCESS_COPY)` per shard, starting at the extent
-  rounded down to `mmap.ALLOCATIONGRANULARITY` and only as long as the extent needs (~857 MiB
-  of commit charge, not the file's 1.27 GiB); `torch.frombuffer` views per tensor;
+- `MmapVisionWeights` — one `mmap.mmap(..., ACCESS_READ)` per shard, starting at the extent
+  rounded down to `mmap.ALLOCATIONGRANULARITY` and only as long as the extent needs (the
+  extent, not the file's 1.27 GiB, and no commit charge at all); zero-copy views per tensor
+  built by `_read_only_uint8_view` (`np.frombuffer` + `torch.from_numpy`, because
+  `torch.frombuffer` refuses a non-writable buffer);
   `tensor()`, `names`, `nbytes`, `mapped_bytes`, `windows`, `contains()`, `prefetch()`,
   `release_prefetch()`, `close()`. Holds `_files` and `_maps` so the mapping outlives every
   view built over it.
@@ -58,10 +65,19 @@ with one `PrefetchVirtualMemory` over the extent issued when a picture is admitt
 
 ### `python/freetoken/models/qwen4_exp/model.py`
 
-- `_attach_picture_weight_source(engine_config)`, called from `load_host_tables`: hands the
-  tower the holder the loader already built (a lookup, never a second mapping).
+- `adopt_weight_sources(engine_config)` — the engine hook that hands the tower the holder the
+  loader already built (a lookup, never a second mapping).
 - `prefetch_picture_weights()` — the scheduler's optional hook, delegating to the tower.
 - `weight_placement_report()` — now reports `backing=mmap|ram`.
+
+### `python/freetoken/engine/engine.py`
+
+- `Engine._install_model_weights(config)` — the ordered boot sequence lifted out of
+  `__init__`: load the weights, call the optional `adopt_weight_sources` model hook, then log
+  the optional `weight_placement_report()`. The report describes what the weight sources
+  decided, so it has to run after they are adopted. Both hooks are optional; models that
+  define neither behave exactly as before. This is the only engine change, and it exists
+  because the design's "no engine change" assumption is what produced the wrong boot log.
 
 ### `python/freetoken/scheduler/scheduler.py`
 
@@ -86,10 +102,10 @@ with one `PrefetchVirtualMemory` over the extent issued when a picture is admitt
 | file | added |
 | --- | --- |
 | `tests/models/qwen4_exp/test_config.py` | 6 flag-plumbing tests |
-| `tests/models/qwen4_exp/test_weight.py` | 24 layout / view / prefetch / fallback / `iter_weights` tests over a synthetic checkpoint with an odd data base |
-| `tests/models/qwen4_exp/test_vision_weights_ckpt.py` | 9 tests against the real checkpoint (new file) |
+| `tests/models/qwen4_exp/test_weight.py` | 28 layout / view / read-only / prefetch / fallback / `iter_weights` tests over a synthetic checkpoint with an odd data base, plus one pinning that the PLE mapping stayed copy-on-write |
+| `tests/models/qwen4_exp/test_vision_weights_ckpt.py` | 10 tests against the real checkpoint (new file) |
 | `tests/models/qwen4_exp/test_vision.py` | 8 prefetch-handshake and mapped-copy tests (1 CUDA-gated) |
-| `tests/engine/test_vision_weight_placement.py` | 3 backing-report / hook tests, 1 updated |
+| `tests/engine/test_vision_weight_placement.py` | 9 backing-report / adoption / install-ordering tests, 1 updated |
 | `tests/scheduler/test_multimodal_admission.py` | 4 prefetch-hook tests |
 | `tests/models/qwen4_exp/common.py` | `write_safetensors_shard` (shared) |
 
@@ -102,6 +118,9 @@ with one `PrefetchVirtualMemory` over the extent issued when a picture is admitt
 | `a9841bf` | feat(vision): prefetch the mapped picture weights at picture admission |
 | `3b417e8` | feat(launcher): add -VisionWeights <ram\|mmap> |
 | `1a6cca0` | test(vision): prove a misaligned mapped view is a valid copy source |
+| `e323813` | docs: record the live GPU verification results |
+| `977ec62` | fix(vision): report the picture-weight backing the boot actually used |
+| `0cdf63b` | fix(vision): map the picture extent read-only so it charges no commit |
 
 Branch point: `750d83d`. Every message ends with the required `Co-Authored-By` and
 `Claude-Session` trailers.
@@ -121,16 +140,15 @@ $py = "$env:LOCALAPPDATA\FreeToken\venv\Scripts\python.exe"
 
 | # | command (after `-m pytest`) | result |
 | --- | --- | --- |
-| 1 | `tests\models\qwen4_exp\test_weight.py tests\models\qwen4_exp\test_vision.py tests\models\qwen4_exp\test_config.py tests\models\qwen4_exp\test_vision_weights_ckpt.py tests\scheduler\test_multimodal_admission.py tests\engine\test_vision_weight_placement.py -q -p no:cacheprovider --timeout=900` | **159 passed**, 0 failed |
-| 2 | `tests\models\qwen4_exp\test_vision_weights_ckpt.py -q -p no:cacheprovider --timeout=900` | **9 passed** (real checkpoint) |
-| 3 | `tests\models\qwen4_exp -q -p no:cacheprovider --timeout=900` | 275 passed, 52 skipped, **90 failed — all pre-existing** |
-| 4 | `tests\models\qwen4_exp tests\scheduler tests\engine -q -p no:cacheprovider --timeout=900` | 1282 passed, 60 skipped, **102 failed + 8 errors — all pre-existing** |
+| 1 | `tests\models\qwen4_exp\test_weight.py tests\models\qwen4_exp\test_vision.py tests\models\qwen4_exp\test_config.py tests\models\qwen4_exp\test_vision_weights_ckpt.py tests\scheduler\test_multimodal_admission.py tests\engine\test_vision_weight_placement.py -q -p no:cacheprovider --timeout=900` | **170 passed**, 0 failed |
+| 2 | `tests\models\qwen4_exp\test_vision_weights_ckpt.py -q -p no:cacheprovider --timeout=900` | **10 passed** (real checkpoint) |
+| 3 | `tests\models\qwen4_exp tests\scheduler tests\engine -q -p no:cacheprovider --timeout=900` | 1293 passed, 60 skipped, **102 failed + 8 errors — all pre-existing** |
 
-The same command 4 was run against a pristine `git archive` of the branch point `750d83d`
+Command 3 was also run against a pristine `git archive` of the branch point `750d83d`
 (extracted to a temp directory, so neither worktree was disturbed): **102 failed, 1230
-passed, 60 skipped, 8 errors**. The sorted list of failing and erroring test ids is
+passed, 60 skipped, 8 errors**. The sorted list of the 110 failing and erroring test ids is
 **byte-identical** between `750d83d` and this branch — nothing regressed, and the delta is
-+52 passing tests. The pre-existing failures are all GPU/`flashinfer` absence on this box
++63 passing tests. The pre-existing failures are all GPU/`flashinfer` absence on this box
 (`AssertionError: Invalid device id`, `Attention backend 'fi' requires flashinfer`,
 `SimpleNamespace has no attribute forward_host_ctx`), which the brief lists as known.
 
@@ -148,8 +166,10 @@ passed, 60 skipped, 8 errors**. The sorted list of failing and erroring test ids
 - The real `PrefetchVirtualMemory` over the real 856 MiB returns success, and a second call
   for the same picture issues no syscall.
 - `target.copy_(view)` from every misaligned mapped view lands the exact bytes, and no view
-  moved out of the mapping — i.e. copying did not write through the copy-on-write view. This
-  also faults the whole extent in, so it doubles as the off-GPU read smoke test.
+  moved out of the mapping. This also faults the whole extent in, so it doubles as the
+  off-GPU read smoke test.
+- The mapping is read-only: `memoryview(mapping).readonly` is `True` and a write to it raises
+  `TypeError`. `MmapPleStorage` is still `ACCESS_COPY`, pinned by its own test.
 
 ## Live-verification checklist for the operator
 
@@ -223,8 +243,7 @@ an encode, at the price of a cold next picture.
    but not how it gets there, and `iter_weights` is a free function that never sees the
    model. A process-scoped registry keyed on the checkpoint folder
    (`open_mmap_vision_weights` / `mmap_vision_weights`) lets the loader build the mapping and
-   `load_host_tables` adopt the same object, with no second mapping and no second 857 MiB of
-   commit charge.
+   the model's `adopt_weight_sources` hook claim the same object, with no second mapping.
 3. **Dtype validation is against the header, not a passed-in model dtype.** `iter_weights`'
    contract carries no model dtype. The layout instead requires that every picture tensor's
    dtype be one the reader maps, that all of them agree, and that each header's byte count
@@ -260,8 +279,11 @@ an encode, at the price of a cold next picture.
 3. **Writing through a view would silently negate the saving.** Copy-on-write makes the page
    private and dirty with no error. Guarded by tests at the tensor, component and real-file
    level, but only check E proves it on the live tower after a real encode.
-4. **~857 MiB of commit charge** for the copy-on-write mapping, in exchange for the private
-   working set. Not free on a machine measured at ~8 GiB free with the server up.
+4. **A write through a view is now an access violation**, not a silently privatised page.
+   Writing was already forbidden and the live probe found zero writes across four encodes;
+   the failure mode is now loud rather than silent, which is the safer end of the trade but
+   is a process kill rather than an exception. Torch has no read-only tensor, so only the OS
+   enforces it.
 5. **Cold latency is a bound, not a measurement.** 0.30-0.45 s expected, 0.90 s pessimistic,
    from proxy slices of a different shard. Check F is the real number.
 6. **The mapping is never closed on the serving path.** The registry holds it for the process
@@ -271,3 +293,57 @@ an encode, at the price of a cold next picture.
    order the sequential read does not follow, so some copies wait on pages the read has not
    reached. Estimated tens of milliseconds over one 856 MiB extent at 5-7 GB/s; not worth
    reordering for unless check F says otherwise.
+8. **The read-only saving is predicted, not yet measured.** `PAGE_READONLY` charges no
+   commit, so the expected private-bytes delta is the full ~856 MiB against `ram` rather than
+   the 347 MiB `ACCESS_COPY` delivered — but that is an inference from Windows' commit
+   accounting, not a measurement. Re-run live check C.
+
+## Post-live revisions
+
+Live verification (`2026-09-02-qwen38-vision-weights-on-demand-live-results.md`) found the
+feature correct, faster cold than `ram`, and free of regressions, but raised two defects.
+Both are fixed on this branch.
+
+**1. The boot log always said `backing=ram`** (`977ec62`, live-results section 3.1,
+checklist D). `Engine.__init__` logged `weight_placement_report()` twenty lines before
+`load_host_tables()`, and the holder was adopted inside the latter, so the report ran while
+`Qwen4VisionModel._weight_source` was still `None`. `Engine._install_model_weights` now owns
+the order — load the weights, adopt the weight sources the loader built, then report — and
+the adoption is an explicit `adopt_weight_sources` engine hook instead of a passenger in
+`load_host_tables`. The report is deliberately *not* moved after `load_host_tables` instead,
+because that call re-homes `model.embed_tokens` into pinned storage and would change the
+unrelated "Token embedding" line of the same report.
+
+**2. The saving measured 347 MiB, not 856** (`0cdf63b`, live-results section 3.2, checklist
+C). Windows charges commit for a copy-on-write reservation whether or not a page is ever
+written. The address-space probe found the 856.3 MiB window 100% `PAGE_WRITECOPY` and 0 bytes
+`PAGE_READWRITE` after four encodes, so the copy-on-write capability was paid for and never
+used. The mapping is now `ACCESS_READ` (`PAGE_READONLY`, no commit charge). `torch.frombuffer`
+refuses a non-writable buffer, so the views are built with `np.frombuffer` +
+`torch.from_numpy` — the route `models/gguf/reader.py` already uses for its read-only mapped
+blocks — with the single "not writable" warning silenced, since non-writability is exactly
+what is being asked for and it would otherwise fire 333 times per boot.
+
+Two side effects, both improvements:
+
+- A write through a view is an access violation instead of a silently privatised page. It was
+  already forbidden; it is no longer silent.
+- `close()` refuses to unmap while any view is still reachable, because the numpy array holds
+  an exported buffer over the mapping. A garbage-collected holder can no longer pull the
+  mapping out from under the tower, and callers drop their borrowed tensors before closing.
+
+`MmapPleStorage` is untouched and stays `ACCESS_COPY`: different workload (a few random rows
+out of 320 M per decoded token, behind a row cache that writes into its own slab), already
+measured and accepted. A test pins that it was not changed.
+
+**What still needs the operator.** Checks A, B, E-K stand as recorded in the live results and
+do not need repeating. Two must be re-run on the read-only build:
+
+- **C, re-measure.** Boot `ram`, then `mmap`, and compare engine `PrivateMemorySize64`.
+  Expect the full ~856 MiB now, against the 347 MiB `ACCESS_COPY` gave. This is the criterion
+  the whole change exists for; if `PAGE_READONLY` does not deliver it, the honest move is to
+  restate criterion 3 around the cold-latency win (0.75 s vs 1.12 s) and merge on that basis.
+- **D, re-verify.** The boot log must now read
+  `Picture weights: mode=layer-stream, backing=mmap, tensors=333, bytes=897862112, devices=cpu`.
+- **E, worth repeating cheaply.** The `VirtualQueryEx` probe should now show the window as
+  `PAGE_READONLY` rather than `PAGE_WRITECOPY`, and still 0 bytes `PAGE_READWRITE`.
