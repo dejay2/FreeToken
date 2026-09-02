@@ -15,6 +15,7 @@ from __future__ import annotations
 import pytest
 
 import torch
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 from freetoken.core import Batch
@@ -167,7 +168,15 @@ def _forward_engine(*, spec_draft=None):
             torch.zeros(1, 2, device=device),
         )
 
-    engine.model = SimpleNamespace(forward=_forward, forward_mtp_capture=_capture)
+    # ``forward_host_ctx`` is BaseLLMModel's no-op hook around each dispatch (upstream #311
+    # enters it in ``forward_batch``); a stand-in model has to carry it like the real ones.
+    @contextmanager
+    def _host_ctx(batch, use_graph):
+        yield
+
+    engine.model = SimpleNamespace(
+        forward=_forward, forward_mtp_capture=_capture, forward_host_ctx=_host_ctx
+    )
 
     req = Req(
         input_ids=torch.arange(4, dtype=torch.int32),
