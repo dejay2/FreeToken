@@ -339,9 +339,12 @@ class SpecStateLadder:
         q_end, k_end = self._splits
         outputs = []
         for li, params in enumerate(self._params):
-            assert params is not None, (
-                f"GDN layer index {li} never stashed; the capture hook did not run"
-            )
+            if params is None:
+                # a raise, not an assert: under ``python -O`` the replay would run with
+                # whatever A_log / dt_bias the previous cycle left behind
+                raise RuntimeError(
+                    f"GDN layer index {li} never stashed; the capture hook did not run"
+                )
             A_log, dt_bias, scale = params
             mixed = self._mixed[li, :steps]
             outputs.append(

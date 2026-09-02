@@ -549,10 +549,13 @@ class SpecSampler:
             )
         for name in ("temperatures", "top_k", "top_p"):
             tensor = getattr(args, name)
-            assert tensor is None or tensor.numel() == 1, (
-                f"the speculative path serves one request per step; {name} has "
-                f"{tensor.numel()} rows"
-            )
+            if tensor is not None and tensor.numel() != 1:
+                # a raise, not an assert: under ``python -O`` a two-row batch would apply
+                # request 0's filter to every row and sample silently wrong
+                raise ValueError(
+                    f"the speculative path serves one request per step; {name} has "
+                    f"{tensor.numel()} rows"
+                )
 
         if int(uid) != self._uid:
             self.reset_request(uid)

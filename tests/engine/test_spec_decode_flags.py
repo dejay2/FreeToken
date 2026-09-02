@@ -219,14 +219,43 @@ def test_speculation_refuses_more_than_one_running_request_at_boot():
     from freetoken.engine.config import require_speculation_supported
 
     enabled = SpecDecodeConfig(enabled=True, depth=3)
-    require_speculation_supported(SimpleNamespace(max_running_req=1, spec_decode=enabled))
+    qwen = SimpleNamespace(model_type="qwen4_exp")
+    require_speculation_supported(
+        SimpleNamespace(max_running_req=1, spec_decode=enabled, model_config=qwen)
+    )
     with pytest.raises(ValueError, match="max-running-requests 1"):
         require_speculation_supported(
-            SimpleNamespace(max_running_req=2, spec_decode=enabled)
+            SimpleNamespace(max_running_req=2, spec_decode=enabled, model_config=qwen)
         )
     # off: any concurrency, no opinion
     require_speculation_supported(
         SimpleNamespace(max_running_req=4, spec_decode=SpecDecodeConfig())
+    )
+
+
+@pytest.mark.parametrize("model_type", ["glm5_next", "gemma4", "qwen3_5_moe", None])
+def test_speculation_refuses_a_model_without_a_draft_head_at_boot(model_type):
+    """Only qwen4_exp carries the MTP draft head the integrated path drives. On any other
+    model the flag used to survive boot and die inside ``derive_mtp_model_config`` with a bare
+    ``TypeError`` from ``dataclasses.replace(None)``; it has to be a sentence at the gate."""
+    from freetoken.engine.config import require_speculation_supported
+
+    config = SimpleNamespace(
+        max_running_req=1,
+        spec_decode=SpecDecodeConfig(enabled=True, depth=3),
+        model_config=SimpleNamespace(model_type=model_type),
+    )
+    with pytest.raises(ValueError, match="qwen4_exp") as info:
+        require_speculation_supported(config)
+    assert "FREETOKEN_MTP_SPECULATE" in str(info.value)
+    assert str(model_type) in str(info.value)
+    # off: the model type is nobody's business
+    require_speculation_supported(
+        SimpleNamespace(
+            max_running_req=1,
+            spec_decode=SpecDecodeConfig(),
+            model_config=SimpleNamespace(model_type=model_type),
+        )
     )
 
 

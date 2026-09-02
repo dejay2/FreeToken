@@ -1045,3 +1045,28 @@ def test_prefill_graph_replay_matches_eager():
 
     assert torch.equal(static_out, eager)
     assert torch.equal(states, eager_states)
+
+
+@pytest.mark.parametrize(
+    "ctx_len, heads_per_ngram, message",
+    [(1, 8, "context"), (2, 5, "heads")],
+)
+def test_the_fused_hash_refuses_a_geometry_it_cannot_address(ctx_len, heads_per_ngram, message):
+    """The kernel's block layout (``heads_per_ngram`` heads per n-gram order, ``ngram_size-1``
+    context ids) is checked BEFORE anything is launched, as a sentence -- not as an ``assert``
+    that ``python -O`` strips, leaving the kernel to read past the context row."""
+    from freetoken.kernel.triton.ple_hash import ple_row_ids
+
+    tokens = 3
+    with pytest.raises(ValueError, match=message):
+        ple_row_ids(
+            torch.arange(tokens, dtype=torch.int64),
+            torch.zeros(1, ctx_len, dtype=torch.int64),
+            torch.zeros(tokens, dtype=torch.int32),
+            torch.arange(tokens, dtype=torch.int32),
+            torch.tensor([3, 5, 7], dtype=torch.int64),  # ngram_size 3
+            torch.full((16,), 11, dtype=torch.int64),  # 16 heads
+            torch.arange(16, dtype=torch.int64) * 11,
+            eos_token_id=EOS,
+            heads_per_ngram=heads_per_ngram,
+        )

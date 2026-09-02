@@ -105,8 +105,18 @@ def ple_row_ids(
     ngram_size = int(multipliers.numel())
     num_heads = int(vocab_sizes.numel())
     ctx_len = int(ngram_context.shape[-1])
-    assert ctx_len == ngram_size - 1, (ctx_len, ngram_size)
-    assert num_heads == heads_per_ngram * (ngram_size - 1), (num_heads, heads_per_ngram)
+    # Checked as raises, not asserts: the kernel addresses the context row and the head
+    # blocks by these, and ``python -O`` must not turn a geometry mismatch into an OOB read.
+    if ctx_len != ngram_size - 1:
+        raise ValueError(
+            f"PLE hash: ngram_context has {ctx_len} context ids but ngram_size {ngram_size} "
+            f"needs {ngram_size - 1}"
+        )
+    if num_heads != heads_per_ngram * (ngram_size - 1):
+        raise ValueError(
+            f"PLE hash: {num_heads} heads is not heads_per_ngram {heads_per_ngram} x "
+            f"{ngram_size - 1} n-gram orders"
+        )
     if out is None:
         out = torch.empty((tokens, num_heads), dtype=torch.int64, device=input_ids.device)
     if tokens == 0:

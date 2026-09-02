@@ -1957,6 +1957,19 @@ def _adjust_config(config: EngineConfig):
             "--dtype float16 with MXFP8 resident weights is unsupported (the "
             "W8A16 fold is only validated exact in bfloat16); use bfloat16."
         )
+    if _dtype == torch.float16 and "int8" in (
+        getattr(model_config, "attn_quant", "none"),
+        getattr(model_config, "dense_quant", "none"),
+        getattr(model_config, "lm_head_quant", "none"),
+    ):
+        # The int8 W8A16 GEMM feeds tl.dot bf16 operands whatever the model dtype, so an
+        # fp16 prefill (M > 1) rounds its activations to bf16 while the M == 1 GEMV stays
+        # exact in fp32 -- prefill and decode disagree -- and the fp32-tiny scale floor in
+        # quantize_int8_rows underflows to 0.0 in fp16.
+        raise ValueError(
+            "--dtype float16 with int8 dense weights (FREETOKEN_DENSE_QUANT=int8) is "
+            "unsupported: the W8A16 kernel computes in bfloat16; use bfloat16."
+        )
     if config.attention_backend == "auto":
         override(
             "attention_backend",

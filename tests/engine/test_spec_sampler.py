@@ -460,7 +460,7 @@ def test_the_step_serves_exactly_one_request():
         top_k=None,
         top_p=None,
     )
-    with pytest.raises(AssertionError, match="one request"):
+    with pytest.raises(ValueError, match="one request"):
         sampler.step(
             uid=1,
             draft_tokens=[1],

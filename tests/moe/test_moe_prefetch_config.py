@@ -27,6 +27,26 @@ def clean_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("FREETOKEN_MOE_PREFETCH_TOPK", "ten"),
+        ("FREETOKEN_MOE_PREFETCH_MAX_MISSES", "8.5"),
+        ("FREETOKEN_MOE_PREFETCH_LOG_EVERY", "0x10"),
+        ("FREETOKEN_MOE_PREFETCH_SKIP_LAYERS", "0,22,thirty-eight"),
+        ("FREETOKEN_MOE_PREFETCH_SKIP_LAYERS", "0;22"),
+    ],
+)
+def test_a_malformed_knob_names_itself(monkeypatch, name, value):
+    """``PREFETCH`` is resolved at import of the MoE module, feature on or off, so a typo in
+    one of these must read as a sentence naming the variable -- not a bare ``int()``
+    traceback out of an unrelated model's boot."""
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name) as info:
+        PrefetchConfig.from_env()
+    assert value in str(info.value)
+
+
 def test_defaults_are_off_and_carry_the_measured_knobs():
     cfg = PrefetchConfig.from_env()
     assert cfg.enabled is False
