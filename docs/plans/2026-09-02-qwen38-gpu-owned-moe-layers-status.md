@@ -111,25 +111,32 @@ and in the check table:
    3 legacy + 2 fresh). Send it with `"temperature": 0, "max_tokens": 48` and
    `chat_template_kwargs.enable_thinking=false`, and compare that md5.
 
-Live run 2026-09-02, results in `docs/research/measurements-gpu-owned-layers-2026-09-02.md`.
+Live run 1, 2026-09-02, results in `docs/research/measurements-gpu-owned-layers-2026-09-02.md`.
 **The candidate never booted**: four attempts (`auto` parallel, `auto` serial, `auto` parallel
-again, `auto:2`), all dead in the expert-bank load. Every check below therefore has an empty
-candidate column. Root cause in the section after the table.
+again, `auto:2`), all dead in the expert-bank load. Root cause in the section after the table;
+fixed in `8a63977`.
+
+Live run 2, 2026-09-02, results in
+`docs/research/measurements-gpu-owned-layers-run2-2026-09-02.md`. **The candidate booted and
+served** at `auto` / 4,400 slots, in 64.2 s to `state == serving`. The table below is filled
+from run 2; its baseline column is run 2's same-session restore boot of `D:\FreeToken` at
+6,750 slots, which reproduces run 1's fresh baseline to within 2.4 % on every speed number.
 
 | check | pass criterion | baseline | candidate | verdict |
 |---|---|---|---|---|
-| boot log shows owned set, LRU size, MTP graphs 6/6 + 7/7 captured | yes | 6/6 + 7/7, 65 s to ready, free VRAM 4.64 GiB | never reached `_gpu_owned_boot_line` | **FAIL** |
-| scheduler private bytes and whole-system commit | -7.9 GiB +/- 0.3 | 98.35 GiB private / 216.90 GiB commit | - | not measurable |
-| whole-system physical in-use | -7.9 GiB +/- 0.5 | 91.96 GiB (empty ref 22.4 GiB) | - | not measurable |
-| boot peak host RAM | <= baseline + 1.5 GiB | - | 181.8 GiB commit at the hang (partial load) | not measurable |
-| 8k-chat decode tok/s (same prompt as the sweep) | recorded; operator decides | 72.1 tok/s fresh (62.1 after 3.7 h uptime) | - | not measurable |
-| TTFT on the same prompt | recorded | cold-7k 5.89 s, warm turn 1.59 s | - | not measurable |
-| answers at temperature 0, `max_tokens` 48 | identical to baseline (md5 `29f0e74dfed744b538f856f38553e1ae`) | 48 tokens: identical across two server processes, md5 `29f0e74d...`. 512 tokens: NOT reproducible against itself (5 runs, 5 answers, first divergence 247-1775 B) | - | criterion **corrected** to 48 tokens; not measurable this run |
-| picture request (`-VisionWeights mmap`) | works, latency recorded | 6.89 s cold / 4.86 s warm, correct answer | - | not measurable |
-| `/v1/cache/routing` (boot with `-CollectRoutingStats`) | owned rows `resident: true`; streaming rows sane | 409: the boot did not pass `--moe-collect-decode-freq` | - | boot command **corrected**; not measurable this run |
-| owned-layer rows on device | byte-identical to a host-bank load (one-off probe script) | - | - | not run (model cannot load) |
+| boot log shows owned set, LRU size, MTP graphs 6/6 + 7/7 captured | yes | 6/6 + 7/7, 71 s to ready, free VRAM 4.58 GiB | `MoE GPU-owned layers: [0, 1, 2, 6, 7, 22] (6 x 1.32 GiB resident, no host bank); LRU cache 4400 slots for 42 streaming layers`; CUDA graph bs=1 captured; spec 6/6 in 2.485 s, draft 7/7 in 0.649 s; free VRAM 3.27 GiB; 64.2 s to serving | **PASS** |
+| scheduler private bytes and whole-system commit | -7.9 GiB +/- 0.3 | 98.48 GiB private / 213.74 GiB commit | 100.00 GiB private (**+1.52**) / 209.37 GiB commit (**-4.37**) | **FAIL** -- but the criterion names the wrong counter: the host expert banks are mapped pages, not private commit, so the saving cannot appear in private bytes. See run 2's *Where the RAM saving shows up*. |
+| whole-system physical in-use | -7.9 GiB +/- 0.5 | 87.83 GiB (empty ref 18.99 GiB) | 80.33 GiB (empty ref 20.84 GiB) = **-7.50 GiB** | **PASS** |
+| boot peak host RAM | <= baseline + 1.5 GiB | 215.45 GiB peak commit, 6.72 GiB min available | 209.16 GiB peak commit (**-6.29**), 14.33 GiB min available | **PASS** |
+| 8k-chat decode tok/s (same prompt as the sweep) | recorded; operator decides | 70.4 tok/s (run 1 fresh: 72.1) | **34.6 tok/s** | recorded -- **-50.9 %**, the finding of run 2 |
+| TTFT on the same prompt | recorded | cold-7k 5.86 s, warm turn 1.64 s | cold-7k **15.57 s**, warm turn 1.87 s | recorded -- cold TTFT +9.71 s |
+| answers at temperature 0, `max_tokens` 48 | identical to baseline (md5 `29f0e74dfed744b538f856f38553e1ae`) | md5 `29f0e74d...`, reproduced again this session | md5 `29f0e74dfed744b538f856f38553e1ae` on 3/3 samples | **PASS** |
+| picture request (`-VisionWeights mmap`) | works, latency recorded | 6.62 s first / 4.68 s warm, correct answer | correct answer (`738214`) on all three; **76.91 s first**, then 5.19 s / 6.74 s | **PASS with a caveat** -- the first-request 11x anomaly is unexplained and deserves a probe |
+| `/v1/cache/routing` (boot with `-CollectRoutingStats`) | owned rows `resident: true`; streaming rows sane | not collected (step 7 required `boot-2020.ps1` unchanged, and it omits the flag) | all 6 owned rows `resident: true, miss_rate: null, steps: 0`; no non-owned row resident; 42 streaming rows all `steps: 2688`, miss rate 0.120-0.234 (median 0.188); `summary.slots_per_layer 104.76 = 4400/42`, so the summary excludes the owned layers | **PASS** |
+| `/v1/cache/status` geometry | shows `gpu_owned_layers` and the LRU size | no `gpu_owned_layers` key; `moe_cache_size: 6750` | `gpu_owned_layers: [0,1,2,6,7,22]`, `moe_cache_size: 4400`; every other geometry field identical to the baseline | **PASS** |
+| owned-layer rows on device | byte-identical to a host-bank load (one-off probe script) | - | - | **NOT RUN** -- no such probe script exists in the tree, and comparing device rows to host-bank rows for the same real layer needs a second model process. Indirect live evidence: the 48-token md5 identity above; `tests/moe/test_gpu_owned_banks.py` pins byte-identity on a synthetic checkpoint. |
 
-### Why it did not boot
+### Why run 1 did not boot
 
 `GpuOwnedStagingPool.flush` (`host_banks.py:288`) does `dst.copy_(staging.tensor,
 non_blocking=True)` on the `PinPipeline` drain thread. The engine loads weights inside
@@ -180,7 +187,19 @@ time; send test requests with `chat_template_kwargs.enable_thinking=false`.
 ## Only a live GPU run can decide this
 
 The CPU suite pins every branch, every refusal and all the arithmetic. These cannot be
-covered without the device, and are what the table above exists to settle:
+covered without the device, and are what the table above exists to settle. **Run 2 settled all
+six**; each item carries its outcome, and the detail is in
+`docs/research/measurements-gpu-owned-layers-run2-2026-09-02.md`.
+
+| # | outcome in run 2 |
+|---|---|
+| 1 | **WORKS, and it is free.** The expert-bank load phase took 38 s against the baseline's 43 s -- the 7.9 GiB of synchronous pageable H2D copies cost *less* than building the same six host banks. The predicted "a few seconds of boot" overhead did not appear. |
+| 2 | **not run** -- needs a second model process (see the check table). Indirect: the 48-token greedy answer is byte-identical to the baseline. |
+| 3 | **lower, as predicted**: 209.16 vs 215.45 GiB peak commit; 14.33 vs 6.72 GiB minimum available. |
+| 4 | **PASS, no change**: bs=1 captured, spec 6/6 in 2.485 s, draft 7/7 in 0.649 s, ladder replays 6/6. |
+| 5 | **PASS** -- `test_copy_plan_holds_a_zero_placeholder_for_gpu_owned_layers` was run with the device visible (in the empty window between servers) and passed; the whole `-k "gpu_owned or fused_copy_plan"` selection is 12 passed, 0 skipped. |
+| 6 | **-50.9 % decode, +9.71 s cold TTFT** (34.6 vs 70.4 tok/s). This is the finding of run 2 and the reason to reconsider the owned set. |
+
 
 1. The real pageable H2D of the owned layers (`E*6` per-slice copies each) against a CUDA
    device: that it works at all -- the CPU test only proves the placement -- and what it
