@@ -682,10 +682,20 @@ def _cache_limits(geo: dict, unit_bytes: dict, pool_budget: int, floors: dict) -
         # small MoE model with a big card budget//cost overshoots the whole model. The other
         # pools have no such bound -- KV, window and GDN capacity all keep paying off with more
         # concurrent requests and longer prefix reuse.
-        total_experts = int(geo["num_experts"]) * int(geo["num_moe_layers"])
-        moe_max = ideal(moe_per_expert)
-        if total_experts > 0:
-            moe_max = min(moe_max, total_experts)
+        # GPU-owned layers (--moe-gpu-owned-layers) are permanently resident and never enter
+        # the slot cache, so they leave BOTH sides of the bound: their experts are not
+        # cacheable, and their bytes are not spendable.
+        owned_layers = len(geo.get("gpu_owned_layers") or ())
+        owned_bytes = int(geo.get("gpu_owned_reserved_bytes", 0) or 0)
+        streaming_experts = int(geo["num_experts"]) * max(
+            0, int(geo["num_moe_layers"]) - owned_layers
+        )
+        # A separate budget: subtracting from ``budget`` would also shrink the KV, window and
+        # GDN ceilings, which the owned banks do not compete with for slot bytes.
+        moe_budget = max(0, budget - owned_bytes)
+        moe_max = moe_budget // moe_per_expert if moe_per_expert > 0 and moe_budget > 0 else 0
+        if streaming_experts > 0:
+            moe_max = min(moe_max, streaming_experts)
         return {
             "kv_tokens": {"min": kv_min, "max": ideal(kv_per_token)},
             "moe_experts": {"min": moe_min, "max": moe_max},
@@ -794,8 +804,18 @@ def cache_geometry(state: Any) -> dict:
         "num_moe_layers": num_moe_layers,
         # MoE layers served from permanently resident VRAM banks (--moe-gpu-owned-layers).
         # num_moe_layers still describes the MODEL; only the residency-rate denominator
-        # (cache_report.cache_rate) drops these layers.
+        # (cache_report.cache_rate) and the moe_experts slider ceiling drop these layers.
         "gpu_owned_layers": list(pools.get("gpu_owned_layers") or []),
+        # VRAM those banks hold permanently. The engine measures it (compute_cache_pools);
+        # the product below is the fallback for an ack that predates the field. Without this
+        # nothing in the geometry showed the reservation at all -- cache_budget_bytes was
+        # byte-identical with and without six owned layers (23,564,753,305 B).
+        "gpu_owned_reserved_bytes": int(
+            pools.get("gpu_owned_reserved_bytes")
+            or len(pools.get("gpu_owned_layers") or [])
+            * num_experts
+            * int((getattr(state, "unit_bytes", None) or {}).get("moe_bytes_per_expert", 0) or 0)
+        ),
         # Eviction policy of the MoE slot cache ("lru"). Reported so a client can label the
         # pool without having to know how the server was started.
         "moe_cache_policy": getattr(config, "moe_cache_policy", None),
