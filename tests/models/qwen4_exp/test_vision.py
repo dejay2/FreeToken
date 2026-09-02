@@ -350,6 +350,88 @@ def test_streamed_encode_from_mapped_sources_prefetches_exactly_once():
     assert calls == ["prefetch", "release"]
 
 
+def _mapped_tower(tmp_path, config: Qwen4VisionConfig, resident: Qwen4VisionModel):
+    """Write ``resident``'s weights out as a checkpoint shard, map it, and load the views
+    into a second tower -- what ``iter_weights`` + ``load_state_dict`` do in ``mmap`` mode."""
+    from freetoken.models.qwen4_exp import weight as weight_mod
+
+    from .common import write_safetensors_shard
+
+    tensors = {f"model.visual.{name}": t for name, t in resident.state_dict().items()}
+    write_safetensors_shard(str(tmp_path / "model-bf16-00001.safetensors"), tensors)
+    source = weight_mod.MmapVisionWeights(weight_mod._vision_layout(str(tmp_path)))
+    with torch.device("cpu"), torch_dtype(torch.bfloat16):
+        mapped = Qwen4VisionModel(config)
+    mapped.load_state_dict(
+        {name[len("visual.") :]: source.tensor(name) for name in source.names}
+    )
+    mapped.attach_weight_source(source)
+    return mapped, source
+
+
+def test_component_copies_from_mapped_weights_are_bit_identical(tmp_path):
+    """The streamed encode's only real operation on a picture weight is
+    ``target.copy_(source)``, and in mmap mode every source is a 2-byte-misaligned bf16 view
+    of a file page. Prove the copy lands the exact bytes for every component, and that
+    copying did not write THROUGH the view -- a copy-on-write fault there would make the
+    page private and silently give back the RAM this mode exists to save.
+
+    The device is CPU here so this runs without a GPU; production copies into a CUDA
+    workspace, which is the same ``copy_`` with a different target device.
+    """
+    torch.manual_seed(37)
+    config = _stream_config(depth=3)
+    resident = _cpu_stream_source(config)
+    mapped, source = _mapped_tower(tmp_path, config, resident)
+    try:
+        pairs = [
+            ("patch_embed", resident.patch_embed, mapped.patch_embed),
+            ("merger", resident.merger, mapped.merger),
+        ]
+        pairs += [
+            (f"blocks.{i}", resident.blocks.op_list[i], mapped.blocks.op_list[i])
+            for i in range(config.depth)
+        ]
+        for label, want, got in pairs:
+            before = {
+                key: tensor.data_ptr() for key, tensor in got.state_dict().items()
+            }
+            with torch.device("cpu"), torch_dtype(torch.bfloat16):
+                target = type(want)(config)
+            _copy_component_state_(target, got)
+
+            for key, tensor in target.state_dict().items():
+                expected = want.state_dict()[key]
+                assert torch.equal(
+                    tensor.view(torch.int16), expected.view(torch.int16)
+                ), f"{label}.{key}"
+            for key, tensor in got.state_dict().items():
+                assert tensor.data_ptr() == before[key], f"{label}.{key} moved"
+                assert source.contains(tensor.data_ptr()), f"{label}.{key} left the mapping"
+    finally:
+        source.close()
+
+
+def test_mapped_weights_reach_the_tower_where_the_resident_ones_did(tmp_path):
+    """``BaseOP.load_state_dict`` setattrs the loaded object itself, so the module attribute
+    IS the mapped view -- and the whole tower still reports CPU, which is what
+    ``forward_layer_streamed``'s residency guard checks."""
+    config = _stream_config(depth=2)
+    resident = _cpu_stream_source(config)
+    mapped, source = _mapped_tower(tmp_path, config, resident)
+    try:
+        state = mapped.state_dict()
+        assert set(state) == set(resident.state_dict())
+        assert {tensor.device.type for tensor in state.values()} == {"cpu"}
+        assert mapped.weight_backing() == "mmap"
+        outside = [
+            key for key, tensor in state.items() if not source.contains(tensor.data_ptr())
+        ]
+        assert outside == ["pos_embed.weight"]
+    finally:
+        source.close()
+
+
 def test_qwen_picture_encoding_owns_input_and_output_placement():
     calls = []
 

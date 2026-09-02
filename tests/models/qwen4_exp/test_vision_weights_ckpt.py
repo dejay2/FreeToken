@@ -137,6 +137,29 @@ def test_the_mapping_charges_only_the_extent_not_the_whole_shard(source, layout)
     assert window.span < PICTURE_BYTES + (64 << 10)
 
 
+def test_every_mapped_view_is_a_valid_copy_source(source, layout):
+    """The riskiest assumption in the design, against the real file: a 2-byte-misaligned
+    bf16 view of a mapped page is a correct ``copy_`` source, and copying FROM it does not
+    write THROUGH it. A copy-on-write fault there would make the page private and dirty and
+    silently give back the 856 MiB this mode exists to save.
+
+    This faults the whole extent in, so it doubles as the off-GPU read smoke test. The
+    target is CPU here; production copies into a CUDA workspace, which is the same ``copy_``
+    with a different target device and is on the operator's live checklist.
+    """
+    shard = layout.shards[0]
+    with torch.no_grad():
+        for spec in shard.tensors:
+            view = source.tensor(spec.name)
+            address = view.data_ptr()
+            target = torch.empty_like(view)
+            target.copy_(view, non_blocking=False)
+            assert torch.equal(target.view(torch.int16), view.view(torch.int16)), spec.name
+            assert view.data_ptr() == address, f"{spec.name} moved"
+            if spec.name not in source.resident_names:
+                assert source.contains(view.data_ptr()), f"{spec.name} left the mapping"
+
+
 def test_a_prefetch_over_the_real_extent_succeeds_and_is_not_reissued(source):
     """The real syscall over the real 856 MiB, no GPU involved. Asynchronous: it returns
     while the reads continue, which is the whole basis of the overlap argument."""

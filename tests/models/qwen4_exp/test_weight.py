@@ -10,7 +10,6 @@ import ctypes
 import json
 import mmap
 import random
-import struct
 from types import SimpleNamespace
 
 import pytest
@@ -29,12 +28,9 @@ from freetoken.models.qwen4_exp.weight import (
     load_mmap_ple_table,
     load_ple_table,
 )
-from freetoken.models.weight import _ST_DTYPE
 from freetoken.moe.host_banks import HostBank, read_range_into
 
-# safetensors dtype string per torch dtype, inverted from the reader's own map so a test
-# shard can never disagree with what the loader will parse back out of the header.
-_ST_NAME = {dtype: name for name, dtype in _ST_DTYPE.items()}
+from .common import write_safetensors_shard
 
 H = 32  # hidden_size
 HC = 4  # hc_count
@@ -1129,47 +1125,6 @@ def _picture_tensors() -> dict[str, torch.Tensor]:
     }
 
 
-def _write_shard(
-    path: str,
-    tensors: dict[str, torch.Tensor],
-    *,
-    dtype_names: dict[str, str] | None = None,
-) -> int:
-    """Serialize a safetensors shard by hand and return its data base offset.
-
-    ``safetensors.torch.save_file`` pads its header to a multiple of 8, so it can only ever
-    produce an EVEN data base. The real Qwen3.8 shard's header is 47,581 B and its base is
-    47,589 -- odd -- which is exactly why every bf16 picture tensor is 2-byte misaligned and
-    why the mapped views must be treated as copy sources only. Build that layout here rather
-    than test a friendlier one than production has. ``dtype_names`` overrides the header
-    dtype string, so a dtype the reader cannot map can be fabricated.
-    """
-    blobs: list[bytes] = []
-    header: dict[str, dict] = {}
-    offset = 0
-    for name, tensor in tensors.items():
-        raw = bytes(tensor.contiguous().flatten().view(torch.uint8).numpy())
-        header[name] = {
-            "dtype": (dtype_names or {}).get(name, _ST_NAME[tensor.dtype]),
-            "shape": list(tensor.shape),
-            "data_offsets": [offset, offset + len(raw)],
-        }
-        blobs.append(raw)
-        offset += len(raw)
-    for pad in (1, 2):
-        body = json.dumps({**header, "__metadata__": {"pad": "x" * pad}}).encode("utf-8")
-        if (8 + len(body)) % 2 == 1:
-            break
-    else:  # pragma: no cover - one extra header byte always flips the parity
-        raise AssertionError("could not pad the header to an odd data base")
-    with open(path, "wb") as fh:
-        fh.write(struct.pack("<Q", len(body)))
-        fh.write(body)
-        for raw in blobs:
-            fh.write(raw)
-    return 8 + len(body)
-
-
 @pytest.fixture(scope="module")
 def picture_checkpoint(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor], str, int]:
     """``(folder, raw picture tensors, the shard holding them, its odd data base)``.
@@ -1185,7 +1140,7 @@ def picture_checkpoint(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor], 
         "lm_head.weight": _bf16(11, H),
     }
     shard = str(folder / "model-bf16-00001.safetensors")
-    base = _write_shard(shard, {**text, **picture})
+    base = write_safetensors_shard(shard, {**text, **picture})
     other_name = "model.language_model.layers.0.mlp.gate.weight"
     save_file({other_name: _bf16(E, H)}, str(folder / "model-bf16-00002.safetensors"))
     weight_map = {name: "model-bf16-00001.safetensors" for name in {**text, **picture}}
@@ -1270,7 +1225,7 @@ def test_picture_layout_rejects_a_mixed_dtype_extent(tmp_path):
 
 def test_picture_layout_rejects_a_dtype_it_cannot_view(tmp_path):
     tensors = {"model.visual.merger.norm.weight": torch.zeros(PW, dtype=torch.bfloat16)}
-    _write_shard(
+    write_safetensors_shard(
         str(tmp_path / "model-bf16-00001.safetensors"),
         tensors,
         dtype_names={"model.visual.merger.norm.weight": "U16"},

@@ -8,17 +8,67 @@ down so a test fits on a shared GPU. Holds no tests itself.
 
 from __future__ import annotations
 
+import json
+import struct
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from freetoken.distributed import set_tp_info, try_get_tp_info
+from freetoken.models.weight import _ST_DTYPE
 
 EOS = 7
 VOCAB = 512
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+# safetensors dtype string per torch dtype, inverted from the reader's own map so a test
+# shard can never disagree with what the loader parses back out of the header.
+_ST_NAME = {dtype: name for name, dtype in _ST_DTYPE.items()}
+
+
+def write_safetensors_shard(
+    path: str,
+    tensors: dict[str, torch.Tensor],
+    *,
+    dtype_names: dict[str, str] | None = None,
+) -> int:
+    """Serialize a safetensors shard by hand and return its data base offset.
+
+    ``safetensors.torch.save_file`` pads its header to a multiple of 8, so it can only ever
+    produce an EVEN data base. The real Qwen3.8 bf16 shard's header is 47,581 B and its base
+    is 47,589 -- ODD -- which is exactly why every bf16 picture tensor in it is 2-byte
+    misaligned and why a mapped view of one may only be used as a copy source. Tests that
+    care about that layout must build it rather than accept a friendlier one than production
+    has, so this pads the header metadata to force the odd parity.
+
+    ``dtype_names`` overrides the header dtype string, to fabricate a dtype no reader maps.
+    """
+    blobs: list[bytes] = []
+    header: dict[str, dict] = {}
+    offset = 0
+    for name, tensor in tensors.items():
+        raw = bytes(tensor.contiguous().flatten().view(torch.uint8).numpy())
+        header[name] = {
+            "dtype": (dtype_names or {}).get(name, _ST_NAME[tensor.dtype]),
+            "shape": list(tensor.shape),
+            "data_offsets": [offset, offset + len(raw)],
+        }
+        blobs.append(raw)
+        offset += len(raw)
+    for pad in (1, 2):
+        body = json.dumps({**header, "__metadata__": {"pad": "x" * pad}}).encode("utf-8")
+        if (8 + len(body)) % 2 == 1:
+            break
+    else:  # pragma: no cover - one extra header byte always flips the parity
+        raise AssertionError("could not pad the header to an odd data base")
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<Q", len(body)))
+        fh.write(body)
+        for raw in blobs:
+            fh.write(raw)
+    return 8 + len(body)
 
 
 def hf_config(
