@@ -314,3 +314,171 @@ behaviour. Two things to settle first:
    mapping so no commit is charged, and re-measure. If the cold-latency win is enough on its
    own — 0.75 s versus 1.12 s, and versus 18.4 s on an idle-trimmed accepted server — then
    restate criterion 3 to what is achievable and merge on that basis.
+
+---
+
+## 9. Re-verification after the read-only mapping (2026-09-02, second pass)
+
+Re-run of checks **C, D and E only** against the branch tip `4d57278` (`0cdf63b` "map the
+picture extent read-only so it charges no commit" and `977ec62` "report the picture-weight
+backing the boot actually used", plus a docs commit). Checks A, B and F-K stand as recorded
+in sections 1-8 and were not repeated. Same box, same port 2020, same
+`boot-vod.ps1 -Root D:\FreeToken-vision-on-demand`, same private root, manifest and picture
+packages, one server at a time, nothing committed or pushed, `D:\Models` untouched. The
+accepted server was stopped first and restored at the end.
+
+Two fresh boots were taken rather than reusing section 2.1's `ram` column, so both sides of
+the comparison come from the same build:
+
+| # | build | picture weights | boot to `state == "serving"` |
+| --- | --- | --- | --- |
+| 5 | worktree `4d57278` | `-VisionWeights ram` | 68.6 s |
+| 6 | worktree `4d57278` | `-VisionWeights mmap` | 69.0 s |
+
+The new `ram` boot reproduces the old one to **2.2 MiB** of private bytes (101,914.7 vs
+101,912.5), which re-confirms the ~1 MiB boot-to-boot noise of section 2.1 and lets the
+earlier `mmap` (`ACCESS_COPY`) and text-only columns be carried across for comparison.
+
+### 9.1 Check C -- RAM saving: **PASS**
+
+Engine process (the ~70 GB `multiprocessing` spawn child) at `state == "serving"`, before
+any picture:
+
+| metric | boot 5 `ram` | boot 6 `mmap` (READONLY) | mmap - ram |
+| --- | --- | --- | --- |
+| private bytes (`PrivateMemorySize64`, commit) | 101,914.7 MiB | 100,710.1 MiB | **-1,204.6 MiB** |
+| working set (`WorkingSet64`) | 68,658.6 MiB | 68,657.3 MiB | -1.3 MiB |
+| private working set | 3,317.7 MiB | 3,317.4 MiB | -0.3 MiB |
+| peak working set | 70,053.8 MiB | 70,058.3 MiB | +4.5 MiB |
+| system standby list | 9.81 GiB | 9.77 GiB | -0.04 GiB |
+| system committed | 209.44 GiB | 208.23 GiB | **-1.21 GiB** |
+
+Criterion 3 asked for at least 800 MiB. The measured saving is **1,204.6 MiB of private
+commit** -- comfortably past it, and past the ~856 MiB the brief predicted.
+
+Where the extra 350 MiB comes from is visible by lining the run up against section 2.1:
+
+| build | engine private bytes | vs `ram` |
+| --- | --- | --- |
+| `ram` (boot 5) | 101,914.7 MiB | -- |
+| `mmap`, `ACCESS_COPY` (boot 1, section 2.1) | 101,564.2 MiB | -347.5 MiB (against boot 2's `ram`, 101,912.5 MiB) |
+| `mmap`, `PAGE_READONLY` (boot 6) | 100,710.1 MiB | **-1,204.6 MiB** |
+| text-only, no picture tower at all (boot 4, section 2.1) | 100,703.5 MiB | -1,209.0 MiB |
+
+Going from `ACCESS_COPY` to `PAGE_READONLY` removed **854.1 MiB** of commit charge on its
+own -- the copy-on-write reservation section 3.2 identified, to the MiB. What is left is the
+whole point: the `mmap` boot now sits **6.6 MiB** above a boot that builds no picture tower
+at all. The picture tower's private-commit cost has gone from **+1,209 MiB** (`ram`) to
+**+6.6 MiB** (`mmap`).
+
+Working set and private working set are unchanged (-1.3 / -0.3 MiB), and the standby list
+still does not move (9.77 vs 9.81 GiB). Section 3.2's second observation therefore stands
+unrevised: at idle the 856 MiB heap copy was already trimmed out of the working set in `ram`
+mode, so there was never resident memory to hand back. **What this change buys is address
+space and commit, not standby pages** -- 1.21 GiB of system commit charge released, which is
+what a 95.6 GiB box carrying 209 GiB of commit actually runs out of.
+
+### 9.2 Check D -- placement report: **PASS**
+
+`server-vod2-mmap.out.log`, verbatim (ANSI stripped):
+
+```
+  Picture weights: mmap                     <- launcher banner
+[2026-09-02|09:44:18|core|rank=0] INFO     Picture weights: mapped 333 tensors, 897862112 bytes in 1 window(s) of model-bf16-00001.safetensors
+Picture weights: mode=layer-stream, backing=mmap, tensors=333, bytes=897862112, devices=cpu
+```
+
+That is the exact line the status doc's check D demands. The `ram` boot's report reads
+`backing=ram`, so the field now tracks the mode in both directions.
+
+Negative grep over both `server-vod2-mmap.{out,err}.log`: **no** `fallback`, **no**
+`Traceback`, **no** `prefetch` line, and no occurrence of `ram` in any picture-weight
+context. The only `WARNING` / `error` hits are pre-existing boot noise present in the `ram`
+boot's logs too -- `Page size is overridden to 64 for the qsa_sparse backend`, the
+`torch.cuda._set_allocator_settings` `FutureWarning`, `expandable_segments not supported`,
+the `transformers` `qwen4_exp` architecture notice, and the c10d `[DESKTOP-2TOO4JN]:2021
+system error 10049` socket line.
+
+### 9.3 Check E -- address-space probe and live picture work: **PASS**
+
+`vq.py <engine pid> 1.0 bf16-00001` against the live engine (pid 23360), three samples:
+
+```
+before any picture:
+  base=0x0215187a0000 total=      856.3 MiB  READONLY=856.3MiB
+      file=\Device\HarddiskVolume6\Models\Qwen3.8-Flash-Next-NVFP4\model-bf16-00001.safetensors
+
+after three picture requests:      base=0x0215187a0000 total=856.3 MiB  READONLY=856.3MiB
+after a fourth picture + one text: base=0x0215187a0000 total=856.3 MiB  READONLY=856.3MiB
+```
+
+One region, the size the design predicts, at the same base every time. **`PAGE_READONLY`
+where the previous build showed `PAGE_WRITECOPY`, and 0 bytes of `PAGE_READWRITE` or
+`PAGE_WRITECOPY` throughout.** No page was written and none could be. `mmap` mode again
+shows no second whole-shard mapping; the `ram` boot's probe still shows the old
+`base=0x01f1a9b40000 total=1214.1 MiB WRITECOPY` handle on the same file, so `iter_weights`
+is still skipping it in `mmap` mode.
+
+Picture requests, from `Picture encoder request N: X seconds` in the boot-6 log -- the same
+1920x1080 `verify-shot.png` and the same 2,141-token prompt:
+
+| encode | seconds | vs section 2.2 `mmap` |
+| --- | --- | --- |
+| 0 (cold, first after boot) | **0.737 s** | 0.744 / 0.767 s |
+| 1 (warm) | 0.322 s | 0.318 s |
+| 2 (warm) | 0.300 s | 0.295 s |
+| 3 (warm, fourth request) | 0.452 s | -- |
+
+Cold is 0.737 s against the 6 s screenshot budget and against 1.122 s for `ram` in section
+2.2 -- the cold-latency win survives the read-only mapping. Warm encodes are
+indistinguishable from the copy-on-write build.
+
+Answers match section 2.2's. The fourth request (450 max tokens, enough to run to
+completion) returned every field:
+
+```
+Verification code: 738214 | Status: PASSED | Total tests: 1,482 | Failures: 0
+Duration: 12m 47s | Machine: RTX 5090 | Branch: vision-on-demand
+Throughput bars: 50, 52, 49, 55, 53
+Last console line: the lazy dog. ORANGE ELEPHANT.
+```
+
+All nine numeric fields correct, same as the `ACCESS_COPY` build and the `ram` build. The
+three 220-token requests returned the identical prefix. (The exact prompt wording of the
+first pass was not recorded; a semantically equivalent one asking for the same fields was
+used, and the transcribed values are the comparison.)
+
+One plain text request immediately after the picture work, `enable_thinking=false`:
+answered in **1.63 s** -- "The capital of France is Paris, and 17 times 23 is 391." (34
+prompt / 22 completion tokens), correct.
+
+Engine memory immediately after the picture work: private 101,605.1 MiB (**+895.0 MiB** over
+serving), working set 69,840.8 MiB. The growth is the picture path's ordinary allocation --
+`ram` grew +1,121 MiB over six pictures in section 5 -- and the probe independently proves
+none of it came through the mapping.
+
+### 9.4 Merge verdict
+
+**Safe to merge.** Both defects section 8 held the merge for are fixed and measured:
+
+1. The boot log reports `backing=mmap` in `mmap` mode and `backing=ram` in `ram` mode
+   (check D).
+2. The saving is **1,204.6 MiB of private commit**, against a criterion of 800 MiB and the
+   347 MiB the copy-on-write build delivered. The picture tower now costs 6.6 MiB of commit
+   instead of 1,209 MiB (check C).
+
+The read-only mapping also strictly improves the containment story: 856.3 MiB
+`PAGE_READONLY`, zero writable bytes, unchanged across four encodes (check E), where before
+the write-protection was a convention the OS did not enforce.
+
+One claim in the brief should be restated before merge rather than after: **the saving is
+commit and address space, not standby pages.** The standby list measures the same in both
+modes (9.77 vs 9.81 GiB) because the `ram` copy was already trimmed at idle, so the 47.7 GiB
+PLE table gets no more resident room than before. What it gets is 1.21 GiB of system commit
+headroom. Everything else -- correct pictures, a faster cold encode (0.737 s vs 1.122 s), no
+regression in geometry, throughput or failure paths -- is as recorded in sections 1-8 and was
+not re-run.
+
+Second-pass logs and probe output, under the scratchpad root of section 7:
+`$S\vision\server-vod2-{ram,mmap}.{out,err}.log`, `$S\vision\mem-{ram2,mmap2}.jsonl`,
+`$S\vision\vq2-{before,after}.txt`, `$S\vision\pics2.txt`.
