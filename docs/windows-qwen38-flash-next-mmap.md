@@ -221,13 +221,23 @@ halved throughput in live run 2 (569 MiB free, 70.4 -> 34.6 tok/s).
 
 Both are respected by `--moe-cache-auto` (they join the fixed budget before the MoE-vs-KV
 split) **and** by an explicit `-MoECacheSize`, which refuses to boot rather than silently
-shrinking:
+shrinking. The refusal quotes the **total you typed** and names the largest **total** that
+fits, so the size it names can be pasted straight back into `-MoECacheSize` (live boot A,
+2026-09-02, `-GpuOwnedLayers auto -MoECacheSize 6750`):
 
 ```
-ValueError: --moe-cache-size 7000 plus 6 GPU-owned MoE layers (8517918720 B resident) plus
-4831838208 B of post-cache reservations (--moe-vram-reserve-bytes + --moe-cache-headroom-bytes)
-needs ... Either lower --moe-cache-size to 5361 slots, or own at most 3 layer(s) at this cache size.
+ValueError: --moe-cache-size 6750 (3678 LRU slots after 6 GPU-owned MoE layers take 3072,
+8517058560 B resident) plus 4831838208 B of post-cache reservations
+(--moe-vram-reserve-bytes + --moe-cache-headroom-bytes) needs 23546078208 B of the
+20861318737 B MoE budget. Either lower --moe-cache-size (launcher: -MoECacheSize) to 5781
+slots, or own at most 4 layer(s) at this cache size.
 ```
+
+The parenthetical is the split, not a second budget: 6750 buys 3072 slots of GPU-owned
+residency and 3678 LRU slots. Both numbers the message hands you -- 6750 and 5781 -- are
+totals in the unit `-MoECacheSize` takes. This check needs the loaded bank geometry, so it
+fires after the expert-bank read (~40 s), not at config time; the LRU-floor refusal above
+fires immediately.
 
 Pass `-MoEVramReserveBytes 0 -MoECacheHeadroomBytes 0` to restore the pre-2026-09 sizing
 (nothing reserved) if a boot refuses a size you know fits.

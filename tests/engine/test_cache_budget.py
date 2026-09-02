@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import re
 import torch
 
 import os
@@ -605,9 +606,11 @@ def test_explicit_cache_size_that_overflows_the_budget_names_what_would_fit():
             owned_layers=6, num_experts=_E,
         )
     message = str(excinfo.value)
-    assert "--moe-cache-size 4400" in message
+    # 4400 is the LRU left after the charge, so the operator typed 4400 + 3072; and the size
+    # the message names is likewise a TOTAL, 1928 + 3072 (see the L4 tests below).
+    assert "--moe-cache-size 7472" in message
     assert "6 GPU-owned MoE layers" in message
-    assert "lower --moe-cache-size to 1928 slots" in message
+    assert "lower --moe-cache-size (launcher: -MoECacheSize) to 5000 slots" in message
     assert "own at most 1 layer" in message
 
 
@@ -755,7 +758,7 @@ def test_an_explicit_cache_size_that_eats_the_reserve_is_refused_naming_the_larg
             owned_layers=6, num_experts=_E, reserved_bytes=reserved,
         )
     message = str(excinfo.value)
-    assert "3928" in message  # the largest slot count that fits
+    assert "to 7000 slots" in message  # the largest TOTAL that fits: 3928 LRU + 3072 owned
     assert str(reserved) in message  # the reservation is named, not hidden
 
 
@@ -776,6 +779,203 @@ def test_the_reserve_is_refused_for_a_no_owned_configuration_too():
             owned_layers=0, num_experts=_E, reserved_bytes=reserved,
         )
     assert "7000" in str(excinfo.value)
+
+
+# ------------------ L4: the refusal must quote the TYPED total and name a TOTAL that boots
+
+
+#: Boot A of the 2026-09-02 live check, verbatim: RTX 5090 32 GB, Qwen3.8-Flash-Next-NVFP4,
+#: ``-GpuOwnedLayers auto -MoECacheSize 6750``, default reserve + headroom.
+#: See docs/research/measurements-gpu-owned-followups-live-2026-09-02.md.
+_LIVE_BUDGET = 20_861_318_737           # net MoE budget after weights, KV reserve, GDN pool
+_LIVE_RESERVED = (3 << 30) + (3 << 29)  # 3 GiB post-cache reserve + 1.5 GiB headroom
+_LIVE_TOTAL = 6750                      # what the operator typed
+
+
+def test_the_refusal_quotes_the_operators_total_and_names_a_total_that_boots():
+    """Live boot A quoted a size nobody typed and named one that cannot be typed.
+
+    The engine charges the owned layers to the explicit total BEFORE the fit check runs, so
+    the check used to read the post-charge LRU count (3678) out of ``config.moe_cache_size``
+    and print it as ``--moe-cache-size 3678`` -- the operator typed 6750. Worse, it named
+    ``fits_slots`` (2709, also an LRU count) as the size to lower ``--moe-cache-size`` to,
+    and ``--moe-cache-size`` is the TOTAL budget: boot B typed 2709 and was refused by the
+    LRU-floor check (2709 - 3072 < 1024). The total that boots is 2709 + 3072 = 5781.
+    """
+    from freetoken.engine.cache_budget import (
+        check_explicit_moe_cache_fits,
+        lru_slots_after_owned_charge,
+    )
+
+    lru = lru_slots_after_owned_charge(
+        moe_cache_size=_LIVE_TOTAL, owned_layers=6, num_experts=_E, floor=2 * _E
+    )
+    assert lru == 3678  # what the engine writes back over the operator's 6750
+
+    with pytest.raises(ValueError) as excinfo:
+        check_explicit_moe_cache_fits(
+            moe_cache_size=lru, per_expert_bytes=_PER_EXPERT, budget_bytes=_LIVE_BUDGET,
+            owned_layers=6, num_experts=_E, reserved_bytes=_LIVE_RESERVED,
+            requested_total=_LIVE_TOTAL,
+        )
+    message = str(excinfo.value)
+
+    # (a) the flag is quoted with the number the operator actually typed
+    assert "--moe-cache-size 6750" in message
+    assert "--moe-cache-size 3678" not in message
+    # the operator boots through the launcher, so name that spelling too (issue 7)
+    assert "-MoECacheSize" in message
+    # the diagnosis is still there: what 6750 bought once the owned layers took their cut
+    assert "3678" in message and "3072" in message
+
+    # (b) the size it names is a TOTAL, and it is the largest total that fits
+    named = int(re.search(r"to (\d+) slots", message).group(1))
+    assert named == 5781 == 2709 + 6 * _E
+
+    # ...and that total survives BOTH checks: the LRU floor first (boot B's refusal),
+    assert named >= 4096  # 6 x 512 charged + the 1024-slot prefill-overlap floor
+    assert lru_slots_after_owned_charge(
+        moe_cache_size=named, owned_layers=6, num_experts=_E, floor=2 * _E
+    ) == 2709
+    # ...then the budget check that produced this very message.
+    check_explicit_moe_cache_fits(
+        moe_cache_size=named - 6 * _E, per_expert_bytes=_PER_EXPERT,
+        budget_bytes=_LIVE_BUDGET, owned_layers=6, num_experts=_E,
+        reserved_bytes=_LIVE_RESERVED, requested_total=named,
+    )
+    # one slot more does not fit, so 5781 really is the largest
+    with pytest.raises(ValueError):
+        check_explicit_moe_cache_fits(
+            moe_cache_size=named + 1 - 6 * _E, per_expert_bytes=_PER_EXPERT,
+            budget_bytes=_LIVE_BUDGET, owned_layers=6, num_experts=_E,
+            reserved_bytes=_LIVE_RESERVED, requested_total=named + 1,
+        )
+
+
+def test_the_typed_total_is_reconstructed_when_the_caller_does_not_pass_it():
+    """``requested_total`` is optional: the charge is exactly one expert layer per owned
+    layer, so a caller that only has the post-charge LRU still gets the operator's total."""
+    from freetoken.engine.cache_budget import check_explicit_moe_cache_fits
+
+    with pytest.raises(ValueError) as excinfo:
+        check_explicit_moe_cache_fits(
+            moe_cache_size=3678, per_expert_bytes=_PER_EXPERT, budget_bytes=_LIVE_BUDGET,
+            owned_layers=6, num_experts=_E, reserved_bytes=_LIVE_RESERVED,
+        )
+    assert "--moe-cache-size 6750" in str(excinfo.value)
+
+
+def _live_engine_stubs():
+    """A config + banks pair with the live box's MoE geometry, for driving
+    ``Engine._init_offload_moe_cache`` up to the explicit-fit refusal on the CPU."""
+    from freetoken.models.config import KVCacheGroupSpec
+
+    class StubModelConfig:
+        has_swa_attention = False
+        is_moe = True
+        num_experts = _E
+        num_moe_layers = _L
+        expert_quant = "nvfp4"
+        moe_backend = "offload"
+        nvfp4_backend = "triton"
+
+        def kv_cache_group_specs(self):
+            return [KVCacheGroupSpec(
+                name="full", layer_ids=(0, 1, 2), num_kv_heads=8, head_dim=64,
+                sliding_window=None,
+            )]
+
+        def linear_attention_group(self):
+            return None
+
+    config = SimpleNamespace(
+        model_config=StubModelConfig(),
+        model_path="/models/anon",
+        dtype=torch.float16,
+        page_size=64,
+        max_running_req=1,
+        hybrid_swa_cache_mode="auto",
+        memory_ratio=0.9,
+        max_seq_len=65536,
+        swa_full_tokens_ratio=0.2,
+        swa_num_pages_override=None,
+        kv_reserve_tokens=0,
+        moe_backend="offload",
+        moe_cpu_layers=None,
+        moe_gpu_owned_layers="auto",
+        moe_prefill_overlap=True,
+        moe_cache_size=_LIVE_TOTAL,
+        moe_cache_auto=False,
+        moe_cache_policy="lru",
+        moe_prefill_hit_d2d=False,
+        moe_hybrid_max_fetch=1,
+        moe_vram_reserve_bytes=3 << 30,
+        moe_cache_headroom_bytes=3 << 29,
+        expert_load=None,
+        use_dummy_weight=True,
+        # the live boot ran integrated MTP speculation (the 2.17 GiB resident draft head)
+        spec_decode=SimpleNamespace(enabled=True),
+        tp_info=SimpleNamespace(size=1),
+    )
+
+    # one bank whose row is a whole live expert slot; layer 3 is the first STREAMING layer
+    row = torch.zeros(2, _PER_EXPERT, dtype=torch.uint8)
+    banks = SimpleNamespace(
+        quant_format="nvfp4",
+        sources={"gate_up": [row] * _L},
+        layer_residency=None,
+        gate_up_alpha=None,
+        down_alpha=None,
+    )
+    return config, banks
+
+
+def test_the_engine_refusal_carries_the_typed_total_through_the_charge(monkeypatch):
+    """End to end at the engine seam: ``_charge_gpu_owned_layers_to_cache_size`` rewrites
+    ``config.moe_cache_size``, and the refusal raised further down still names 6750.
+
+    Also pins WHERE the refusal happens. It is raised from ``_init_offload_moe_cache``
+    immediately after ``load_expert_banks`` -- i.e. after the ~40 s bank read boot A paid
+    before being told its size was wrong. Every other term of the check is known at config
+    time; the one that is not is ``expert_bytes_per_slot``, measured off the loaded bank
+    rows. The config-time ``_BANK_BYTES_PER_EXPERT`` formula cannot stand in for it: it is
+    documented as an over-estimate for the repacked marlin/b12x layouts and it is TP-blind,
+    so a refusal built on it could refuse a size that fits. Hoisting the check therefore
+    needs a new format- and TP-aware pre-load slot-byte estimate, not a move. When that
+    estimate exists, the last assertion here becomes ``calls == []``.
+    """
+    from freetoken.engine import engine as engine_module
+    from freetoken.engine.engine import Engine
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    config, banks = _live_engine_stubs()
+    calls: list[str] = []
+
+    def fake_load_expert_banks(model_path, model_config, **kwargs):
+        calls.append(model_path)
+        return banks
+
+    monkeypatch.setattr(engine_module, "load_expert_banks", fake_load_expert_banks)
+    monkeypatch.setattr(engine_module, "_pin_budget_bytes", lambda _reserved: None)
+
+    engine = Engine.__new__(Engine)
+    engine.model = SimpleNamespace()          # no make_offload_moe_cache
+    engine.device = torch.device("cpu")
+    engine.dtype = torch.float16
+    engine._host_tables_bytes = 0
+    engine._pool_cls = MHAKVCache
+    engine._baseline_free = 32_479_182_848    # 30.25 GiB, the live card
+    engine._weights_bytes = 5_750_000_000     # ~5.36 GiB of weights: 6750 no longer fits
+
+    with pytest.raises(ValueError) as excinfo:
+        engine._init_offload_moe_cache(config)
+    message = str(excinfo.value)
+
+    assert config.moe_cache_size == 3678       # the charge did happen
+    assert "--moe-cache-size 6750" in message  # ...and the refusal still quotes 6750
+    named = int(re.search(r"to (\d+) slots", message).group(1))
+    assert named >= 4096                       # the named total clears the LRU floor
+    assert calls == ["/models/anon"]           # see the docstring: still one bank load
 
 
 def test_the_vram_ledger_lists_every_term_in_one_block():

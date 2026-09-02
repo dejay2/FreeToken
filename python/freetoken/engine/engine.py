@@ -726,6 +726,10 @@ class Engine:
         lru = _gpu_owned_lru_slots(config, len(owned))
         if lru == total:
             return
+        # Keep what the operator typed: from here on config.moe_cache_size is the LRU count,
+        # and a refusal that quotes it names a --moe-cache-size nobody passed (live boot A
+        # said "--moe-cache-size 3678" to an operator who typed 6750).
+        object.__setattr__(config, "_moe_cache_size_requested", total)
         object.__setattr__(config, "moe_cache_size", lru)
         logger.info_rank0(
             f"--moe-cache-size {total} is the total MoE expert-slot budget: "
@@ -780,6 +784,7 @@ class Engine:
             owned_layers=len(owned),
             num_experts=config.model_config.num_experts,
             reserved_bytes=self._post_cache_reserve(config),
+            requested_total=getattr(config, "_moe_cache_size_requested", None),
         )
 
     def _stash_vram_ledger_inputs(self, banks, gpu_owned_layer_ids: "frozenset[int]") -> None:

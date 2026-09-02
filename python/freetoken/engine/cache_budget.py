@@ -217,11 +217,23 @@ def check_explicit_moe_cache_fits(
     owned_layers: int,
     num_experts: int,
     reserved_bytes: int = 0,
+    requested_total: int | None = None,
 ) -> None:
     """Raise when an explicit ``--moe-cache-size`` plus the GPU-owned reservation plus the
     post-cache reservations exceed the net MoE budget. Operator decision: fail loudly naming
     the largest slot count that fits, never silently shrink the cache the operator asked for.
+
+    ``moe_cache_size`` is the LRU count: the GPU-owned layers have already been charged to
+    the operator's total by :func:`lru_slots_after_owned_charge`. ``--moe-cache-size`` is the
+    TOTAL, so the message must quote and name TOTALS, never LRU counts. ``requested_total``
+    is the number the operator typed (default: the charge added back, which reconstructs it
+    exactly); the size named to lower to is ``fits_slots`` plus the same charge, so typing it
+    clears the LRU floor instead of tripping the other refusal. Live boot A named the raw
+    ``fits_slots`` and boot B, which typed it verbatim, was refused -- see
+    ``docs/research/measurements-gpu-owned-followups-live-2026-09-02.md``.
     """
+    charge = gpu_owned_reservation_slots(owned_layers, num_experts)
+    typed = moe_cache_size + charge if requested_total is None else requested_total
     owned_bytes = gpu_owned_reservation_bytes(owned_layers, num_experts, per_expert_bytes)
     need = moe_cache_size * per_expert_bytes + owned_bytes + reserved_bytes
     if need <= budget_bytes:
@@ -233,7 +245,8 @@ def check_explicit_moe_cache_fits(
         // (num_experts * per_expert_bytes),
     )
     owned_clause = (
-        f" plus {owned_layers} GPU-owned MoE layers ({owned_bytes} B resident)"
+        f" ({moe_cache_size} LRU slots after {owned_layers} GPU-owned MoE layers take "
+        f"{charge}, {owned_bytes} B resident)"
         if owned_layers
         else ""
     )
@@ -241,10 +254,11 @@ def check_explicit_moe_cache_fits(
         f", or own at most {fits_owned} layer(s) at this cache size" if owned_layers else ""
     )
     raise ValueError(
-        f"--moe-cache-size {moe_cache_size}{owned_clause} plus {reserved_bytes} B of "
+        f"--moe-cache-size {typed}{owned_clause} plus {reserved_bytes} B of "
         f"post-cache reservations (--moe-vram-reserve-bytes + --moe-cache-headroom-bytes) "
         f"needs {need} B of the {budget_bytes} B MoE budget. "
-        f"Either lower --moe-cache-size to {fits_slots} slots{owned_advice}."
+        f"Either lower --moe-cache-size (launcher: -MoECacheSize) to "
+        f"{fits_slots + charge} slots{owned_advice}."
     )
 
 
