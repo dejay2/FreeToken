@@ -707,16 +707,22 @@ class Int8DenseLinear(_Int8DenseBase):
 
 
 class Int8DenseColMerged(_Int8DenseBase):
-    """Column-merged int8 dense linear (drop-in for ``LinearColParallelMerged`` at TP=1).
+    """Column-merged int8 dense linear mirroring ``LinearColParallelMerged``.
 
     One weight concatenating several projections on the output dim; each output row keeps
-    its own scale, so a merged weight is exactly as accurate as the split ones. The caller
-    splits the output by ``output_sizes`` as before.
+    its own scale, so a merged weight is exactly as accurate as the split ones. Each output
+    part is sharded independently by tensor-parallel rank, and the caller splits the output
+    by ``output_sizes`` as before.
     """
 
     def __init__(self, in_features: int, output_sizes: list[int], has_bias: bool = False):
+        from freetoken.distributed import get_tp_info
+        from freetoken.utils import div_even
+
+        tp_info = get_tp_info()
         self.output_sizes = list(output_sizes)
-        super().__init__(in_features, sum(output_sizes), has_bias)
+        tp_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
+        super().__init__(in_features, sum(tp_output_sizes), has_bias)
 
 
 class Int8DenseRowParallel(_Int8DenseBase):
@@ -773,6 +779,12 @@ class Int8LMHead(BaseOP):
         return self._scale
 
     def quantize_from(self, weight: torch.Tensor) -> None:
+        expected_shape = (self.num_embeddings_tp, self.embedding_dim)
+        if tuple(weight.shape) != expected_shape:
+            raise ValueError(
+                f"expected a [{expected_shape[0]}, {expected_shape[1]}] weight, "
+                f"got {tuple(weight.shape)}"
+            )
         self.weight, self._scale = quantize_int8_rows(weight)
 
     def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:

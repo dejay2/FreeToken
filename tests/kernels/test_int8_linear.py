@@ -336,9 +336,10 @@ def test_int8_dense_linear_matches_its_bf16_twin(device: str):
 
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
-def test_int8_col_merged_keeps_a_per_part_scale(device: str):
+def test_int8_col_merged_keeps_a_per_part_scale(device: str, monkeypatch):
     """A merged weight is exactly as accurate as the split ones: the scale is per ROW, so a
     part whose rows are 100x smaller keeps its own resolution."""
+    _set_tp_info_for_test(monkeypatch, rank=0, size=1)
     torch.manual_seed(1)
     small = torch.randn(32, 128, device=device, dtype=torch.bfloat16) * 0.0005
     large = torch.randn(64, 128, device=device, dtype=torch.bfloat16) * 0.05
@@ -354,6 +355,55 @@ def test_int8_col_merged_keeps_a_per_part_scale(device: str):
     want = torch.nn.functional.linear(x, merged).float()
     head = _rel_err(got[:, :32], want[:, :32])
     assert head < 3e-2, head  # the small part is not swamped by the large one's scale
+
+
+def _set_tp_info_for_test(monkeypatch, *, rank: int, size: int = 2) -> None:
+    import freetoken.distributed.info as tp_info
+    from freetoken.distributed import set_tp_info
+
+    monkeypatch.setattr(tp_info, "_TP_INFO", None)
+    set_tp_info(rank=rank, size=size)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_int8_col_merged_tp2_shards_each_part_like_bf16_twin(monkeypatch, rank: int):
+    from freetoken.layers import LinearColParallelMerged
+
+    _set_tp_info_for_test(monkeypatch, rank=rank)
+    input_size = 4
+    non_divisible_output_sizes = [3, 5]
+    assert sum(non_divisible_output_sizes) % 2 == 0
+    with pytest.raises(AssertionError):
+        LinearColParallelMerged(input_size, non_divisible_output_sizes, has_bias=False)
+    with pytest.raises(AssertionError):
+        Int8DenseColMerged(input_size, non_divisible_output_sizes)
+
+    output_sizes = [4, 6]
+    full_weight = torch.arange(40, dtype=torch.bfloat16).reshape(10, input_size)
+    local_rows = torch.cat(
+        [
+            full_weight[offset + rank * (size // 2): offset + (rank + 1) * (size // 2)]
+            for offset, size in ((0, output_sizes[0]), (output_sizes[0], output_sizes[1]))
+        ]
+    )
+
+    bf16 = LinearColParallelMerged(input_size, output_sizes, has_bias=False)
+    bf16.weight = local_rows.clone()
+    quant = Int8DenseColMerged(input_size, output_sizes)
+    quant.load_state_dict({"weight": bf16.weight.clone()})
+
+    expected_codes, expected_scales = quantize_int8_rows(bf16.weight)
+    assert quant.weight.shape == bf16.weight.shape
+    assert torch.equal(quant.weight, expected_codes)
+    assert torch.equal(quant.weight_scale, expected_scales)
+
+
+def test_int8_lm_head_rejects_a_mis_sharded_weight(monkeypatch):
+    _set_tp_info_for_test(monkeypatch, rank=0)
+    head = Int8LMHead(num_embeddings=8, embedding_dim=4)
+
+    with pytest.raises(ValueError, match=r"expected a \[4, 4\] weight"):
+        head.quantize_from(torch.zeros(8, 4, dtype=torch.bfloat16))
 
 
 @requires_cuda
