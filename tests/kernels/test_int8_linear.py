@@ -18,9 +18,11 @@ from freetoken.kernel.triton.int8_linear import (
     Int8LMHead,
     _gemm_config,
     _gemv_config,
+    _m_bucket,
     int8_linear,
     quantize_int8_rows,
 )
+from freetoken.kernel.triton.int8_tuning import _GEMM_TABLE, _GEMV_TABLE
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -186,6 +188,34 @@ def test_config_choice_is_a_pure_function_of_the_shape(n: int, k: int):
 def test_every_decode_batch_size_shares_one_launch_shape(m: int):
     """M in 2..16 is one bucket, so a captured decode graph does not depend on batch size."""
     assert _gemm_config(m, 16480, 2560) == _gemm_config(2, 16480, 2560)
+
+
+def _assert_valid_tuning_config(config: tuple[int, ...]) -> None:
+    blocks = config[:-3]
+    warps, stages, split_k = config[-3:]
+    assert all(block >= 16 for block in blocks)
+    assert warps in {4, 8}
+    assert stages in {3, 4}
+    assert split_k >= 1
+
+
+def test_tuning_tables_have_valid_entries_and_absent_shape_fallbacks():
+    for config in _GEMV_TABLE.values():
+        _assert_valid_tuning_config(config)
+    for config in _GEMM_TABLE.values():
+        _assert_valid_tuning_config(config)
+
+    absent_gemv = (1001, 129)
+    assert absent_gemv not in _GEMV_TABLE
+    _assert_valid_tuning_config(_gemv_config(*absent_gemv))
+
+    absent_gemm = (16, 1001, 129)
+    assert absent_gemm not in _GEMM_TABLE
+    _assert_valid_tuning_config(_gemm_config(2, absent_gemm[1], absent_gemm[2]))
+
+    absent_prefill_gemm = (128, 1001, 129)
+    assert (_m_bucket(absent_prefill_gemm[0]), *absent_prefill_gemm[1:]) not in _GEMM_TABLE
+    _assert_valid_tuning_config(_gemm_config(*absent_prefill_gemm))
 
 
 @requires_cuda
