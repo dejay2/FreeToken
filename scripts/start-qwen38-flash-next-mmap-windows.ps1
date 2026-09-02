@@ -46,12 +46,19 @@ param(
     [ValidateRange(0, 4194304)]
     [int]$KVCacheTokens = 0,
 
-    # How the MoE expert banks are read into host RAM (--expert-load). 'serial' is the
-    # low-memory reclaimable read this launcher has always used; 'parallel' forces the
-    # cache-bypassing multi-threaded reader (FILE_FLAG_NO_BUFFERING on Windows); 'auto'
-    # lets the loader pick (parallel for scattered expert tensors).
+    # How the MoE expert banks are read into host RAM (--expert-load). 'parallel' is the
+    # cache-bypassing multi-threaded reader (FILE_FLAG_NO_BUFFERING on Windows); 'serial' is
+    # the older one-shard-at-a-time read; 'auto' lets the loader pick (it resolves to
+    # parallel here, since this checkpoint's expert tensors are scattered).
+    # Measured 2026-09-02 on the RTX 5090, same flags, back to back: the expert-load phase
+    # is 43 s serial -> 37 s parallel (-14 %), standby stays flat across the load either way
+    # (+0.0 / -0.4 GiB while 64 GiB of banks are pinned), and boot-to-serving is a wash
+    # (73.1 s -> 73.2 s). Parallel costs ~1.4 GiB more peak RAM for its whole-shard buffers
+    # (peak physical 85.4 -> 86.8 GiB, min available 10.3 -> 8.8 GiB) and the loader's
+    # low-RAM fallback to serial is inert on Windows (it reads /proc/meminfo), so on a
+    # tighter box pass -ExpertLoad serial explicitly.
     [ValidateSet('auto', 'serial', 'parallel')]
-    [string]$ExpertLoad = 'serial',
+    [string]$ExpertLoad = 'parallel',
 
     # Accumulate the per-(MoE layer, expert) decode routing histogram and serve it at
     # GET /v1/cache/routing (--moe-collect-decode-freq). Boot-time only: the counters are

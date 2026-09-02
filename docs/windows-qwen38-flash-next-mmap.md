@@ -67,7 +67,7 @@ The defaults are:
 - full 262,144-token usable context;
 - automatic GPU expert-cache sizing;
 - one active request, with extra requests queued;
-- serial expert loading for the proven Windows path (`-ExpertLoad`).
+- parallel (cache-bypassing) expert loading (`-ExpertLoad`).
 
 Do not change the host to a public address unless authentication and network
 security are added separately.
@@ -106,17 +106,27 @@ FreeToken allocates 4,097 pages (262,208 total). After the reserved page,
 `-ExpertLoad` selects how the MoE expert banks are read into host RAM and maps
 straight onto the server's `--expert-load`:
 
-| Value      | Behaviour                                                                         |
-| ---------- | --------------------------------------------------------------------------------- |
-| `serial`   | Low-memory reclaimable read, one shard at a time. The launcher default.            |
-| `parallel` | Cache-bypassing multi-threaded read (`FILE_FLAG_NO_BUFFERING` on Windows).         |
-| `auto`     | Let the loader pick; resolves to `parallel` when the expert tensors are scattered. |
+| Value      | Behaviour                                                                          |
+| ---------- | ---------------------------------------------------------------------------------- |
+| `parallel` | Cache-bypassing multi-threaded read (`FILE_FLAG_NO_BUFFERING`). The default.        |
+| `serial`   | The older one-shard-at-a-time read. Lower peak RAM.                                 |
+| `auto`     | Let the loader pick; resolves to `parallel` when the expert tensors are scattered.  |
+
+Measured on the tested system, same flags back to back: the expert-load phase takes
+**43 s serial vs 37 s parallel** (-14 %), and standby stays flat across the load
+either way while 64 GiB of banks are pinned. Boot-to-serving is a wash (73.1 s vs
+73.2 s), so the win is in the load phase, not the headline number.
+
+Parallel costs about **1.4 GiB more peak RAM** for its whole-shard buffers (peak
+physical used 85.4 -> 86.8 GiB of 95.6; minimum available 10.3 -> 8.8 GiB). The
+loader has a low-RAM fallback to serial, but it reads `/proc/meminfo` and so never
+trips on Windows. On a machine with less RAM, ask for serial explicitly:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File `
   .\scripts\start-qwen38-flash-next-mmap-windows.ps1 `
   -ModelPath $ModelPath `
-  -ExpertLoad parallel
+  -ExpertLoad serial
 ```
 
 `parallel` and `auto` both fall back to the serial build when the unbuffered
@@ -124,7 +134,7 @@ reader is unavailable (`FREETOKEN_WIN_UNBUFFERED_IO=0`) or the expert quant has
 no parallel provider; the boot log always names the build it took:
 
 ```
-INFO expert banks: slow path (serial build)
+INFO expert banks: slow path (parallel build)
 ```
 
 ### Expert routing statistics

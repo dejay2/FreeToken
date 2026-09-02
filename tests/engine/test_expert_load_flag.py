@@ -57,7 +57,8 @@ def test_launcher_exposes_expert_load_and_passes_it_through():
     launcher = LAUNCHER.read_text(encoding="utf-8")
 
     assert "[ValidateSet('auto', 'serial', 'parallel')]" in launcher
-    assert "[string]$ExpertLoad = 'serial'" in launcher
+    assert "[string]$ExpertLoad = 'parallel'" in launcher
     assert "'--expert-load', $ExpertLoad" in launcher
     # the hard-coded value is gone: the flag is only ever built from the parameter
     assert "'--expert-load', 'serial'" not in launcher
+    assert "'--expert-load', 'parallel'" not in launcher
