@@ -83,7 +83,7 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-backend` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family backends) |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
-| `--moe-vram-reserve-bytes` | 3 GiB | VRAM the expert cache must not spend because it is allocated AFTER the cache is sized: the integrated MTP resident draft head (2.17 GiB measured), the CUDA-graph pools, the vision layer-stream workspace. Respected by `auto` and by an explicit `--moe-cache-size` |
+| `--moe-vram-reserve-bytes` | auto (-1) | VRAM the expert cache must not spend because it is allocated AFTER the cache is sized: the integrated MTP resident draft head (2.17 GiB measured), the CUDA-graph pools, the vision layer-stream workspace. Auto = 0.75 GiB of graph pools plus 2.25 GiB of draft head when speculation is on; 0 reserves nothing. Respected by `auto` and by an explicit `--moe-cache-size` |
 | `--moe-cache-headroom-bytes` | 1.5 GiB | Free VRAM the cache must leave after every reservation; an explicit `--moe-cache-size` that leaves less refuses to boot, naming the largest slot count that fits |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |

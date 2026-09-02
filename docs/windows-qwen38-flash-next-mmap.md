@@ -191,6 +191,53 @@ The flag needs `--moe-backend offload`, refuses to overlap with `--moe-cpu-layer
 not supported on an FTW packed checkpoint.
 
 
+### The VRAM ledger and the post-cache reserve
+
+The expert cache is sized before the engine allocates the resident MTP draft head (2.17 GiB
+measured), the CUDA-graph pools and the picture layer-stream workspace, so those bytes have
+to be reserved in advance or the card ends up oversubscribed at decode peak -- which is what
+halved throughput in live run 2 (569 MiB free, 70.4 -> 34.6 tok/s).
+
+| Launcher | Flag | Default |
+| --- | --- | --- |
+| `-MoEVramReserveBytes` | `--moe-vram-reserve-bytes` | `-1` = auto: 0.75 GiB for the graph pools, plus 2.25 GiB for the draft head when speculation is on |
+| `-MoECacheHeadroomBytes` | `--moe-cache-headroom-bytes` | `-1` = the engine default, 1.5 GiB of free VRAM left after every reservation |
+
+Both are respected by `--moe-cache-auto` (they join the fixed budget before the MoE-vs-KV
+split) **and** by an explicit `-MoECacheSize`, which refuses to boot rather than silently
+shrinking:
+
+```
+ValueError: --moe-cache-size 7000 plus 6 GPU-owned MoE layers (8517918720 B resident) plus
+4831838208 B of post-cache reservations (--moe-vram-reserve-bytes + --moe-cache-headroom-bytes)
+needs ... Either lower --moe-cache-size to 5361 slots, or own at most 3 layer(s) at this cache size.
+```
+
+Pass `-MoEVramReserveBytes 0 -MoECacheHeadroomBytes 0` to restore the pre-2026-09 sizing
+(nothing reserved) if a boot refuses a size you know fits.
+
+Once the KV pool is sized the boot log prints one **VRAM ledger** block naming every term
+of the plan, so a boot that will page is visible in the log rather than only in `nvidia-smi`
+at decode peak:
+
+```
+INFO VRAM ledger (30.42 GiB on the card):
+INFO   weights               13.10 GiB
+INFO   KV cache               4.21 GiB
+INFO   GDN state pool         0.42 GiB
+INFO   GPU-owned MoE layers   7.93 GiB (6 layers [0, 1, 2, 6, 7, 22])
+INFO   MoE LRU cache          9.49 GiB (3678 slots)
+INFO   post-cache reserve     3.00 GiB (MTP draft head, graphs, vision)
+INFO   headroom               1.50 GiB
+INFO   unaccounted           -9.23 GiB
+INFO   named total           39.65 GiB
+```
+
+`unaccounted` is what the ledger cannot name -- allocator slack and activations. A negative
+number means the plan is over the card: that is the number to read when a boot starts paging.
+(The figures above are illustrative, not a measured boot.)
+
+
 ### Expert routing statistics
 
 `-CollectRoutingStats` boots with `--moe-collect-decode-freq`, which accumulates a

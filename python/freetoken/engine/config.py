@@ -359,8 +359,11 @@ class EngineConfig:
     # the decode/spec/draft CUDA-graph pools, and the vision layer-stream workspace. Joins
     # fixed_cache_size before the MoE-vs-KV split, exactly like the GDN state pool, so both
     # --moe-cache-auto and an explicit --moe-cache-size respect it.
+    # -1 (the default) = auto: cache_budget.auto_vram_reserve_bytes composes it from the
+    # features this boot actually switched on (the 2.25 GiB draft-head half only when
+    # speculation is on); >= 0 is taken as typed, and 0 reserves nothing.
     # (--moe-vram-reserve-bytes; see cache_budget.DEFAULT_MOE_VRAM_RESERVE_BYTES.)
-    moe_vram_reserve_bytes: int = 3 << 30
+    moe_vram_reserve_bytes: int = -1
     # Free-VRAM headroom the MoE cache must leave after every known reservation. An explicit
     # --moe-cache-size that leaves less fails loudly at boot naming the largest slot count
     # that fits (--moe-cache-headroom-bytes; 1.5 GiB default).

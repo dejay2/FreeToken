@@ -272,6 +272,35 @@ def test_the_launcher_banner_reports_the_owned_spec():
     assert "GPU-owned MoE layers: $(if ($GpuOwnedLayers) { $GpuOwnedLayers } else { 'off' })" in _launcher_text()
 
 
+def test_the_launcher_exposes_the_vram_reserve_knobs():
+    """The operator boots only through the launcher, and the post-cache reserve can refuse
+    an explicit -MoECacheSize. Without a passthrough the only way past a wrong reserve would
+    be editing the engine."""
+    launcher = _launcher_text()
+
+    assert "[long]$MoEVramReserveBytes = -1" in launcher
+    assert "[long]$MoECacheHeadroomBytes = -1" in launcher
+    assert "'--moe-vram-reserve-bytes', \"$MoEVramReserveBytes\"" in launcher
+    assert "'--moe-cache-headroom-bytes', \"$MoECacheHeadroomBytes\"" in launcher
+    # -1 means "leave the engine default alone", so the flag is not passed at all
+    assert "if ($MoEVramReserveBytes -ge 0) {" in launcher
+    assert "if ($MoECacheHeadroomBytes -ge 0) {" in launcher
+
+
+def test_the_docs_describe_the_vram_reserve_knobs():
+    from pathlib import Path
+
+    root = Path(__file__).parents[2]
+    cli = (root / "docs" / "cli.md").read_text(encoding="utf-8")
+    windows = (root / "docs" / "windows-qwen38-flash-next-mmap.md").read_text(encoding="utf-8")
+    for flag in ("--moe-vram-reserve-bytes", "--moe-cache-headroom-bytes"):
+        assert flag in cli, flag
+        assert flag in windows, flag
+    assert "-MoEVramReserveBytes" in windows
+    assert "-MoECacheHeadroomBytes" in windows
+    assert "VRAM ledger" in windows
+
+
 def test_the_docs_describe_the_flag():
     from pathlib import Path
 

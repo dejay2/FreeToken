@@ -81,7 +81,22 @@ param(
     # (docs/research/routing-skew-2026-09-02); 'auto:N' takes the first N; an explicit id
     # list, a count or a fraction also work. Empty (the default) leaves the feature off.
     # FREETOKEN_MOE_GPU_OWNED_LAYERS is the env fallback, read only here.
-    [string]$GpuOwnedLayers = ''
+    [string]$GpuOwnedLayers = '',
+
+    # VRAM the expert cache must NOT spend because it is allocated AFTER the cache is sized
+    # (--moe-vram-reserve-bytes): the resident MTP draft head, the CUDA-graph pools, the
+    # picture layer-stream workspace. -1 (the default) leaves the engine's auto composition
+    # alone -- 0.75 GiB of graph pools plus 2.25 GiB of draft head when speculation is on.
+    # Pass 0 to reserve nothing (the pre-2026-09 sizing), or a byte count to override.
+    [ValidateRange(-1, 34359738368)]
+    [long]$MoEVramReserveBytes = -1,
+
+    # Free VRAM the expert cache must leave after every known reservation
+    # (--moe-cache-headroom-bytes). -1 keeps the engine default (1.5 GiB, the floor every
+    # healthy boot measured; the 569 MiB-free run halved decode throughput). An explicit
+    # -MoECacheSize that leaves less refuses to boot, naming the largest size that fits.
+    [ValidateRange(-1, 34359738368)]
+    [long]$MoECacheHeadroomBytes = -1
 )
 
 $ErrorActionPreference = 'Stop'
@@ -208,6 +223,12 @@ if ($CollectRoutingStats) {
 }
 if ($GpuOwnedLayers) {
     $serveArgs += @('--moe-gpu-owned-layers', $GpuOwnedLayers)
+}
+if ($MoEVramReserveBytes -ge 0) {
+    $serveArgs += @('--moe-vram-reserve-bytes', "$MoEVramReserveBytes")
+}
+if ($MoECacheHeadroomBytes -ge 0) {
+    $serveArgs += @('--moe-cache-headroom-bytes', "$MoECacheHeadroomBytes")
 }
 if ($CudaGraphMaxBS -ge 0) {
     $serveArgs += @('--cuda-graph-max-bs', "$CudaGraphMaxBS")

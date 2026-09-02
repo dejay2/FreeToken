@@ -872,3 +872,156 @@ def test_engine_auto_sizing_charges_the_declared_post_cache_reserve():
 
     per_slot = 512 + 256
     assert resolve(0, 0) - resolve(4 * per_slot, 2 * per_slot) == 6
+
+
+# ------------------------- the reserve is only charged for what the boot actually allocates
+
+
+def test_the_auto_reserve_drops_the_draft_head_when_speculation_is_off():
+    """The 2.17 GiB resident MTP draft head only exists when speculation is on. Charging it
+    on every boot would cost ~800 expert slots to reserve bytes nothing will allocate."""
+    from freetoken.engine.cache_budget import (
+        DEFAULT_MOE_VRAM_RESERVE_BYTES,
+        GRAPH_POOL_RESERVE_BYTES,
+        MTP_DRAFT_HEAD_RESERVE_BYTES,
+        auto_vram_reserve_bytes,
+    )
+
+    assert MTP_DRAFT_HEAD_RESERVE_BYTES + GRAPH_POOL_RESERVE_BYTES == (
+        DEFAULT_MOE_VRAM_RESERVE_BYTES
+    )
+    assert MTP_DRAFT_HEAD_RESERVE_BYTES >= 2.17 * 2**30  # the measured draft head fits
+    assert auto_vram_reserve_bytes(mtp_resident=True) == DEFAULT_MOE_VRAM_RESERVE_BYTES
+    assert auto_vram_reserve_bytes(mtp_resident=False) == GRAPH_POOL_RESERVE_BYTES
+
+
+def test_an_explicit_reserve_overrides_the_auto_composition():
+    from freetoken.engine.cache_budget import (
+        GRAPH_POOL_RESERVE_BYTES,
+        resolve_vram_reserve_bytes,
+    )
+
+    assert resolve_vram_reserve_bytes(-1, mtp_resident=False) == GRAPH_POOL_RESERVE_BYTES
+    assert resolve_vram_reserve_bytes(0, mtp_resident=True) == 0
+    assert resolve_vram_reserve_bytes(1 << 20, mtp_resident=True) == 1 << 20
+    with pytest.raises(ValueError):
+        resolve_vram_reserve_bytes(-2, mtp_resident=True)
+
+
+def _auto_sizing_stubs():
+    """Engine stubs for _resolve_auto_moe_cache_size without a device (see the kwarg test)."""
+    import torch
+
+    from freetoken.models.config import KVCacheGroupSpec
+
+    class StubModelConfig:
+        has_swa_attention = False
+        num_experts = 64
+        num_moe_layers = 4
+
+        def kv_cache_group_specs(self):
+            return [KVCacheGroupSpec(
+                name="full", layer_ids=(0, 1, 2), num_kv_heads=8, head_dim=64,
+                sliding_window=None,
+            )]
+
+        def linear_attention_group(self):
+            return None
+
+    class StubSpecDecode:
+        enabled = False
+
+    class StubConfig:
+        dtype = torch.float16
+        page_size = 16
+        max_running_req = 4
+        hybrid_swa_cache_mode = "auto"
+        memory_ratio = 0.9
+        moe_prefill_overlap = True
+        kv_reserve_tokens = 32
+        max_seq_len = 1 << 20
+        swa_full_tokens_ratio = 0.2
+        swa_num_pages_override = None
+        moe_vram_reserve_bytes = -1  # auto
+        moe_cache_headroom_bytes = 0
+        model_config = StubModelConfig()
+        spec_decode = StubSpecDecode()
+
+        class tp_info:
+            size = 1
+
+    class StubBanks:
+        quant_format = "bf16"
+        sources = {
+            "gate_up": [torch.zeros(64, 32, 8, dtype=torch.float16)] * 4,  # row = 512 B
+            "down": [torch.zeros(64, 8, 16, dtype=torch.float16)] * 4,     # row = 256 B
+        }
+
+    return StubConfig, StubBanks
+
+
+def test_engine_auto_sizing_charges_the_draft_head_only_when_speculation_is_on():
+    from freetoken.engine.cache_budget import MTP_DRAFT_HEAD_RESERVE_BYTES
+    from freetoken.engine.engine import Engine
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    StubConfig, StubBanks = _auto_sizing_stubs()
+
+    def reserve(spec_enabled: bool) -> int:
+        config = StubConfig()
+        config.spec_decode.enabled = spec_enabled
+        engine = Engine.__new__(Engine)
+        engine._baseline_free = 1 << 33
+        engine._weights_bytes = 0
+        engine._pool_cls = MHAKVCache
+        # the same number _resolve_auto_moe_cache_size folds into fixed_cache_size
+        assert engine._resolve_auto_moe_cache_size(config, StubBanks())[0] >= 0
+        return engine._post_cache_reserve(config)
+
+    assert reserve(True) - reserve(False) == MTP_DRAFT_HEAD_RESERVE_BYTES
+
+
+def test_the_vram_ledger_reports_the_kv_pages_the_boot_actually_took():
+    """The ledger is emitted where num_pages is known. It used to be printed inside the MoE
+    cache build -- before the KV pool is sized -- so its KV row read 0 pages on every boot
+    that did not pass --num-tokens, and 'unaccounted' absorbed the whole KV pool."""
+    import torch
+
+    from freetoken.engine.engine import Engine
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    StubConfig, StubBanks = _auto_sizing_stubs()
+    config = StubConfig()
+    config.num_page_override = None
+    lines: list[str] = []
+
+    engine = Engine.__new__(Engine)
+    engine._baseline_free = 1 << 33
+    engine._weights_bytes = 1 << 30
+    engine._pool_cls = MHAKVCache
+    engine.num_pages = 321
+    engine._vram_ledger_inputs = {
+        "per_expert_bytes": 512 + 256,
+        "gpu_owned_layers": (0, 1),
+    }
+    config.moe_cache_size = 100
+
+    from freetoken.engine import engine as engine_module
+
+    class _Recorder:
+        def info_rank0(self, message, *args):
+            lines.append(message % args if args else message)
+
+    original, engine_module.logger = engine_module.logger, _Recorder()
+    try:
+        engine._log_vram_ledger(config)
+    finally:
+        engine_module.logger = original
+
+    block = "\n".join(lines)
+    assert "VRAM ledger" in block
+    cache_per_page, kv_fixed, _, _ = MHAKVCache.kv_cost(config)
+    expected = (kv_fixed + 321 * cache_per_page) / 2**30
+    assert f"KV cache" in block
+    assert f"{expected:.2f} GiB" in block
+    assert torch  # keep the import honest for the stub tensors above

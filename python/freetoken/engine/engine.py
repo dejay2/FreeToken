@@ -441,6 +441,9 @@ class Engine:
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
+        # Every term of the plan in one block, here because this is the first point where
+        # they are all known: the MoE cache was sized above, the KV pages just now.
+        self._log_vram_ledger(config)
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
@@ -660,7 +663,7 @@ class Engine:
         # head, graph pools, vision workspace) plus the free-VRAM headroom. Without this the
         # greedy slot fill spends bytes the draft head is about to take, and the card starts
         # paging at decode peak: measured 2x slowdown at 569 MiB free.
-        fixed_cache_size += _post_cache_reserved_bytes(config)
+        fixed_cache_size += self._post_cache_reserve(config)
         total_experts = (config.model_config.num_moe_layers - len(owned)) * num_experts
         moe_cache_size, num_pages, overlap = resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
@@ -705,6 +708,20 @@ class Engine:
             f"leaving {lru} for the streaming-layer LRU"
         )
 
+    def _post_cache_reserve(self, config: EngineConfig) -> int:
+        """:func:`_post_cache_reserved_bytes` with this boot's post-cache features filled in.
+
+        The only feature the auto reserve is conditional on is the resident MTP draft head:
+        integrated speculation (``--spec-decode`` / ``FREETOKEN_MTP_SPECULATE``) or a
+        resident MTP shadow observer. Everything else in the reserve (the decode/spec graph
+        pools, the vision workspace) is allocated on every boot.
+        """
+        shadow = getattr(self, "_mtp_shadow_config", None)
+        mtp_resident = bool(
+            getattr(getattr(config, "spec_decode", None), "enabled", False)
+        ) or bool(getattr(shadow, "enabled", False) and getattr(shadow, "resident", False))
+        return _post_cache_reserved_bytes(config, mtp_resident=mtp_resident)
+
     def _check_explicit_cache_fits(self, config: EngineConfig, banks) -> None:
         """An explicit --moe-cache-size plus the owned reservation plus everything allocated
         after the cache must fit the same budget the auto path solves against. Fails loudly
@@ -737,41 +754,70 @@ class Engine:
             budget_bytes=budget - kv_reserve_pages * cache_per_page,
             owned_layers=len(owned),
             num_experts=config.model_config.num_experts,
-            reserved_bytes=_post_cache_reserved_bytes(config),
+            reserved_bytes=self._post_cache_reserve(config),
         )
 
-    def _log_vram_ledger(
-        self, config: EngineConfig, banks, gpu_owned_layer_ids: "frozenset[int]"
-    ) -> None:
+    def _stash_vram_ledger_inputs(self, banks, gpu_owned_layer_ids: "frozenset[int]") -> None:
+        """Keep what only the MoE cache build knows, for the ledger printed further down.
+
+        The ledger cannot be printed here: ``num_pages`` is solved AFTER this cache exists
+        (the KV pool takes what the MoE cache left), so a ledger printed at cache-build time
+        reads 0 KV pages on every boot that did not pass ``--num-tokens``.
+        """
+        from freetoken.engine.cache_budget import expert_bytes_per_slot
+
+        self._vram_ledger_inputs = {
+            "per_expert_bytes": expert_bytes_per_slot(banks.sources, gpu_owned_layer_ids),
+            "gpu_owned_layers": tuple(sorted(gpu_owned_layer_ids)),
+        }
+
+    def _log_vram_ledger(self, config: EngineConfig) -> None:
         """Print the whole VRAM plan as one block, so a boot that will page is visible in the
-        log instead of only in ``nvidia-smi`` at decode peak."""
-        from freetoken.engine.cache_budget import (
-            expert_bytes_per_slot,
-            format_vram_ledger,
-            gpu_owned_reservation_bytes,
-        )
+        log instead of only in ``nvidia-smi`` at decode peak.
 
-        per_expert_bytes = expert_bytes_per_slot(banks.sources, gpu_owned_layer_ids)
-        cache_per_page, kv_fixed, page_tokens, _ = self._pool_cls.kv_cost(config)
-        pages = config.num_page_override or 0
-        logger.info_rank0(
-            format_vram_ledger(
-                total_bytes=int(self._baseline_free),
-                weights_bytes=int(self._weights_bytes),
-                kv_bytes=kv_fixed + pages * cache_per_page,
-                gdn_state_bytes=state_pool_bytes(config),
-                gpu_owned_bytes=gpu_owned_reservation_bytes(
-                    len(gpu_owned_layer_ids),
-                    config.model_config.num_experts,
-                    per_expert_bytes,
-                ),
-                gpu_owned_layers=tuple(sorted(gpu_owned_layer_ids)),
-                lru_slots=config.moe_cache_size,
-                lru_bytes=config.moe_cache_size * per_expert_bytes,
-                vram_reserve_bytes=int(getattr(config, "moe_vram_reserve_bytes", 0) or 0),
-                headroom_bytes=int(getattr(config, "moe_cache_headroom_bytes", 0) or 0),
+        Called once the KV pool has been sized, so every term is the number the boot actually
+        took. Never fatal: a ledger is a log line, and a bad read must not kill a boot.
+        """
+        inputs = getattr(self, "_vram_ledger_inputs", None)
+        if not inputs:
+            return
+        try:
+            from freetoken.engine.cache_budget import (
+                format_vram_ledger,
+                gpu_owned_reservation_bytes,
+                resolve_vram_reserve_bytes,
             )
-        )
+
+            per_expert_bytes = int(inputs["per_expert_bytes"])
+            owned = tuple(inputs["gpu_owned_layers"])
+            cache_per_page, kv_fixed, _page_tokens, _ = self._pool_cls.kv_cost(config)
+            declared = getattr(config, "moe_vram_reserve_bytes", -1)
+            shadow = getattr(self, "_mtp_shadow_config", None)
+            mtp_resident = bool(
+                getattr(getattr(config, "spec_decode", None), "enabled", False)
+            ) or bool(
+                getattr(shadow, "enabled", False) and getattr(shadow, "resident", False)
+            )
+            logger.info_rank0(
+                format_vram_ledger(
+                    total_bytes=int(self._baseline_free),
+                    weights_bytes=int(self._weights_bytes),
+                    kv_bytes=kv_fixed + int(getattr(self, "num_pages", 0) or 0) * cache_per_page,
+                    gdn_state_bytes=state_pool_bytes(config),
+                    gpu_owned_bytes=gpu_owned_reservation_bytes(
+                        len(owned), config.model_config.num_experts, per_expert_bytes
+                    ),
+                    gpu_owned_layers=owned,
+                    lru_slots=config.moe_cache_size,
+                    lru_bytes=config.moe_cache_size * per_expert_bytes,
+                    vram_reserve_bytes=resolve_vram_reserve_bytes(
+                        int(-1 if declared is None else declared), mtp_resident=mtp_resident
+                    ),
+                    headroom_bytes=int(getattr(config, "moe_cache_headroom_bytes", 0) or 0),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 -- a log block must never fail a boot
+            logger.info_rank0(f"VRAM ledger unavailable: {exc!r}")
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         # A model may fully own cache construction via make_offload_moe_cache.
@@ -932,7 +978,7 @@ class Engine:
                         config.moe_cache_size,
                     )
                 )
-            self._log_vram_ledger(config, banks, gpu_owned_layer_ids)
+            self._stash_vram_ledger_inputs(banks, gpu_owned_layer_ids)
         else:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
@@ -2032,7 +2078,7 @@ def _gpu_owned_lru_slots(config: EngineConfig, owned_layers: int) -> int:
     )
 
 
-def _post_cache_reserved_bytes(config: EngineConfig) -> int:
+def _post_cache_reserved_bytes(config: EngineConfig, *, mtp_resident: bool) -> int:
     """The declared post-cache VRAM reservation plus the required headroom.
 
     The single place reservations made AFTER the MoE cache is sized are declared: the
@@ -2040,16 +2086,20 @@ def _post_cache_reserved_bytes(config: EngineConfig) -> int:
     ``_init_offload_moe_cache`` on purpose), the decode/spec/draft CUDA-graph pools and the
     vision layer-stream workspace. Read through ``getattr`` so a hand-built stub config
     (tests, the shadow tooling) that predates the fields keeps the old behaviour.
+
+    ``mtp_resident`` says whether the draft head is part of THIS boot; at the ``-1`` auto
+    default its bytes are only reserved when something is going to allocate them.
     """
     from freetoken.engine.cache_budget import (
         DEFAULT_MOE_CACHE_HEADROOM_BYTES,
-        DEFAULT_MOE_VRAM_RESERVE_BYTES,
         post_cache_reserved_bytes,
+        resolve_vram_reserve_bytes,
     )
 
+    declared = getattr(config, "moe_vram_reserve_bytes", -1)
     return post_cache_reserved_bytes(
-        vram_reserve_bytes=int(
-            getattr(config, "moe_vram_reserve_bytes", DEFAULT_MOE_VRAM_RESERVE_BYTES) or 0
+        vram_reserve_bytes=resolve_vram_reserve_bytes(
+            int(-1 if declared is None else declared), mtp_resident=mtp_resident
         ),
         headroom_bytes=int(
             getattr(config, "moe_cache_headroom_bytes", DEFAULT_MOE_CACHE_HEADROOM_BYTES) or 0

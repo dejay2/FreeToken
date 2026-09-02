@@ -94,10 +94,44 @@ def gpu_owned_reservation_slots(owned_layers: int, num_experts: int) -> int:
 #:     on purpose, so its bytes cannot be measured before the cache exists;
 #:   * the MTP spec/draft CUDA-graph pools and the decode graph pool;
 #:   * the vision layer-stream encoder's transient workspace.
-#: 3 GiB covers the measured draft head with room for the graph pools; boots without
-#: speculation or vision simply leave it unspent (it is not allocated, only not spent on
-#: expert slots). Override with ``--moe-vram-reserve-bytes``.
-DEFAULT_MOE_VRAM_RESERVE_BYTES = 3 << 30
+#: 3 GiB covers the measured draft head with room for the graph pools. It is the reserve of
+#: a boot that runs speculation; :func:`auto_vram_reserve_bytes` composes the reserve a given
+#: boot actually needs out of the two components below. Override with
+#: ``--moe-vram-reserve-bytes``.
+#:
+#: The draft-head half: 2.25 GiB, the 2.17 GiB measured resident head plus its slack. Only
+#: allocated when integrated speculation (or the MTP shadow observer) is on, so a boot
+#: without either must not be charged for it -- 2.25 GiB is ~850 expert slots on this
+#: geometry, and reserving bytes nothing will allocate is the same sizing error as spending
+#: bytes something will.
+MTP_DRAFT_HEAD_RESERVE_BYTES = 9 << 28
+#: The always-on half: 0.75 GiB for the decode/spec/draft CUDA-graph pools and the vision
+#: layer-stream encoder's transient workspace. Charged on every boot -- the decode graph pool
+#: exists whatever else is switched off.
+GRAPH_POOL_RESERVE_BYTES = 3 << 28
+DEFAULT_MOE_VRAM_RESERVE_BYTES = MTP_DRAFT_HEAD_RESERVE_BYTES + GRAPH_POOL_RESERVE_BYTES
+
+
+def auto_vram_reserve_bytes(*, mtp_resident: bool) -> int:
+    """The post-cache reserve for a boot with these features on (``--moe-vram-reserve-bytes``
+    left at its ``-1`` auto default).
+
+    ``mtp_resident`` is whether a resident MTP draft head will be built after the cache:
+    integrated speculation (``config.spec_decode.enabled``) or the MTP shadow observer.
+    """
+    return GRAPH_POOL_RESERVE_BYTES + (MTP_DRAFT_HEAD_RESERVE_BYTES if mtp_resident else 0)
+
+
+def resolve_vram_reserve_bytes(declared: int, *, mtp_resident: bool) -> int:
+    """``--moe-vram-reserve-bytes`` as the budget sees it: ``-1`` = auto, else taken as typed
+    (``0`` restores the pre-2026-09 behaviour of reserving nothing)."""
+    if declared == -1:
+        return auto_vram_reserve_bytes(mtp_resident=mtp_resident)
+    if declared < 0:
+        raise ValueError(
+            f"--moe-vram-reserve-bytes must be >= 0, or -1 for auto, got {declared}"
+        )
+    return declared
 
 #: Default free-VRAM headroom the MoE cache must leave after every known reservation, in
 #: bytes. 1.5 GiB: every healthy configuration measured on this box peaked at 1.3-1.4 GiB

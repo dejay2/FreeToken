@@ -600,7 +600,9 @@ def parse_args(
             "cache is sized: the integrated MTP resident draft head (2.17 GiB measured on "
             "an RTX 5090), the decode/spec/draft CUDA-graph pools and the vision "
             "layer-stream workspace. Respected by both --moe-cache-auto and an explicit "
-            "--moe-cache-size. Default 3 GiB; 0 restores the pre-2026-09 behaviour."
+            "--moe-cache-size. Default -1 = auto: 0.75 GiB for the graph pools plus 2.25 "
+            "GiB for the draft head when speculation is on (3 GiB together). 0 reserves "
+            "nothing, which restores the pre-2026-09 behaviour."
         ),
     )
 
