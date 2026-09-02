@@ -37,7 +37,8 @@ without an intervening reset: `union`.
 
 Raw data and the two scripts are in [`routing-skew-2026-09-02/`](routing-skew-2026-09-02/)
 (`code|prose|chat8k|toolcall|union.json` = the server's reply verbatim, including
-`decode_freq`; `analysis.json` = the derived numbers below; `collect.py`, `analyze.py`).
+`decode_freq`; `analysis.json` = the derived numbers below; `collect.py`, `analyze.py`;
+`boot-parallel-memory.csv` = the 3 s standby/RAM/GPU trace of this boot).
 
 Two caveats on every number here. The histogram is counted in `ensure_experts`, which the
 MTP draft/verify path also drives, so **rejected speculative tokens are counted too**; and
