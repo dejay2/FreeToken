@@ -363,7 +363,11 @@ def load_weight(
     # fails loudly in load_state_dict (strict missing/unexpected expert keys), so the reader
     # just yields the stored weight tensors regardless of the include_moe_experts flag.
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, iter_ftw_weights
-    from freetoken.models.config import VISION_KEY_PREFIXES, vision_load_enabled
+    from freetoken.models.config import (
+        VISION_KEY_PREFIXES,
+        vision_load_enabled,
+        vision_weights_backing,
+    )
 
     if is_ftw_checkpoint(model_path):
         # The FTW dense shard stores whatever existed at conversion, including the vision
@@ -371,6 +375,14 @@ def load_weight(
         # model never builds the tower, so replaying those tensors would trip load_state_dict's
         # strict unexpected-key check. Skip them here to match the model the engine built.
         skip_vision = not vision_load_enabled()
+        if not skip_vision and vision_weights_backing() == "mmap":
+            # This reader replays post-iter_weights tensors and never reaches the per-model
+            # one that builds the mapping, so there is nothing to map. An optimization is
+            # not worth failing a boot over.
+            logger.warning(
+                "FREETOKEN_VISION_WEIGHTS=mmap does not apply to an FTW checkpoint; "
+                "serving the picture weights from resident RAM"
+            )
         for name, tensor in iter_ftw_weights(model_path):
             if skip_vision and name.startswith(VISION_KEY_PREFIXES):
                 continue

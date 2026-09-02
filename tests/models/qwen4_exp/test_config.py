@@ -9,6 +9,7 @@ from freetoken.models.config import (
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
     vision_execution_mode,
+    vision_weights_backing,
 )
 from freetoken.models.qwen4_exp.config import parse_config
 
@@ -122,6 +123,54 @@ def test_picture_execution_rejects_unknown_value(monkeypatch):
     monkeypatch.setenv("FREETOKEN_VISION_EXECUTION", "cpu")
     with pytest.raises(ValueError, match="gpu.*layer-stream"):
         vision_execution_mode()
+
+
+@pytest.fixture
+def _picture_env(monkeypatch):
+    """The gates ``mmap`` requires: picture input on, streamed execution."""
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+    monkeypatch.setenv("FREETOKEN_VISION_EXECUTION", "layer-stream")
+
+
+def test_picture_weights_default_to_resident_ram(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_VISION_WEIGHTS", raising=False)
+    assert vision_weights_backing() == "ram"
+
+
+def test_picture_weights_accepts_ram_and_mmap(monkeypatch, _picture_env):
+    for value, expected in (("ram", "ram"), ("MMAP", "mmap"), (" mmap ", "mmap")):
+        monkeypatch.setenv("FREETOKEN_VISION_WEIGHTS", value)
+        assert vision_weights_backing() == expected
+
+
+def test_picture_weights_rejects_unknown_value(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_VISION_WEIGHTS", "disk")
+    with pytest.raises(ValueError, match="mmap.*ram"):
+        vision_weights_backing()
+
+
+def test_mapped_picture_weights_require_picture_input(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_VISION_WEIGHTS", "mmap")
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "0")
+    monkeypatch.setenv("FREETOKEN_VISION_EXECUTION", "layer-stream")
+    with pytest.raises(ValueError, match="FREETOKEN_LOAD_VISION=1"):
+        vision_weights_backing()
+
+
+def test_mapped_picture_weights_require_layer_stream_execution(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_VISION_WEIGHTS", "mmap")
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+    monkeypatch.setenv("FREETOKEN_VISION_EXECUTION", "gpu")
+    with pytest.raises(ValueError, match="layer-stream"):
+        vision_weights_backing()
+
+
+def test_resident_picture_weights_need_no_other_gate(monkeypatch):
+    """``ram`` is the default everywhere, including a text-only boot."""
+    monkeypatch.setenv("FREETOKEN_VISION_WEIGHTS", "ram")
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "0")
+    monkeypatch.setenv("FREETOKEN_VISION_EXECUTION", "gpu")
+    assert vision_weights_backing() == "ram"
 
 
 def test_picture_configuration_is_off_by_default(monkeypatch):

@@ -400,12 +400,7 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
-        self.model.load_state_dict(self._load_weight_state_dict(config))
-        placement_report = getattr(self.model, "weight_placement_report", None)
-        if callable(placement_report):
-            report = placement_report()
-            if report:
-                logger.info_rank0(report)
+        self._install_model_weights(config)
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -592,6 +587,28 @@ class Engine:
             tp_cpu_group = torch.distributed.new_group(backend="gloo")
             assert tp_cpu_group is not None
         return tp_cpu_group
+
+    def _install_model_weights(self, config: EngineConfig) -> None:
+        """Load the weights, let the model adopt the weight sources it built while loading,
+        then log where everything landed -- in that order.
+
+        ``adopt_weight_sources`` exists for state the loader creates but the state dict
+        cannot carry: qwen4_exp's memory-mapped picture-weight holder is built inside
+        ``iter_weights`` and has to reach the vision tower, which is what lets it prefetch
+        its extent. It has to happen before the placement report, because the report
+        describes what those sources decided; adopting later (it used to ride along in
+        ``load_host_tables``) made every mapped boot log ``backing=ram`` while the mapping
+        was live.
+        """
+        self.model.load_state_dict(self._load_weight_state_dict(config))
+        adopt = getattr(self.model, "adopt_weight_sources", None)
+        if callable(adopt):
+            adopt(config)
+        placement_report = getattr(self.model, "weight_placement_report", None)
+        if callable(placement_report):
+            report = placement_report()
+            if report:
+                logger.info_rank0(report)
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()

@@ -273,10 +273,22 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             nbytes += tensor.numel() * tensor.element_size()
             devices.add(tensor.device.type)
         lines.append(
-            f"Picture weights: mode={self._vision_execution}, tensors={count}, "
+            f"Picture weights: mode={self._vision_execution}, "
+            f"backing={self.visual.weight_backing()}, tensors={count}, "
             f"bytes={nbytes}, devices={','.join(sorted(devices))}"
         )
         return "\n".join(lines)
+
+    def prefetch_picture_weights(self) -> None:
+        """Scheduler hook: start reading the picture weights when a picture is admitted.
+
+        A no-op unless the weights are mapped. Called through ``getattr`` by the scheduler,
+        so the engine never learns a Qwen-specific name -- same wiring as
+        ``weight_device_for_key``.
+        """
+        visual = getattr(self, "visual", None)
+        if visual is not None:
+            visual.prefetch_weights()
 
     @torch.inference_mode()
     def encode_images(
@@ -325,6 +337,24 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
         pinned = copy_to_pinned_tensor(embed.weight.contiguous())
         return embed.attach_host_table(pinned, torch.device("cuda", torch.cuda.current_device()))
+
+    def adopt_weight_sources(self, engine_config) -> None:
+        """Engine hook, straight after the weights load: hand the tower the mapping the
+        loader built, so it can prefetch its extent.
+
+        The same holder ``iter_weights`` used to install the views -- cached per checkpoint
+        folder, so this is a lookup, not a second mapping. Nothing to do when the picture
+        weights are resident: that covers ``ram`` mode, an FTW checkpoint, and a mapping the
+        OS refused. Runs before ``weight_placement_report``, which reports what it decided.
+        """
+        visual = getattr(self, "visual", None)
+        if visual is None:
+            return
+        from .weight import mmap_vision_weights
+
+        source = mmap_vision_weights(engine_config.model_path)
+        if source is not None:
+            visual.attach_weight_source(source)
 
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE table (and any host-resident embedding) and return pinned bytes."""

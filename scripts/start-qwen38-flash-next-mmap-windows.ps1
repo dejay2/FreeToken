@@ -22,6 +22,14 @@ param(
     [ValidateSet('layer-stream', 'gpu')]
     [string]$VisionExecution = 'layer-stream',
 
+    # Where the 856 MiB of picture weights live. 'ram' reads them into process memory at
+    # boot and holds them for the life of the server, even for text-only sessions. 'mmap'
+    # maps their extent of the bf16 shard copy-on-write and faults it in only when a
+    # picture arrives, handing that 856 MiB back to the standby list the 47.7 GiB PLE table
+    # is served from. Layer-stream picture execution only.
+    [ValidateSet('ram', 'mmap')]
+    [string]$VisionWeights = 'ram',
+
     [switch]$EnableCacheReport,
 
     # Weight-only int8 for every dense projection the checkpoint ships bf16 (GDN, QSA,
@@ -109,6 +117,11 @@ $env:CUDA_PATH = (Resolve-Path -LiteralPath $cudaRoot).Path
 
 $pathParts = @($shimDir)
 if ($EnableVision) {
+    # Cheap argument check before the package probe below, so a bad combination reports
+    # itself instead of a torchvision traceback.
+    if ($VisionWeights -eq 'mmap' -and $VisionExecution -ne 'layer-stream') {
+        throw "-VisionWeights mmap needs -VisionExecution layer-stream (got '$VisionExecution'). In gpu mode every picture tensor is copied to CUDA at load, so the mapping would be read once and then be dead address space."
+    }
     if (-not (Test-Path -LiteralPath $VisionPackagesPath -PathType Container)) {
         throw "Local picture packages do not exist: $VisionPackagesPath. Run install-qwen38-vision-deps-windows.ps1 first."
     }
@@ -127,11 +140,13 @@ if ($EnableVision) {
     $pathParts += $resolvedVisionPackages
     $env:FREETOKEN_LOAD_VISION = '1'
     $env:FREETOKEN_VISION_EXECUTION = $VisionExecution
+    $env:FREETOKEN_VISION_WEIGHTS = $VisionWeights
 }
 else {
     # Make the fallback deterministic even if the parent shell previously ran picture mode.
     $env:FREETOKEN_LOAD_VISION = '0'
     $env:FREETOKEN_VISION_EXECUTION = 'gpu'
+    $env:FREETOKEN_VISION_WEIGHTS = 'ram'
 }
 # Switches only ever SET these; an operator who exported the env vars keeps them.
 if ($DenseQuant -ne '') { $env:FREETOKEN_DENSE_QUANT = $DenseQuant }
@@ -147,6 +162,7 @@ Write-Host "  Active requests: $MaxRunningRequests"
 Write-Host "  MoE cache slots: $(if ($MoECacheSize -gt 0) { $MoECacheSize } else { 'auto' })"
 Write-Host "  Picture input: $($EnableVision.IsPresent)"
 Write-Host "  Picture execution: $(if ($EnableVision) { $VisionExecution } else { 'disabled' })"
+Write-Host "  Picture weights: $(if ($EnableVision) { $VisionWeights } else { 'disabled' })"
 Write-Host 'FreeToken Desktop supplies the Windows runtime but does not need to be open.'
 
 # --moe-cache-size and --moe-cache-auto are mutually exclusive; an explicit size opts out

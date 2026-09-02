@@ -153,6 +153,74 @@ def test_scheduler_still_rejects_picture_prompt_at_combined_context_limit():
     assert message.mm_token_type_ids is None
 
 
+# --------------------------------------------------------------------------------------
+# The picture-weight prefetch hook
+# --------------------------------------------------------------------------------------
+
+
+def _scheduler_with_prefetch(prefetch_error: Exception | None = None):
+    """A model that also offers the optional ``prefetch_picture_weights`` hook."""
+    order = []
+
+    class Model:
+        def prefetch_picture_weights(self):
+            order.append("prefetch")
+            if prefetch_error is not None:
+                raise prefetch_error
+
+        def encode_images(self, pixels, grid):
+            order.append("encode")
+            return torch.arange(4 * 8, dtype=torch.float32).view(4, 8)
+
+    scheduler, _calls, added, sent = _scheduler()
+    scheduler.engine = SimpleNamespace(max_seq_len=262_144, model=Model())
+    return scheduler, order, added, sent
+
+
+def test_scheduler_prefetches_picture_weights_once_before_encoding():
+    """In mmap mode the ~856 MiB extent may be entirely non-resident. The syscall returns
+    while the reads continue, so issuing it at admission overlaps the read with the encode's
+    own GPU work -- which only helps if it happens before the encode, exactly once."""
+    scheduler, order, added, sent = _scheduler_with_prefetch()
+
+    Scheduler._process_one_msg(scheduler, _message(uid=11))
+
+    assert order == ["prefetch", "encode"]
+    assert len(added) == 1 and not sent
+
+
+def test_scheduler_prefetches_once_per_picture_request():
+    scheduler, order, added, _sent = _scheduler_with_prefetch()
+
+    Scheduler._process_one_msg(scheduler, _message(uid=12))
+    Scheduler._process_one_msg(scheduler, _message(uid=13))
+
+    assert order == ["prefetch", "encode", "prefetch", "encode"]
+    assert len(added) == 2
+
+
+def test_a_failing_prefetch_never_costs_the_request():
+    """The prefetch is an optimization. Losing it costs latency, not the picture."""
+    scheduler, order, added, sent = _scheduler_with_prefetch(
+        prefetch_error=OSError("no working set quota")
+    )
+
+    Scheduler._process_one_msg(scheduler, _message(uid=14))
+
+    assert order == ["prefetch", "encode"]
+    assert len(added) == 1 and not sent
+
+
+def test_a_model_without_the_prefetch_hook_still_admits_pictures():
+    """``ram`` mode and every non-Qwen multimodal model: the hook is optional."""
+    scheduler, calls, added, sent = _scheduler()
+    assert not hasattr(scheduler.engine.model, "prefetch_picture_weights")
+
+    Scheduler._process_one_msg(scheduler, _message(uid=15))
+
+    assert len(calls) == 1 and len(added) == 1 and not sent
+
+
 def test_prefill_marks_picture_request_private_then_releases_soft_embeddings_after_gather():
     message = _message(uid=4)
     message.mm_embeds = torch.ones(4, 8)

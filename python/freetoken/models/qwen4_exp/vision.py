@@ -200,6 +200,11 @@ class Qwen4VisionModel(BaseOP):
     def __init__(self, config: Qwen4VisionConfig):
         self._config = config
         self._active_stream_workspace: dict[str, BaseOP] | None = None
+        # Set only in FREETOKEN_VISION_WEIGHTS=mmap, by the loader that installed the views
+        # (see weight.MmapVisionWeights). ``_``-prefixed so BaseOP.state_dict skips it and
+        # the mapping stays invisible to state_dict, load_state_dict and the placement
+        # report -- and so the mapping outlives every view built over it.
+        self._weight_source = None
         self.patch_embed = Qwen4VisionPatchEmbed(config)
         self.pos_embed = _Embedding(config.num_position_embeddings, config.hidden_size)
         self.blocks = OPList([Qwen4VisionBlock(config) for _ in range(config.depth)])
@@ -215,6 +220,29 @@ class Qwen4VisionModel(BaseOP):
         # value is derived, not loaded from the checkpoint, so keep only its
         # shape here and materialize the tiny frequency vector on the real device.
         self._inv_dim = self.head_dim // 2
+
+    def attach_weight_source(self, source) -> None:
+        """Adopt the mapping the loader built, so the encode can prefetch its pages."""
+        self._weight_source = source
+
+    def weight_backing(self) -> str:
+        """``mmap`` when the persistent picture weights are mapped views, else ``ram``."""
+        return "ram" if self._weight_source is None else "mmap"
+
+    def prefetch_weights(self) -> bool:
+        """Ask the OS to start reading the picture weights. A no-op in ``ram`` mode.
+
+        Idempotent for the duration of one picture: the scheduler issues this at admission
+        and the streamed encode issues it again at entry.
+        """
+        source = self._weight_source
+        return False if source is None else source.prefetch()
+
+    def release_weight_prefetch(self) -> None:
+        """End of encode: let the next picture issue its own prefetch."""
+        source = self._weight_source
+        if source is not None:
+            source.release_prefetch()
 
     def _position_data(self, grid_thw: torch.Tensor, dtype: torch.dtype):
         from transformers.vision_utils import (
@@ -275,38 +303,47 @@ class Qwen4VisionModel(BaseOP):
         device: torch.device,
     ) -> torch.Tensor:
         """Run a CPU-resident picture reader through one bounded GPU component."""
-        if self.deepstack_visual_indexes:
-            raise ValueError(
-                "layer-stream does not support non-empty deepstack_visual_indexes"
-            )
-        if device.type != "cuda":
-            raise ValueError("layer-stream picture execution requires a CUDA device")
-        if self._active_stream_workspace is not None:
-            raise RuntimeError("layer-stream picture execution is already active")
-        source_devices = {tensor.device.type for tensor in self.state_dict().values()}
-        if source_devices != {"cpu"}:
-            raise RuntimeError(
-                "layer-stream picture weights must all be CPU-resident, got "
-                f"{sorted(source_devices)}"
-            )
-
-        workspace: dict[str, BaseOP] = {}
-        self._active_stream_workspace = workspace
+        # The encode's first act, before any validation: in mmap mode the ~856 MiB extent
+        # may be entirely non-resident, and the call returns while the reads continue, so
+        # the earliest issue wins the most overlap. Idempotent -- the scheduler normally
+        # already issued it at admission -- and the outer finally releases it so the next
+        # picture prefetches again however this one ends.
+        self.prefetch_weights()
         try:
-            return self._forward_layer_streamed_impl(
-                pixel_values,
-                grid_thw,
-                device=device,
-                workspace=workspace,
-            )
+            if self.deepstack_visual_indexes:
+                raise ValueError(
+                    "layer-stream does not support non-empty deepstack_visual_indexes"
+                )
+            if device.type != "cuda":
+                raise ValueError("layer-stream picture execution requires a CUDA device")
+            if self._active_stream_workspace is not None:
+                raise RuntimeError("layer-stream picture execution is already active")
+            source_devices = {tensor.device.type for tensor in self.state_dict().values()}
+            if source_devices != {"cpu"}:
+                raise RuntimeError(
+                    "layer-stream picture weights must all be CPU-resident, got "
+                    f"{sorted(source_devices)}"
+                )
+
+            workspace: dict[str, BaseOP] = {}
+            self._active_stream_workspace = workspace
+            try:
+                return self._forward_layer_streamed_impl(
+                    pixel_values,
+                    grid_thw,
+                    device=device,
+                    workspace=workspace,
+                )
+            finally:
+                # The implementation has its own frame so every patch/block/merger and
+                # hidden tensor is unreachable before empty_cache runs. Measurements on the
+                # live server showed that retaining this ~631 MiB allocator segment reduced
+                # subsequent text throughput below the acceptance threshold.
+                workspace.clear()
+                self._active_stream_workspace = None
+                torch.cuda.empty_cache()
         finally:
-            # The implementation has its own frame so every patch/block/merger and hidden
-            # tensor is unreachable before empty_cache runs. Measurements on the live server
-            # showed that retaining this ~631 MiB allocator segment reduced subsequent text
-            # throughput below the acceptance threshold.
-            workspace.clear()
-            self._active_stream_workspace = None
-            torch.cuda.empty_cache()
+            self.release_weight_prefetch()
 
     def _forward_layer_streamed_impl(
         self,

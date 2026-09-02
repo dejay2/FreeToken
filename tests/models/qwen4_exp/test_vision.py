@@ -259,6 +259,189 @@ def test_layer_stream_rejects_deepstack_before_allocating_workspace():
     assert source._active_stream_workspace is None
 
 
+# --------------------------------------------------------------------------------------
+# Picture weights served from a mapping: the prefetch handshake
+# --------------------------------------------------------------------------------------
+
+
+class _RecordingSource:
+    """Stands in for ``MmapVisionWeights``: records the prefetch handshake, maps nothing."""
+
+    def __init__(self, calls: list[str], *, succeeds: bool = True) -> None:
+        self.calls = calls
+        self._succeeds = succeeds
+
+    def prefetch(self) -> bool:
+        self.calls.append("prefetch")
+        return self._succeeds
+
+    def release_prefetch(self) -> None:
+        self.calls.append("release")
+
+
+def test_picture_weight_prefetch_is_a_no_op_in_resident_mode():
+    """``ram`` mode attaches no source, and the encode must not care."""
+    source = _cpu_stream_source(_stream_config(depth=1))
+    assert source.prefetch_weights() is False
+    assert source.release_weight_prefetch() is None
+
+
+def test_attached_weight_source_receives_the_prefetch():
+    calls: list[str] = []
+    source = _cpu_stream_source(_stream_config(depth=1))
+    source.attach_weight_source(_RecordingSource(calls))
+
+    assert source.prefetch_weights() is True
+    source.release_weight_prefetch()
+    assert calls == ["prefetch", "release"]
+
+
+def test_a_failed_prefetch_is_reported_but_never_raises():
+    source = _cpu_stream_source(_stream_config(depth=1))
+    source.attach_weight_source(_RecordingSource([], succeeds=False))
+    assert source.prefetch_weights() is False
+
+
+def test_the_weight_source_is_invisible_to_the_state_dict():
+    """It hangs off a ``_``-prefixed attribute, so ``BaseOP.state_dict`` skips it and
+    ``load_state_dict``'s strict key check never sees it."""
+    source = _cpu_stream_source(_stream_config(depth=1))
+    before = set(source.state_dict())
+    source.attach_weight_source(_RecordingSource([]))
+
+    state = source.state_dict()
+    assert set(state) == before
+    assert all(isinstance(value, torch.Tensor) for value in state.values())
+
+
+def test_streamed_encode_prefetches_at_entry_and_releases_on_every_exit():
+    """The prefetch is the encode's first act -- in ``mmap`` mode the whole 856 MiB extent
+    may be non-resident and the syscall returns while the reads continue -- and it is
+    released however the encode ends, so the next picture issues its own."""
+    calls: list[str] = []
+    source = _cpu_stream_source(_stream_config(depth=1))
+    source.attach_weight_source(_RecordingSource(calls))
+
+    with pytest.raises(ValueError, match="requires a CUDA device"):
+        source.forward_layer_streamed(
+            torch.randn(16, 24),
+            torch.tensor([[1, 4, 4]], dtype=torch.long),
+            device=torch.device("cpu"),
+        )
+
+    assert calls == ["prefetch", "release"]
+    assert source._active_stream_workspace is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
+def test_streamed_encode_from_mapped_sources_prefetches_exactly_once():
+    torch.manual_seed(31)
+    calls: list[str] = []
+    source = _cpu_stream_source(_stream_config(depth=2))
+    source.attach_weight_source(_RecordingSource(calls))
+
+    features = source.forward_layer_streamed(
+        torch.randn(16, 24, dtype=torch.bfloat16),
+        torch.tensor([[1, 4, 4]], dtype=torch.long),
+        device=torch.device("cuda"),
+    )
+
+    assert features.device.type == "cuda"
+    assert calls == ["prefetch", "release"]
+
+
+def _mapped_tower(tmp_path, config: Qwen4VisionConfig, resident: Qwen4VisionModel):
+    """Write ``resident``'s weights out as a checkpoint shard, map it, and load the views
+    into a second tower -- what ``iter_weights`` + ``load_state_dict`` do in ``mmap`` mode."""
+    from freetoken.models.qwen4_exp import weight as weight_mod
+
+    from .common import write_safetensors_shard
+
+    tensors = {f"model.visual.{name}": t for name, t in resident.state_dict().items()}
+    write_safetensors_shard(str(tmp_path / "model-bf16-00001.safetensors"), tensors)
+    source = weight_mod.MmapVisionWeights(weight_mod._vision_layout(str(tmp_path)))
+    with torch.device("cpu"), torch_dtype(torch.bfloat16):
+        mapped = Qwen4VisionModel(config)
+    mapped.load_state_dict(
+        {name[len("visual.") :]: source.tensor(name) for name in source.names}
+    )
+    mapped.attach_weight_source(source)
+    return mapped, source
+
+
+def _assert_component_copies(config, resident, mapped, source) -> None:
+    """Every component of ``mapped`` copies into a fresh workspace bit-identically to
+    ``resident``'s, and no source view leaves the mapping. Its own frame, so every borrowed
+    view is unreachable by the time the caller unmaps."""
+    pairs = [
+        ("patch_embed", resident.patch_embed, mapped.patch_embed),
+        ("merger", resident.merger, mapped.merger),
+    ]
+    pairs += [
+        (f"blocks.{i}", resident.blocks.op_list[i], mapped.blocks.op_list[i])
+        for i in range(config.depth)
+    ]
+    for label, want, got in pairs:
+        before = {key: tensor.data_ptr() for key, tensor in got.state_dict().items()}
+        with torch.device("cpu"), torch_dtype(torch.bfloat16):
+            target = type(want)(config)
+        _copy_component_state_(target, got)
+
+        for key, tensor in target.state_dict().items():
+            expected = want.state_dict()[key]
+            assert torch.equal(
+                tensor.view(torch.int16), expected.view(torch.int16)
+            ), f"{label}.{key}"
+        for key, tensor in got.state_dict().items():
+            assert tensor.data_ptr() == before[key], f"{label}.{key} moved"
+            assert source.contains(tensor.data_ptr()), f"{label}.{key} left the mapping"
+
+
+def test_component_copies_from_mapped_weights_are_bit_identical(tmp_path):
+    """The streamed encode's only real operation on a picture weight is
+    ``target.copy_(source)``, and in mmap mode every source is a 2-byte-misaligned bf16 view
+    of a read-only file page. Prove the copy lands the exact bytes for every component, and
+    that copying did not write THROUGH the view.
+
+    The device is CPU here so this runs without a GPU; production copies into a CUDA
+    workspace, which is the same ``copy_`` with a different target device.
+    """
+    torch.manual_seed(37)
+    config = _stream_config(depth=3)
+    resident = _cpu_stream_source(config)
+    mapped, source = _mapped_tower(tmp_path, config, resident)
+    try:
+        _assert_component_copies(config, resident, mapped, source)
+    finally:
+        # A live view holds an exported buffer over the mapping, so the tower has to go
+        # before it can be unmapped. See MmapVisionWeights.close.
+        del mapped
+        source.close()
+
+
+def _assert_tower_state(resident, mapped, source) -> None:
+    state = mapped.state_dict()
+    assert set(state) == set(resident.state_dict())
+    assert {tensor.device.type for tensor in state.values()} == {"cpu"}
+    assert mapped.weight_backing() == "mmap"
+    outside = [key for key, tensor in state.items() if not source.contains(tensor.data_ptr())]
+    assert outside == ["pos_embed.weight"]
+
+
+def test_mapped_weights_reach_the_tower_where_the_resident_ones_did(tmp_path):
+    """``BaseOP.load_state_dict`` setattrs the loaded object itself, so the module attribute
+    IS the mapped view -- and the whole tower still reports CPU, which is what
+    ``forward_layer_streamed``'s residency guard checks."""
+    config = _stream_config(depth=2)
+    resident = _cpu_stream_source(config)
+    mapped, source = _mapped_tower(tmp_path, config, resident)
+    try:
+        _assert_tower_state(resident, mapped, source)
+    finally:
+        del mapped
+        source.close()
+
+
 def test_qwen_picture_encoding_owns_input_and_output_placement():
     calls = []
 
