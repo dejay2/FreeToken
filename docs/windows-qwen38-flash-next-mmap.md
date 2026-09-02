@@ -433,17 +433,47 @@ enough because first-use kernels may need `nvcc.exe`.
 
 ### Port already occupied
 
-Inspect the local ports before stopping anything:
+The usual cause is a leftover `python.exe ... spawn_main` child: the launcher was killed
+from the console, its `multiprocessing` children outlived it as orphans, and they still
+hold the ZMQ side ports, so the next boot dies with
+
+```
+ZMQError: Address in use (tcp://127.0.0.1:2033)
+```
+
+Use the stop script rather than a `taskkill` by image name -- `ft.exe`, the FreeToken
+Desktop daemon on port 1900, also has `freetoken.cli serve` in its command line, and killing
+it takes the Windows runtime down with it:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+  .\scripts\stop-qwen38-flash-next-windows.ps1 -Port 2020
+```
+
+It selects `python.exe` / `pythonw.exe` running `freetoken.cli serve` on that port, every
+python descendant of those to any depth, and any orphaned `spawn_main` python whose parent
+no longer exists; it never touches a non-python process. It prints what it will kill, kills
+it, then waits (up to `-TimeoutSeconds`, default 120) until `nvidia-smi` reports less than
+`-VramFreeThresholdMB` (default 3072) in use **and** nothing is listening on the port or the
+nine ZMQ side ports above it, and reports which of the two is still holding. Exit code 0
+means settled; 1 means it timed out. `-Port 0` (the default) takes every FreeToken server on
+the box; `-DryRun` prints the selection and stops.
+
+Waiting matters: the card is only really free once the driver has torn the context down, and
+booting into a half-released card is how the last expert bank dies in `cudaHostRegister
+failed ... out of memory`.
+
+To inspect the ports by hand instead:
 
 ```powershell
 Get-NetTCPConnection -State Listen |
   Where-Object LocalPort -ge 2020 |
-  Where-Object LocalPort -le 2026 |
+  Where-Object LocalPort -le 2029 |
   Select-Object LocalAddress, LocalPort, OwningProcess
 ```
 
 Confirm the owning command is a stale FreeToken process before stopping it.
-The server uses the requested API port and nearby worker ports through `+6`.
+The server uses the requested API port and nearby worker ports through `+9`.
 
 ### First request is slower
 
