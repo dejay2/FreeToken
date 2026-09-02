@@ -778,7 +778,7 @@ Claude-Session: https://claude.ai/code/session_01Hnf1bGBLU4HLq9uHPtNjwU
   - `_note_decode_routing(layer_id, expert_ids) -> None`
   - `decode_miss_stats_per_layer()` rows carry `"resident": bool` and `"miss_rate": None` for owned layers
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/moe/test_offload.py`:
 
@@ -973,7 +973,7 @@ Add the `Stat` import that `tests/moe/test_offload.py` does not yet have -- put 
 from flashlib.kernels.slot_cache import Stat
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -991,7 +991,7 @@ Expected failures:
   `AssertionError: ('gate_up', 1, torch.Size([4, 32, 8]), torch.float32)` from the head-shape
   check that still keys on layer 0).
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/freetoken/moe/host_banks.py` -- extend the enum (after `PAGEABLE = "pageable"`, line 60):
 
@@ -1320,7 +1320,7 @@ after `bank_views` (line 793):
         C = max(1, int(round(slots_per_layer)))
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -1328,7 +1328,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 & "$env:LOCALAPPDATA\FreeToken\venv\Scripts\python.exe" -m pytest tests/moe/test_offload.py tests/moe/test_routing_stats.py tests/moe/test_hybrid_fetch.py tests/moe/test_prefill_hit_d2d.py -q -p no:cacheprovider
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add python/freetoken/moe/host_banks.py python/freetoken/moe/offload_cache.py tests/moe/test_offload.py

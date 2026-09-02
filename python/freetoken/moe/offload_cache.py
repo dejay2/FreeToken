@@ -154,6 +154,15 @@ class OffloadMoeCache:
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-backend cpu case).
         self.cpu_layer_ids: frozenset = frozenset()
+        # MoE layer ids whose full expert set is permanently VRAM-resident: no host bank, no
+        # LRU slot, no copy plan row. Set by the engine BEFORE set_bank_sources (like
+        # cpu_layer_ids), which validates it against the residency labels and stores the
+        # per-layer device banks in resident_banks (schema order) for resident_views().
+        self.gpu_owned_layer_ids: frozenset = frozenset()
+        self.resident_banks: dict[int, tuple[torch.Tensor, ...]] = {}
+        # Index of the lowest STREAMING layer: layer 0 is in the default owned set, so every
+        # "read the head layer's geometry" site must use this instead (spec section 11).
+        self._first_streaming_layer = 0
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size)
         assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
@@ -340,6 +349,7 @@ class OffloadMoeCache:
             and 0 <= target_layer < self.num_layers
             and target_layer not in self.prefetch_config.skip_layers
             and target_layer not in self.cpu_layer_ids
+            and target_layer not in self.gpu_owned_layer_ids
             and target_layer not in self._unpinned_layers
             and bool(self.banks)
         )
@@ -495,6 +505,7 @@ class OffloadMoeCache:
         self,
         sources: dict[str, list[torch.Tensor]],
         layer_residency: list[str] | None = None,
+        gpu_owned_layers: "frozenset[int] | None" = None,
     ) -> None:
         """Attach the host (CPU pinned) expert source banks and allocate a GPU slot
         cache per bank, following the format's bank schema.
@@ -508,6 +519,11 @@ class OffloadMoeCache:
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all pinned).
         Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them.
+
+        ``gpu_owned_layers`` (``None`` = use ``self.gpu_owned_layer_ids``, set before this
+        call like ``cpu_layer_ids``) are GPU_OWNED layers: their entries are already-resident
+        device tensors, kept in ``resident_banks`` and read straight by the kernels. They
+        never enter the slot cache, the copy plan, the prefill buffers or the LRU.
         """
         from freetoken.moe.host_banks import HostResidency
 
@@ -517,8 +533,33 @@ class OffloadMoeCache:
         )
         residency = layer_residency or [HostResidency.PINNED.value] * self.num_layers
         assert len(residency) == self.num_layers, (len(residency), self.num_layers)
+        owned = (
+            self.gpu_owned_layer_ids if gpu_owned_layers is None else frozenset(gpu_owned_layers)
+        )
+        labelled = frozenset(
+            i for i, r in enumerate(residency) if r == HostResidency.GPU_OWNED.value
+        )
+        if owned != labelled:
+            raise ValueError(
+                f"gpu_owned_layers {sorted(owned)} disagree with the GPU_OWNED residency "
+                f"labels {sorted(labelled)}: the loader and the cache must name the same set"
+            )
+        clash = sorted(owned & self.cpu_layer_ids)
+        if clash:
+            raise ValueError(
+                f"layers {clash} are both GPU-owned and CPU layers: a VRAM-resident layer "
+                f"has no host bank for the CPU executor to read"
+            )
+        if owned and len(owned) == self.num_layers:
+            raise ValueError(
+                "every MoE layer is GPU-owned; there is no streaming layer left to size the "
+                "slot cache from (drop --moe-gpu-owned-layers or own fewer layers)"
+            )
+        self.gpu_owned_layer_ids = owned
+        self._first_streaming_layer = min(set(range(self.num_layers)) - owned)
         unpinned = frozenset(
-            i for i, r in enumerate(residency) if r != HostResidency.PINNED.value
+            i for i, r in enumerate(residency)
+            if r not in (HostResidency.PINNED.value, HostResidency.GPU_OWNED.value)
         )
         if unpinned:
             if not unpinned <= self.cpu_layer_ids:
@@ -537,10 +578,14 @@ class OffloadMoeCache:
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
-            head = per_layer[0]
+            head = per_layer[self._first_streaming_layer]
             for layer_id, source in enumerate(per_layer):
-                assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
                 assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
+                if layer_id in owned:
+                    # a resident layer's rows never enter the slot cache or a pointer table:
+                    # the kernel indexes them directly, and the loader owns their geometry
+                    continue
+                assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
                 assert source.shape == head.shape and source.dtype == head.dtype, (
                     name, layer_id, source.shape, source.dtype,
                 )
@@ -551,6 +596,10 @@ class OffloadMoeCache:
                 device=self.device,
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
+        self.resident_banks = {
+            layer_id: tuple(self.bank_sources[n][layer_id] for n in self.bank_schema)
+            for layer_id in sorted(owned)
+        }
         self._build_copy_plan()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
@@ -593,12 +642,17 @@ class OffloadMoeCache:
         dst_ptrs, feats = [], []
         layer_src_ptrs = [[] for _ in range(self.num_layers)]
         for per_layer, cache in self.banks:
-            feat = math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
+            # the row geometry of a STREAMING layer: a GPU-owned layer 0 is not a slot-cache
+            # row and need not share its shape (spec section 11's layer-0 special cases)
+            head = per_layer[self._first_streaming_layer]
+            feat = math.prod(head.shape[1:]) * head.element_size()
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
-                if layer_id in self._unpinned_layers:
+                if layer_id in self._unpinned_layers or layer_id in self.gpu_owned_layer_ids:
                     # unregistered layer: no device alias exists, and the row is never consumed (CPU decode; pageable prefill)
+                    # GPU-owned layer: device_ptr() WOULD succeed on its CUDA tensor
+                    # (kernel/pinned.py:66) and hand the kernel a plausible but wrong source
                     # a 0 placeholder keeps the descriptor shape
                     layer_src_ptrs[layer_id].append(0)
                     continue
@@ -675,9 +729,11 @@ class OffloadMoeCache:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
             torch.cuda.empty_cache()
-        # 3. Reallocate the slot cache from the retained host sources.
+        # 3. Reallocate the slot cache from the retained host sources. resident_banks are NOT
+        #    slot-cache rows -- they survive a rebuild untouched, and _build_copy_plan below
+        #    keeps skipping them.
         for name in self.bank_schema:
-            head = self.bank_sources[name][0]
+            head = self.bank_sources[name][self._first_streaming_layer]
             self.bank_caches[name] = torch.empty(
                 (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
             )
@@ -762,6 +818,21 @@ class OffloadMoeCache:
         ``copy_missing`` takes the whole-layer pageable branch, which presumes materialize's position == expert id (never ``ensure_experts``'s LRU slot remap)."""
         return layer_id in self._unpinned_layers
 
+    def is_gpu_owned_layer(self, layer_id: int) -> bool:
+        """Whether ``layer_id``'s full expert set is permanently VRAM-resident.
+
+        Such a layer has no host bank, no slot-cache rows and no LRU bookkeeping: the kernels
+        read ``resident_views(layer_id)`` with the RAW expert ids."""
+        return layer_id in self.gpu_owned_layer_ids
+
+    def _reject_gpu_owned(self, layer_id: int, what: str) -> None:
+        if layer_id in self.gpu_owned_layer_ids:
+            raise RuntimeError(
+                f"{what} was called for GPU-owned layer {layer_id}: its experts are already "
+                f"resident, so there is no host bank to fetch from and no slot to fill "
+                f"(the forward path must use resident_views)"
+            )
+
     def alphas_for_slots(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Per-slot global scales for a decode call, or ``None`` when the format
         keeps no GPU-resident alphas (bf16 / triton-nvfp4). Slots of other layers
@@ -791,6 +862,15 @@ class OffloadMoeCache:
         if n is None:
             return tuple(cache for _, cache in self.banks)
         return tuple(cache[:n] for _, cache in self.banks)
+
+    def resident_views(self, layer_id: int) -> tuple[torch.Tensor, ...]:
+        """A GPU-owned layer's device banks in registration order.
+
+        Position == expert id (the whole layer is resident), so routing ids pass through
+        unmapped -- exactly the contract the prefill double buffer offers, without the copy."""
+        views = self.resident_banks.get(layer_id)
+        assert views is not None, f"layer {layer_id} is not GPU-owned"
+        return views
 
     def _init_prefill_overlap_buffers(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
@@ -859,6 +939,11 @@ class OffloadMoeCache:
             return
         if layer_id < 0:
             raise ValueError(f"Invalid prefill layer id: {layer_id}")
+        if layer_id in self.gpu_owned_layer_ids:
+            # keyed on the TARGET: _wait_prefill_overlap pre-issues layer_id + 1 blindly, so
+            # an owned layer must be a quiet no-op here, not an error. It borrows no buffer,
+            # so there is nothing to invalidate, wait on or release either.
+            return
 
         assert self.banks and self.prefill_bank_buffers
 
@@ -1029,14 +1114,25 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
+    def _note_decode_routing(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """Accumulate the raw per-(layer, expert) routing histogram for ``layer_id``.
+
+        Called from BOTH the streaming path (before ``ensure_experts``' kernel rewrites the
+        ids to slots in place) and the GPU-owned decode branch (which never rewrites them),
+        so ``/v1/cache/routing`` still counts owned layers. Graph-safe: a device-side
+        scatter_add_ over fixed shapes, captured and replayed like any other decode op."""
+        if not self.collect_decode_freq:
+            return
+        ids = expert_ids.reshape(-1).long()
+        self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
-        if self.collect_decode_freq:
-            # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
-            # slot ids in place), so snapshot the routing histogram before that happens.
-            ids = expert_ids.reshape(-1).long()
-            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        self._reject_gpu_owned(layer_id, "ensure_experts")
+        # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
+        # slot ids in place), so snapshot the routing histogram before that happens.
+        self._note_decode_routing(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
@@ -1053,9 +1149,8 @@ class OffloadMoeCache:
         miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe."""
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
-        if self.collect_decode_freq:
-            ids = expert_ids.reshape(-1).long()
-            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        self._reject_gpu_owned(layer_id, "ensure_experts_hybrid")
+        self._note_decode_routing(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts_hybrid(
@@ -1065,6 +1160,7 @@ class OffloadMoeCache:
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
 
+        self._reject_gpu_owned(layer_id, "materialize_layer")
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
         materialize_layer(self, layer_id)
@@ -1186,13 +1282,18 @@ class OffloadMoeCache:
         per_layer = []
         for L in range(self.num_layers):
             s, m, a, f = steps[L], missing[L], active[L], fetched[L]
+            resident = L in self.gpu_owned_layer_ids
             per_layer.append({
                 "layer": L,
                 "steps": s,
+                # A GPU-owned layer never misses BY CONSTRUCTION. Reporting 0.0 would read
+                # as a perfectly cacheable STREAMING layer to any later heuristic, so the
+                # rate is null and the row says why.
+                "resident": resident,
                 "active_per_step": (a / s) if s else 0.0,
-                "missing_per_step": (m / s) if s else 0.0,
-                "miss_rate": (m / a) if a else 0.0,
-                "fetched_per_step": (f / s) if s else 0.0,
+                "missing_per_step": 0.0 if resident else ((m / s) if s else 0.0),
+                "miss_rate": None if resident else ((m / a) if a else 0.0),
+                "fetched_per_step": 0.0 if resident else ((f / s) if s else 0.0),
             })
         return {"per_layer": per_layer}
 
@@ -1211,9 +1312,17 @@ class OffloadMoeCache:
         freq = self.decode_freq.float()
         total = freq.sum(dim=1)
         valid = total > 0
+        if self.gpu_owned_layer_ids:
+            # the summary describes the STREAMING cache: a resident layer's oracle hit is 1.0
+            # by construction and would bias the very number used to size the slot cache.
+            # Its raw counts stay in decode_freq for offline study.
+            owned = torch.zeros_like(valid)
+            owned[sorted(self.gpu_owned_layer_ids)] = True
+            valid = valid & ~owned
         if int(valid.sum()) == 0:
             return prefetch
-        slots_per_layer = self.cache_size / self.num_layers
+        streaming_layers = self.num_layers - len(self.gpu_owned_layer_ids)
+        slots_per_layer = self.cache_size / max(1, streaming_layers)
         C = max(1, int(round(slots_per_layer)))
         sorted_f, _ = torch.sort(freq, dim=1, descending=True)
         oracle_hit = (sorted_f[:, :C].sum(dim=1)[valid] / total[valid]).mean().item()
@@ -1237,6 +1346,7 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        self._reject_gpu_owned(layer_id, "copy_missing")
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 raise RuntimeError(

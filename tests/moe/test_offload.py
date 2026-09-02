@@ -3,6 +3,8 @@ from contextlib import contextmanager
 import pytest
 import torch
 
+from flashlib.kernels.slot_cache import Stat
+
 from freetoken.distributed import set_tp_info, try_get_tp_info
 
 
@@ -944,3 +946,187 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+# ----------------------------------------------------- GPU-owned MoE layers (spec sections 5, 7)
+
+
+def _make_owned_cache(num_layers=3, owned=(1,), prefill_overlap=False, head_shape=(32, 8)):
+    """A [gate_up, down] bf16 cache with the given layers GPU_OWNED (the rest pinned).
+
+    The "device" tensors are plain CPU tensors: an owned layer's whole point is that it never
+    takes a device address and never enters a pointer table, so every assertion below is
+    exercisable without CUDA.
+    """
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=num_layers, num_experts=4, cache_size=8,
+        device=torch.device("cpu"), prefill_overlap=prefill_overlap,
+    )
+    cache.gpu_owned_layer_ids = frozenset(owned)
+    sources = {
+        "gate_up": [
+            torch.randn(4, *(head_shape if i in owned else (32, 8))) for i in range(num_layers)
+        ],
+        "down": [torch.randn(4, 8, 16) for _ in range(num_layers)],
+    }
+    residency = [
+        HostResidency.GPU_OWNED.value if i in owned else HostResidency.PINNED.value
+        for i in range(num_layers)
+    ]
+    cache.set_bank_sources(sources, layer_residency=residency)
+    return cache, sources
+
+
+def test_gpu_owned_layer_is_registered_as_resident_views_not_slot_cache_rows():
+    cache, sources = _make_owned_cache(num_layers=3, owned=(1,))
+
+    assert cache.is_gpu_owned_layer(1)
+    assert not cache.is_gpu_owned_layer(0) and not cache.is_gpu_owned_layer(2)
+    # views come back in bank REGISTRATION order and are the source tensors themselves
+    views = cache.resident_views(1)
+    assert views[0] is sources["gate_up"][1]
+    assert views[1] is sources["down"][1]
+    # an owned layer is NOT unpinned: it has a device address, it just has no host bank
+    assert not cache.is_unpinned_layer(1)
+    # the slot cache is unchanged: still cache_size rows of the streaming geometry
+    assert cache.bank_caches["gate_up"].shape == (8, 32, 8)
+
+
+def test_the_slot_cache_geometry_comes_from_the_first_streaming_layer():
+    # layer 0 is owned (it is in the default owned set) and deliberately a different row
+    # shape; the slot cache must be sized from layer 1.
+    cache, _ = _make_owned_cache(num_layers=3, owned=(0,), head_shape=(99, 8))
+
+    assert cache._first_streaming_layer == 1
+    assert cache.bank_caches["gate_up"].shape == (8, 32, 8)
+
+
+def test_set_bank_sources_rejects_a_layer_that_is_both_gpu_owned_and_a_cpu_layer():
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
+    )
+    cache.cpu_layer_ids = frozenset({1})
+    cache.gpu_owned_layer_ids = frozenset({1})
+    sources = {
+        "gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
+        "down": [torch.randn(4, 8, 16) for _ in range(2)],
+    }
+    with pytest.raises(ValueError, match="both GPU-owned and CPU layers"):
+        cache.set_bank_sources(
+            sources,
+            layer_residency=[HostResidency.PINNED.value, HostResidency.GPU_OWNED.value],
+        )
+
+
+def test_set_bank_sources_rejects_labels_that_disagree_with_the_owned_set():
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
+    )
+    sources = {
+        "gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
+        "down": [torch.randn(4, 8, 16) for _ in range(2)],
+    }
+    with pytest.raises(ValueError, match="disagree with the GPU_OWNED residency labels"):
+        cache.set_bank_sources(
+            sources,
+            layer_residency=[HostResidency.PINNED.value, HostResidency.GPU_OWNED.value],
+            gpu_owned_layers=frozenset(),
+        )
+
+
+@pytest.mark.parametrize("call", ["ensure_experts", "ensure_experts_hybrid", "materialize_layer"])
+def test_gpu_owned_layer_refuses_every_movement_entry_point(call):
+    # a wiring bug that routed an owned layer into the LRU would gather the wrong rows;
+    # mirror test_locked_layer_copy_missing_rejects_ensure_experts_staging and fail loudly
+    cache, _ = _make_owned_cache(num_layers=3, owned=(1,))
+    args = (1,) if call == "materialize_layer" else (1, torch.zeros(1, 2, dtype=torch.int32))
+
+    with pytest.raises(RuntimeError, match="GPU-owned layer 1"):
+        getattr(cache, call)(*args)
+
+
+def test_gpu_owned_layer_refuses_copy_missing():
+    cache, _ = _make_owned_cache(num_layers=3, owned=(1,))
+    cache._pending_src_layer = 1
+    cache._pending_whole_layer = True
+
+    with pytest.raises(RuntimeError, match="GPU-owned layer 1"):
+        cache.copy_missing()
+
+
+def test_gpu_owned_layer_is_excluded_from_prefetch_and_the_prefill_double_buffer():
+    cache, _ = _make_owned_cache(num_layers=3, owned=(1,), prefill_overlap=True)
+
+    assert cache.prefetch_ready(1) is False  # no PCIe fetch to hide
+    # the caller pre-issues layer_id + 1 blindly, so the guard is keyed on the TARGET and
+    # returns quietly rather than raising
+    cache.prefetch_prefill_layer(1)
+    assert cache._prefill_buffer_layer == [None, None]
+    cache.prefetch_prefill_layer(0)
+    assert cache._prefill_buffer_layer == [0, None]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_copy_plan_holds_a_zero_placeholder_for_gpu_owned_layers():
+    # device_ptr() on a CUDA tensor returns data_ptr() -- a plausible but WRONG copy source;
+    # the owned layer's descriptor row must stay the 0 placeholder
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    dev = torch.device("cuda")
+    cache = OffloadMoeCache(num_layers=2, num_experts=4, cache_size=8, device=dev)
+    cache.gpu_owned_layer_ids = frozenset({1})
+    sources = {
+        "gate_up": [torch.randn(4, 32, 8, device=dev) for _ in range(2)],
+        "down": [torch.randn(4, 8, 16, device=dev) for _ in range(2)],
+    }
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.PINNED.value, HostResidency.GPU_OWNED.value],
+    )
+
+    assert cache._copy_fused_ok
+    assert (cache._copy_src_ptrs[1] == 0).all(), "GPU-owned layer row must stay 0"
+    assert (cache._copy_src_ptrs[0] != 0).all()
+
+
+def test_rebuild_preserves_resident_banks_and_resizes_only_the_slot_cache():
+    cache, sources = _make_owned_cache(num_layers=3, owned=(0,), head_shape=(99, 8))
+    before = cache.resident_banks[0]
+
+    cache.rebuild(12)
+
+    assert cache.resident_banks[0] is before
+    assert cache.resident_views(0)[0] is sources["gate_up"][0]
+    assert cache.bank_caches["gate_up"].shape == (12, 32, 8)  # from streaming layer 1
+
+
+def test_per_layer_rows_report_gpu_owned_layers_as_resident_with_no_miss_rate():
+    cache, _ = _make_owned_cache(num_layers=3, owned=(1,))
+    cache.collect_stats = True
+    cache.lru_stats[0, Stat.ACTIVE] = 10
+    cache.lru_stats[0, Stat.MISS] = 2
+    cache.lru_stats[0, Stat.CALLS] = 1
+
+    rows = cache.decode_miss_stats_per_layer()["per_layer"]
+
+    assert rows[0]["resident"] is False
+    assert rows[0]["miss_rate"] == pytest.approx(0.2)
+    # a resident layer never misses BY CONSTRUCTION; 0.0 would read as a perfect streaming
+    # layer to any future heuristic, so it must be null
+    assert rows[1]["resident"] is True
+    assert rows[1]["miss_rate"] is None
+    assert rows[1]["missing_per_step"] == 0.0
