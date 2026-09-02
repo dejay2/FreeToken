@@ -67,7 +67,7 @@ The defaults are:
 - full 262,144-token usable context;
 - automatic GPU expert-cache sizing;
 - one active request, with extra requests queued;
-- serial expert loading for the proven Windows path.
+- serial expert loading for the proven Windows path (`-ExpertLoad`).
 
 Do not change the host to a public address unless authentication and network
 security are added separately.
@@ -100,6 +100,32 @@ powershell -NoProfile -ExecutionPolicy Bypass -File `
 
 FreeToken allocates 4,097 pages (262,208 total). After the reserved page,
 262,144 tokens are usable.
+
+### Expert loading
+
+`-ExpertLoad` selects how the MoE expert banks are read into host RAM and maps
+straight onto the server's `--expert-load`:
+
+| Value      | Behaviour                                                                         |
+| ---------- | --------------------------------------------------------------------------------- |
+| `serial`   | Low-memory reclaimable read, one shard at a time. The launcher default.            |
+| `parallel` | Cache-bypassing multi-threaded read (`FILE_FLAG_NO_BUFFERING` on Windows).         |
+| `auto`     | Let the loader pick; resolves to `parallel` when the expert tensors are scattered. |
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+  .\scripts\start-qwen38-flash-next-mmap-windows.ps1 `
+  -ModelPath $ModelPath `
+  -ExpertLoad parallel
+```
+
+`parallel` and `auto` both fall back to the serial build when the unbuffered
+reader is unavailable (`FREETOKEN_WIN_UNBUFFERED_IO=0`) or the expert quant has
+no parallel provider; the boot log always names the build it took:
+
+```
+INFO expert banks: slow path (serial build)
+```
 
 ## Check the API
 

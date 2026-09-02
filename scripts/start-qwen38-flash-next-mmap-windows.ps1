@@ -44,7 +44,14 @@ param(
     # Hard KV-pool capacity in tokens (--num-tokens); 0 keeps the default sizing, where
     # the pool grows into free memory and -ContextTokens is only a floor.
     [ValidateRange(0, 4194304)]
-    [int]$KVCacheTokens = 0
+    [int]$KVCacheTokens = 0,
+
+    # How the MoE expert banks are read into host RAM (--expert-load). 'serial' is the
+    # low-memory reclaimable read this launcher has always used; 'parallel' forces the
+    # cache-bypassing multi-threaded reader (FILE_FLAG_NO_BUFFERING on Windows); 'auto'
+    # lets the loader pick (parallel for scattered expert tensors).
+    [ValidateSet('auto', 'serial', 'parallel')]
+    [string]$ExpertLoad = 'serial'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -148,7 +155,7 @@ $serveArgs = @(
 ) + $moeCacheArgs + @(
     '--max-running-requests', "$MaxRunningRequests",
     '--kv-reserve-tokens', "$ContextTokens",
-    '--expert-load', 'serial'
+    '--expert-load', $ExpertLoad
 )
 if ($EnableCacheReport) {
     $serveArgs += '--enable-cache-report'
