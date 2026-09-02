@@ -2971,7 +2971,7 @@ Claude-Session: https://claude.ai/code/session_01Hnf1bGBLU4HLq9uHPtNjwU
 - Consumes: the boot line from Task 6, the launcher flags from Task 7, spec section 9's check table.
 - Produces: no code. The document is the hand-off: the implementer fills the commit list, the CPU test results and the "what only a live run can decide" section; the operator fills the measurement rows.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/engine/test_moe_gpu_owned_layers.py`:
 
@@ -3009,7 +3009,7 @@ def test_the_operator_checklist_covers_every_live_check_the_spec_asks_for():
         assert check in status, check
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -3019,7 +3019,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 
 Expected: `FileNotFoundError: [Errno 2] No such file or directory: 'D:\\FreeToken\\docs\\plans\\2026-09-02-qwen38-gpu-owned-moe-layers-status.md'`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Create `docs/plans/2026-09-02-qwen38-gpu-owned-moe-layers-status.md` (the implementer fills the
 result cells of the first two sections before handing over; the operator fills the third):
@@ -3126,7 +3126,7 @@ covered without the device, and are what the table above exists to settle:
    owned set.
 ````
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -3134,7 +3134,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 & "$env:LOCALAPPDATA\FreeToken\venv\Scripts\python.exe" -m pytest tests/engine/test_moe_gpu_owned_layers.py -q -p no:cacheprovider
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add docs/plans/2026-09-02-qwen38-gpu-owned-moe-layers-status.md tests/engine/test_moe_gpu_owned_layers.py

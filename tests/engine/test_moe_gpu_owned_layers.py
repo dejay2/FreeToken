@@ -239,3 +239,42 @@ def test_the_docs_describe_the_flag():
     windows = (root / "docs" / "windows-qwen38-flash-next-mmap.md").read_text(encoding="utf-8")
     assert "### GPU-owned MoE layers" in windows
     assert "-GpuOwnedLayers" in windows
+
+
+# ------------------------------------------------------------------ the operator checklist
+
+
+def test_the_operator_checklist_covers_every_live_check_the_spec_asks_for():
+    from pathlib import Path
+
+    status = (
+        Path(__file__).parents[2] / "docs" / "plans"
+        / "2026-09-02-qwen38-gpu-owned-moe-layers-status.md"
+    ).read_text(encoding="utf-8")
+
+    for heading in (
+        "## Commits",
+        "## CPU test results",
+        "## Live verification",
+        "## Only a live GPU run can decide this",
+    ):
+        assert heading in status
+    for check in (
+        "boot log shows owned set",
+        "scheduler private bytes",
+        "whole-system physical in-use",
+        "boot peak host RAM",
+        "8k-chat decode tok/s",
+        "TTFT",
+        "answers at temperature 0",
+        "picture request",
+        "/v1/cache/routing",
+        "owned-layer rows on device",
+    ):
+        assert check in status, check
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-q"]))
