@@ -94,18 +94,47 @@ powershell -NoProfile -ExecutionPolicy Bypass -File `
   -VisionExecution layer-stream -EnableCacheReport
 ```
 
+Live run 2026-09-02, results in `docs/research/measurements-gpu-owned-layers-2026-09-02.md`.
+**The candidate never booted**: four attempts (`auto` parallel, `auto` serial, `auto` parallel
+again, `auto:2`), all dead in the expert-bank load. Every check below therefore has an empty
+candidate column. Root cause in the section after the table.
+
 | check | pass criterion | baseline | candidate | verdict |
 |---|---|---|---|---|
-| boot log shows owned set, LRU size, MTP graphs 6/6 + 7/7 captured | yes | | | |
-| scheduler private bytes and whole-system commit | -7.9 GiB +/- 0.3 | | | |
-| whole-system physical in-use | -7.9 GiB +/- 0.5 | | | |
-| boot peak host RAM | <= baseline + 1.5 GiB | | | |
-| 8k-chat decode tok/s (same prompt as the sweep) | recorded; operator decides | | | |
-| TTFT on the same prompt | recorded | | | |
-| answers at temperature 0 | identical to baseline | | | |
-| picture request (`-VisionWeights mmap`) | works, latency recorded | | | |
-| `/v1/cache/routing` | owned rows `resident: true`; streaming rows sane | | | |
-| owned-layer rows on device | byte-identical to a host-bank load (one-off probe script) | | | |
+| boot log shows owned set, LRU size, MTP graphs 6/6 + 7/7 captured | yes | 6/6 + 7/7, 65 s to ready, free VRAM 4.64 GiB | never reached `_gpu_owned_boot_line` | **FAIL** |
+| scheduler private bytes and whole-system commit | -7.9 GiB +/- 0.3 | 98.35 GiB private / 216.90 GiB commit | - | not measurable |
+| whole-system physical in-use | -7.9 GiB +/- 0.5 | 91.96 GiB (empty ref 22.4 GiB) | - | not measurable |
+| boot peak host RAM | <= baseline + 1.5 GiB | - | 181.8 GiB commit at the hang (partial load) | not measurable |
+| 8k-chat decode tok/s (same prompt as the sweep) | recorded; operator decides | 72.1 tok/s fresh (62.1 after 3.7 h uptime) | - | not measurable |
+| TTFT on the same prompt | recorded | cold-7k 5.89 s, warm turn 1.59 s | - | not measurable |
+| answers at temperature 0 | identical to baseline | 512 tokens: NOT reproducible against itself (5 runs, 5 answers, first divergence 247-1775 B). 48 tokens: identical across two server processes, md5 `29f0e74d...` | - | **check unusable as written**; use the 48-token form |
+| picture request (`-VisionWeights mmap`) | works, latency recorded | 6.89 s cold / 4.86 s warm, correct answer | - | not measurable |
+| `/v1/cache/routing` | owned rows `resident: true`; streaming rows sane | 409: needs `--moe-collect-decode-freq`, which the plan's boot command does not pass | - | **check unreachable as written** |
+| owned-layer rows on device | byte-identical to a host-bank load (one-off probe script) | - | - | not run (model cannot load) |
+
+### Why it did not boot
+
+`GpuOwnedStagingPool.flush` (`host_banks.py:288`) does `dst.copy_(staging.tensor,
+non_blocking=True)` on the `PinPipeline` drain thread. The engine loads weights inside
+`torch.inference_mode()`, which is **thread-local**, so `alloc_layer_banks` makes each owned
+layer's device bank an *inference tensor* while the drain thread is not in inference mode:
+
+```
+RuntimeError: Inplace update to inference tensor outside InferenceMode is not allowed.
+```
+
+With `auto` (six layers) that error is invisible: `PinPipeline._run` stores it in `self._exc`
+and then drains the queue without running anything, so no staging slot is ever returned, and
+the single-threaded NVFP4 placement loop blocks forever in `_acquire_locked` (cap 2) the moment
+it touches a third owned layer. `self._exc` is only re-raised by `wait()`/`__exit__`, which the
+blocked loop never reaches -> a silent, CPU-idle hang. With `auto:2` there is no third acquire,
+so the loop finishes and the boot crashes with the stack above instead.
+
+Both faces reproduce off-server in seconds (`repro_pipeline_real.py`, `repro_loader.py`,
+`repro_staging_deadlock.py` in the run's scratchpad); the hang was also confirmed on the live
+process with `py-spy dump`. Note the second face is a design issue in its own right: with a
+single-threaded placement loop, cap-2 back-pressure has no other thread that can complete a
+layer, so `auto`'s six layers deadlock the parallel reader even once the copy is fixed.
 
 Hazards, from the boot notes for this box: only ever kill `python.exe` from
 `nvidia-smi --query-compute-apps`; settle 45-60 s between servers or the last expert bank
