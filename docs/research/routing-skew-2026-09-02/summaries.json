@@ -1,0 +1,69 @@
+{
+  "code": {
+    "completion_tokens": 520,
+    "seconds": 10.62,
+    "tok_s": 49.0,
+    "summary": {
+      "slots_per_layer": 140.625,
+      "working_set_mean": 307.16668701171875,
+      "working_set_max": 428,
+      "experts_for_90pct": 139.3125,
+      "oracle_hit_at_slots": 0.8939432501792908,
+      "norm_entropy": 0.7757127285003662
+    },
+    "total_counts": 284640
+  },
+  "prose": {
+    "completion_tokens": 520,
+    "seconds": 8.8,
+    "tok_s": 59.1,
+    "summary": {
+      "slots_per_layer": 140.625,
+      "working_set_mean": 274.625,
+      "working_set_max": 384,
+      "experts_for_90pct": 128.39584350585938,
+      "oracle_hit_at_slots": 0.9128931760787964,
+      "norm_entropy": 0.7759242057800293
+    },
+    "total_counts": 279840
+  },
+  "chat8k": {
+    "completion_tokens": 520,
+    "seconds": 16.91,
+    "tok_s": 30.7,
+    "summary": {
+      "slots_per_layer": 140.625,
+      "working_set_mean": 309.54168701171875,
+      "working_set_max": 435,
+      "experts_for_90pct": 151.625,
+      "oracle_hit_at_slots": 0.8738707304000854,
+      "norm_entropy": 0.8080172538757324
+    },
+    "total_counts": 279840
+  },
+  "toolcall": {
+    "completion_tokens": 520,
+    "seconds": 7.75,
+    "tok_s": 67.1,
+    "summary": {
+      "slots_per_layer": 140.625,
+      "working_set_mean": 327.35418701171875,
+      "working_set_max": 389,
+      "experts_for_90pct": 163.6666717529297,
+      "oracle_hit_at_slots": 0.8609489798545837,
+      "norm_entropy": 0.812609851360321
+    },
+    "total_counts": 261120
+  },
+  "union": {
+    "summary": {
+      "slots_per_layer": 140.625,
+      "working_set_mean": 461.2708435058594,
+      "working_set_max": 497,
+      "experts_for_90pct": 242.20834350585938,
+      "oracle_hit_at_slots": 0.7161258459091187,
+      "norm_entropy": 0.8932744264602661
+    },
+    "total_counts": 996480
+  }
+}
