@@ -1973,6 +1973,7 @@ def _resolve_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> froz
 def _validate_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int]:
     """Resolve and fully validate the owned set, or raise. Returns the empty set when off."""
     from freetoken.checkpoint.ftw import is_ftw_checkpoint
+    from freetoken.moe.host_banks import GPU_OWNED_EXPERT_QUANTS
 
     spec = config.moe_gpu_owned_layers
     if not spec:
@@ -1992,6 +1993,17 @@ def _validate_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> fro
         raise ValueError(
             f"--moe-gpu-owned-layers and --moe-cpu-layers name layers that are "
             f"both GPU-owned and CPU layers: {clash}"
+        )
+    expert_quant = getattr(config.model_config, "expert_quant", None)
+    if expert_quant is not None and expert_quant not in GPU_OWNED_EXPERT_QUANTS:
+        # Boot-time twin of the loader guard in host_banks.plan_gpu_owned: only the NVFP4
+        # providers are reviewed for filling an owned layer's device banks in place, and
+        # since 8a63977 an unreviewed one writes the device tensor without tripping an
+        # assert (status doc, residual risk 6). Refuse before the load, not after 40 s of it.
+        raise ValueError(
+            f"--moe-gpu-owned-layers needs NVFP4 expert banks; this checkpoint's expert "
+            f"quant format is {expert_quant!r} (supported: "
+            f"{sorted(GPU_OWNED_EXPERT_QUANTS)}). Drop the flag for this model"
         )
     if config.model_path and is_ftw_checkpoint(config.model_path):
         raise ValueError(
