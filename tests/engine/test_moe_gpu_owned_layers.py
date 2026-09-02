@@ -185,7 +185,21 @@ def test_the_dense_override_table_clears_the_flag():
     assert _DENSE_MOE_SETTINGS["moe_gpu_owned_layers"] is None
 
 
-if __name__ == "__main__":
-    import sys
+# ------------------------------------------------------------------ the boot line
 
-    sys.exit(pytest.main([__file__, "-q"]))
+
+def test_the_boot_line_reports_the_owned_set_the_resident_bytes_and_the_lru():
+    from freetoken.engine.engine import _gpu_owned_boot_line
+
+    line = _gpu_owned_boot_line(
+        owned=frozenset({0, 1, 2, 6, 7, 22}),
+        num_moe_layers=48,
+        num_experts=512,
+        per_expert_bytes=2_772_480,
+        cache_size=4400,
+    )
+
+    assert line == (
+        "MoE GPU-owned layers: [0, 1, 2, 6, 7, 22] (6 x 1.32 GiB resident, no host bank); "
+        "LRU cache 4400 slots for 42 streaming layers"
+    )

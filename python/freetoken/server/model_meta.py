@@ -120,17 +120,25 @@ def effort_toggle_kwargs(
 
 
 def moe_total_experts(config: Any) -> int:
-    """Total routed-expert slots the model has: experts per layer x MoE layers. Matches the
-    engine's own basis (``Engine._resolve_auto_moe_cache_size``), so a residency rate derived
-    from it agrees with the size the engine resolved -- ``num_moe_layers`` excludes the leading
-    dense layers a model like DSV4 carries."""
+    """Total routed-expert slots the SLOT CACHE serves: experts per layer x streaming MoE
+    layers. Matches the engine's own basis (``Engine._resolve_auto_moe_cache_size``), so a
+    residency rate or a ``--moe-cache-rate`` derived from it agrees with the size the engine
+    resolved -- ``num_moe_layers`` excludes the leading dense layers a model like DSV4
+    carries, and ``--moe-gpu-owned-layers`` layers are permanently resident, never cached."""
     try:
         model_config = config.model_config
     except Exception:  # noqa: BLE001 -- dummy/absent config: report "unknown", never raise
         return 0
-    return int(getattr(model_config, "num_moe_layers", 0) or 0) * int(
-        getattr(model_config, "num_experts", 0) or 0
-    )
+    layers = int(getattr(model_config, "num_moe_layers", 0) or 0)
+    if getattr(config, "moe_gpu_owned_layers", None):
+        # local import: the frontend must not pay for the engine module unless the flag is set
+        from freetoken.engine.engine import _resolve_gpu_owned_layers
+
+        try:
+            layers -= len(_resolve_gpu_owned_layers(config, layers))
+        except Exception:  # noqa: BLE001 -- a bad spec is reported by _adjust_config, not here
+            pass
+    return max(0, layers) * int(getattr(model_config, "num_experts", 0) or 0)
 
 
 def moe_cache_size(config: Any) -> int:

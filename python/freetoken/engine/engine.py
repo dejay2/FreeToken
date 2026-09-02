@@ -724,6 +724,13 @@ class Engine:
         # layout; the GPU slot-cache GEMM reads those same native rows. decode_target also
         # gates the CPU executor build below.
         cpu_layer_ids = _resolve_cpu_layers(config, config.model_config.num_moe_layers)
+        # Resolved (and fully validated) here, not just in _adjust_config: the backend may
+        # still have been 'auto' at parse time. Stored on the engine because the budget
+        # helpers read it.
+        gpu_owned_layer_ids = _validate_gpu_owned_layers(
+            config, config.model_config.num_moe_layers
+        )
+        self._gpu_owned_layer_ids = gpu_owned_layer_ids
         if (
             not cpu_layer_ids
             and config.moe_cpu_layers is None
@@ -731,8 +738,11 @@ class Engine:
             and _pin_budget_bytes(self._host_tables_bytes) is not None
         ):
             cpu_layer_ids = _auto_cpu_layers(
-                config, config.model_config.num_moe_layers, reserved=self._host_tables_bytes
-            )
+                config,
+                config.model_config.num_moe_layers,
+                reserved=self._host_tables_bytes,
+                gpu_owned=len(gpu_owned_layer_ids),
+            ) - gpu_owned_layer_ids  # an owned layer has no host bank to lock
         if config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
@@ -754,7 +764,9 @@ class Engine:
             budget = _pin_budget_bytes(self._host_tables_bytes)
             bank_bytes = None
             if budget is not None:
-                bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
+                bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(
+                    config.model_config, gpu_owned=len(gpu_owned_layer_ids)
+                )
             if bank_bytes and bank_bytes > budget:
                 split_residency = True
                 logger.info_rank0(
@@ -776,11 +788,13 @@ class Engine:
             # pick (parallel for scattered experts, with a low-RAM fallback to serial).
             expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
             requested_residency = None
-            if split_residency:
+            if split_residency or gpu_owned_layer_ids:
                 from freetoken.moe.host_banks import HostResidency
 
                 requested_residency = [
-                    HostResidency.LOCKED.value if i in cpu_layer_ids
+                    HostResidency.GPU_OWNED.value if i in gpu_owned_layer_ids
+                    else HostResidency.LOCKED.value
+                    if (split_residency and i in cpu_layer_ids)
                     else HostResidency.PINNED.value
                     for i in range(config.model_config.num_moe_layers)
                 ]
@@ -811,6 +825,8 @@ class Engine:
                     f"--moe-cache-auto resolved moe_cache_size={size} "
                     f"num_pages={pages} (prefill_overlap={overlap})"
                 )
+            else:
+                self._check_gpu_owned_cache_fits(config, banks)
             _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
             cache = OffloadMoeCache(
                 # Models with leading dense layers (GLM-4) only have experts on the MoE
@@ -826,10 +842,27 @@ class Engine:
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
             )
-            # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
+            # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set; the GPU-owned set is validated against the residency labels the loader honored
             cache.cpu_layer_ids = cpu_layer_ids
-            cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+            cache.gpu_owned_layer_ids = gpu_owned_layer_ids
+            cache.set_bank_sources(
+                banks.sources,
+                layer_residency=banks.layer_residency,
+                gpu_owned_layers=gpu_owned_layer_ids,
+            )
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+            if gpu_owned_layer_ids:
+                from freetoken.engine.cache_budget import expert_bytes_per_slot
+
+                logger.info_rank0(
+                    _gpu_owned_boot_line(
+                        gpu_owned_layer_ids,
+                        config.model_config.num_moe_layers,
+                        config.model_config.num_experts,
+                        expert_bytes_per_slot(banks.sources, gpu_owned_layer_ids),
+                        config.moe_cache_size,
+                    )
+                )
         else:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
@@ -1908,6 +1941,22 @@ def _validate_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> fro
     return owned
 
 
+def _gpu_owned_boot_line(
+    owned: frozenset[int],
+    num_moe_layers: int,
+    num_experts: int,
+    per_expert_bytes: int,
+    cache_size: int,
+) -> str:
+    """The single boot line reporting what --moe-gpu-owned-layers actually did (spec 3)."""
+    layer_gib = num_experts * per_expert_bytes / 2**30
+    return (
+        f"MoE GPU-owned layers: {sorted(owned)} ({len(owned)} x {layer_gib:.2f} GiB "
+        f"resident, no host bank); LRU cache {cache_size} slots for "
+        f"{num_moe_layers - len(owned)} streaming layers"
+    )
+
+
 # expert activations the CPU MoE executor supports (csrc ActKind)
 _CPU_MOE_ACTS = (
     "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
@@ -1954,13 +2003,17 @@ def _pin_budget_bytes(reserved: int = 0) -> int | None:
     return max(0, cap - reserved)
 
 
-def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 0) -> frozenset[int]:
+def _auto_cpu_layers(
+    config: EngineConfig, num_moe_layers: int, reserved: int = 0, gpu_owned: int = 0
+) -> frozenset[int]:
     """Pick CPU (locked) MoE layers automatically when the banks exceed the pin budget.
 
     Locks just enough head+tail layers: per-layer decode miss rates are U-shaped, so the ends are the cheapest to move off the slot cache."""
     from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
-    bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
+    bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(
+        config.model_config, gpu_owned=gpu_owned
+    )
     if not bank_bytes:
         return frozenset()
     budget = _pin_budget_bytes(reserved)

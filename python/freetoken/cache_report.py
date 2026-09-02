@@ -82,10 +82,13 @@ def format_tokens(pages: int, page_size: int) -> str:
 
 
 def cache_rate(cache_size: int, geometry: dict) -> float | None:
-    """MoE residency: cached slots / the model's total routed experts (experts per layer x MoE
-    layers, the same basis the engine sizes the cache against). None for a non-MoE model, or a
-    server that reports no expert counts."""
-    total = _int(geometry, "num_experts") * _int(geometry, "num_moe_layers")
+    """MoE residency: cached slots / the routed experts the SLOT CACHE actually serves
+    (experts per layer x streaming MoE layers, the same basis the engine sizes the cache
+    against). GPU-owned layers are permanently resident and never occupy a slot, so they
+    leave the denominator. None for a non-MoE model, or a server that reports no expert
+    counts."""
+    owned = len((geometry or {}).get("gpu_owned_layers") or ())
+    total = _int(geometry, "num_experts") * max(0, _int(geometry, "num_moe_layers") - owned)
     if total <= 0 or cache_size <= 0:
         return None
     return cache_size / total

@@ -792,6 +792,10 @@ def cache_geometry(state: Any) -> dict:
         "num_mamba_slots": num_mamba_slots,
         "num_experts": num_experts,
         "num_moe_layers": num_moe_layers,
+        # MoE layers served from permanently resident VRAM banks (--moe-gpu-owned-layers).
+        # num_moe_layers still describes the MODEL; only the residency-rate denominator
+        # (cache_report.cache_rate) drops these layers.
+        "gpu_owned_layers": list(pools.get("gpu_owned_layers") or []),
         # Eviction policy of the MoE slot cache ("lru"). Reported so a client can label the
         # pool without having to know how the server was started.
         "moe_cache_policy": getattr(config, "moe_cache_policy", None),

@@ -399,6 +399,11 @@ class MTPFastVerifier:
                 "cpu_experts": 0,
                 "d2d_rows": 0,
                 "bytes_per_expert": bytes_per_expert,
+                # GPU-owned MoE layers never call ensure_experts, so they add nothing to
+                # active/missing/fetched and the reconciliation invariant below is unchanged.
+                # Reported so a reader knows why h2d_bytes covers fewer layers than the model
+                # has (bytes_per_expert / actual_h2d_bytes are over bank_caches only).
+                "gpu_owned_layers": len(getattr(cache, "gpu_owned_layer_ids", ()) or ()),
                 "h2d_bytes": 0,
                 "d2d_bytes": 0,
                 "transfer_bytes": 0,
@@ -428,6 +433,11 @@ class MTPFastVerifier:
             "cpu_experts": cpu_experts,
             "d2d_rows": 0,
             "bytes_per_expert": bytes_per_expert,
+            # GPU-owned MoE layers never call ensure_experts, so they add nothing to
+            # active/missing/fetched and the reconciliation invariant below is unchanged.
+            # Reported so a reader knows why h2d_bytes covers fewer layers than the model
+            # has (bytes_per_expert / actual_h2d_bytes are over bank_caches only).
+            "gpu_owned_layers": len(getattr(cache, "gpu_owned_layer_ids", ()) or ()),
             "h2d_bytes": h2d_bytes,
             "d2d_bytes": 0,
             "transfer_bytes": h2d_bytes,

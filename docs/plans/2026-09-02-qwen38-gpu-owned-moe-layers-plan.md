@@ -2308,7 +2308,7 @@ Claude-Session: https://claude.ai/code/session_01Hnf1bGBLU4HLq9uHPtNjwU
 
 Note: the model-level `weight_placement_report` hook (spec section 7) is deliberately NOT extended -- `Engine._load_weights` calls it at line 606, before `_init_offload_moe_cache` exists, so it cannot see the owned set. The boot log line below is the single place that reports the owned layers and their resident bytes.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/engine/test_moe_gpu_owned_layers.py`:
 
@@ -2489,7 +2489,7 @@ def test_movement_reconciles_when_resident_layers_contribute_no_counters():
     assert movement["hit_experts"] + movement["missing_experts"] == movement["active_experts"]
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -2506,7 +2506,7 @@ Expected failures:
 - `KeyError: 'gpu_owned_layers'` in `test_movement_reconciles_when_resident_layers_contribute_no_counters`
 - `test_the_summary_denominates_slots_over_the_streaming_layers_only` -> `assert 2.0 == 4.0`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/freetoken/engine/engine.py` -- the pure boot-line formatter, immediately after `_validate_gpu_owned_layers`:
 
@@ -2739,7 +2739,7 @@ def moe_total_experts(config: Any) -> int:
                 "gpu_owned_layers": len(getattr(cache, "gpu_owned_layer_ids", ()) or ()),
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -2749,7 +2749,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 
 (Expect only the pre-existing failures listed in "Known pre-existing failures" below.)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add python/freetoken/engine/engine.py python/freetoken/kvcache/cache_status.py python/freetoken/server/api_server.py python/freetoken/cache_report.py python/freetoken/server/model_meta.py python/freetoken/scheduler/scheduler.py python/freetoken/engine/mtp_fast_verify.py tests/engine/test_moe_gpu_owned_layers.py tests/moe/test_routing_stats.py tests/engine/test_mtp_fast_verify.py tests/server/test_gpu_owned_geometry.py

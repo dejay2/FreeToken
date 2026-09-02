@@ -860,6 +860,10 @@ class Scheduler(SchedulerIOMixin):
                     "num_layers": cache.num_layers,
                     "num_experts": cache.num_experts,
                     "cache_size": cache.cache_size,
+                    # MoE layers served from resident VRAM banks: their per_layer rows carry
+                    # resident: true / miss_rate: null, and they are excluded from the
+                    # streaming-cache summary.
+                    "gpu_owned_layers": sorted(getattr(cache, "gpu_owned_layer_ids", ()) or ()),
                     "summary": cache.decode_routing_stats(),
                     "per_layer": cache.decode_miss_stats_per_layer()["per_layer"],
                     # raw [layers, experts] histogram: the input every offline skew study
