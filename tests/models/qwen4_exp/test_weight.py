@@ -7,10 +7,14 @@ The tensors are tiny but the key names, dtypes and the fusion geometry that matt
 from __future__ import annotations
 
 import ctypes
+import json
+import mmap
 import random
+import struct
 from types import SimpleNamespace
 
 import pytest
+import safetensors
 import torch
 from safetensors.torch import save_file
 
@@ -25,7 +29,12 @@ from freetoken.models.qwen4_exp.weight import (
     load_mmap_ple_table,
     load_ple_table,
 )
+from freetoken.models.weight import _ST_DTYPE
 from freetoken.moe.host_banks import HostBank, read_range_into
+
+# safetensors dtype string per torch dtype, inverted from the reader's own map so a test
+# shard can never disagree with what the loader will parse back out of the header.
+_ST_NAME = {dtype: name for name, dtype in _ST_DTYPE.items()}
 
 H = 32  # hidden_size
 HC = 4  # hc_count
@@ -1089,3 +1098,450 @@ def test_the_windows_prefetch_takes_precedence_over_advice(
         assert calls == []
     finally:
         storage.close()
+
+
+# ======================================================================================
+# Picture weights served from the mapped shard extent (FREETOKEN_VISION_WEIGHTS=mmap)
+# ======================================================================================
+#
+# In ``mmap`` mode the 333 picture tensors are not read into process RAM at boot. Their one
+# contiguous extent of the bf16 shard is mapped copy-on-write and each tensor becomes a
+# zero-copy ``torch.frombuffer`` view installed exactly where the resident tensor used to
+# go. What is pinned here: the extent comes out of the header (never a constant), the views
+# carry the checkpoint's bytes, they live inside the mapping, ``pos_embed`` deliberately
+# does not, one prefetch covers each window, and every failure lands back on ``ram``.
+
+PW = 16  # picture hidden size, tiny
+
+
+def _picture_tensors() -> dict[str, torch.Tensor]:
+    """One of each real component class: patch projection, two blocks, merger, pos_embed."""
+    return {
+        "model.visual.patch_embed.proj.weight": _bf16(PW, 3, 1, 2, 2),
+        "model.visual.patch_embed.proj.bias": _bf16(PW),
+        "model.visual.pos_embed.weight": _bf16(9, PW),
+        "model.visual.blocks.0.norm1.weight": _bf16(PW),
+        "model.visual.blocks.0.attn.qkv.weight": _bf16(3 * PW, PW),
+        "model.visual.blocks.0.attn.qkv.bias": _bf16(3 * PW),
+        "model.visual.blocks.1.attn.qkv.weight": _bf16(3 * PW, PW),
+        "model.visual.merger.linear_fc1.weight": _bf16(PW, PW),
+        "model.visual.merger.norm.weight": _bf16(PW),
+    }
+
+
+def _write_shard(
+    path: str,
+    tensors: dict[str, torch.Tensor],
+    *,
+    dtype_names: dict[str, str] | None = None,
+) -> int:
+    """Serialize a safetensors shard by hand and return its data base offset.
+
+    ``safetensors.torch.save_file`` pads its header to a multiple of 8, so it can only ever
+    produce an EVEN data base. The real Qwen3.8 shard's header is 47,581 B and its base is
+    47,589 -- odd -- which is exactly why every bf16 picture tensor is 2-byte misaligned and
+    why the mapped views must be treated as copy sources only. Build that layout here rather
+    than test a friendlier one than production has. ``dtype_names`` overrides the header
+    dtype string, so a dtype the reader cannot map can be fabricated.
+    """
+    blobs: list[bytes] = []
+    header: dict[str, dict] = {}
+    offset = 0
+    for name, tensor in tensors.items():
+        raw = bytes(tensor.contiguous().flatten().view(torch.uint8).numpy())
+        header[name] = {
+            "dtype": (dtype_names or {}).get(name, _ST_NAME[tensor.dtype]),
+            "shape": list(tensor.shape),
+            "data_offsets": [offset, offset + len(raw)],
+        }
+        blobs.append(raw)
+        offset += len(raw)
+    for pad in (1, 2):
+        body = json.dumps({**header, "__metadata__": {"pad": "x" * pad}}).encode("utf-8")
+        if (8 + len(body)) % 2 == 1:
+            break
+    else:  # pragma: no cover - one extra header byte always flips the parity
+        raise AssertionError("could not pad the header to an odd data base")
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<Q", len(body)))
+        fh.write(body)
+        for raw in blobs:
+            fh.write(raw)
+    return 8 + len(body)
+
+
+@pytest.fixture(scope="module")
+def picture_checkpoint(tmp_path_factory) -> tuple[str, dict[str, torch.Tensor], str, int]:
+    """``(folder, raw picture tensors, the shard holding them, its odd data base)``.
+
+    Two bf16 shards and an index, so the layout has to consult the index and map exactly the
+    one shard that carries ``model.visual.*``.
+    """
+    torch.manual_seed(3)
+    folder = tmp_path_factory.mktemp("qwen4_exp_picture_ckpt")
+    picture = _picture_tensors()
+    text = {
+        "model.language_model.embed_tokens.weight": _bf16(11, H),
+        "lm_head.weight": _bf16(11, H),
+    }
+    shard = str(folder / "model-bf16-00001.safetensors")
+    base = _write_shard(shard, {**text, **picture})
+    other_name = "model.language_model.layers.0.mlp.gate.weight"
+    save_file({other_name: _bf16(E, H)}, str(folder / "model-bf16-00002.safetensors"))
+    weight_map = {name: "model-bf16-00001.safetensors" for name in {**text, **picture}}
+    weight_map[other_name] = "model-bf16-00002.safetensors"
+    (folder / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": weight_map}), encoding="utf-8"
+    )
+    return str(folder), picture, shard, base
+
+
+def _header_ranges(shard: str) -> dict[str, tuple[int, int, list[int]]]:
+    """``raw name -> (absolute offset, bytes, shape)`` read straight out of the JSON header."""
+    header, base = weight_mod._safetensors_header(shard)
+    ranges = {}
+    for key, meta in header.items():
+        if key == "__metadata__":
+            continue
+        begin, end = meta["data_offsets"]
+        ranges[key] = (base + begin, end - begin, meta["shape"])
+    return ranges
+
+
+def test_picture_layout_offsets_come_from_the_header(picture_checkpoint):
+    folder, picture, shard, base = picture_checkpoint
+    assert base % 2 == 1, "the interesting layout is the misaligned one"
+    ranges = _header_ranges(shard)
+
+    layout = weight_mod._vision_layout(folder)
+
+    assert [s.path for s in layout.shards] == [shard], "only the shard with picture tensors"
+    specs = {spec.name: spec for spec in layout.shards[0].tensors}
+    assert set(specs) == {name.replace("model.visual.", "visual.") for name in picture}
+    for raw_name, tensor in picture.items():
+        spec = specs[raw_name.replace("model.visual.", "visual.")]
+        offset, nbytes, shape = ranges[raw_name]
+        assert (spec.offset, spec.nbytes, list(spec.shape)) == (offset, nbytes, shape)
+        assert spec.offset % 2 == 1, "bf16 at an odd file offset, like the real checkpoint"
+        assert spec.dtype is tensor.dtype
+    assert layout.nbytes == sum(t.numel() * t.element_size() for t in picture.values())
+
+
+def test_picture_layout_window_covers_the_extent_and_nothing_is_hard_coded(picture_checkpoint):
+    folder, _picture, _shard, _base = picture_checkpoint
+    shard_layout = weight_mod._vision_layout(folder).shards[0]
+
+    offsets = [spec.offset for spec in shard_layout.tensors]
+    ends = [spec.offset + spec.nbytes for spec in shard_layout.tensors]
+    assert shard_layout.start == min(offsets)
+    assert shard_layout.end == max(ends)
+    assert shard_layout.span == shard_layout.end - shard_layout.start
+
+
+def test_picture_layout_finds_the_shard_without_an_index(checkpoint):
+    """No ``model.safetensors.index.json``: scan the shards instead. The stock fixture also
+    splits its two picture tensors across both bf16 shards, so both get mapped."""
+    folder, _raw = checkpoint
+    layout = weight_mod._vision_layout(folder)
+    assert len(layout.shards) == 2
+    assert {spec.name for shard in layout.shards for spec in shard.tensors} == {
+        "visual.blocks.0.attn.qkv.weight",
+        "visual.merger.norm.weight",
+    }
+
+
+def test_picture_layout_without_picture_tensors_is_fatal(tmp_path):
+    save_file({"lm_head.weight": _bf16(4, H)}, str(tmp_path / "model-bf16-00001.safetensors"))
+    with pytest.raises(ValueError, match="no picture tensors"):
+        weight_mod._vision_layout(str(tmp_path))
+
+
+def test_picture_layout_rejects_a_mixed_dtype_extent(tmp_path):
+    save_file(
+        {
+            "model.visual.blocks.0.attn.qkv.weight": _bf16(PW, PW),
+            "model.visual.merger.norm.weight": torch.randn(PW),  # float32 among bf16
+        },
+        str(tmp_path / "model-bf16-00001.safetensors"),
+    )
+    with pytest.raises(ValueError, match="visual.merger.norm.weight"):
+        weight_mod._vision_layout(str(tmp_path))
+
+
+def test_picture_layout_rejects_a_dtype_it_cannot_view(tmp_path):
+    tensors = {"model.visual.merger.norm.weight": torch.zeros(PW, dtype=torch.bfloat16)}
+    _write_shard(
+        str(tmp_path / "model-bf16-00001.safetensors"),
+        tensors,
+        dtype_names={"model.visual.merger.norm.weight": "U16"},
+    )
+    with pytest.raises(ValueError, match="unsupported dtype"):
+        weight_mod._vision_layout(str(tmp_path))
+
+
+@pytest.fixture
+def picture_source(picture_checkpoint):
+    """A mapped holder over the picture checkpoint, closed afterwards."""
+    folder, picture, shard, _base = picture_checkpoint
+    source = weight_mod.MmapVisionWeights(weight_mod._vision_layout(folder))
+    try:
+        yield source, picture, shard
+    finally:
+        source.close()
+
+
+def test_mapped_views_are_byte_identical_to_the_checkpoint(picture_source):
+    source, picture, shard = picture_source
+    with safetensors.safe_open(shard, framework="pt", device="cpu") as handle:
+        for raw_name, expected in picture.items():
+            name = raw_name.replace("model.visual.", "visual.")
+            view = source.tensor(name)
+            reference = handle.get_tensor(raw_name)
+            assert view.shape == expected.shape and view.dtype is expected.dtype, name
+            # bf16 through int16 so a NaN payload still compares as bytes
+            assert torch.equal(view.view(torch.int16), reference.view(torch.int16)), name
+
+
+def test_mapped_views_live_inside_the_mapping_and_pos_embed_does_not(picture_source):
+    source, picture, _shard = picture_source
+    for raw_name in picture:
+        name = raw_name.replace("model.visual.", "visual.")
+        view = source.tensor(name)
+        if name == "visual.pos_embed.weight":
+            # CPU ``F.embedding`` operand, not a memcpy source: kept resident and aligned.
+            assert not source.contains(view.data_ptr())
+            assert view.data_ptr() % 2 == 0
+        else:
+            assert source.contains(view.data_ptr()), name
+
+
+def test_mapped_bytes_exclude_the_resident_carve_out(picture_source):
+    source, picture, _shard = picture_source
+    pos_embed = picture["model.visual.pos_embed.weight"]
+    assert source.resident_names == frozenset({"visual.pos_embed.weight"})
+    assert source.mapped_bytes == source.layout.nbytes - pos_embed.numel() * 2
+
+
+def test_mapped_windows_start_on_an_allocation_granularity_boundary(picture_source):
+    """``mmap`` requires the FILE offset to be a multiple of the allocation granularity, so
+    the window starts below the extent and the views carry the difference."""
+    source, _picture, _shard = picture_source
+    for window in source.windows:
+        assert window.file_offset % mmap.ALLOCATIONGRANULARITY == 0
+        assert window.span > 0
+    shard_layout = source.layout.shards[0]
+    assert source.windows[0].file_offset <= shard_layout.start
+    assert source.windows[0].span >= shard_layout.span
+
+
+def test_a_repeated_lookup_returns_the_same_view(picture_source):
+    source, _picture, _shard = picture_source
+    first = source.tensor("visual.merger.norm.weight")
+    assert source.tensor("visual.merger.norm.weight").data_ptr() == first.data_ptr()
+
+
+def test_an_unknown_picture_key_is_a_named_error(picture_source):
+    source, _picture, _shard = picture_source
+    with pytest.raises(KeyError, match="visual.blocks.9.attn.qkv.weight"):
+        source.tensor("visual.blocks.9.attn.qkv.weight")
+
+
+@pytest.fixture
+def picture_prefetch_enabled(monkeypatch):
+    """Force the Windows prefetch on with a stub that records ``(entries, count)``."""
+    calls: list[tuple[list[tuple[int, int]], int]] = []
+
+    def fake(_process, count, entries, flags):
+        assert flags == 0
+        array = (ctypes.c_size_t * (2 * count)).from_address(entries.value)
+        calls.append(([(array[2 * i], array[2 * i + 1]) for i in range(count)], count))
+        return 1
+
+    monkeypatch.setattr(weight_mod, "_prefetch_virtual_memory", fake)
+    monkeypatch.setattr(weight_mod, "_current_process", ctypes.c_void_p(0))
+    monkeypatch.setattr(weight_mod, "_vision_prefetch_failed", False)
+    return calls
+
+
+def test_prefetch_asks_for_every_mapped_window_in_one_call(
+    picture_source, picture_prefetch_enabled
+):
+    source, _picture, _shard = picture_source
+
+    assert source.prefetch() is True
+    assert len(picture_prefetch_enabled) == 1
+    entries, count = picture_prefetch_enabled[0]
+    assert count == len(source.windows)
+    assert [span for _address, span in entries] == [w.span for w in source.windows]
+    for address, span in entries:
+        assert source.contains(address) and source.contains(address + span - 1)
+
+
+def test_prefetch_is_not_reissued_until_the_encode_releases_it(
+    picture_source, picture_prefetch_enabled
+):
+    """The scheduler prefetches at admission and the streamed encode prefetches defensively
+    at entry; the second call must not pay the syscall again for the same picture."""
+    source, _picture, _shard = picture_source
+
+    assert source.prefetch() is True
+    assert source.prefetch() is True
+    assert len(picture_prefetch_enabled) == 1
+
+    source.release_prefetch()
+    assert source.prefetch() is True
+    assert len(picture_prefetch_enabled) == 2
+
+
+def test_a_false_prefetch_return_warns_once_and_stops_trying(
+    picture_source, monkeypatch, caplog
+):
+    source, _picture, _shard = picture_source
+    calls = []
+
+    def fake(_process, count, _entries, _flags):
+        calls.append(count)
+        return 0
+
+    monkeypatch.setattr(weight_mod, "_prefetch_virtual_memory", fake)
+    monkeypatch.setattr(weight_mod, "_current_process", ctypes.c_void_p(0))
+    monkeypatch.setattr(weight_mod, "_vision_prefetch_failed", False)
+
+    with caplog.at_level("WARNING", logger=weight_mod.logger.name):
+        assert source.prefetch() is False
+        source.release_prefetch()
+        assert source.prefetch() is False
+
+    assert len(calls) == 1, "a documented FALSE is not fixed by retrying"
+    assert sum("PrefetchVirtualMemory" in r.message for r in caplog.records) == 1
+    assert weight_mod._vision_prefetch_failed is True
+
+
+def test_prefetch_falls_back_to_madvise_willneed_off_windows(picture_source, monkeypatch):
+    """No PrefetchVirtualMemory: one ``madvise(MADV_WILLNEED)`` per window, not per row --
+    the picture extent is one sequential run, unlike the PLE table's random rows."""
+    source, _picture, shard = picture_source
+    advice: list[tuple[int, int, int]] = []
+
+    class _Advising:
+        def madvise(self, option, start, length):
+            advice.append((int(option), int(start), int(length)))
+
+    monkeypatch.setattr(weight_mod, "_prefetch_virtual_memory", None)
+    monkeypatch.setattr(weight_mod.mmap, "MADV_WILLNEED", 3, raising=False)
+    monkeypatch.setattr(weight_mod, "_vision_advise_failed", False)
+    monkeypatch.setitem(source._maps, shard, _Advising())
+
+    assert source.prefetch() is True
+    assert advice == [(3, 0, source.windows[0].span)]
+
+
+def test_prefetch_reports_failure_when_neither_mechanism_exists(picture_source, monkeypatch):
+    source, _picture, _shard = picture_source
+    monkeypatch.setattr(weight_mod, "_prefetch_virtual_memory", None)
+    monkeypatch.delattr(weight_mod.mmap, "MADV_WILLNEED", raising=False)
+
+    assert source.prefetch() is False
+
+
+def test_close_releases_every_map_and_file(picture_checkpoint):
+    folder, _picture, _shard, _base = picture_checkpoint
+    source = weight_mod.MmapVisionWeights(weight_mod._vision_layout(folder))
+    mappings = list(source._maps.values())
+    files = list(source._files.values())
+
+    source.close()
+
+    assert all(mapping.closed for mapping in mappings)
+    assert all(handle.closed for handle in files)
+    assert source.close() is None, "close is idempotent"
+
+
+# --------------------------------------------------------------------------------------
+# iter_weights installs the views where the resident tensors used to go
+# --------------------------------------------------------------------------------------
+
+
+def _read_picture_weights(folder: str, backing: str, monkeypatch) -> dict[str, torch.Tensor]:
+    # The mapping is process-scoped and cached per checkpoint folder, so start from a clean
+    # registry: these tests assert on whether THIS load mapped anything.
+    weight_mod.close_mmap_vision_weights()
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+    monkeypatch.setenv("FREETOKEN_VISION_EXECUTION", "layer-stream")
+    monkeypatch.setenv("FREETOKEN_VISION_WEIGHTS", backing)
+    return dict(
+        iter_weights(
+            folder, torch.device("cpu"), include_moe_experts=True, include_non_moe=True
+        )
+    )
+
+
+def test_iter_weights_installs_mapped_views_for_the_picture_keys(
+    picture_checkpoint, monkeypatch
+):
+    folder, picture, _shard, _base = picture_checkpoint
+    try:
+        values = _read_picture_weights(folder, "mmap", monkeypatch)
+        source = weight_mod.mmap_vision_weights(folder)
+        assert source is not None
+        for raw_name in picture:
+            name = raw_name.replace("model.visual.", "visual.")
+            inside = source.contains(values[name].data_ptr())
+            assert inside is (name != "visual.pos_embed.weight"), name
+        assert values["lm_head.weight"].device.type == "cpu"
+        assert not source.contains(values["lm_head.weight"].data_ptr())
+    finally:
+        weight_mod.close_mmap_vision_weights()
+
+
+def test_mapped_and_resident_picture_weights_are_the_same_bytes(
+    picture_checkpoint, monkeypatch
+):
+    """Only where the bytes live changes. Anything else is a layout bug."""
+    folder, picture, _shard, _base = picture_checkpoint
+    try:
+        resident = _read_picture_weights(folder, "ram", monkeypatch)
+        mapped = _read_picture_weights(folder, "mmap", monkeypatch)
+        assert set(resident) == set(mapped)
+        for raw_name in picture:
+            name = raw_name.replace("model.visual.", "visual.")
+            assert torch.equal(
+                mapped[name].view(torch.int16), resident[name].view(torch.int16)
+            ), name
+    finally:
+        weight_mod.close_mmap_vision_weights()
+
+
+def test_resident_mode_never_opens_a_mapping(picture_checkpoint, monkeypatch):
+    folder, _picture, _shard, _base = picture_checkpoint
+    monkeypatch.setattr(
+        weight_mod, "_vision_layout", lambda *a, **k: pytest.fail("ram must not map")
+    )
+    values = _read_picture_weights(folder, "ram", monkeypatch)
+    assert weight_mod.mmap_vision_weights(folder) is None
+    assert values["visual.merger.norm.weight"].device.type == "cpu"
+
+
+def test_a_mapping_failure_falls_back_to_resident_ram_with_one_warning(
+    picture_checkpoint, monkeypatch, caplog
+):
+    folder, picture, shard, _base = picture_checkpoint
+    monkeypatch.setattr(weight_mod, "_vision_mmap_warned", False)
+
+    def refuse(*_args, **_kwargs):
+        raise OSError(8, "not enough address space")
+
+    monkeypatch.setattr(weight_mod.mmap, "mmap", refuse)
+    with caplog.at_level("WARNING", logger=weight_mod.logger.name):
+        first = _read_picture_weights(folder, "mmap", monkeypatch)
+        second = _read_picture_weights(folder, "mmap", monkeypatch)
+
+    assert weight_mod.mmap_vision_weights(folder) is None
+    warnings = [r for r in caplog.records if "picture weights" in r.message]
+    assert len(warnings) == 1, "one warning for the process, not one per boot attempt"
+    with safetensors.safe_open(shard, framework="pt", device="cpu") as handle:
+        for raw_name in picture:
+            name = raw_name.replace("model.visual.", "visual.")
+            reference = handle.get_tensor(raw_name).view(torch.int16)
+            assert torch.equal(first[name].view(torch.int16), reference), name
+            assert torch.equal(second[name].view(torch.int16), reference), name

@@ -28,12 +28,17 @@ from typing import BinaryIO, Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
-from freetoken.models.config import vision_execution_mode, vision_load_enabled
+from freetoken.models.config import (
+    vision_execution_mode,
+    vision_load_enabled,
+    vision_weights_backing,
+)
 from freetoken.models.loader import drop_page_cache, iter_weight_files
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
     load_nvfp4_expert_source_banks,
 )
+from freetoken.models.weight import _ST_DTYPE
 from freetoken.moe.host_banks import HostBank, read_range_into
 from freetoken.utils import download_hf_weight, init_logger
 from freetoken.utils.progress import byte_bar
@@ -179,6 +184,14 @@ def iter_weights(
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
     include_vision = vision_load_enabled()
     stream_vision = include_vision and vision_execution_mode() == "layer-stream"
+    # ``mmap``: install the picture tensors as zero-copy views over a copy-on-write mapping
+    # of their shard extent instead of reading 856 MiB into process RAM. ``None`` means
+    # today's resident behaviour -- either the flag says ``ram`` or the mapping was refused.
+    mapped_vision = (
+        open_mmap_vision_weights(model_path)
+        if stream_vision and vision_weights_backing() == "mmap"
+        else None
+    )
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -193,7 +206,7 @@ def iter_weights(
                 raw.startswith(("model.visual.", "visual.")) for raw in raw_names
             )
             vision_file = engine_file
-            if has_vision and device.type != "cpu":
+            if has_vision and mapped_vision is None and device.type != "cpu":
                 # Read picture tensors directly into their persistent CPU home. Loading
                 # them on CUDA first would leave allocator reservations behind and make
                 # automatic expert sizing undercount the memory this mode is meant to free.
@@ -204,8 +217,11 @@ def iter_weights(
                 name = _rename(raw_name, include_vision=include_vision)
                 if name is None:
                     continue
-                source = vision_file if name.startswith("visual.") else engine_file
-                tensor = source.get_tensor(raw_name)
+                if mapped_vision is not None and name.startswith("visual."):
+                    tensor = mapped_vision.tensor(name)
+                else:
+                    source = vision_file if name.startswith("visual.") else engine_file
+                    tensor = source.get_tensor(raw_name)
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
@@ -792,6 +808,470 @@ def load_mmap_ple_table(model_path: str, qwen4_args) -> MmapPleTable:
 
 
 # ======================================================================================
+# Picture weights served from the mapped shard extent
+# ======================================================================================
+#
+# With FREETOKEN_VISION_WEIGHTS=mmap the 333 picture tensors (897,862,112 B of bf16, one
+# unbroken extent at the end of model-bf16-00001.safetensors) are never read into process
+# memory. Their extent is mapped copy-on-write and each tensor becomes a zero-copy
+# torch.frombuffer view installed exactly where the resident tensor used to go, so the
+# ~856 MiB stays on the SSD until a picture request faults it in -- and goes back to the
+# standby list that feeds the 47.7 GiB mapped PLE table when the OS wants it.
+#
+# This reuses MmapPleStorage's mechanics (header-derived ranges, ACCESS_COPY, frombuffer
+# views, batched PrefetchVirtualMemory / madvise(WILLNEED)) but none of its caching or
+# fault fan-out: PLE gathers a few random rows out of 320 M per decoded token, while a
+# picture reads 100% of its tensors, in the same order, once. The only cache it wants is
+# the OS page cache, and one prefetch over one sequential extent beats any fan-out.
+
+_VISION_RAW_PREFIXES = ("model.visual.", "visual.")
+# ``visual.pos_embed.weight`` (5,308,416 B) is the one picture tensor the streamed encode
+# uses as a CPU compute operand -- ``F.embedding`` in ``Qwen4VisionModel._position_data`` --
+# rather than a memcpy source, and its mapped view would be 2-byte misaligned like every
+# other bf16 tensor in this shard. 0.6% of the extent buys an ordinary aligned tensor and
+# removes an entire class of question about misaligned CPU kernels.
+_VISION_RESIDENT_KEYS = frozenset({"visual.pos_embed.weight"})
+
+
+@dataclass(frozen=True)
+class VisionTensorSpec:
+    """One picture tensor's byte range in a safetensor file."""
+
+    name: str  # FreeToken state-dict key, e.g. ``visual.blocks.0.attn.qkv.weight``
+    raw_name: str  # the checkpoint's own key
+    offset: int  # absolute file offset of its first byte
+    nbytes: int
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+
+
+@dataclass(frozen=True)
+class VisionShardLayout:
+    """One shard's picture tensors and the file window that covers them."""
+
+    path: str
+    start: int  # lowest file offset of any picture tensor here
+    end: int  # one past the highest
+    tensors: tuple[VisionTensorSpec, ...]
+
+    @property
+    def span(self) -> int:
+        return self.end - self.start
+
+    @property
+    def nbytes(self) -> int:
+        return sum(spec.nbytes for spec in self.tensors)
+
+
+@dataclass(frozen=True)
+class VisionLayout:
+    """Validated on-disk layout of the picture weights."""
+
+    shards: tuple[VisionShardLayout, ...]
+    dtype: torch.dtype
+
+    @property
+    def nbytes(self) -> int:
+        """Bytes the picture tensors actually occupy."""
+        return sum(shard.nbytes for shard in self.shards)
+
+    @property
+    def span(self) -> int:
+        """Bytes the windows cover -- equal to ``nbytes`` when the extent is unbroken."""
+        return sum(shard.span for shard in self.shards)
+
+    @property
+    def count(self) -> int:
+        return sum(len(shard.tensors) for shard in self.shards)
+
+
+def _vision_shard_files(folder: str) -> list[str]:
+    """Shards holding picture tensors, from the index when there is one."""
+    index = os.path.join(folder, "model.safetensors.index.json")
+    if not os.path.exists(index):
+        return sorted(iter_weight_files(folder))
+    with open(index, encoding="utf-8") as fh:
+        weight_map = json.load(fh)["weight_map"]
+    files = {
+        shard for name, shard in weight_map.items() if name.startswith(_VISION_RAW_PREFIXES)
+    }
+    return sorted(os.path.join(folder, shard) for shard in files)
+
+
+def _vision_layout(model_path: str) -> VisionLayout:
+    """Parse and validate the picture tensors' byte ranges out of the shard headers.
+
+    Which shards, which ranges, which dtype: all of it comes from the headers, so a
+    re-exported checkpoint with a different layout is either read correctly or rejected,
+    never misread. Contiguity is NOT assumed -- the window per shard is
+    ``[min offset, max end)``, which for this checkpoint is exactly the 897,862,112-byte run
+    at the end of ``model-bf16-00001.safetensors`` and in general is a superset of the
+    picture bytes.
+    """
+    folder = download_hf_weight(model_path)
+    shards: list[VisionShardLayout] = []
+    dtypes: dict[torch.dtype, str] = {}
+    for path in _vision_shard_files(folder):
+        header, base = _safetensors_header(path)
+        specs: list[VisionTensorSpec] = []
+        for key, meta in header.items():
+            if key == "__metadata__":
+                continue
+            name = _rename(key, include_vision=True)
+            if name is None or not name.startswith("visual."):
+                continue
+            dtype = _ST_DTYPE.get(meta["dtype"])
+            if dtype is None:
+                raise ValueError(f"picture tensor {name} has unsupported dtype {meta['dtype']}")
+            shape = tuple(int(extent) for extent in meta["shape"])
+            begin, end = meta["data_offsets"]
+            count = 1
+            for extent in shape:
+                count *= extent
+            if end - begin != count * dtype.itemsize:
+                raise ValueError(
+                    f"picture tensor {name} header says {list(shape)} {meta['dtype']} "
+                    f"but reserves {end - begin} bytes"
+                )
+            dtypes.setdefault(dtype, name)
+            specs.append(
+                VisionTensorSpec(
+                    name=name,
+                    raw_name=key,
+                    offset=base + begin,
+                    nbytes=end - begin,
+                    shape=shape,
+                    dtype=dtype,
+                )
+            )
+        if not specs:
+            continue
+        shards.append(
+            VisionShardLayout(
+                path=path,
+                start=min(spec.offset for spec in specs),
+                end=max(spec.offset + spec.nbytes for spec in specs),
+                tensors=tuple(specs),
+            )
+        )
+    if not shards:
+        raise ValueError(f"{folder} has no picture tensors (model.visual.*) to map")
+    if len(dtypes) > 1:
+        named = ", ".join(
+            f"{name} is {dtype}" for dtype, name in sorted(dtypes.items(), key=lambda kv: kv[1])
+        )
+        raise ValueError(f"picture tensors have mixed dtypes: {named}")
+    return VisionLayout(shards=tuple(shards), dtype=next(iter(dtypes)))
+
+
+@dataclass(frozen=True)
+class MappedVisionWindow:
+    """One ``mmap`` window: where it starts in the file, how long, and where it landed."""
+
+    path: str
+    file_offset: int  # aligned down to mmap.ALLOCATIONGRANULARITY
+    span: int
+    address: int  # virtual address of ``file_offset``
+
+
+# A one-shot disable per mechanism, separate from the PLE table's: a FALSE return for a
+# 112,000-entry PLE row prefetch is a working-set/quota refusal that says nothing about a
+# single-entry request over one extent, so one subsystem must not silence the other.
+_vision_prefetch_failed = False
+_vision_advise_failed = False
+
+
+class MmapVisionWeights:
+    """The picture weights as zero-copy views over a copy-on-write mapping of their shard.
+
+    One mapping per shard that carries picture tensors, starting at the extent rounded down
+    to ``mmap.ALLOCATIONGRANULARITY`` and only as long as the extent needs, so the commit
+    charge is the extent (~857 MiB here) rather than the whole 1.27 GiB file.
+
+    ``ACCESS_COPY``, not ``ACCESS_READ``: over a read-only buffer ``torch.frombuffer`` warns
+    on every call and then hands back a tensor it believes is writable, while copy-on-write
+    is silent and correct. Clean copy-on-write pages are still file-backed and still
+    reclaimable with no pagefile write.
+
+    NEVER write through one of these views. The copy-on-write fault would make the page
+    private and dirty and silently hand back the RAM this mode exists to save. They are only
+    ever ``copy_`` sources (``vision._copy_component_state_``).
+    """
+
+    def __init__(self, layout: VisionLayout) -> None:
+        self.layout = layout
+        self.resident_names = frozenset(
+            spec.name
+            for shard in layout.shards
+            for spec in shard.tensors
+            if spec.name in _VISION_RESIDENT_KEYS
+        )
+        self._files: dict[str, BinaryIO] = {}
+        self._maps: dict[str, mmap.mmap] = {}
+        self._views: dict[str, torch.Tensor] = {}
+        # uint8 view over each whole window: what turns a mapping into the virtual address
+        # the prefetch API wants, and what ``contains`` measures against.
+        self._window_views: list[torch.Tensor] = []
+        self._windows: tuple[MappedVisionWindow, ...] = ()
+        self._entries = torch.empty((0, 2), dtype=torch.int64)
+        self._prefetch_issued = False
+        windows: list[MappedVisionWindow] = []
+        try:
+            for shard in layout.shards:
+                fh = open(shard.path, "rb")
+                self._files[shard.path] = fh
+                aligned = shard.start - shard.start % mmap.ALLOCATIONGRANULARITY
+                span = shard.end - aligned
+                mapping = mmap.mmap(
+                    fh.fileno(), length=span, access=mmap.ACCESS_COPY, offset=aligned
+                )
+                self._maps[shard.path] = mapping
+                window = torch.frombuffer(mapping, dtype=torch.uint8, count=span)
+                self._window_views.append(window)
+                windows.append(
+                    MappedVisionWindow(
+                        path=shard.path,
+                        file_offset=aligned,
+                        span=span,
+                        address=window.data_ptr(),
+                    )
+                )
+                for spec in shard.tensors:
+                    if spec.name in _VISION_RESIDENT_KEYS:
+                        self._views[spec.name] = self._read_resident(fh, spec)
+                        continue
+                    self._views[spec.name] = (
+                        torch.frombuffer(
+                            mapping,
+                            dtype=torch.uint8,
+                            count=spec.nbytes,
+                            offset=spec.offset - aligned,
+                        )
+                        .view(spec.dtype)
+                        .reshape(spec.shape)
+                    )
+        except Exception:
+            self.close()
+            raise
+        self._windows = tuple(windows)
+        # int64 [n, 2] laid out exactly as ``WIN32_MEMORY_RANGE_ENTRY[n]`` --
+        # ``{PVOID VirtualAddress; SIZE_T NumberOfBytes;}``, 16 B per entry on x64 -- so the
+        # tensor's data_ptr is the array pointer the API wants. Same trick as
+        # ``MmapPleStorage._range_entries``, minus the vectorized row arithmetic: there is
+        # one entry per shard, not one per gathered row.
+        self._entries = torch.tensor(
+            [[window.address, window.span] for window in self._windows], dtype=torch.int64
+        )
+
+    @staticmethod
+    def _read_resident(fh: BinaryIO, spec: VisionTensorSpec) -> torch.Tensor:
+        """One picture tensor as an ordinary aligned heap tensor (the ``pos_embed`` carve-out)."""
+        buffer = bytearray(spec.nbytes)
+        fh.seek(spec.offset)
+        got = fh.readinto(buffer)
+        if got != spec.nbytes:
+            raise ValueError(
+                f"picture tensor {spec.name}: read {got} of {spec.nbytes} bytes from {fh.name}"
+            )
+        return torch.frombuffer(buffer, dtype=torch.uint8).view(spec.dtype).reshape(spec.shape)
+
+    def tensor(self, name: str) -> torch.Tensor:
+        """The installed tensor for a state-dict key."""
+        view = self._views.get(name)
+        if view is None:
+            raise KeyError(f"{name} is not a picture tensor of this checkpoint")
+        return view
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._views)
+
+    @property
+    def nbytes(self) -> int:
+        """Bytes of picture weights this holder serves."""
+        return self.layout.nbytes
+
+    @property
+    def mapped_bytes(self) -> int:
+        """Of those, the bytes that live in the mapping rather than in process RAM."""
+        return self.layout.nbytes - sum(
+            spec.nbytes
+            for shard in self.layout.shards
+            for spec in shard.tensors
+            if spec.name in self.resident_names
+        )
+
+    @property
+    def windows(self) -> tuple[MappedVisionWindow, ...]:
+        return self._windows
+
+    def contains(self, address: int) -> bool:
+        """Is ``address`` inside a mapped window? The containment check the acceptance
+        criteria are written against -- a picture tensor that has left the mapping has been
+        copied, and the saving with it."""
+        return any(
+            window.address <= address < window.address + window.span for window in self._windows
+        )
+
+    def prefetch(self) -> bool:
+        """Ask the OS to start reading the whole picture extent; ``False`` if it cannot.
+
+        The call is asynchronous, and that is the property this design leans on: measured on
+        this box it returned in 84-156 ms while 260-820 ms of cold faulting still had to
+        happen, so the ~1.5 s encode that follows consumes the extent while the drive is
+        still filling it.
+
+        At most one outstanding prefetch per picture: the scheduler issues it at admission
+        and ``forward_layer_streamed`` issues it defensively at entry, and the encode
+        releases it when it finishes, so a picture never pays the syscall (40 ms even warm)
+        twice. Never raises -- a failed prefetch only costs latency.
+        """
+        if self._prefetch_issued:
+            return True
+        if self._prefetch_windows() or self._advise_windows():
+            self._prefetch_issued = True
+            return True
+        return False
+
+    def release_prefetch(self) -> None:
+        """Let the next picture issue its own prefetch."""
+        self._prefetch_issued = False
+
+    def _prefetch_windows(self) -> bool:
+        """Windows: one ``PrefetchVirtualMemory`` covering every window."""
+        global _vision_prefetch_failed
+        if _prefetch_virtual_memory is None or _vision_prefetch_failed:
+            return False
+        count = int(self._entries.shape[0])
+        if count == 0:
+            return False
+        if _prefetch_virtual_memory(
+            _current_process, count, ctypes.c_void_p(self._entries.data_ptr()), 0
+        ):
+            return True
+        _vision_prefetch_failed = True
+        logger.warning(
+            "PrefetchVirtualMemory failed for the %d-byte picture extent (error %d); "
+            "the encode's own copies will fault the pages in for the rest of this process",
+            self.mapped_bytes,
+            ctypes.get_last_error(),
+        )
+        return False
+
+    def _advise_windows(self) -> bool:
+        """POSIX: one ``madvise(MADV_WILLNEED)`` per window.
+
+        One call for the whole window, not the per-row loop ``MmapPleStorage._advise_rows``
+        needs: the picture extent is a single sequential run.
+        """
+        global _vision_advise_failed
+        willneed = getattr(mmap, "MADV_WILLNEED", None)
+        if willneed is None or _vision_advise_failed or not self._windows:
+            return False
+        try:
+            for window in self._windows:
+                mapping = self._maps[window.path]
+                if not hasattr(mapping, "madvise"):
+                    return False
+                mapping.madvise(willneed, 0, window.span)
+        except OSError as exc:
+            _vision_advise_failed = True
+            logger.warning(
+                "madvise(MADV_WILLNEED) failed for the picture extent (%s); the encode's own "
+                "copies will fault the pages in for the rest of this process",
+                exc,
+            )
+            return False
+        return True
+
+    def close(self) -> None:
+        self._views.clear()
+        self._window_views.clear()
+        self._windows = ()
+        self._entries = torch.empty((0, 2), dtype=torch.int64)
+        for mapping in self._maps.values():
+            mapping.close()
+        self._maps.clear()
+        for fh in self._files.values():
+            fh.close()
+        self._files.clear()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+_vision_sources: dict[str, MmapVisionWeights] = {}
+_vision_sources_lock = threading.Lock()
+_vision_mmap_warned = False
+
+
+def open_mmap_vision_weights(model_path: str) -> MmapVisionWeights | None:
+    """Map this checkpoint's picture extent, or ``None`` to fall back to resident RAM.
+
+    Process-scoped and idempotent per checkpoint folder: ``iter_weights`` builds the holder
+    while it installs the views, and the model claims the same object afterwards, so there
+    is never a second mapping or a second 857 MiB of commit charge.
+
+    A layout the reader cannot trust -- no picture tensors at all, a dtype it cannot view, a
+    header that disagrees with itself -- raises, because that means the picture weights are
+    not where the caller thinks they are. A mapping the OS refuses costs only the
+    optimization, so it warns once and falls back.
+    """
+    global _vision_mmap_warned
+    folder = download_hf_weight(model_path)
+    with _vision_sources_lock:
+        existing = _vision_sources.get(folder)
+        if existing is not None:
+            return existing
+        layout = _vision_layout(folder)
+        try:
+            source = MmapVisionWeights(layout)
+        except Exception as exc:  # noqa: BLE001 - an optimization must never fail a boot
+            if not _vision_mmap_warned:
+                _vision_mmap_warned = True
+                logger.warning(
+                    "picture weights: mapping the %d-byte extent of %s failed (%s); serving "
+                    "them from resident RAM for the rest of this process",
+                    layout.nbytes,
+                    folder,
+                    exc,
+                )
+            return None
+        logger.info(
+            "Picture weights: mapped %d tensors, %d bytes in %d window(s) of %s",
+            layout.count,
+            layout.nbytes,
+            len(source.windows),
+            ", ".join(os.path.basename(shard.path) for shard in layout.shards),
+        )
+        _vision_sources[folder] = source
+        return source
+
+
+def mmap_vision_weights(model_path: str) -> MmapVisionWeights | None:
+    """The holder built for this checkpoint, or ``None`` if the weights are resident."""
+    with _vision_sources_lock:
+        return _vision_sources.get(download_hf_weight(model_path))
+
+
+def close_mmap_vision_weights(model_path: str | None = None) -> None:
+    """Unmap the picture extent.
+
+    The engine holds the mapping for its whole life, exactly as it holds the PLE one, so
+    nothing on the serving path calls this; it exists for tests and explicit teardown.
+    """
+    with _vision_sources_lock:
+        keys = list(_vision_sources) if model_path is None else [download_hf_weight(model_path)]
+        for key in keys:
+            source = _vision_sources.pop(key, None)
+            if source is not None:
+                source.close()
+
+
+# ======================================================================================
 # Routed NVFP4 experts
 # ======================================================================================
 
@@ -829,10 +1309,15 @@ def load_nvfp4_expert_sources_parallel(
 __all__ = [
     "MmapPleStorage",
     "MmapPleTable",
+    "MmapVisionWeights",
     "PleTable",
+    "VisionLayout",
+    "close_mmap_vision_weights",
     "iter_weights",
+    "load_mmap_ple_table",
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",
-    "load_mmap_ple_table",
     "load_ple_table",
+    "mmap_vision_weights",
+    "open_mmap_vision_weights",
 ]
