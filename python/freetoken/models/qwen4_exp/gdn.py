@@ -62,7 +62,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
     def __init__(
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
         conv_kernel_size, rms_norm_eps, layer_id, output_gate: str = "sigmoid",
-        expert_quant: str = "none", attn_quant: str = "none",
+        expert_quant: str = "none", attn_quant: str = "none", dense_quant: str = "none",
     ):
         self.layer_id = layer_id
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
@@ -101,7 +101,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             # in the checkpoint, so only the load-time int8 conversion applies here (and it is
             # the single largest dense read of a GDN layer: [16480, 2560]).
             self.in_proj = make_dense_col_merged(
-                attn_quant, hidden_size, self._in_proj_split, has_bias=False
+                dense_quant, hidden_size, self._in_proj_split, has_bias=False
             )
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,

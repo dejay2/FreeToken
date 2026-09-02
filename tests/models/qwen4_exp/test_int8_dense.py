@@ -113,6 +113,7 @@ def _modules(monkeypatch, mode: str | None):
         hidden_size=args.hidden_size, num_k_heads=2, num_v_heads=2, head_k_dim=32,
         head_v_dim=32, conv_kernel_size=4, rms_norm_eps=1e-6, layer_id=0,
         expert_quant=config.expert_quant, attn_quant=config.attn_quant,
+        dense_quant=config.dense_quant,
     )
     attn = Qwen4ExpAttention(config, layer_id=3)
     hc = GatedResidual(config, use_combine=True)
@@ -164,6 +165,20 @@ def test_int8_replaces_every_dense_class_on_the_decode_path(monkeypatch):
     }
     for name, module in _modules(monkeypatch, "int8").items():
         assert type(module) is expected[name], name
+
+
+def test_gdn_in_proj_uses_dense_quant_with_packed_attention(monkeypatch):
+    """Packed attention storage must not hide the separate int8 dense conversion."""
+    from dataclasses import replace
+
+    from freetoken.models.qwen4_exp.model import build_linear_mixer
+
+    monkeypatch.delenv(ENV, raising=False)
+    config = replace(
+        parse_config(toy_hf_config()), attn_quant="mxfp8", dense_quant="int8"
+    )
+    gdn = build_linear_mixer(config, layer_id=0)
+    assert type(gdn.in_proj) is Int8DenseColMerged
 
 
 def test_the_router_and_the_shared_gate_stay_bf16(monkeypatch):

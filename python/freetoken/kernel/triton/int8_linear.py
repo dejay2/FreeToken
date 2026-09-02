@@ -67,6 +67,8 @@ import triton.language as tl
 from freetoken.layers import BaseOP
 from freetoken.layers.base import _concat_prefix
 
+from freetoken.kernel.triton.int8_tuning import _GEMM_TABLE, _GEMV_TABLE
+
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
 
 # Output rows quantized per pass in :func:`quantize_int8_rows`. The fp32 working copy of the
@@ -113,89 +115,8 @@ def quantize_int8_rows(
         scales[lo:hi] = scale
     return codes, scales
 
+# Heuristic fallbacks for shapes missing from int8_tuning.
 
-# ======================================================================================
-# Tuning table. Keyed on (M bucket, N, K); values measured offline on an RTX 5090 (sm_120,
-# 170 SMs) against the shapes this checkpoint actually runs. A miss falls back to the
-# heuristic below, which is what carries other shapes and other cards.
-# ======================================================================================
-# GEMV (M == 1): (BLOCK_N, BLOCK_K, num_warps, num_stages, split_k)
-_GEMV_TABLE: dict[tuple[int, int], tuple[int, int, int, int, int]] = {
-    (16480, 2560): (16, 256, 4, 4, 1),    # GDN in_proj
-    (2560, 6144): (16, 256, 4, 4, 4),     # GDN out_proj / QSA o_proj
-    (13312, 2560): (16, 256, 4, 4, 1),    # QSA qkv_proj
-    (640, 2560): (16, 256, 8, 4, 8),      # QSA indexer
-    (1280, 2560): (16, 256, 4, 4, 8),     # shared expert gate_up
-    (2560, 640): (16, 64, 8, 4, 1),       # shared expert down (K=640: BK=64 keeps EVEN_K)
-    (336, 10240): (32, 256, 8, 4, 32),    # hyper-connection down_block_inject
-    (10240, 320): (16, 256, 8, 4, 1),     # hyper-connection up
-    (248320, 2560): (16, 256, 8, 4, 1),   # lm_head
-}
-# GEMM (M > 1): (M bucket, N, K) -> (BLOCK_M, BLOCK_N, BLOCK_K, warps, stages, split_k).
-# A shape missing from a bucket (e.g. qkv above M=16) lands on the heuristic and still beats
-# bf16 there; entries exist where measurement showed the heuristic leaving >10% behind.
-_GEMM_TABLE: dict[tuple[int, int, int], tuple[int, int, int, int, int, int]] = {
-    # M <= 16: batched decode and the 6-row speculative verify -- the shapes that matter.
-    (16, 16480, 2560): (16, 64, 128, 4, 4, 1),
-    (16, 2560, 6144): (16, 64, 128, 4, 4, 4),
-    (16, 13312, 2560): (16, 64, 128, 4, 4, 1),
-    (16, 640, 2560): (16, 64, 128, 4, 4, 16),
-    (16, 1280, 2560): (16, 64, 128, 4, 4, 4),
-    (16, 2560, 640): (16, 64, 128, 8, 4, 1),
-    (16, 336, 10240): (16, 64, 128, 4, 4, 16),
-    (16, 10240, 320): (16, 64, 128, 8, 4, 1),
-    (16, 248320, 2560): (16, 128, 128, 4, 3, 1),
-    # 16 < M <= 32
-    (32, 16480, 2560): (32, 64, 128, 4, 4, 1),
-    (32, 2560, 6144): (32, 64, 128, 4, 3, 4),
-    (32, 640, 2560): (32, 64, 128, 8, 4, 8),
-    (32, 2560, 640): (32, 64, 128, 8, 4, 1),
-    (32, 10240, 320): (32, 64, 128, 8, 3, 1),
-    (32, 336, 10240): (32, 64, 128, 4, 4, 16),
-    (32, 1280, 2560): (32, 64, 128, 4, 4, 8),
-    (32, 248320, 2560): (32, 64, 128, 4, 4, 1),
-    # 32 < M <= 64
-    (64, 16480, 2560): (64, 64, 128, 4, 3, 1),
-    (64, 2560, 6144): (64, 64, 128, 8, 4, 4),
-    (64, 640, 2560): (64, 64, 64, 4, 4, 8),
-    (64, 2560, 640): (64, 64, 128, 8, 4, 1),
-    (64, 10240, 320): (64, 64, 64, 8, 4, 1),
-    (64, 336, 10240): (64, 64, 128, 4, 4, 16),
-    (64, 1280, 2560): (64, 64, 128, 8, 4, 4),
-    (64, 248320, 2560): (64, 64, 128, 4, 3, 1),
-    # 64 < M <= 256 (short prefill / chunk tail), measured at M = 128
-    (256, 16480, 2560): (64, 128, 64, 8, 4, 1),
-    (256, 2560, 6144): (64, 64, 128, 4, 3, 4),
-    (256, 13312, 2560): (64, 64, 128, 4, 3, 1),
-    (256, 640, 2560): (64, 64, 64, 8, 3, 8),
-    (256, 1280, 2560): (64, 64, 128, 8, 4, 4),
-    (256, 2560, 640): (64, 64, 128, 8, 4, 1),
-    (256, 336, 10240): (64, 64, 128, 4, 3, 16),
-    (256, 10240, 320): (64, 64, 64, 4, 4, 1),
-    (256, 248320, 2560): (64, 256, 64, 8, 4, 1),
-    # 256 < M <= 1024, measured at M = 1024
-    (1024, 16480, 2560): (64, 128, 64, 8, 3, 1),
-    (1024, 2560, 6144): (128, 128, 64, 8, 4, 1),
-    (1024, 13312, 2560): (64, 128, 64, 4, 3, 1),
-    (1024, 640, 2560): (64, 64, 128, 8, 4, 1),
-    (1024, 1280, 2560): (64, 64, 64, 4, 3, 1),
-    (1024, 2560, 640): (64, 128, 64, 8, 3, 1),
-    (1024, 336, 10240): (64, 64, 128, 4, 3, 8),
-    (1024, 10240, 320): (64, 64, 64, 4, 3, 1),
-    (1024, 248320, 2560): (128, 128, 32, 4, 3, 1),
-    # M > 1024 (long prefill), measured at M = 4096
-    (0, 16480, 2560): (128, 128, 32, 4, 4, 2),
-    (0, 2560, 6144): (128, 128, 32, 4, 3, 1),
-    (0, 13312, 2560): (128, 256, 64, 8, 3, 1),
-    (0, 640, 2560): (128, 128, 64, 8, 4, 1),
-    (0, 1280, 2560): (64, 256, 32, 4, 3, 1),
-    (0, 2560, 640): (64, 128, 64, 4, 3, 1),
-    (0, 336, 10240): (64, 128, 64, 8, 3, 4),
-    (0, 10240, 320): (64, 128, 64, 4, 3, 1),
-    (0, 248320, 2560): (128, 128, 32, 4, 3, 1),
-}
-
-# Heuristic fallbacks.
 _GEMV_DEFAULT = (16, 256, 4, 4)
 _GEMV_SPLITK_TARGET = 2048  # target total programs before split-K stops growing
 _GEMM_SPLITK_TARGET = 512
@@ -707,16 +628,22 @@ class Int8DenseLinear(_Int8DenseBase):
 
 
 class Int8DenseColMerged(_Int8DenseBase):
-    """Column-merged int8 dense linear (drop-in for ``LinearColParallelMerged`` at TP=1).
+    """Column-merged int8 dense linear mirroring ``LinearColParallelMerged``.
 
     One weight concatenating several projections on the output dim; each output row keeps
-    its own scale, so a merged weight is exactly as accurate as the split ones. The caller
-    splits the output by ``output_sizes`` as before.
+    its own scale, so a merged weight is exactly as accurate as the split ones. Each output
+    part is sharded independently by tensor-parallel rank, and the caller splits the output
+    by ``output_sizes`` as before.
     """
 
     def __init__(self, in_features: int, output_sizes: list[int], has_bias: bool = False):
+        from freetoken.distributed import get_tp_info
+        from freetoken.utils import div_even
+
+        tp_info = get_tp_info()
         self.output_sizes = list(output_sizes)
-        super().__init__(in_features, sum(output_sizes), has_bias)
+        tp_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
+        super().__init__(in_features, sum(tp_output_sizes), has_bias)
 
 
 class Int8DenseRowParallel(_Int8DenseBase):
@@ -773,6 +700,12 @@ class Int8LMHead(BaseOP):
         return self._scale
 
     def quantize_from(self, weight: torch.Tensor) -> None:
+        expected_shape = (self.num_embeddings_tp, self.embedding_dim)
+        if tuple(weight.shape) != expected_shape:
+            raise ValueError(
+                f"expected a [{expected_shape[0]}, {expected_shape[1]}] weight, "
+                f"got {tuple(weight.shape)}"
+            )
         self.weight, self._scale = quantize_int8_rows(weight)
 
     def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
