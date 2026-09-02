@@ -129,6 +129,7 @@ def _adjust(**over):
         moe_gpu_owned_layers="auto",
         moe_prefill_overlap=True,
         moe_cache_size=6750,
+        moe_cache_auto=False,
     )
     for name, value in over.items():
         setattr(config, name, value)
@@ -163,12 +164,52 @@ def test_validation_rejects_an_ftw_checkpoint(tmp_path):
 def test_validation_keeps_two_expert_layers_of_lru_when_overlap_is_on():
     from freetoken.engine.engine import _validate_gpu_owned_layers
 
-    # 512 experts, prefill overlap on -> the LRU floor is 2 * 512 = 1024 slots
-    config, _ = _adjust(moe_cache_size=1023)
-    with pytest.raises(ValueError, match="prefill overlap needs at least 1024"):
+    # --moe-cache-size is the TOTAL budget: 6 owned layers charge 6 * 512 = 3072 slots of it,
+    # and prefill overlap needs 2 * 512 = 1024 left over, so the floor on the total is 4096.
+    config, _ = _adjust(moe_cache_size=4095)
+    with pytest.raises(ValueError, match="need at least 1024"):
         _validate_gpu_owned_layers(config, L)
-    config, _ = _adjust(moe_cache_size=1024)
+    config, _ = _adjust(moe_cache_size=4096)
     assert _validate_gpu_owned_layers(config, L) == frozenset({0, 1, 2, 6, 7, 22})
+
+
+def test_validation_does_not_charge_the_size_when_auto_sizing_owns_the_budget():
+    from freetoken.engine.engine import _validate_gpu_owned_layers
+
+    # --moe-cache-auto charges the reservation through fixed_cache_size instead; a leftover
+    # moe_cache_size must not be re-checked (or re-charged) against the overlap floor here.
+    config, _ = _adjust(moe_cache_size=1024, moe_cache_auto=True)
+    assert _validate_gpu_owned_layers(config, L) == frozenset({0, 1, 2, 6, 7, 22})
+
+
+def test_the_engine_charges_the_owned_layers_to_an_explicit_cache_size_once():
+    """The run-2 regression, in one assertion: 6750 + auto must stay a 6750-slot card."""
+    from freetoken.engine.engine import Engine
+
+    config, _ = _adjust(moe_cache_size=6750, moe_cache_auto=False)
+    owned = frozenset({0, 1, 2, 6, 7, 22})
+
+    Engine._charge_gpu_owned_layers_to_cache_size(None, config, owned)
+    assert config.moe_cache_size == 3678  # 6750 - 6 * 512
+
+    # idempotence is not claimed, so the guard is that the call site is single: assert the
+    # engine only ever calls it from _init_offload_moe_cache.
+    import inspect
+
+    source = inspect.getsource(Engine)
+    assert source.count("_charge_gpu_owned_layers_to_cache_size(") == 2  # def + one call
+
+
+def test_the_engine_leaves_the_cache_size_alone_without_owned_layers_or_under_auto():
+    from freetoken.engine.engine import Engine
+
+    config, _ = _adjust(moe_cache_size=6750, moe_cache_auto=False)
+    Engine._charge_gpu_owned_layers_to_cache_size(None, config, frozenset())
+    assert config.moe_cache_size == 6750
+
+    config, _ = _adjust(moe_cache_size=6750, moe_cache_auto=True)
+    Engine._charge_gpu_owned_layers_to_cache_size(None, config, frozenset({0, 1}))
+    assert config.moe_cache_size == 6750
 
 
 def test_validation_is_inert_without_the_flag():

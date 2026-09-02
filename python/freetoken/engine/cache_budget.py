@@ -45,6 +45,47 @@ def gpu_owned_reservation_bytes(
     return owned_layers * num_experts * per_expert_bytes
 
 
+def lru_slots_after_owned_charge(
+    *, moe_cache_size: int, owned_layers: int, num_experts: int, floor: int
+) -> int:
+    """Split an explicit ``--moe-cache-size`` into the owned reservation and the LRU.
+
+    ``--moe-cache-size`` is the TOTAL expert-slot budget on the card. The GPU-owned layers
+    hold one full expert layer each and are CHARGED to that budget; the LRU keeps the rest.
+    Charging rather than adding is what makes ``--moe-gpu-owned-layers`` VRAM-neutral:
+    turning it on can never raise total MoE residency above the size the operator asked for.
+
+    Measured 2026-09-02 on an RTX 5090 32 GB: 6 owned layers ADDED to 4400 slots put the card
+    at 569 MiB free at decode peak and halved throughput (70.4 -> 34.6 tok/s) even though it
+    moved 11 % FEWER expert rows per step; the same owned set CHARGED to a 6750-slot budget
+    (3678 LRU slots, byte-identical residency to the no-owned baseline) runs at 63 tok/s. See
+    ``docs/research/gpu-owned-layers-speed-diagnosis-2026-09-02.md``.
+
+    ``--moe-cache-auto`` needs none of this: there the reservation already joins
+    ``fixed_cache_size`` before :func:`plan_cache_budget` splits what is left.
+    """
+    charge = gpu_owned_reservation_slots(owned_layers, num_experts)
+    lru = moe_cache_size - charge
+    if lru < floor:
+        raise ValueError(
+            f"--moe-cache-size {moe_cache_size} is the TOTAL expert-slot budget, and "
+            f"{owned_layers} GPU-owned MoE layer(s) charge {charge} slots of it "
+            f"({owned_layers} x {num_experts} experts), leaving {lru} for the LRU -- but the "
+            f"streaming layers need at least {floor}. Raise --moe-cache-size to "
+            f"{floor + charge} or own fewer layers."
+        )
+    return lru
+
+
+def gpu_owned_reservation_slots(owned_layers: int, num_experts: int) -> int:
+    """Slot-equivalents the GPU-owned layers hold permanently: one full expert layer each.
+
+    The slot twin of :func:`gpu_owned_reservation_bytes` -- same memory, counted in the unit
+    ``--moe-cache-size`` is expressed in.
+    """
+    return owned_layers * num_experts
+
+
 def check_explicit_moe_cache_fits(
     *,
     moe_cache_size: int,

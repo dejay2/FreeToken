@@ -676,6 +676,30 @@ class Engine:
         max_context_pages = -(-config.max_seq_len // page_tokens) + 1
         return moe_cache_size, min(num_pages, max_context_pages), overlap
 
+    def _charge_gpu_owned_layers_to_cache_size(
+        self, config: EngineConfig, owned: "frozenset[int]"
+    ) -> None:
+        """Take the owned layers' resident slots OUT of an explicit ``--moe-cache-size``.
+
+        ``--moe-cache-size`` is the total expert-slot budget on the card, so switching
+        ``--moe-gpu-owned-layers`` on trades LRU slots for resident layers rather than adding
+        7.9 GiB of VRAM on top of them. Called exactly once, from the single
+        :meth:`_init_offload_moe_cache` call site, before anything reads the size --
+        ``--moe-cache-auto`` charges the same bytes through ``fixed_cache_size`` instead.
+        """
+        if not owned or config.moe_cache_auto or not config.moe_cache_size:
+            return
+        total = config.moe_cache_size
+        lru = _gpu_owned_lru_slots(config, len(owned))
+        if lru == total:
+            return
+        object.__setattr__(config, "moe_cache_size", lru)
+        logger.info_rank0(
+            f"--moe-cache-size {total} is the total MoE expert-slot budget: "
+            f"{len(owned)} GPU-owned layer(s) hold {total - lru} of those slots, "
+            f"leaving {lru} for the streaming-layer LRU"
+        )
+
     def _check_gpu_owned_cache_fits(self, config: EngineConfig, banks) -> None:
         """Explicit --moe-cache-size + the owned reservation must fit the same budget the
         auto path solves against. Fails loudly (never shrinks) -- see spec section 6."""
@@ -731,6 +755,7 @@ class Engine:
             config, config.model_config.num_moe_layers
         )
         self._gpu_owned_layer_ids = gpu_owned_layer_ids
+        self._charge_gpu_owned_layers_to_cache_size(config, gpu_owned_layer_ids)
         if (
             not cpu_layer_ids
             and config.moe_cpu_layers is None
@@ -1929,16 +1954,25 @@ def _validate_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> fro
             "(load_ftw_banks always allocates one host bank per layer); serve the original "
             "checkpoint or drop the flag"
         )
-    num_experts = config.model_config.num_experts
-    floor = 2 * num_experts if config.moe_prefill_overlap else num_experts
-    if config.moe_cache_size and config.moe_cache_size < floor:
-        raise ValueError(
-            f"--moe-gpu-owned-layers leaves an LRU of {config.moe_cache_size} slots for the "
-            f"{num_moe_layers - len(owned)} streaming layers, but prefill overlap needs at "
-            f"least {floor} slots (2 x num_experts); raise --moe-cache-size, own fewer "
-            f"layers, or pass --disable-moe-prefill-overlap"
-        )
+    # --moe-cache-size is the TOTAL expert-slot budget: the owned layers are charged to it
+    # (see _charge_gpu_owned_layers_to_cache_size), so what has to clear the prefill-overlap
+    # floor is what is LEFT for the streaming layers, not the number the operator typed.
+    if config.moe_cache_size and not getattr(config, "moe_cache_auto", False):
+        _gpu_owned_lru_slots(config, len(owned))
     return owned
+
+
+def _gpu_owned_lru_slots(config: EngineConfig, owned_layers: int) -> int:
+    """LRU slots left once ``owned_layers`` are charged to an explicit ``--moe-cache-size``."""
+    from freetoken.engine.cache_budget import lru_slots_after_owned_charge
+
+    num_experts = config.model_config.num_experts
+    return lru_slots_after_owned_charge(
+        moe_cache_size=config.moe_cache_size,
+        owned_layers=owned_layers,
+        num_experts=num_experts,
+        floor=2 * num_experts if config.moe_prefill_overlap else num_experts,
+    )
 
 
 def _gpu_owned_boot_line(

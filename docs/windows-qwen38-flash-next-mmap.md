@@ -156,22 +156,33 @@ to give the RAM back.
 
 The ranking comes from four decode captures on this box
 (`docs/research/routing-skew-2026-09-02/`) and is a fixed built-in list, not a runtime
-heuristic. Lower `-MoECacheSize` by roughly 512 slots per owned layer, or the server
-refuses to boot and names the size that would fit:
+heuristic.
+
+**`-MoECacheSize` is the total expert-slot budget, and the owned layers are charged to
+it** -- you do NOT lower it yourself. Keep the number that works without the flag (6750
+here) and the LRU shrinks by 512 slots per owned layer, so the card holds exactly the same
+MoE bytes with or without `-GpuOwnedLayers`:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File `
   .\scripts\start-qwen38-flash-next-mmap-windows.ps1 `
   -ModelPath $ModelPath `
   -GpuOwnedLayers auto `
-  -MoECacheSize 4400
+  -MoECacheSize 6750
 ```
 
 The boot log says exactly what happened:
 
 ```
-INFO MoE GPU-owned layers: [0, 1, 2, 6, 7, 22] (6 x 1.32 GiB resident, no host bank); LRU cache 4400 slots for 42 streaming layers
+INFO --moe-cache-size 6750 is the total MoE expert-slot budget: 6 GPU-owned layer(s) hold 3072 of those slots, leaving 3678 for the streaming-layer LRU
+INFO MoE GPU-owned layers: [0, 1, 2, 6, 7, 22] (6 x 1.32 GiB resident, no host bank); LRU cache 3678 slots for 42 streaming layers
 ```
+
+Adding the owned layers on top of the budget instead of charging them to it is what made
+the first live run twice as slow: 6 owned layers plus 4400 LRU slots is +1.85 GiB of VRAM,
+which left the card 569 MiB free at decode peak and halved throughput even though it moved
+11 % fewer expert rows per step. Measurements:
+`docs/research/gpu-owned-layers-speed-diagnosis-2026-09-02.md`.
 
 `GET /v1/cache/routing` reports the owned layers as `resident: true` with a null
 `miss_rate` (a resident layer cannot miss, and reporting `0.0` would read as a perfectly

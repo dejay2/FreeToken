@@ -605,3 +605,76 @@ def test_explicit_cache_size_that_overflows_the_budget_names_what_would_fit():
     assert "6 GPU-owned MoE layers" in message
     assert "lower --moe-cache-size to 1928 slots" in message
     assert "own at most 1 layer" in message
+
+
+# ------------------------------- --moe-cache-size is the TOTAL slot budget (VRAM neutrality)
+
+
+def test_owned_layers_are_charged_to_the_explicit_cache_size_not_added_to_it():
+    """The measured regression: 6 owned layers ADDED to 6750 slots is +7.93 GiB of VRAM.
+
+    Charging them keeps the flag VRAM-neutral -- the same 6750-slot budget, 3072 of it held
+    by the owned layers, 3678 left for the LRU. See
+    docs/research/gpu-owned-layers-speed-diagnosis-2026-09-02.md.
+    """
+    from freetoken.engine.cache_budget import lru_slots_after_owned_charge
+
+    assert lru_slots_after_owned_charge(
+        moe_cache_size=6750, owned_layers=6, num_experts=_E, floor=2 * _E
+    ) == 3678
+    # the charge is exactly one full expert layer per owned layer
+    assert 6750 - 3678 == 6 * _E
+
+
+def test_no_owned_layers_leaves_the_explicit_cache_size_untouched():
+    from freetoken.engine.cache_budget import lru_slots_after_owned_charge
+
+    assert lru_slots_after_owned_charge(
+        moe_cache_size=6750, owned_layers=0, num_experts=_E, floor=2 * _E
+    ) == 6750
+
+
+def test_the_charged_total_never_exceeds_the_uncharged_one_slot_for_slot():
+    """VRAM neutrality, stated as the property that motivated the change."""
+    from freetoken.engine.cache_budget import (
+        gpu_owned_reservation_bytes,
+        lru_slots_after_owned_charge,
+    )
+
+    for owned in range(0, 8):
+        lru = lru_slots_after_owned_charge(
+            moe_cache_size=6750, owned_layers=owned, num_experts=_E, floor=_E
+        )
+        resident = lru * _PER_EXPERT + gpu_owned_reservation_bytes(owned, _E, _PER_EXPERT)
+        assert resident == 6750 * _PER_EXPERT
+
+
+def test_a_budget_too_small_for_the_owned_set_plus_the_lru_floor_names_the_size_that_works():
+    from freetoken.engine.cache_budget import lru_slots_after_owned_charge
+
+    # 6 owned layers charge 3072 slots; with prefill overlap the LRU floor is 1024
+    assert lru_slots_after_owned_charge(
+        moe_cache_size=4096, owned_layers=6, num_experts=_E, floor=2 * _E
+    ) == 1024
+    with pytest.raises(ValueError) as excinfo:
+        lru_slots_after_owned_charge(
+            moe_cache_size=4095, owned_layers=6, num_experts=_E, floor=2 * _E
+        )
+    message = str(excinfo.value)
+    assert "--moe-cache-size 4095" in message
+    assert "3072 slots" in message
+    assert "at least 1024" in message
+    assert "4096" in message
+
+
+def test_the_charge_is_reported_against_the_owned_reservation_bytes():
+    """The slot charge and the byte reservation must describe the same memory."""
+    from freetoken.engine.cache_budget import (
+        gpu_owned_reservation_bytes,
+        lru_slots_after_owned_charge,
+    )
+
+    lru = lru_slots_after_owned_charge(
+        moe_cache_size=6750, owned_layers=6, num_experts=_E, floor=2 * _E
+    )
+    assert (6750 - lru) * _PER_EXPERT == gpu_owned_reservation_bytes(6, _E, _PER_EXPERT)
