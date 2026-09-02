@@ -56,6 +56,64 @@ For More details:
 - [Supported models](https://github.com/FlashML-org/FreeToken/blob/main/docs/models.md)
 - [CLI reference](https://github.com/FlashML-org/FreeToken/blob/main/docs/cli.md)
 
+## This fork: Windows PLE-mmap, still-picture serving, and the MTP spike
+
+This fork (github.com/dejay2/FreeToken) tracks upstream FlashML-org/FreeToken and adds three features developed and tested on Windows 11 with an RTX 5090 for Qwen3.8-Flash-Next-NVFP4. The branch `mtp-upstream-merge` contains the upstream main branch plus this work.
+
+### PLE table backends
+
+Qwen3.8-Flash-Next has a 47.7 GiB n-gram (PLE) lookup table. Choose where it lives with `--ple-backend` or the launcher's parameter:
+
+| Backend | Description | Default |
+|---------|-------------|---------|
+| `disk` | Linux-only io_uring row store (reads rows straight from checkpoint files) | Linux |
+| `mmap` | Demand-pages the safetensors table with a bounded LRU row cache; includes a Windows PrefetchVirtualMemory fast path | Windows |
+| `pinned` | Preloads the whole table into page-locked host RAM | non-Linux |
+
+The launcher script `start-qwen38-flash-next-mmap-windows.ps1` defaults to `--ple-backend mmap`.
+
+### Still-picture (vision) serving
+
+Vision support is opt-in and disabled by default. Enable it with environment variables or launcher flags:
+
+- `FREETOKEN_LOAD_VISION=1` or the launcher's `-EnableVision` flag loads the vision tower and multimodal embedder (~1 GiB of bf16 GPU weights).
+- `-VisionExecution layer-stream|gpu` selects where picture components run: `layer-stream` (the launcher's default) keeps vision weights on CPU and stages bounded components per encode; `gpu` runs everything on the GPU (and is the default when `FREETOKEN_VISION_EXECUTION` is set directly without the launcher).
+- `-VisionPackagesPath` points to the installed packages (Pillow, TorchVision).
+- Install vision dependencies: `pip install "freetoken[vision]"` (pulls pillow>=11,<13 and torchvision>=0.26,<0.27) or run the helper script `install-qwen38-vision-deps-windows.ps1`.
+
+### MTP speculative decoding (feasibility spike)
+
+MTP (Multi-Token Prediction) speculative decoding is a feasibility spike and is off by default. It requires:
+
+- `FREETOKEN_MTP_PRIVATE_ROOT`: path to a private spike root (not in the repo) containing MTP head weights derived from the checkpoint and pre-converted NVFP4 expert banks. Required whenever any MTP mode is active.
+- Key environment variables for configuration:
+  - `FREETOKEN_MTP_SPECULATE` (0|1): Enable integrated speculative decoding.
+  - `FREETOKEN_MTP_SPEC_DEPTH`: Maximum draft chain length (1-5, default 5).
+  - `FREETOKEN_MTP_SPEC_GRAPH` (0|1): Capture speculation cycles in CUDA graphs.
+  - `FREETOKEN_MTP_SPEC_EMA_ALPHA`: Smoothing factor for acceptance EMA (default 0.3).
+  - `FREETOKEN_MTP_SPEC_MIN_EMITTED`: Minimum emitted tokens per cycle to keep speculating (defaults to the measured break-even, capped at depth+1).
+  - `FREETOKEN_MTP_SPEC_COST_AWARE` (0|1): Adapt the acceptance bar to measured wall time (default 1).
+  - `FREETOKEN_MTP_SHADOW` (0|1): Observer-only mode (no integration).
+  - `FREETOKEN_DENSE_QUANT` (int8|): W8A16 quantization for dense projections.
+  - `FREETOKEN_EMBED_HOST` (0|1): Keep token embeddings in pinned host RAM.
+- Limitation: `--ple-backend disk` is incompatible with MTP (the capture path does not enter forward_host_ctx); use `mmap` or `pinned` instead.
+- Tests in `tests/spike/` skip unless `FREETOKEN_MTP_PRIVATE_ROOT` points at a valid private root.
+
+### Running the tests on Windows
+
+There is no uv build on Windows. Tests run with the FreeToken Desktop venv's Python
+(it already ships torch + CUDA). Two things must be on `PYTHONPATH`, in this order:
+the repo's `python/` (the Desktop venv carries its own installed `freetoken`, which
+would otherwise shadow the checkout) and the `scripts/windows-ple-mmap` shim
+(`sitecustomize.py`: selector event loop, ZMQ over loopback TCP, kernel DLL reuse).
+
+```powershell
+$env:PYTHONPATH = "python;scripts\windows-ple-mmap"
+python -m pytest tests/ -m "not slow"
+```
+
+GPU tests skip themselves when CUDA is not available; `-m "not slow"` deselects long-running tests (big kernel sweeps, real-checkpoint reads).
+
 ## Citation
 
 If you use FreeToken for your research, please cite our [paper](https://arxiv.org/abs/2608.16157):
