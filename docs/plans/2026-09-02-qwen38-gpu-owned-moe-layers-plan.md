@@ -84,7 +84,7 @@
   - `_DENSE_MOE_SETTINGS["moe_gpu_owned_layers"] = None`
   - CLI `--moe-gpu-owned-layers <spec>`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `tests/engine/test_moe_gpu_owned_layers.py`:
 
@@ -282,7 +282,7 @@ if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -293,7 +293,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 Expected: collection error, every test errors out with
 `ImportError: cannot import name 'GPU_OWNED_LAYER_RANK' from 'freetoken.engine.engine'`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/freetoken/engine/config.py` -- insert immediately after the `moe_cpu_layers` field (line 350):
 
@@ -444,7 +444,7 @@ def _validate_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> fro
         _validate_gpu_owned_layers(config, model_config.num_moe_layers)
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -452,7 +452,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 & "$env:LOCALAPPDATA\FreeToken\venv\Scripts\python.exe" -m pytest tests/engine/test_moe_gpu_owned_layers.py tests/engine/test_moe_cpu_layers.py -q -p no:cacheprovider
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add python/freetoken/engine/config.py python/freetoken/server/args.py python/freetoken/engine/engine.py tests/engine/test_moe_gpu_owned_layers.py

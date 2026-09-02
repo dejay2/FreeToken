@@ -578,6 +578,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-gpu-owned-layers",
+        type=str,
+        default=ServerArgs.moe_gpu_owned_layers,
+        help=(
+            "With --moe-backend offload: which MoE layers keep every expert permanently "
+            "resident in VRAM and allocate no host bank at all (the rest keep the pinned "
+            "bank + LRU slot cache). Explicit id list ('0,1,2'), a count ('6' = 6 layers "
+            "evenly strided), a fraction ('0.125'), 'auto' (the measured hungriest layers) "
+            "or 'auto:N'. Each owned layer costs num_experts cache slots of VRAM and "
+            "returns one layer of host RAM. Unset = off."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hybrid-max-fetch",
         type=int,
         default=ServerArgs.moe_hybrid_max_fetch,

@@ -1767,6 +1767,99 @@ def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[
     return _parse_cpu_layers_spec(spec, num_moe_layers)
 
 
+# MoE layers ranked by measured decode miss rate, hungriest first: the mean of
+# per_layer[].miss_rate over the four cache_size=6750 decode captures in
+# docs/research/routing-skew-2026-09-02/{code,prose,chat8k,toolcall}.json. The order is
+# identical under mean missing_per_step and under the pooled union.json. A fixed constant,
+# never a runtime heuristic; _auto_cpu_layers' U-shaped head+tail guess is NOT supported by
+# this data (the tail 39-47 is mid-pack, the minimum is layer 31) and must not be reused.
+GPU_OWNED_LAYER_RANK = (
+    1, 6, 0, 2, 7, 22, 10, 13, 5, 18, 21, 38, 8, 12, 34, 11,
+    24, 26, 29, 14, 28, 17, 19, 4, 35, 9, 37, 30, 33, 20, 3, 23,
+    27, 25, 45, 36, 42, 47, 41, 46, 44, 40, 43, 39, 16, 32, 15, 31,
+)
+
+
+def _parse_gpu_owned_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
+    """Parse ``--moe-gpu-owned-layers``: the ``--moe-cpu-layers`` grammar (explicit id list
+    ``"0,1,2"``, count ``"6"``, fraction ``"0.125"``) plus ``"auto"`` (the six hungriest
+    layers of :data:`GPU_OWNED_LAYER_RANK`) and ``"auto:N"`` (its first N)."""
+    s = spec.strip()
+    if s == "auto":
+        s = "auto:6"
+    if s.startswith("auto:"):
+        try:
+            n = int(s[len("auto:"):])
+        except ValueError as exc:
+            raise ValueError(f"--moe-gpu-owned-layers {spec!r}: 'auto:N' needs an integer N") from exc
+        if not 0 <= n <= num_moe_layers:
+            raise ValueError(
+                f"--moe-gpu-owned-layers auto:{n} must be in [0, {num_moe_layers}]"
+            )
+        ranked = [i for i in GPU_OWNED_LAYER_RANK if i < num_moe_layers]
+        return frozenset(ranked[:n])
+    try:
+        return _parse_cpu_layers_spec(s, num_moe_layers)
+    except ValueError as exc:
+        # reuse the grammar, not its error text: the operator typed a different flag
+        raise ValueError(str(exc).replace("--moe-cpu-layers", "--moe-gpu-owned-layers")) from None
+
+
+def _resolve_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int]:
+    """MoE layer ids whose experts are permanently VRAM-resident (no host bank).
+
+    Only ``--moe-backend offload`` supports it: ``cpu``/``hybrid`` read every expert on the
+    CPU (a VRAM-resident layer has no host bank to read), and ``fused`` keeps every expert
+    resident already. Validation of the resolved set lives in
+    :func:`_validate_gpu_owned_layers`.
+    """
+    spec = config.moe_gpu_owned_layers
+    if not spec or config.moe_backend != "offload":
+        return frozenset()
+    return _parse_gpu_owned_layers_spec(spec, num_moe_layers)
+
+
+def _validate_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int]:
+    """Resolve and fully validate the owned set, or raise. Returns the empty set when off."""
+    from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+    spec = config.moe_gpu_owned_layers
+    if not spec:
+        return frozenset()
+    if config.moe_backend != "offload":
+        raise ValueError(
+            "--moe-gpu-owned-layers requires --moe-backend offload (got "
+            f"{config.moe_backend!r}): a VRAM-resident layer has no host bank for the CPU "
+            "executor to read, and 'fused' keeps every expert resident already"
+        )
+    owned = _parse_gpu_owned_layers_spec(spec, num_moe_layers)
+    if not owned:
+        return owned
+    cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers)
+    clash = sorted(owned & cpu_layer_ids)
+    if clash:
+        raise ValueError(
+            f"--moe-gpu-owned-layers and --moe-cpu-layers name layers that are "
+            f"both GPU-owned and CPU layers: {clash}"
+        )
+    if config.model_path and is_ftw_checkpoint(config.model_path):
+        raise ValueError(
+            "--moe-gpu-owned-layers is not supported on an FTW packed checkpoint "
+            "(load_ftw_banks always allocates one host bank per layer); serve the original "
+            "checkpoint or drop the flag"
+        )
+    num_experts = config.model_config.num_experts
+    floor = 2 * num_experts if config.moe_prefill_overlap else num_experts
+    if config.moe_cache_size and config.moe_cache_size < floor:
+        raise ValueError(
+            f"--moe-gpu-owned-layers leaves an LRU of {config.moe_cache_size} slots for the "
+            f"{num_moe_layers - len(owned)} streaming layers, but prefill overlap needs at "
+            f"least {floor} slots (2 x num_experts); raise --moe-cache-size, own fewer "
+            f"layers, or pass --disable-moe-prefill-overlap"
+        )
+    return owned
+
+
 # expert activations the CPU MoE executor supports (csrc ActKind)
 _CPU_MOE_ACTS = (
     "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
@@ -1850,6 +1943,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_rate": None,
     "moe_cache_auto": False,
     "moe_cpu_layers": None,
+    "moe_gpu_owned_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
@@ -2164,6 +2258,11 @@ def _adjust_config(config: EngineConfig):
             "--moe-cpu-layers requires --moe-backend offload or hybrid (got "
             f"{config.moe_backend!r}); use --moe-backend cpu to run all layers on CPU"
         )
+
+    if is_moe:
+        # resolved once here so a bad spec fails before any weight is read; the engine
+        # re-resolves at cache build (the backend may still be 'auto' at parse time)
+        _validate_gpu_owned_layers(config, model_config.num_moe_layers)
 
     if is_moe:
         object.__setattr__(model_config, "moe_backend", config.moe_backend)

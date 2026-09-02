@@ -348,6 +348,12 @@ class EngineConfig:
     # fraction ("0.5"). None/"" = all layers on GPU (plain offload). --moe-backend cpu
     # already means all layers on CPU and ignores this.
     moe_cpu_layers: str | None = None
+    # GPU-owned MoE layers (--moe-backend offload only): layers whose full expert set is
+    # permanently VRAM-resident and which allocate NO host bank at all. Spec is the
+    # --moe-cpu-layers grammar (explicit ids "0,1,2", a count "6", a fraction "0.125")
+    # plus "auto" (the measured six hungriest layers) and "auto:N". None = off.
+    # Each owned layer costs num_experts LRU slots of VRAM and returns one host bank of RAM.
+    moe_gpu_owned_layers: str | None = None
     # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's
