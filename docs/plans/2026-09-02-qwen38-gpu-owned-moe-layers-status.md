@@ -19,6 +19,8 @@ One row per plan task.
 | 6 Engine wiring and reports | `a01736d` | feat(moe): wire GPU-owned MoE layers through the engine and the reports |
 | 7 Launcher and docs | `f0acdf1` | feat(launcher): -GpuOwnedLayers passthrough and docs |
 | 8 This checklist | `00ffa83` | docs(moe): operator checklist for the GPU-owned MoE layer live run |
+| Live run 1 results | `53cdbc4` | docs(moe): live run 1 results (loader hang) |
+| Live run 1 fix | `8a63977` | fix(moe): fill GPU-owned banks directly in the placement thread |
 
 ## CPU test results
 
@@ -46,12 +48,12 @@ New and changed files (all green):
 Whole suites, measured before the branch (at `cc085cf`) and after task 8, same box, same
 runner. **No failure count moved**; every new test is additive:
 
-| Suite | Baseline (cc085cf) | After |
-|---|---|---|
-| `tests/engine` | 12 failed, 589 passed, 96 skipped | 12 failed, 622 passed, 96 skipped |
-| `tests/moe` | 31 failed, 222 passed, 148 skipped | 31 failed, 248 passed, 149 skipped |
-| `tests/server` | 548 passed | 552 passed |
-| `tests/models/qwen4_exp` | 1 failed, 254 passed, 167 skipped | 1 failed, 254 passed, 167 skipped |
+| Suite | Baseline (cc085cf) | After task 8 | After the live-run fix (`8a63977`) |
+|---|---|---|---|
+| `tests/engine` | 12 failed, 589 passed, 96 skipped | 12 failed, 622 passed, 96 skipped | 12 failed, 622 passed, 96 skipped |
+| `tests/moe` | 31 failed, 222 passed, 148 skipped | 31 failed, 248 passed, 149 skipped | 31 failed, 251 passed, 149 skipped |
+| `tests/server` | 548 passed | 552 passed | 552 passed |
+| `tests/models/qwen4_exp` | 1 failed, 254 passed, 167 skipped | 1 failed, 254 passed, 167 skipped | not re-run |
 
 (The extra `tests/moe` skip is
 `test_offload.py::test_copy_plan_holds_a_zero_placeholder_for_gpu_owned_layers`, which is
@@ -91,8 +93,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File `
   -MoECacheSize 4400 -GpuOwnedLayers auto `
   -DenseQuant int8 -EmbedHost -EnableVision `
   -VisionPackagesPath D:\FreeToken\.local\vision-packages `
-  -VisionExecution layer-stream -EnableCacheReport
+  -VisionExecution layer-stream -EnableCacheReport -CollectRoutingStats
 ```
+
+Two corrections the 2026-09-02 run forced on this checklist; both are already applied above
+and in the check table:
+
+1. **`-CollectRoutingStats` is required on both boots.** It is what passes
+   `--moe-collect-decode-freq`, and without it `/v1/cache/routing` answers **409** -- the
+   baseline server did exactly that, so the owned-rows check could not have passed as the
+   command was originally written.
+2. **The temperature-0 answer-identity check must ask for 48 tokens, not 512.** A 512-token
+   temperature-0 answer is not reproducible even against the *same* server (5 runs, 5
+   different answers, first divergence 247-1775 B), so it cannot decide anything about the
+   candidate. The 48-token form of the same 8k prompt IS stable and was byte-identical
+   across two different server processes: md5 `29f0e74dfed744b538f856f38553e1ae` (5 samples,
+   3 legacy + 2 fresh). Send it with `"temperature": 0, "max_tokens": 48` and
+   `chat_template_kwargs.enable_thinking=false`, and compare that md5.
 
 Live run 2026-09-02, results in `docs/research/measurements-gpu-owned-layers-2026-09-02.md`.
 **The candidate never booted**: four attempts (`auto` parallel, `auto` serial, `auto` parallel
@@ -107,9 +124,9 @@ candidate column. Root cause in the section after the table.
 | boot peak host RAM | <= baseline + 1.5 GiB | - | 181.8 GiB commit at the hang (partial load) | not measurable |
 | 8k-chat decode tok/s (same prompt as the sweep) | recorded; operator decides | 72.1 tok/s fresh (62.1 after 3.7 h uptime) | - | not measurable |
 | TTFT on the same prompt | recorded | cold-7k 5.89 s, warm turn 1.59 s | - | not measurable |
-| answers at temperature 0 | identical to baseline | 512 tokens: NOT reproducible against itself (5 runs, 5 answers, first divergence 247-1775 B). 48 tokens: identical across two server processes, md5 `29f0e74d...` | - | **check unusable as written**; use the 48-token form |
+| answers at temperature 0, `max_tokens` 48 | identical to baseline (md5 `29f0e74dfed744b538f856f38553e1ae`) | 48 tokens: identical across two server processes, md5 `29f0e74d...`. 512 tokens: NOT reproducible against itself (5 runs, 5 answers, first divergence 247-1775 B) | - | criterion **corrected** to 48 tokens; not measurable this run |
 | picture request (`-VisionWeights mmap`) | works, latency recorded | 6.89 s cold / 4.86 s warm, correct answer | - | not measurable |
-| `/v1/cache/routing` | owned rows `resident: true`; streaming rows sane | 409: needs `--moe-collect-decode-freq`, which the plan's boot command does not pass | - | **check unreachable as written** |
+| `/v1/cache/routing` (boot with `-CollectRoutingStats`) | owned rows `resident: true`; streaming rows sane | 409: the boot did not pass `--moe-collect-decode-freq` | - | boot command **corrected**; not measurable this run |
 | owned-layer rows on device | byte-identical to a host-bank load (one-off probe script) | - | - | not run (model cannot load) |
 
 ### Why it did not boot
@@ -136,6 +153,25 @@ process with `py-spy dump`. Note the second face is a design issue in its own ri
 single-threaded placement loop, cap-2 back-pressure has no other thread that can complete a
 layer, so `auto`'s six layers deadlock the parallel reader even once the copy is fixed.
 
+### How it was fixed (`8a63977`, before the next live run)
+
+The staging pool is **gone**. `GpuOwnedBank.fill` IS its device tensor, so each
+`fill[expert] = row` is a synchronous pageable H2D copy issued by the placement thread
+itself, inside the loader's own `inference_mode()`: no staging layer, no cap, no
+back-pressure, no CUDA event, no second thread, and therefore neither failure above by
+construction. Six owned layers are 7.9 GiB of such copies (a few seconds of boot); that cost
+is the trade. `PinPipeline.__call__` now settles nothing for a `GPU_OWNED` layer (the
+completion tracker still counts it, so the loaders' `placed` asserts are unchanged), and
+`submit_flush` is removed. With no blocking path left on the drain thread its post-failure
+"drain without settling" can strand no one -- a failing settle surfaces at `wait()`, which is
+now pinned by a test.
+
+Regression tests (`tests/moe/test_gpu_owned_banks.py`) run the REAL NVFP4 loaders -- serial,
+and parallel with a strict round-robin interleave of three owned layers -- over a synthetic
+checkpoint **inside `torch.inference_mode()`**, and assert byte-identity against a plain
+host-bank load. All three hang or fail on the pre-fix code. That one context manager was the
+whole difference between the green suite and this run.
+
 Hazards, from the boot notes for this box: only ever kill `python.exe` from
 `nvidia-smi --query-compute-apps`; settle 45-60 s between servers or the last expert bank
 dies in `cudaHostRegister failed ... out of memory`; one Claude session booting servers at a
@@ -146,12 +182,13 @@ time; send test requests with `chat_template_kwargs.enable_thinking=false`.
 The CPU suite pins every branch, every refusal and all the arithmetic. These cannot be
 covered without the device, and are what the table above exists to settle:
 
-1. The `cudaHostAlloc`'d staging banks and the real `copy_(non_blocking=True)` H2D, including
-   the CUDA event that gates staging reuse when two owned layers are in flight. The CPU test
-   proves the pool's cap-2 back-pressure and slot recycling; it cannot prove the event.
+1. The real pageable H2D of the owned layers (`E*6` per-slice copies each) against a CUDA
+   device: that it works at all -- the CPU test only proves the placement -- and what it
+   costs in boot seconds. Rough expectation: 7.9 GiB of pageable H2D, a few seconds.
 2. That the resident VRAM rows are byte-identical to the host-bank rows a normal load
    produces for the same layer (the one-off probe script).
-3. Boot peak host RAM with cap-2 staging live (the CPU test proves the bound, not the cost).
+3. Boot peak host RAM. It should now be *lower* than the staging design's: nothing extra is
+   allocated on the host at all for an owned layer.
 4. That the decode and MTP CUDA graphs still capture (bs=1, MTP widths 1-6): the owned path
    is fixed-shape reads of fixed-address tensors, strictly simpler than today's, so no
    capture change is expected -- but "expected" is not "observed".
@@ -182,12 +219,13 @@ covered without the device, and are what the table above exists to settle:
    otherwise have set the wrong copy width for every layer.
 5. The plan's task-5 verification command names `tests/checkpoint`, which does not exist in
    this tree (there are no FTW-loader tests outside the new one). `tests/moe` was run instead.
-6. Residual risk, out of the spec's scope: `alloc_layer_banks` now honours the ambient plan
-   for EVERY provider, but only the NVFP4 loaders were converted to write through
-   `bank.fill`. A non-NVFP4 MoE checkpoint booted with `--moe-gpu-owned-layers` fails loudly
-   rather than silently: the `pin_banks` providers hit the refusal in item 3, and the
-   `PinPipeline` providers hit `GpuOwnedStagingPool.flush`'s
-   `"GPU-owned layer N never acquired staging"` assert. Neither is a wrong-memory read, but
-   neither is a friendly message either. The flag is documented as Qwen3.8-Flash-Next-NVFP4.
+6. Residual risk, out of the spec's scope: `alloc_layer_banks` honours the ambient plan for
+   EVERY provider, but only the NVFP4 loaders were reviewed. `pin_banks` providers still
+   refuse loudly (item 3). Since `8a63977` the `PinPipeline` providers no longer hit an
+   assert: with no staging indirection, a provider that writes through either `.fill` or
+   `.tensor` writes the device tensor directly, so it may now *appear* to work -- untested,
+   on a checkpoint whose row geometry the owned path was never checked against. Prefer the
+   quant-format guard in item 7 over relying on an accident. The flag is documented as
+   Qwen3.8-Flash-Next-NVFP4 only.
 7. `--moe-gpu-owned-layers` is validated against `--moe-cpu-layers`, the backend, the FTW
    path and the LRU floor, but nothing checks the checkpoint's expert quant format. See 6.
