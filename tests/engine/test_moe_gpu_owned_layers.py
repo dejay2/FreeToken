@@ -385,7 +385,10 @@ def test_the_operator_checklist_covers_every_live_check_the_spec_asks_for():
         assert heading in status
     for check in (
         "boot log shows owned set",
-        "scheduler private bytes",
+        # CORRECTED after run 2: the host banks are mapped pages, so the saving shows in
+        # working set / physical in use, never in private bytes.
+        "scheduler working set",
+        "whole-system commit",
         "whole-system physical in-use",
         "boot peak host RAM",
         "8k-chat decode tok/s",

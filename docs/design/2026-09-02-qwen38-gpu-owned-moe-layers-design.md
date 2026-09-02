@@ -235,8 +235,9 @@ the fit). Measure against the current baseline (6,750 slots, no owned layers), f
 | check | pass |
 |---|---|
 | boot log shows owned set, LRU size, MTP graphs 6/6 + 7/7 captured | yes |
-| scheduler private bytes and whole-system commit | −7.9 GiB ± 0.3 |
-| whole-system physical in-use | −7.9 GiB ± 0.5 |
+| scheduler working set | −7.9 GiB ± 0.5 |
+| whole-system physical in use | −7.9 GiB ± 0.5 |
+| whole-system commit | lower; NOT expected to move by the full 7.9 GiB |
 | boot peak host RAM | ≤ baseline + 1.5 GiB |
 | 8k-chat decode tok/s (same prompt as the sweep) | recorded; operator decides |
 | TTFT on the same prompt | recorded |
@@ -244,6 +245,18 @@ the fit). Measure against the current baseline (6,750 slots, no owned layers), f
 | picture request (`-VisionWeights mmap`) | works, latency recorded |
 | `/v1/cache/routing` | owned rows `resident: true`; streaming rows sane |
 | owned-layer rows on device | byte-identical to a host-bank load (one-off probe script) |
+
+**Not `private bytes`** (CORRECTED 2026-09-02 after run 2). The first version of this table
+asked for −7.9 GiB of *scheduler private bytes*, which this design cannot deliver and which
+would have to be read as a failure of a feature that worked: the host expert banks are
+**mapped** pages, not private commit (the server's ~103 GiB of private bytes across its four
+processes against ~167 GiB of attributable commit; the loader reads 63.3 GiB of experts
+through the mmap path). Never allocating six layers' banks therefore removes mapped pages,
+which moves working set and whole-system physical in use by the full amount while private
+bytes does not move at all -- measured: working set −8.02 GiB, physical in use −7.50 GiB,
+commit −4.37 GiB, private bytes **+1.52 GiB**. See
+`docs/research/measurements-gpu-owned-layers-run2-2026-09-02.md`, *Where the RAM saving shows
+up*.
 
 ## 10. Out of scope
 

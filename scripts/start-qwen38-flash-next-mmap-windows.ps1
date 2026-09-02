@@ -76,8 +76,11 @@ param(
 
     # MoE layers that keep every expert permanently resident in VRAM and allocate NO host
     # bank at all (--moe-gpu-owned-layers). Each owned layer hands back 1.32 GiB of host RAM
-    # and costs 1.32 GiB of VRAM (about 512 LRU slots), so lower -MoECacheSize by ~512 per
-    # owned layer. 'auto' is the six hungriest layers measured on this box
+    # and costs 1.32 GiB of VRAM (about 512 LRU slots). Do NOT lower -MoECacheSize yourself:
+    # it is the TOTAL expert-slot budget and the engine charges the owned layers to it, so
+    # the card holds the same MoE bytes either way. 'auto' (six layers) therefore needs
+    # -MoECacheSize >= 4096 = 6 x 512 charged + the 1024-slot prefill-overlap floor.
+    # 'auto' is the six hungriest layers measured on this box
     # (docs/research/routing-skew-2026-09-02); 'auto:N' takes the first N; an explicit id
     # list, a count or a fraction also work. Empty (the default) leaves the feature off.
     # FREETOKEN_MOE_GPU_OWNED_LAYERS is the env fallback, read only here.

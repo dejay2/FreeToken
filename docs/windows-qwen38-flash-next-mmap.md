@@ -171,6 +171,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File `
   -MoECacheSize 6750
 ```
 
+`auto` therefore needs `-MoECacheSize` **>= 4096**: its six layers charge 6 x 512 = 3072
+slots, and the prefill-overlap floor keeps 2 x 512 = 1024 slots for the 42 streaming layers.
+Anything lower refuses to boot, naming the size to raise to:
+
+```
+ValueError: --moe-cache-size 4095 is the TOTAL expert-slot budget, and 6 GPU-owned MoE
+layer(s) charge 3072 slots of it (6 x 512 experts), leaving 1023 for the LRU -- but the
+streaming layers need at least 1024. Raise --moe-cache-size (launcher: -MoECacheSize) to at
+least 4096, or own fewer layers.
+```
+
+In general the floor is `512 * owned_layers + 1024` (or `+ 512` with prefill overlap off).
+It is a floor, not a recommendation: 4096 leaves 24 slots per streaming layer, and the
+measured working set is ~449 experts per layer. `-MoECacheSize 6750` is what the box was
+measured at.
+
 The boot log says exactly what happened:
 
 ```
