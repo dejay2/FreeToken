@@ -14,18 +14,62 @@ if TYPE_CHECKING:
     import torch
 
 
-def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
+def expert_bytes_per_slot(
+    sources: dict[str, "list[torch.Tensor]"],
+    gpu_owned_layers: "frozenset[int]" = frozenset(),
+) -> int:
     """Bytes one expert slot occupies on GPU: summed row bytes over all banks.
 
     Each bank source is per-layer ``[num_experts, *row_shape]`` tensors and is
     already TP-sharded upstream, so the per-row byte count is the per-rank slot
-    size.
+    size. ``gpu_owned_layers`` are permanently resident and never enter the slot
+    cache, so the geometry is read from the first STREAMING layer (layer 0 is in
+    the default owned set, and an owned layer's tensor lives on the device).
     """
     # marlin/b12x gate_up/down alpha scales are fixed [L*E] residency (do not scale
     # with cache_size), so they are intentionally excluded from the per-slot growth term.
-    # tensor[0].numel() is the per-row element count (one expert slot); see the matching
-    # slot-byte idiom in kvcache/linear_state_pool.py and kvcache/dsv4_paged_pool.py.
-    return sum(t[0][0].numel() * t[0].element_size() for t in sources.values())
+    # tensor[layer][0].numel() is the per-row element count (one expert slot); see the
+    # matching slot-byte idiom in kvcache/linear_state_pool.py and kvcache/dsv4_paged_pool.py.
+    first = next(i for i in range(len(next(iter(sources.values())))) if i not in gpu_owned_layers)
+    return sum(t[first][0].numel() * t[first].element_size() for t in sources.values())
+
+
+def gpu_owned_reservation_bytes(
+    owned_layers: int, num_experts: int, per_expert_bytes: int
+) -> int:
+    """VRAM the GPU-owned MoE layers hold permanently: one full expert layer each.
+
+    Accounted exactly like ``state_pool_bytes`` -- it joins ``fixed_cache_size`` before the
+    MoE-vs-KV split, so the greedy slot fill never spends bytes the owned layers already own.
+    """
+    return owned_layers * num_experts * per_expert_bytes
+
+
+def check_explicit_moe_cache_fits(
+    *,
+    moe_cache_size: int,
+    per_expert_bytes: int,
+    budget_bytes: int,
+    owned_layers: int,
+    num_experts: int,
+) -> None:
+    """Raise when an explicit ``--moe-cache-size`` plus the GPU-owned reservation exceeds the
+    net MoE budget. Operator decision: fail loudly naming both sizes that would fit, never
+    silently shrink the cache the operator asked for."""
+    owned_bytes = gpu_owned_reservation_bytes(owned_layers, num_experts, per_expert_bytes)
+    need = moe_cache_size * per_expert_bytes + owned_bytes
+    if need <= budget_bytes:
+        return
+    fits_slots = max(0, (budget_bytes - owned_bytes) // per_expert_bytes)
+    fits_owned = max(
+        0, (budget_bytes - moe_cache_size * per_expert_bytes) // (num_experts * per_expert_bytes)
+    )
+    raise ValueError(
+        f"--moe-cache-size {moe_cache_size} plus {owned_layers} GPU-owned MoE layers "
+        f"({owned_bytes} B resident) needs {need} B of the {budget_bytes} B MoE budget. "
+        f"Either lower --moe-cache-size to {fits_slots} slots at this owned set, or "
+        f"own at most {fits_owned} layer(s) at this cache size."
+    )
 
 
 def net_cache_budget_bytes(

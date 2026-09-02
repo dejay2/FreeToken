@@ -486,7 +486,7 @@ Claude-Session: https://claude.ai/code/session_01Hnf1bGBLU4HLq9uHPtNjwU
 
 Note on scope: the two pure functions and `expert_bytes_per_slot` are unit-tested here. The three engine call sites are pure glue over them (no new arithmetic) and are exercised at boot -- Task 8's checklist records the boot line that proves the reservation landed.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/engine/test_cache_budget.py`:
 
@@ -571,7 +571,7 @@ def test_explicit_cache_size_that_overflows_the_budget_names_what_would_fit():
     assert "own at most 1 layer" in message
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -583,7 +583,7 @@ Expected: 4 failures, each an
 `ImportError: cannot import name 'gpu_owned_reservation_bytes' from 'freetoken.engine.cache_budget'`
 (and `... name 'check_explicit_moe_cache_fits' ...` for the last one).
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/freetoken/engine/cache_budget.py` -- replace `expert_bytes_per_slot` (lines 17-28) and add the two new functions after it:
 
@@ -733,7 +733,7 @@ def check_explicit_moe_cache_fits(
         )
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -741,7 +741,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 & "$env:LOCALAPPDATA\FreeToken\venv\Scripts\python.exe" -m pytest tests/engine/test_cache_budget.py -q -p no:cacheprovider
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add python/freetoken/engine/cache_budget.py python/freetoken/engine/engine.py tests/engine/test_cache_budget.py

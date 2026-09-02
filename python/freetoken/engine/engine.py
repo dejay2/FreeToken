@@ -357,6 +357,11 @@ class SpecForwardOutput(NamedTuple):
 
 
 class Engine:
+    # MoE layer ids resolved from --moe-gpu-owned-layers. A CLASS default so the budget
+    # helpers read a sane empty set on an Engine.__new__(Engine) stub (the unit tests build
+    # one to exercise _resolve_auto_moe_cache_size without a GPU); __init__ rebinds it.
+    _gpu_owned_layer_ids: frozenset = frozenset()
+
     def __init__(self, config: EngineConfig):
         from .mtp_shadow import MTPShadowConfig
 
@@ -410,6 +415,9 @@ class Engine:
         # graphs, or other processes. Cross-rank MIN, deterministic across ranks.
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
+        # MoE layer ids resolved from --moe-gpu-owned-layers; read by the budget helpers
+        # below and by the cache build. Empty until _init_offload_moe_cache resolves it.
+        self._gpu_owned_layer_ids: frozenset = frozenset()
         self.cpu_moe_executor = None
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
@@ -634,19 +642,28 @@ class Engine:
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
         """
-        from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
+        from freetoken.engine.cache_budget import (
+            expert_bytes_per_slot,
+            gpu_owned_reservation_bytes,
+            resolve_moe_cache_auto,
+        )
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         num_experts = config.model_config.num_experts
-        total_experts = config.model_config.num_moe_layers * num_experts
+        owned = self._gpu_owned_layer_ids
+        per_expert_bytes = expert_bytes_per_slot(banks.sources, owned)
+        # GPU-owned layers hold a full expert layer of VRAM forever and leave the slot cache
+        # entirely, exactly as state_pool_bytes accounts for the GDN pool.
+        fixed_cache_size += gpu_owned_reservation_bytes(len(owned), num_experts, per_expert_bytes)
+        total_experts = (config.model_config.num_moe_layers - len(owned)) * num_experts
         moe_cache_size, num_pages, overlap = resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
             memory_ratio=config.memory_ratio,
             cache_per_page=cache_per_page,
             fixed_cache_size=fixed_cache_size,
-            per_expert_bytes=expert_bytes_per_slot(banks.sources),
+            per_expert_bytes=per_expert_bytes,
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
@@ -658,6 +675,35 @@ class Engine:
         # cannot serve a request, so do not spend residual auto-budget on unreachable KV.
         max_context_pages = -(-config.max_seq_len // page_tokens) + 1
         return moe_cache_size, min(num_pages, max_context_pages), overlap
+
+    def _check_gpu_owned_cache_fits(self, config: EngineConfig, banks) -> None:
+        """Explicit --moe-cache-size + the owned reservation must fit the same budget the
+        auto path solves against. Fails loudly (never shrinks) -- see spec section 6."""
+        from freetoken.engine.cache_budget import (
+            check_explicit_moe_cache_fits,
+            expert_bytes_per_slot,
+            net_cache_budget_bytes,
+        )
+        from freetoken.utils import div_ceil
+
+        owned = self._gpu_owned_layer_ids
+        if not owned or config.moe_cache_auto:
+            return
+        cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
+        fixed_cache_size += state_pool_bytes(config)
+        budget = net_cache_budget_bytes(
+            config.memory_ratio, self._baseline_free, self._weights_bytes, fixed_cache_size
+        )
+        kv_reserve_pages = (
+            div_ceil(max(config.kv_reserve_tokens, min_reserve), page_tokens) + 1
+        )
+        check_explicit_moe_cache_fits(
+            moe_cache_size=config.moe_cache_size,
+            per_expert_bytes=expert_bytes_per_slot(banks.sources, owned),
+            budget_bytes=budget - kv_reserve_pages * cache_per_page,
+            owned_layers=len(owned),
+            num_experts=config.model_config.num_experts,
+        )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         # A model may fully own cache construction via make_offload_moe_cache.
@@ -910,7 +956,9 @@ class Engine:
             else (self.moe_offload_cache.cache_size if self.moe_offload_cache else 0)
         )
         per_expert_bytes = (
-            expert_bytes_per_slot(self.moe_offload_cache.bank_sources)
+            expert_bytes_per_slot(
+                self.moe_offload_cache.bank_sources, self._gpu_owned_layer_ids
+            )
             if self.moe_offload_cache is not None else 0
         )
         return target_moe, per_expert_bytes
@@ -2259,9 +2307,11 @@ def _adjust_config(config: EngineConfig):
             f"{config.moe_backend!r}); use --moe-backend cpu to run all layers on CPU"
         )
 
-    if is_moe:
+    if is_moe and getattr(config, "moe_gpu_owned_layers", None):
         # resolved once here so a bad spec fails before any weight is read; the engine
-        # re-resolves at cache build (the backend may still be 'auto' at parse time)
+        # re-resolves at cache build (the backend may still be 'auto' at parse time).
+        # Gated on the spec (which _validate_gpu_owned_layers checks first anyway) so a
+        # partial stub model_config without num_moe_layers is untouched when the flag is off.
         _validate_gpu_owned_layers(config, model_config.num_moe_layers)
 
     if is_moe:
