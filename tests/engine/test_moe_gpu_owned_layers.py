@@ -226,6 +226,60 @@ def test_the_dense_override_table_clears_the_flag():
     assert _DENSE_MOE_SETTINGS["moe_gpu_owned_layers"] is None
 
 
+# ------------------------------------------- issue 7: both refusals must name the fix
+
+
+def test_the_cpu_layer_clash_says_a_layer_cannot_be_both_and_how_to_fix_it():
+    from freetoken.engine.engine import _validate_gpu_owned_layers
+
+    config, _ = _adjust(moe_cpu_layers="0,1", moe_gpu_owned_layers="auto")
+    with pytest.raises(ValueError) as excinfo:
+        _validate_gpu_owned_layers(config, L)
+    message = str(excinfo.value)
+    assert "[0, 1]" in message
+    assert "cannot be both" in message
+    # the fix, not just the diagnosis
+    assert "--moe-cpu-layers" in message and "--moe-gpu-owned-layers" in message
+    assert "Drop" in message
+
+
+def test_the_lru_floor_refusal_names_the_size_to_raise_to_in_both_spellings():
+    """The operator boots through the launcher, so the refusal has to name -MoECacheSize
+    as well as the engine flag, and the number to raise it TO."""
+    from freetoken.engine.engine import _validate_gpu_owned_layers
+
+    config, _ = _adjust(moe_cache_size=4095)
+    with pytest.raises(ValueError) as excinfo:
+        _validate_gpu_owned_layers(config, L)
+    message = str(excinfo.value)
+    assert "4096" in message  # 6 * 512 charged + the 1024-slot overlap floor
+    assert "--moe-cache-size" in message
+    assert "-MoECacheSize" in message
+    assert "at least" in message
+
+
+# ------------------------------------------- issue 7: auto:N beyond the first eight
+
+
+@pytest.mark.parametrize("n", [9, 13, 24, 47, 48])
+def test_auto_n_keeps_working_past_the_documented_first_eight(n):
+    """The doc tables only print the first eight ranks; the list has all 48 and auto:N must
+    take the first N of it, in ranked order, for any N up to the layer count."""
+    owned = parse(f"auto:{n}", L)
+    assert owned == frozenset(GPU_OWNED_LAYER_RANK[:n])
+    assert len(owned) == n
+    assert parse("auto:8", L) < owned  # ranked order, so each N is a superset of the last
+
+
+def test_auto_n_larger_than_the_ranked_list_refuses_instead_of_silently_truncating():
+    """A model with more MoE layers than the ranked list has entries: auto:N would have
+    quietly returned len(list) layers instead of N."""
+    with pytest.raises(ValueError, match="ranked list"):
+        parse("auto:60", 96)
+    # and the list itself still covers every layer of a model that IS 48 layers deep
+    assert len(parse("auto:48", L)) == 48
+
+
 # ------------------------------------------------------------------ the boot line
 
 

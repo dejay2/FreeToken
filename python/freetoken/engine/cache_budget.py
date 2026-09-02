@@ -71,8 +71,8 @@ def lru_slots_after_owned_charge(
             f"--moe-cache-size {moe_cache_size} is the TOTAL expert-slot budget, and "
             f"{owned_layers} GPU-owned MoE layer(s) charge {charge} slots of it "
             f"({owned_layers} x {num_experts} experts), leaving {lru} for the LRU -- but the "
-            f"streaming layers need at least {floor}. Raise --moe-cache-size to "
-            f"{floor + charge} or own fewer layers."
+            f"streaming layers need at least {floor}. Raise --moe-cache-size (launcher: "
+            f"-MoECacheSize) to at least {floor + charge}, or own fewer layers."
         )
     return lru
 

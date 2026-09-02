@@ -2019,6 +2019,14 @@ def _parse_gpu_owned_layers_spec(spec: str, num_moe_layers: int) -> frozenset[in
                 f"--moe-gpu-owned-layers auto:{n} must be in [0, {num_moe_layers}]"
             )
         ranked = [i for i in GPU_OWNED_LAYER_RANK if i < num_moe_layers]
+        if n > len(ranked):
+            # A model deeper than the measured ranking: taking ranked[:n] would silently own
+            # len(ranked) layers instead of the n that were asked for.
+            raise ValueError(
+                f"--moe-gpu-owned-layers auto:{n} needs {n} entries, but the measured "
+                f"ranked list only covers {len(ranked)} of this model's {num_moe_layers} "
+                f"MoE layers. Name the layers explicitly, or lower N to {len(ranked)}"
+            )
         return frozenset(ranked[:n])
     try:
         return _parse_cpu_layers_spec(s, num_moe_layers)
@@ -2063,7 +2071,9 @@ def _validate_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> fro
     if clash:
         raise ValueError(
             f"--moe-gpu-owned-layers and --moe-cpu-layers name layers that are "
-            f"both GPU-owned and CPU layers: {clash}"
+            f"both GPU-owned and CPU layers: {clash} -- a layer cannot be both (an owned "
+            f"layer has no host bank for the CPU executor to read). Drop {clash} from one "
+            f"of the two flags"
         )
     expert_quant = getattr(config.model_config, "expert_quant", None)
     if expert_quant is not None and expert_quant not in GPU_OWNED_EXPERT_QUANTS:
