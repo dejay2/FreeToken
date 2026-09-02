@@ -126,6 +126,7 @@ def test_eager_fast_verifier_returns_all_rows_and_movement_counters():
         "cpu_experts": 0,
         "d2d_rows": 0,
         "bytes_per_expert": 16,
+        "gpu_owned_layers": 0,
         "h2d_bytes": 48,
         "d2d_bytes": 0,
         "transfer_bytes": 48,
@@ -230,6 +231,7 @@ def test_eager_fast_verifier_reads_hybrid_fetch_counters():
         "cpu_experts": 4,
         "d2d_rows": 0,
         "bytes_per_expert": 16,
+        "gpu_owned_layers": 0,
         "h2d_bytes": 48,
         "d2d_bytes": 0,
         "transfer_bytes": 48,
@@ -914,3 +916,21 @@ def test_compare_mode_keeps_exact_sampling_order_between_graph_and_eager(tmp_pat
 
     with pytest.raises(RuntimeError, match="eager fast checker"):
         _compare(observer, captured=_NORMAL_SAMPLING)
+
+
+def test_movement_reconciles_when_resident_layers_contribute_no_counters():
+    """A GPU-owned layer never calls ensure_experts, so it adds nothing to lru_stats or
+    stat_fetched. The hit + missing == active invariant therefore still holds, and the report
+    says how many layers were resident so a reader is not left wondering where the bytes went
+    (bytes_per_expert/actual_h2d_bytes are over bank_caches only -- spec section 7)."""
+    cache = _StatsCache()
+    cache.gpu_owned_layer_ids = frozenset({0, 1})
+    ctx = _TargetContext()
+    target = SimpleNamespace(model=_TargetTextModel(cache, ctx), lm_head=_LMHead())
+    verifier = MTPFastVerifier(ctx, target, cache, torch.device("cpu"))
+
+    movement = verifier.forward_eager(_batch(rows=3)).expert_movement
+
+    assert movement["gpu_owned_layers"] == 2
+    assert movement["active_experts"] == 20 and movement["missing_experts"] == 5
+    assert movement["hit_experts"] + movement["missing_experts"] == movement["active_experts"]

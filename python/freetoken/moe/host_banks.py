@@ -51,11 +51,14 @@ class HostResidency(str, Enum):
 
     Only PINNED (cudaHostRegister'd) memory can feed the GPU movement paths; LOCKED (mlock'd, no device address) and PAGEABLE layers must decode on the CPU executor.
     The non-pinned classes exist for hosts that cap CUDA pin quota (WSL/WDDM: ~half of RAM).
+    GPU_OWNED is the odd one out: there is no host bank at all -- the layer's experts live in
+    VRAM for the process lifetime, so it neither spends pin quota nor holds host pages.
     """
 
     PINNED = "pinned"
     LOCKED = "locked"
     PAGEABLE = "pageable"
+    GPU_OWNED = "gpu_owned"
 
 
 _DEFAULT_CHUNK = 8 << 20
@@ -129,6 +132,15 @@ class HostBank:
         if self._locked:
             return HostResidency.LOCKED
         return HostResidency.PAGEABLE
+
+    @property
+    def fill(self) -> torch.Tensor:
+        """Where a loader writes this bank's rows.
+
+        Identical to :attr:`tensor` here, and also for :class:`GpuOwnedBank` (whose tensor
+        already lives on the device): the attribute exists so the assignment loops stay one
+        code path whichever kind of bank a layer got."""
+        return self.tensor
 
     def memoryview(self) -> memoryview:
         return memoryview(self._buf)
@@ -207,21 +219,83 @@ def _os_lock(addr: int, nbytes: int) -> None:
     _os_locked_total += nbytes
 
 
+class GpuOwnedBank:
+    """One bank kind of a GPU-owned MoE layer: the device tensor consumers read, which is
+    also the tensor the loader writes.
+
+    Duck-types the two attributes the loaders touch on a :class:`HostBank` -- ``tensor``
+    (what the bank IS, here already on the device) and ``fill`` (where to write) -- so the
+    placement loops stay one code path. They are the SAME tensor here: every
+    ``fill[expert] = row`` is a synchronous pageable H2D copy issued by the placement
+    thread itself. Six owned layers of Qwen3.8 are 7.9 GiB of such copies, a few seconds
+    of boot, and that is the price of two properties nothing else gave us:
+
+    * The engine loads weights inside ``torch.inference_mode()``, which is THREAD-LOCAL.
+      The device banks are therefore inference tensors, and only the loading thread may
+      write them. The first design staged through a pinned host layer and flushed it on
+      the :class:`PinPipeline` drain thread, which is not in inference mode: every flush
+      raised ``"Inplace update to inference tensor outside InferenceMode is not allowed"``.
+    * The NVFP4 placement loop is single-threaded (the parallel reader parallelises the
+      byte reads and yields to one consumer), so ANY bounded per-layer resource it has to
+      wait for deadlocks as soon as the reader interleaves more owned layers than the
+      bound: the only thread that could release a slot is the one that is blocked.
+
+    Both were observed live on 2026-09-02
+    (``docs/research/measurements-gpu-owned-layers-2026-09-02.md``). There are no host
+    pages, so ``pin``/``lock``/``release`` have no meaning: the layer-completion sink
+    settles nothing for this label (see :meth:`PinPipeline.__call__`) and :func:`_settle`
+    refuses it outright.
+    """
+
+    __slots__ = ("tensor",)
+
+    def __init__(self, tensor: torch.Tensor) -> None:
+        self.tensor = tensor
+
+    @property
+    def fill(self) -> torch.Tensor:
+        return self.tensor
+
+    @property
+    def residency(self) -> HostResidency:
+        return HostResidency.GPU_OWNED
+
+
 def alloc_banks(specs: dict[str, tuple[tuple[int, ...], torch.dtype]]) -> dict[str, HostBank]:
     """Allocate (lazy, unpinned) host banks from ``{name: (shape, dtype)}``."""
     return {name: HostBank(shape, dtype) for name, (shape, dtype) in specs.items()}
 
 
 def alloc_layer_banks(
-    specs: dict[str, tuple[tuple[int, ...], torch.dtype]], num_layers: int
-) -> dict[str, list[HostBank]]:
+    specs: dict[str, tuple[tuple[int, ...], torch.dtype]],
+    num_layers: int,
+    *,
+    gpu_owned: "frozenset[int] | None" = None,
+    device: "torch.device | None" = None,
+) -> dict[str, list]:
     """Allocate per-layer host banks: ``{name: ([num_experts, ...] row shape, dtype)}``
     -> one independently allocated (page-aligned, independently pin/lock-able)
-    ``HostBank`` per layer per name."""
-    return {
-        name: [HostBank(shape, dtype) for _ in range(num_layers)]
-        for name, (shape, dtype) in specs.items()
-    }
+    ``HostBank`` per layer per name.
+
+    ``gpu_owned`` layer ids get NO host bank at all: their entry is a :class:`GpuOwnedBank`
+    wrapping the ``[num_experts, ...]`` tensor on ``device``, which the loader fills in
+    place (see that class for why there is no staging). The per-layer list keeps length
+    ``num_layers`` and every entry still has ``size(0) == num_experts``, so downstream
+    consumers are unchanged. ``None`` (the default) reads the set and the device from the
+    ambient :func:`requested_residency` plan, so every provider honors
+    ``--moe-gpu-owned-layers`` without a new parameter; pass ``frozenset()`` to force plain
+    host banks.
+    """
+    if gpu_owned is None:
+        gpu_owned, device = plan_gpu_owned()
+    banks: dict[str, list] = {name: [] for name in specs}
+    for layer_id in range(num_layers):
+        for name, (shape, dtype) in specs.items():
+            if layer_id in gpu_owned:
+                banks[name].append(GpuOwnedBank(torch.empty(shape, dtype=dtype, device=device)))
+            else:
+                banks[name].append(HostBank(shape, dtype))
+    return banks
 
 
 class _ResidencyPlan:
@@ -229,13 +303,19 @@ class _ResidencyPlan:
 
     Installed by ``load_expert_banks`` around the provider dispatch so every loader honors --moe-cpu-layers without a new parameter in each signature. ``applied`` flips once a settle point consults the plan."""
 
-    __slots__ = ("labels", "applied", "has_unpinned", "actual")
+    __slots__ = ("labels", "applied", "has_unpinned", "actual", "gpu_owned", "device")
 
-    def __init__(self, labels: list[str]):
+    def __init__(self, labels: list[str], device=None):
         self.labels = list(labels)
         self.applied = False
         self.has_unpinned = any(r != HostResidency.PINNED.value for r in labels)
         self.actual: dict[int, str] = {}
+        # GPU_OWNED layers are resolved once here so alloc_layer_banks can consult the plan
+        # ambiently, exactly like pin_banks/PinPipeline consult it for LOCKED.
+        self.gpu_owned = frozenset(
+            i for i, r in enumerate(labels) if r == HostResidency.GPU_OWNED.value
+        )
+        self.device = device
 
     def residency_for(self, layer_id: int) -> str:
         self.applied = True
@@ -251,13 +331,14 @@ _requested_residency: _ResidencyPlan | None = None
 
 
 @contextlib.contextmanager
-def requested_residency(labels: list[str] | None):
-    """Install the ambient per-layer residency plan for the enclosed bank load (``None`` = no plan, everything pins)."""
+def requested_residency(labels: list[str] | None, device=None):
+    """Install the ambient per-layer residency plan for the enclosed bank load (``None`` = no plan, everything pins).
+    ``device`` is where GPU_OWNED layers' banks are allocated."""
     global _requested_residency
     if labels is None:
         yield None
         return
-    plan = _ResidencyPlan(labels)
+    plan = _ResidencyPlan(labels, device)
     prev, _requested_residency = _requested_residency, plan
     try:
         yield plan
@@ -265,8 +346,28 @@ def requested_residency(labels: list[str] | None):
         _requested_residency = prev
 
 
-def _settle(bank: HostBank, residency: str) -> None:
+def plan_gpu_owned() -> "tuple[frozenset[int], torch.device | None]":
+    """The ambient plan's GPU_OWNED layer ids and their target device (empty without a plan).
+
+    Consulting the plan for owned layers counts as applying it (``_echo_residency`` keys its
+    "this loader ignored the request" failure on that), but only when there is an owned set
+    to honor -- a LOCKED-only plan is still only applied by a settle point."""
+    plan = _requested_residency
+    if plan is None:
+        return frozenset(), None
+    if plan.gpu_owned:
+        plan.applied = True
+    return plan.gpu_owned, plan.device
+
+
+def _settle(bank, residency: str) -> None:
     """Route a filled bank to its residency class (PAGEABLE = leave the plain mmap)."""
+    if residency == HostResidency.GPU_OWNED.value:
+        raise RuntimeError(
+            "a GPU-owned MoE layer reached the host settle path: this checkpoint's bank "
+            "loader has no per-layer completion sink, so its device banks would never be "
+            "filled; drop --moe-gpu-owned-layers for this model"
+        )
     if residency == HostResidency.PINNED.value:
         bank.pin()
     elif residency == HostResidency.LOCKED.value:
@@ -277,6 +378,16 @@ def pin_banks(banks: dict[str, HostBank | list[HostBank]]) -> None:
     """Settle every bank after it has been filled -- pin-after-fill by default.
     List-valued entries are per-layer and honor the ambient :func:`requested_residency` plan; scalar banks always pin."""
     plan = _requested_residency
+    if plan is not None and plan.gpu_owned:
+        # Refuse BEFORE settling anything: reaching this function at all means the loader has
+        # no per-layer completion sink, so the owned layers' device banks would never be
+        # filled. Checked here (not only in _settle) so the failure does not depend on which
+        # layer happens to be settled first. _settle keeps the same guard.
+        raise RuntimeError(
+            "a GPU-owned MoE layer reached the host settle path: this checkpoint's bank "
+            "loader has no per-layer completion sink, so its device banks would never be "
+            "filled; drop --moe-gpu-owned-layers for this model"
+        )
     for bank in banks.values():
         if isinstance(bank, list):
             for layer_id, layer_bank in enumerate(bank):
@@ -315,9 +426,15 @@ class PinPipeline:
             if item is None:
                 return
             if self._exc is not None:
-                continue  # drain without settling after a failure
-            bank, residency, plan, layer_id = item
+                # Drain without settling after a failure. Safe to swallow the rest only
+                # because NOTHING blocks on this thread: submitters never wait for a slot,
+                # a token or an event, so a stored exception can strand no one and is
+                # simply re-raised by wait()/__exit__. (It could, before GPU-owned layers
+                # stopped staging through here; that made a settle failure a silent hang --
+                # docs/research/measurements-gpu-owned-layers-2026-09-02.md.)
+                continue
             try:
+                bank, residency, plan, layer_id = item
                 _settle(bank, residency)
                 if plan is not None and residency == HostResidency.LOCKED.value:
                     plan.record(layer_id, bank.residency.value)
@@ -329,11 +446,14 @@ class PinPipeline:
         self._q.put((bank, residency, plan, layer_id))
 
     def __call__(self, layer_id: int, banks: dict[str, HostBank]) -> None:
-        """Layer-completion sink: queue every bank of the completed layer at its ambient :func:`requested_residency` label."""
+        """Layer-completion sink: queue every bank of the completed layer at its ambient :func:`requested_residency` label.
+        A GPU_OWNED layer is already finished when it gets here -- the loader filled its device tensor in place -- and it has no host pages, so there is nothing to settle and nothing to queue. Consulting the plan still marks it applied, and the tracker still counted the layer, so the loaders' ``placed`` asserts are unaffected."""
         plan = _requested_residency
         residency = (
             HostResidency.PINNED.value if plan is None else plan.residency_for(layer_id)
         )
+        if residency == HostResidency.GPU_OWNED.value:
+            return
         for bank in banks.values():
             self.submit(bank, residency, plan, layer_id)
 

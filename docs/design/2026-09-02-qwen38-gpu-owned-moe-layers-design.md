@@ -88,7 +88,20 @@ New residency label `GPU_OWNED` in the per-layer vector. For owned layers:
    `num_layers`; owned indices hold the **device tensor** `[512, *row_shape]` for that bank kind
    (allocated with `torch.empty(..., device="cuda")` before the fill), so every consumer still sees
    one entry per layer and `size(0) == num_experts`.
-2. Fill goes through **one reusable pinned staging layer**: a `HostBank` per bank kind shaped for
+2. **AMENDED 2026-09-02 after live run 1 — the staging design below was built, failed on the
+   box and has been removed (`8a63977`).** What ships instead: an owned layer's `.fill` **is**
+   its device tensor, so each `fill[expert] = row` is a synchronous pageable H2D copy issued
+   by the placement thread itself. No staging, no cap, no back-pressure, no CUDA event. Two
+   reasons, both observed live (`docs/research/measurements-gpu-owned-layers-2026-09-02.md`):
+   the engine loads weights inside `torch.inference_mode()`, which is **thread-local**, so the
+   device banks are inference tensors that only the loading thread may write — the drain-thread
+   flush raised `Inplace update to inference tensor outside InferenceMode is not allowed` every
+   time; and the NVFP4 placement loop is single-threaded, so choice (a)'s bounded staging
+   deadlocks by construction (the thread waiting for a slot is the only thread that could free
+   one). Cost: 7.9 GiB of pageable H2D at boot for six owned layers, a few seconds. The
+   original text follows for the record.
+
+   ~~Fill goes through **one reusable pinned staging layer**~~: a `HostBank` per bank kind shaped for
    one layer, allocated once, `pin()`ed once, reused for each owned layer in turn. The existing
    assignment loops (`nvfp4_banks.py:200-221` serial, `326-341` parallel) write into the staging
    bank instead of the layer bank; at the layer-completion sink (`LayerCompletionTracker`,
@@ -205,7 +218,10 @@ Mirror the existing suites:
   owned layers; `decode_freq` still counts them.
 - Loader: with the real checkpoint present (skip otherwise), owned-layer device tensors (on CPU in
   the test via a device override) are byte-identical to the host-bank rows of a normal load for the
-  same layer; staging bank reuse does not corrupt rows when two owned layers are in flight.
+  same layer; ~~staging bank reuse does not corrupt rows when two owned layers are in flight~~.
+  AMENDED (§4.2): the shipped tests run the real NVFP4 loaders over a *synthetic* checkpoint
+  (no `D:\Models` needed), inside `torch.inference_mode()`, serial and with the parallel
+  reader's rows of three owned layers interleaved round-robin.
 - Runner: `uv pip install --target <scratch>\pytest-site pytest pytest-timeout` once, then
   `PYTHONPATH="<tree>\scripts\windows-ple-mmap;<tree>\python;<scratch>\pytest-site"` and
   `%LOCALAPPDATA%\FreeToken\venv\Scripts\python.exe -m pytest ... -p no:cacheprovider`.
@@ -245,5 +261,10 @@ the fit). Measure against the current baseline (6,750 slots, no owned layers), f
   builds pointer tables must exclude owned layers or raise.
 - Layer 0 is special-cased in three places (`cache_budget.py:28`, `offload_cache.py:542-546`,
   `offload_cache.py:680`); all three must use "first streaming layer".
-- Parallel reader interleaving requires bounded staging (§4.2).
+- ~~Parallel reader interleaving requires bounded staging (§4.2).~~ RESOLVED the other way:
+  bounded staging *is* the deadlock against a single-threaded placement loop; owned layers
+  fill in place instead (§4.2 amendment).
+- The loader path only works from a thread that is in the same `torch.inference_mode()` as
+  the one that allocated the device banks. Any future attempt to move owned-layer filling
+  onto a helper thread must allocate those banks outside inference mode first.
 - Two bank-allocation sites exist (raw + FTW); the FTW site must refuse, not ignore.

@@ -88,8 +88,12 @@ def _bank_layer(spec: Nvfp4ExpertSourceSpec, layer: int, config) -> int | None:
 def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int):
     """6 NVFP4 source banks, one ``[E, ...]`` tensor per layer (independent allocations),
     unpinned (pin-after-fill): register only after fill to skip cudaHostAlloc's slow
-    commit. Caller fills each layer's ``.tensor`` then pins it (per-layer, via
-    ``PinPipeline``, as its writes complete)."""
+    commit. Caller fills each layer's ``.fill`` then settles it (per-layer, via
+    ``PinPipeline``, as its writes complete).
+
+    GPU-owned layers (the ambient ``requested_residency`` plan) get a device tensor instead
+    of a host bank and the placement loop fills it directly; see ``alloc_layer_banks`` and
+    ``GpuOwnedBank``."""
     from freetoken.moe.host_banks import alloc_layer_banks
 
     fp8 = torch.float8_e4m3fn
@@ -175,12 +179,14 @@ def load_nvfp4_expert_source_banks(
         drop_page_cache(path)
 
     _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
-    gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
-    gate_up_scale = [b.tensor for b in _hb["gate_up_scale"]]
-    gate_up_global = [b.tensor for b in _hb["gate_up_global"]]
-    down_packed = [b.tensor for b in _hb["down_packed"]]
-    down_scale = [b.tensor for b in _hb["down_scale"]]
-    down_global = [b.tensor for b in _hb["down_global"]]
+    # bank OBJECTS, not tensors: for a GPU-owned layer ``.fill`` IS the device tensor, so
+    # each assignment below is a direct H2D copy issued by this (the placement) thread.
+    gate_up_packed = _hb["gate_up_packed"]
+    gate_up_scale = _hb["gate_up_scale"]
+    gate_up_global = _hb["gate_up_global"]
+    down_packed = _hb["down_packed"]
+    down_scale = _hb["down_scale"]
+    down_global = _hb["down_global"]
 
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
 
@@ -199,24 +205,24 @@ def load_nvfp4_expert_source_banks(
                     tensor = f.get_tensor(name)
                     if kind == "weight":
                         if role == "gate":
-                            gate_up_packed[bank_layer_id][expert, :I] = tensor
+                            gate_up_packed[bank_layer_id].fill[expert, :I] = tensor
                         elif role == "up":
-                            gate_up_packed[bank_layer_id][expert, I:] = tensor
+                            gate_up_packed[bank_layer_id].fill[expert, I:] = tensor
                         elif role == "down":
-                            down_packed[bank_layer_id][expert] = tensor
+                            down_packed[bank_layer_id].fill[expert] = tensor
                         else:
                             raise ValueError(f"{spec.desc}: unknown projection role {role!r}")
                     else:
                         global_scale = globals_map[(layer, expert, proj)]
                         if role == "gate":
-                            gate_up_scale[bank_layer_id][expert, :I] = tensor
-                            gate_up_global[bank_layer_id][expert, :I] = global_scale
+                            gate_up_scale[bank_layer_id].fill[expert, :I] = tensor
+                            gate_up_global[bank_layer_id].fill[expert, :I] = global_scale
                         elif role == "up":
-                            gate_up_scale[bank_layer_id][expert, I:] = tensor
-                            gate_up_global[bank_layer_id][expert, I:] = global_scale
+                            gate_up_scale[bank_layer_id].fill[expert, I:] = tensor
+                            gate_up_global[bank_layer_id].fill[expert, I:] = global_scale
                         elif role == "down":
-                            down_scale[bank_layer_id][expert] = tensor
-                            down_global[bank_layer_id][expert] = global_scale
+                            down_scale[bank_layer_id].fill[expert] = tensor
+                            down_global[bank_layer_id].fill[expert] = global_scale
                         else:
                             raise ValueError(f"{spec.desc}: unknown projection role {role!r}")
                     tracker.note(bank_layer_id)
@@ -232,14 +238,8 @@ def load_nvfp4_expert_source_banks(
 
     expected = num_layers * E * 6
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
-    return {
-        "gate_up_packed": gate_up_packed,
-        "gate_up_scale": gate_up_scale,
-        "gate_up_global": gate_up_global,
-        "down_packed": down_packed,
-        "down_scale": down_scale,
-        "down_global": down_global,
-    }
+    # after _load: a GPU-owned layer's ``.tensor`` is its (now filled) device bank
+    return {name: [bank.tensor for bank in per_layer] for name, per_layer in _hb.items()}
 
 
 def load_nvfp4_expert_source_banks_parallel(
@@ -299,12 +299,14 @@ def load_nvfp4_expert_source_banks_parallel(
         drop_page_cache(path)
 
     _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
-    gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
-    gate_up_scale = [b.tensor for b in _hb["gate_up_scale"]]
-    gate_up_global = [b.tensor for b in _hb["gate_up_global"]]
-    down_packed = [b.tensor for b in _hb["down_packed"]]
-    down_scale = [b.tensor for b in _hb["down_scale"]]
-    down_global = [b.tensor for b in _hb["down_global"]]
+    # bank OBJECTS, not tensors: for a GPU-owned layer ``.fill`` IS the device tensor, so
+    # each assignment below is a direct H2D copy issued by this (the placement) thread.
+    gate_up_packed = _hb["gate_up_packed"]
+    gate_up_scale = _hb["gate_up_scale"]
+    gate_up_global = _hb["gate_up_global"]
+    down_packed = _hb["down_packed"]
+    down_scale = _hb["down_scale"]
+    down_global = _hb["down_global"]
 
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
 
@@ -323,22 +325,22 @@ def load_nvfp4_expert_source_banks_parallel(
             kind = _canon_kind(spec, match.group("kind"))
             if kind == "weight":
                 if role == "gate":
-                    gate_up_packed[bank_layer_id][expert, :I] = tensor
+                    gate_up_packed[bank_layer_id].fill[expert, :I] = tensor
                 elif role == "up":
-                    gate_up_packed[bank_layer_id][expert, I:] = tensor
+                    gate_up_packed[bank_layer_id].fill[expert, I:] = tensor
                 else:
-                    down_packed[bank_layer_id][expert] = tensor
+                    down_packed[bank_layer_id].fill[expert] = tensor
             else:
                 g = globals_map[(layer, expert, proj)]
                 if role == "gate":
-                    gate_up_scale[bank_layer_id][expert, :I] = tensor
-                    gate_up_global[bank_layer_id][expert, :I] = g
+                    gate_up_scale[bank_layer_id].fill[expert, :I] = tensor
+                    gate_up_global[bank_layer_id].fill[expert, :I] = g
                 elif role == "up":
-                    gate_up_scale[bank_layer_id][expert, I:] = tensor
-                    gate_up_global[bank_layer_id][expert, I:] = g
+                    gate_up_scale[bank_layer_id].fill[expert, I:] = tensor
+                    gate_up_global[bank_layer_id].fill[expert, I:] = g
                 else:
-                    down_scale[bank_layer_id][expert] = tensor
-                    down_global[bank_layer_id][expert] = g
+                    down_scale[bank_layer_id].fill[expert] = tensor
+                    down_global[bank_layer_id].fill[expert] = g
             tracker.note(bank_layer_id)
             placed += 1
         return placed
@@ -351,14 +353,8 @@ def load_nvfp4_expert_source_banks_parallel(
 
     expected = num_layers * E * 6
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
-    return {
-        "gate_up_packed": gate_up_packed,
-        "gate_up_scale": gate_up_scale,
-        "gate_up_global": gate_up_global,
-        "down_packed": down_packed,
-        "down_scale": down_scale,
-        "down_global": down_global,
-    }
+    # after _load: a GPU-owned layer's ``.tensor`` is its (now filled) device bank
+    return {name: [bank.tensor for bank in per_layer] for name, per_layer in _hb.items()}
 
 
 __all__ = [

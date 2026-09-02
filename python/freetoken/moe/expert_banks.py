@@ -400,11 +400,13 @@ def ftw_bank_bytes(model_path: str) -> int | None:
     return sum(t["nbytes"] for t in tensors if t.get("kind") == "experts_bank")
 
 
-def bank_bytes_estimate(model_config) -> int | None:
+def bank_bytes_estimate(model_config, gpu_owned: int = 0) -> int | None:
     """Estimated total expert-bank bytes of a raw checkpoint, from the model config alone.
 
     Sizes the pin-budget decisions where FTW metadata is not available; ``None`` for unknown formats or missing dims (callers then skip the pre-load sizing).
-    nvfp4 uses the native-row formula, a slight over-estimate for the repacked backends."""
+    nvfp4 uses the native-row formula, a slight over-estimate for the repacked backends.
+    ``gpu_owned`` MoE layers allocate no host bank, so they are subtracted -- the pin budget
+    and the boot banner must not claim RAM that is never asked for."""
     expert_quant = getattr(model_config, "expert_quant", "none")
     fmt = expert_quant if expert_quant != "none" else (
         getattr(model_config, "moe_weight_format", None) or "bf16"
@@ -416,7 +418,7 @@ def bank_bytes_estimate(model_config) -> int | None:
     inter = getattr(model_config, "moe_intermediate_size", None)
     if per_expert is None or not all((layers, experts, hidden, inter)):
         return None
-    return layers * experts * per_expert(hidden, inter)
+    return max(0, layers - gpu_owned) * experts * per_expert(hidden, inter)
 
 
 def load_expert_banks(
@@ -494,7 +496,7 @@ def load_expert_banks(
     # allocation) falls back to serial.
     from freetoken.moe.host_banks import requested_residency
 
-    with requested_residency(layer_residency) as residency_plan:
+    with requested_residency(layer_residency, device=device) as residency_plan:
         try:
             banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk,
                                         decode_target, layer_sink)
@@ -525,6 +527,15 @@ def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:
         return dataclasses.replace(banks, layer_residency=labels)
     from freetoken.moe.host_banks import HostResidency
 
+    if any(r == HostResidency.GPU_OWNED.value for r in requested):
+        # unlike a pin/lock downgrade this is not a degradation: the owned layers were
+        # allocated as HOST banks, so no device tensor exists and set_bank_sources would
+        # register host rows as resident. Fail the boot instead.
+        raise RuntimeError(
+            "--moe-gpu-owned-layers: this checkpoint's bank loader settles banks without "
+            "per-layer residency, so the owned layers were allocated in host RAM and no "
+            "resident device banks exist; drop the flag for this model"
+        )
     if any(r != HostResidency.PINNED.value for r in requested):
         logger.warning_rank0(
             "--moe-cpu-layers: this checkpoint's bank loader settles banks without "

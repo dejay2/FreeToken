@@ -137,6 +137,60 @@ no parallel provider; the boot log always names the build it took:
 INFO expert banks: slow path (parallel build)
 ```
 
+### GPU-owned MoE layers
+
+`-GpuOwnedLayers` passes `--moe-gpu-owned-layers`. The named MoE layers keep all 512
+experts permanently resident in VRAM and allocate **no pinned host bank at all**, so each
+one hands 1.322 GiB of host RAM back and costs 1.322 GiB of VRAM (about 512 LRU slots).
+Host RAM is the binding constraint on the tested system (95.6 GiB, ~89 GiB commit), and a
+pinned bank cannot be partially released on Windows -- never allocating it is the only way
+to give the RAM back.
+
+| Value | Meaning |
+| --- | --- |
+| *(empty)* | Off. The default. |
+| `auto` | The six hungriest layers by measured decode miss rate: `0, 1, 2, 6, 7, 22`. |
+| `auto:N` | The first N of that ranked list (`1, 6, 0, 2, 7, 22, 10, 13, 5, 18, ...`). |
+| `0,1,2` | An explicit MoE-layer id list. |
+| `6` / `0.125` | A count (evenly strided) or a fraction, as `--moe-cpu-layers` reads them. |
+
+The ranking comes from four decode captures on this box
+(`docs/research/routing-skew-2026-09-02/`) and is a fixed built-in list, not a runtime
+heuristic.
+
+**`-MoECacheSize` is the total expert-slot budget, and the owned layers are charged to
+it** -- you do NOT lower it yourself. Keep the number that works without the flag (6750
+here) and the LRU shrinks by 512 slots per owned layer, so the card holds exactly the same
+MoE bytes with or without `-GpuOwnedLayers`:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+  .\scripts\start-qwen38-flash-next-mmap-windows.ps1 `
+  -ModelPath $ModelPath `
+  -GpuOwnedLayers auto `
+  -MoECacheSize 6750
+```
+
+The boot log says exactly what happened:
+
+```
+INFO --moe-cache-size 6750 is the total MoE expert-slot budget: 6 GPU-owned layer(s) hold 3072 of those slots, leaving 3678 for the streaming-layer LRU
+INFO MoE GPU-owned layers: [0, 1, 2, 6, 7, 22] (6 x 1.32 GiB resident, no host bank); LRU cache 3678 slots for 42 streaming layers
+```
+
+Adding the owned layers on top of the budget instead of charging them to it is what made
+the first live run twice as slow: 6 owned layers plus 4400 LRU slots is +1.85 GiB of VRAM,
+which left the card 569 MiB free at decode peak and halved throughput even though it moved
+11 % fewer expert rows per step. Measurements:
+`docs/research/gpu-owned-layers-speed-diagnosis-2026-09-02.md`.
+
+`GET /v1/cache/routing` reports the owned layers as `resident: true` with a null
+`miss_rate` (a resident layer cannot miss, and reporting `0.0` would read as a perfectly
+cacheable streaming layer), and the `summary` block describes the streaming cache only.
+The flag needs `--moe-backend offload`, refuses to overlap with `--moe-cpu-layers`, and is
+not supported on an FTW packed checkpoint.
+
+
 ### Expert routing statistics
 
 `-CollectRoutingStats` boots with `--moe-collect-decode-freq`, which accumulates a

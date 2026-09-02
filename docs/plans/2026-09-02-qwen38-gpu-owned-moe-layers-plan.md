@@ -84,7 +84,7 @@
   - `_DENSE_MOE_SETTINGS["moe_gpu_owned_layers"] = None`
   - CLI `--moe-gpu-owned-layers <spec>`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `tests/engine/test_moe_gpu_owned_layers.py`:
 
@@ -282,7 +282,7 @@ if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -293,7 +293,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 Expected: collection error, every test errors out with
 `ImportError: cannot import name 'GPU_OWNED_LAYER_RANK' from 'freetoken.engine.engine'`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/freetoken/engine/config.py` -- insert immediately after the `moe_cpu_layers` field (line 350):
 
@@ -444,7 +444,7 @@ def _validate_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> fro
         _validate_gpu_owned_layers(config, model_config.num_moe_layers)
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -452,7 +452,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 & "$env:LOCALAPPDATA\FreeToken\venv\Scripts\python.exe" -m pytest tests/engine/test_moe_gpu_owned_layers.py tests/engine/test_moe_cpu_layers.py -q -p no:cacheprovider
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add python/freetoken/engine/config.py python/freetoken/server/args.py python/freetoken/engine/engine.py tests/engine/test_moe_gpu_owned_layers.py
@@ -486,7 +486,7 @@ Claude-Session: https://claude.ai/code/session_01Hnf1bGBLU4HLq9uHPtNjwU
 
 Note on scope: the two pure functions and `expert_bytes_per_slot` are unit-tested here. The three engine call sites are pure glue over them (no new arithmetic) and are exercised at boot -- Task 8's checklist records the boot line that proves the reservation landed.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/engine/test_cache_budget.py`:
 
@@ -571,7 +571,7 @@ def test_explicit_cache_size_that_overflows_the_budget_names_what_would_fit():
     assert "own at most 1 layer" in message
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -583,7 +583,7 @@ Expected: 4 failures, each an
 `ImportError: cannot import name 'gpu_owned_reservation_bytes' from 'freetoken.engine.cache_budget'`
 (and `... name 'check_explicit_moe_cache_fits' ...` for the last one).
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/freetoken/engine/cache_budget.py` -- replace `expert_bytes_per_slot` (lines 17-28) and add the two new functions after it:
 
@@ -733,7 +733,7 @@ def check_explicit_moe_cache_fits(
         )
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -741,7 +741,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 & "$env:LOCALAPPDATA\FreeToken\venv\Scripts\python.exe" -m pytest tests/engine/test_cache_budget.py -q -p no:cacheprovider
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add python/freetoken/engine/cache_budget.py python/freetoken/engine/engine.py tests/engine/test_cache_budget.py
@@ -778,7 +778,7 @@ Claude-Session: https://claude.ai/code/session_01Hnf1bGBLU4HLq9uHPtNjwU
   - `_note_decode_routing(layer_id, expert_ids) -> None`
   - `decode_miss_stats_per_layer()` rows carry `"resident": bool` and `"miss_rate": None` for owned layers
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/moe/test_offload.py`:
 
@@ -973,7 +973,7 @@ Add the `Stat` import that `tests/moe/test_offload.py` does not yet have -- put 
 from flashlib.kernels.slot_cache import Stat
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -991,7 +991,7 @@ Expected failures:
   `AssertionError: ('gate_up', 1, torch.Size([4, 32, 8]), torch.float32)` from the head-shape
   check that still keys on layer 0).
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/freetoken/moe/host_banks.py` -- extend the enum (after `PAGEABLE = "pageable"`, line 60):
 
@@ -1320,7 +1320,7 @@ after `bank_views` (line 793):
         C = max(1, int(round(slots_per_layer)))
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -1328,7 +1328,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 & "$env:LOCALAPPDATA\FreeToken\venv\Scripts\python.exe" -m pytest tests/moe/test_offload.py tests/moe/test_routing_stats.py tests/moe/test_hybrid_fetch.py tests/moe/test_prefill_hit_d2d.py -q -p no:cacheprovider
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add python/freetoken/moe/host_banks.py python/freetoken/moe/offload_cache.py tests/moe/test_offload.py
@@ -1356,7 +1356,7 @@ Claude-Session: https://claude.ai/code/session_01Hnf1bGBLU4HLq9uHPtNjwU
 - Consumes: `cache.is_gpu_owned_layer`, `cache.resident_views`, `cache.alphas_for_layer`, `cache.prefetch_prefill_layer`, `cache.begin_prefill`, `self._expert_gemm(..., views=, n=, alphas=, is_prefill=)`.
 - Produces: no new public names. The owned branch of `_decode_routed` is the SINGLE entry point both real decode and the `FREETOKEN_MOE_SMALL_PREFILL_ROWS` narrow-prefill path reach (`forward`/`routed_forward` -> `_use_decode_movement` -> `_decode_routed`), so one branch covers both. `_wait_prefill_overlap` needs no owned branch: it is only reachable from `_prefill_routed`, which returns before it.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/moe/test_offload.py`:
 
@@ -1501,7 +1501,7 @@ def test_prefill_overlap_skips_a_gpu_owned_layer_and_still_alternates_buffers(mo
     assert cache._prefill_buffer_layer == [2, None]  # buffer 1 was never claimed
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -1517,7 +1517,7 @@ fails with `AssertionError: assert 139... == 139...` on
 `fused_calls[1]["w1_ptr"] == sources["gate_up"][1].data_ptr()` (layer 1 was copied into
 double buffer 1 instead of read in place).
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/freetoken/layers/moe.py` -- `_decode_routed`, inserting the owned branch after the CPU-layer branch (line 714) and before the hybrid branch:
 
@@ -1583,7 +1583,7 @@ Also extend the method docstring's final paragraph (line 704-708) with one sente
         if cache.prefill_overlap:
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -1591,7 +1591,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 & "$env:LOCALAPPDATA\FreeToken\venv\Scripts\python.exe" -m pytest tests/moe/test_offload.py tests/moe/test_small_prefill_movement.py tests/moe/test_moe_prefetch_config.py -q -p no:cacheprovider
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add python/freetoken/layers/moe.py tests/moe/test_offload.py
@@ -1632,7 +1632,7 @@ Claude-Session: https://claude.ai/code/session_01Hnf1bGBLU4HLq9uHPtNjwU
   - `bank_bytes_estimate(model_config, gpu_owned: int = 0)`
   - `freetoken.moe.cpu_executor._reject_cuda_sources(banks) -> None`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `tests/moe/test_gpu_owned_banks.py`:
 
@@ -1813,7 +1813,7 @@ if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -1826,7 +1826,7 @@ Expected: 9 failures. The first is
 tests fail with `AttributeError: module 'freetoken.moe.host_banks' has no attribute 'GpuOwnedStagingPool'`;
 the executor test with `ImportError: cannot import name '_reject_cuda_sources' from 'freetoken.moe.cpu_executor'`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/freetoken/moe/host_banks.py` -- add the `fill` property to `HostBank` (after the `residency` property, line 131):
 
@@ -2255,7 +2255,7 @@ and inside `_resolve_banks`, as its first statement after the docstring:
         if fmt == "bf16":
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -2263,7 +2263,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 & "$env:LOCALAPPDATA\FreeToken\venv\Scripts\python.exe" -m pytest tests/moe/test_gpu_owned_banks.py tests/moe/test_offload.py tests/moe/test_cpu_moe.py tests/checkpoint -q -p no:cacheprovider
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add python/freetoken/moe/host_banks.py python/freetoken/models/nvfp4_banks.py python/freetoken/moe/expert_banks.py python/freetoken/checkpoint/ftw.py python/freetoken/moe/cpu_executor.py tests/moe/test_gpu_owned_banks.py
@@ -2308,7 +2308,7 @@ Claude-Session: https://claude.ai/code/session_01Hnf1bGBLU4HLq9uHPtNjwU
 
 Note: the model-level `weight_placement_report` hook (spec section 7) is deliberately NOT extended -- `Engine._load_weights` calls it at line 606, before `_init_offload_moe_cache` exists, so it cannot see the owned set. The boot log line below is the single place that reports the owned layers and their resident bytes.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/engine/test_moe_gpu_owned_layers.py`:
 
@@ -2489,7 +2489,7 @@ def test_movement_reconciles_when_resident_layers_contribute_no_counters():
     assert movement["hit_experts"] + movement["missing_experts"] == movement["active_experts"]
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -2506,7 +2506,7 @@ Expected failures:
 - `KeyError: 'gpu_owned_layers'` in `test_movement_reconciles_when_resident_layers_contribute_no_counters`
 - `test_the_summary_denominates_slots_over_the_streaming_layers_only` -> `assert 2.0 == 4.0`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/freetoken/engine/engine.py` -- the pure boot-line formatter, immediately after `_validate_gpu_owned_layers`:
 
@@ -2739,7 +2739,7 @@ def moe_total_experts(config: Any) -> int:
                 "gpu_owned_layers": len(getattr(cache, "gpu_owned_layer_ids", ()) or ()),
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -2749,7 +2749,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 
 (Expect only the pre-existing failures listed in "Known pre-existing failures" below.)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add python/freetoken/engine/engine.py python/freetoken/kvcache/cache_status.py python/freetoken/server/api_server.py python/freetoken/cache_report.py python/freetoken/server/model_meta.py python/freetoken/scheduler/scheduler.py python/freetoken/engine/mtp_fast_verify.py tests/engine/test_moe_gpu_owned_layers.py tests/moe/test_routing_stats.py tests/engine/test_mtp_fast_verify.py tests/server/test_gpu_owned_geometry.py
@@ -2782,7 +2782,7 @@ Claude-Session: https://claude.ai/code/session_01Hnf1bGBLU4HLq9uHPtNjwU
 
 The launcher is tested the way `-ExpertLoad` and `-CollectRoutingStats` already are (`tests/engine/test_expert_load_flag.py:56-63`, `tests/moe/test_routing_stats.py:58-69`): parse the script text and assert the parameter, the passthrough and the absence of a hard-coded value.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/engine/test_moe_gpu_owned_layers.py`:
 
@@ -2823,7 +2823,7 @@ def test_the_docs_describe_the_flag():
     assert "-GpuOwnedLayers" in windows
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -2833,7 +2833,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 
 Expected: 3 failures, each `AssertionError: assert "[string]$GpuOwnedLayers = ''" in '[CmdletBinding()]\nparam(\n...'` (and the equivalent for the banner and the docs assertions).
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `scripts/start-qwen38-flash-next-mmap-windows.ps1` -- add the parameter at the end of the `param(...)` block (after `[switch]$CollectRoutingStats`, line 75; remember the comma):
 
@@ -2930,7 +2930,7 @@ The flag needs `--moe-backend offload`, refuses to overlap with `--moe-cpu-layer
 not supported on an FTW packed checkpoint.
 ````
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -2944,7 +2944,7 @@ Then confirm the script still parses (this does NOT run it):
 $null = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\scripts\start-qwen38-flash-next-mmap-windows.ps1), [ref]$null, [ref]$null); "parsed"
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add scripts/start-qwen38-flash-next-mmap-windows.ps1 docs/cli.md docs/windows-qwen38-flash-next-mmap.md tests/engine/test_moe_gpu_owned_layers.py
@@ -2971,7 +2971,7 @@ Claude-Session: https://claude.ai/code/session_01Hnf1bGBLU4HLq9uHPtNjwU
 - Consumes: the boot line from Task 6, the launcher flags from Task 7, spec section 9's check table.
 - Produces: no code. The document is the hand-off: the implementer fills the commit list, the CPU test results and the "what only a live run can decide" section; the operator fills the measurement rows.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/engine/test_moe_gpu_owned_layers.py`:
 
@@ -3009,7 +3009,7 @@ def test_the_operator_checklist_covers_every_live_check_the_spec_asks_for():
         assert check in status, check
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -3019,7 +3019,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 
 Expected: `FileNotFoundError: [Errno 2] No such file or directory: 'D:\\FreeToken\\docs\\plans\\2026-09-02-qwen38-gpu-owned-moe-layers-status.md'`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Create `docs/plans/2026-09-02-qwen38-gpu-owned-moe-layers-status.md` (the implementer fills the
 result cells of the first two sections before handing over; the operator fills the third):
@@ -3126,7 +3126,7 @@ covered without the device, and are what the table above exists to settle:
    owned set.
 ````
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -3134,7 +3134,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 & "$env:LOCALAPPDATA\FreeToken\venv\Scripts\python.exe" -m pytest tests/engine/test_moe_gpu_owned_layers.py -q -p no:cacheprovider
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add docs/plans/2026-09-02-qwen38-gpu-owned-moe-layers-status.md tests/engine/test_moe_gpu_owned_layers.py

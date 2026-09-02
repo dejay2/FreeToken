@@ -85,6 +85,7 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
+| `--moe-gpu-owned-layers` | off | With `offload`: MoE layers whose experts stay permanently resident in VRAM with no host bank (`0,1,2`, a count, a fraction, `auto`, or `auto:N`); each is CHARGED `num_experts` slots of `--moe-cache-size` (so total VRAM is unchanged) and returns one layer of host RAM |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |

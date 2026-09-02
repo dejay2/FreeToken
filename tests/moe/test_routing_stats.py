@@ -252,3 +252,57 @@ def test_a_dead_backend_wakes_a_pending_routing_waiter():
         return await asyncio.wait_for(fut, timeout=2)
 
     assert asyncio.run(scenario()) == {"stats": {}, "error": "worker died"}
+
+
+# ------------------------------------------------ GPU-owned layers (--moe-gpu-owned-layers)
+
+
+def test_the_summary_denominates_slots_over_the_streaming_layers_only():
+    # 8 slots over 4 layers is 2 slots/layer; with 2 layers resident the STREAMING cache is
+    # 8 slots over 2 layers, and the resident layers are excluded from every average
+    cache = _cpu_cache(num_layers=4, num_experts=4, cache_size=8)
+    cache.gpu_owned_layer_ids = frozenset({0, 3})
+    cache.decode_freq[1] = torch.tensor([97, 1, 1, 1], dtype=torch.int64)
+    cache.decode_freq[0] = torch.tensor([25, 25, 25, 25], dtype=torch.int64)
+
+    stats = cache.decode_routing_stats()
+
+    assert stats["slots_per_layer"] == 4.0
+    assert stats["experts_for_90pct"] == 1.0        # layer 1 only; the resident layer 0 is out
+    assert stats["oracle_hit_at_slots"] == pytest.approx(1.0)
+
+
+def test_the_raw_histogram_still_counts_a_resident_layer():
+    # the summary is about the streaming cache, but decode_freq is the input to every offline
+    # skew study, so a resident layer's routing must still be recorded
+    cache = _cpu_cache(num_layers=2, num_experts=4, cache_size=8)
+    cache.gpu_owned_layer_ids = frozenset({1})
+    cache.collect_decode_freq = True
+
+    cache._note_decode_routing(1, torch.tensor([[2, 3]], dtype=torch.int32))
+
+    assert cache.decode_freq[1].tolist() == [0, 0, 1, 1]
+
+
+def test_the_routing_reply_names_the_gpu_owned_layers():
+    from types import SimpleNamespace
+
+    from freetoken.message.backend import RoutingStatsBackendMsg
+    from freetoken.scheduler.scheduler import Scheduler
+
+    cache = _cpu_cache(num_layers=3, num_experts=4, cache_size=8)
+    cache.collect_stats = True
+    cache.collect_decode_freq = True
+    cache.gpu_owned_layer_ids = frozenset({1})
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.engine = SimpleNamespace(moe_offload_cache=cache)
+    sent: list = []
+    scheduler.send_result = sent.append
+
+    scheduler._reply_routing_stats(RoutingStatsBackendMsg(request_id="r1"))
+
+    stats = sent[0][0].stats
+    assert stats["gpu_owned_layers"] == [1]
+    assert stats["per_layer"][1]["resident"] is True
+    assert stats["per_layer"][1]["miss_rate"] is None
+    assert stats["per_layer"][0]["resident"] is False

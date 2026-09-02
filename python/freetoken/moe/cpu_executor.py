@@ -141,6 +141,24 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     return len(reps), list(reps)
 
 
+def _reject_cuda_sources(banks: dict) -> None:
+    """Refuse CUDA per-layer bank sources.
+
+    ``_make_table`` hands the C++ executor raw ``data_ptr()`` values that it dereferences on
+    the CPU. A GPU-owned MoE layer's source is a CUDA tensor, whose ``data_ptr()`` is a
+    device address -- a silent wrong-memory read. Unreachable today (the flag requires
+    ``--moe-backend offload`` with no CPU layers), which is exactly why it must be a guard.
+    """
+    for name, layers in banks.items():
+        for layer_id, tensor in enumerate(layers):
+            if tensor.is_cuda:
+                raise ValueError(
+                    f"CPU MoE executor cannot read bank {name!r} layer {layer_id}: it is a "
+                    f"CUDA tensor (a GPU-owned MoE layer). --moe-gpu-owned-layers requires "
+                    f"--moe-backend offload with no CPU layers"
+                )
+
+
 class CpuMoeExecutor:
     """Decode-time CPU expert compute over an ``OffloadMoeCache``'s host banks
     (bf16, nvfp4, mxfp4_triton, ds_fp4 or q4_0 — see ``_WFMT_IDS`` / ``_resolve_banks``)."""
@@ -342,6 +360,7 @@ class CpuMoeExecutor:
         is actually a per-layer table's address (see ``_make_table``), not a single
         bank's -- the C++ ctor resolves ``tbl[layer_id]`` per task.
         """
+        _reject_cuda_sources(banks)
         if fmt == "bf16":
             gate_up = banks["gate_up"]
             down = banks["down"]

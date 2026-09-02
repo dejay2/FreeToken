@@ -3,6 +3,8 @@ from contextlib import contextmanager
 import pytest
 import torch
 
+from flashlib.kernels.slot_cache import Stat
+
 from freetoken.distributed import set_tp_info, try_get_tp_info
 
 
@@ -944,3 +946,327 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+# ----------------------------------------------------- GPU-owned MoE layers (spec sections 5, 7)
+
+
+def _make_owned_cache(num_layers=3, owned=(1,), prefill_overlap=False, head_shape=(32, 8)):
+    """A [gate_up, down] bf16 cache with the given layers GPU_OWNED (the rest pinned).
+
+    The "device" tensors are plain CPU tensors: an owned layer's whole point is that it never
+    takes a device address and never enters a pointer table, so every assertion below is
+    exercisable without CUDA.
+    """
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=num_layers, num_experts=4, cache_size=8,
+        device=torch.device("cpu"), prefill_overlap=prefill_overlap,
+    )
+    cache.gpu_owned_layer_ids = frozenset(owned)
+    sources = {
+        "gate_up": [
+            torch.randn(4, *(head_shape if i in owned else (32, 8))) for i in range(num_layers)
+        ],
+        "down": [torch.randn(4, 8, 16) for _ in range(num_layers)],
+    }
+    residency = [
+        HostResidency.GPU_OWNED.value if i in owned else HostResidency.PINNED.value
+        for i in range(num_layers)
+    ]
+    cache.set_bank_sources(sources, layer_residency=residency)
+    return cache, sources
+
+
+def test_gpu_owned_layer_is_registered_as_resident_views_not_slot_cache_rows():
+    cache, sources = _make_owned_cache(num_layers=3, owned=(1,))
+
+    assert cache.is_gpu_owned_layer(1)
+    assert not cache.is_gpu_owned_layer(0) and not cache.is_gpu_owned_layer(2)
+    # views come back in bank REGISTRATION order and are the source tensors themselves
+    views = cache.resident_views(1)
+    assert views[0] is sources["gate_up"][1]
+    assert views[1] is sources["down"][1]
+    # an owned layer is NOT unpinned: it has a device address, it just has no host bank
+    assert not cache.is_unpinned_layer(1)
+    # the slot cache is unchanged: still cache_size rows of the streaming geometry
+    assert cache.bank_caches["gate_up"].shape == (8, 32, 8)
+
+
+def test_the_slot_cache_geometry_comes_from_the_first_streaming_layer():
+    # layer 0 is owned (it is in the default owned set) and deliberately a different row
+    # shape; the slot cache must be sized from layer 1.
+    cache, _ = _make_owned_cache(num_layers=3, owned=(0,), head_shape=(99, 8))
+
+    assert cache._first_streaming_layer == 1
+    assert cache.bank_caches["gate_up"].shape == (8, 32, 8)
+
+
+def test_set_bank_sources_rejects_a_layer_that_is_both_gpu_owned_and_a_cpu_layer():
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
+    )
+    cache.cpu_layer_ids = frozenset({1})
+    cache.gpu_owned_layer_ids = frozenset({1})
+    sources = {
+        "gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
+        "down": [torch.randn(4, 8, 16) for _ in range(2)],
+    }
+    with pytest.raises(ValueError, match="both GPU-owned and CPU layers"):
+        cache.set_bank_sources(
+            sources,
+            layer_residency=[HostResidency.PINNED.value, HostResidency.GPU_OWNED.value],
+        )
+
+
+def test_set_bank_sources_rejects_labels_that_disagree_with_the_owned_set():
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
+    )
+    sources = {
+        "gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
+        "down": [torch.randn(4, 8, 16) for _ in range(2)],
+    }
+    with pytest.raises(ValueError, match="disagree with the GPU_OWNED residency labels"):
+        cache.set_bank_sources(
+            sources,
+            layer_residency=[HostResidency.PINNED.value, HostResidency.GPU_OWNED.value],
+            gpu_owned_layers=frozenset(),
+        )
+
+
+@pytest.mark.parametrize("call", ["ensure_experts", "ensure_experts_hybrid", "materialize_layer"])
+def test_gpu_owned_layer_refuses_every_movement_entry_point(call):
+    # a wiring bug that routed an owned layer into the LRU would gather the wrong rows;
+    # mirror test_locked_layer_copy_missing_rejects_ensure_experts_staging and fail loudly
+    cache, _ = _make_owned_cache(num_layers=3, owned=(1,))
+    args = (1,) if call == "materialize_layer" else (1, torch.zeros(1, 2, dtype=torch.int32))
+
+    with pytest.raises(RuntimeError, match="GPU-owned layer 1"):
+        getattr(cache, call)(*args)
+
+
+def test_gpu_owned_layer_refuses_copy_missing():
+    cache, _ = _make_owned_cache(num_layers=3, owned=(1,))
+    cache._pending_src_layer = 1
+    cache._pending_whole_layer = True
+
+    with pytest.raises(RuntimeError, match="GPU-owned layer 1"):
+        cache.copy_missing()
+
+
+def test_gpu_owned_layer_is_excluded_from_prefetch_and_the_prefill_double_buffer():
+    cache, _ = _make_owned_cache(num_layers=3, owned=(1,), prefill_overlap=True)
+
+    assert cache.prefetch_ready(1) is False  # no PCIe fetch to hide
+    # the caller pre-issues layer_id + 1 blindly, so the guard is keyed on the TARGET and
+    # returns quietly rather than raising
+    cache.prefetch_prefill_layer(1)
+    assert cache._prefill_buffer_layer == [None, None]
+    cache.prefetch_prefill_layer(0)
+    assert cache._prefill_buffer_layer == [0, None]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_copy_plan_holds_a_zero_placeholder_for_gpu_owned_layers():
+    # device_ptr() on a CUDA tensor returns data_ptr() -- a plausible but WRONG copy source;
+    # the owned layer's descriptor row must stay the 0 placeholder
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    dev = torch.device("cuda")
+    cache = OffloadMoeCache(num_layers=2, num_experts=4, cache_size=8, device=dev)
+    cache.gpu_owned_layer_ids = frozenset({1})
+    sources = {
+        "gate_up": [torch.randn(4, 32, 8, device=dev) for _ in range(2)],
+        "down": [torch.randn(4, 8, 16, device=dev) for _ in range(2)],
+    }
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.PINNED.value, HostResidency.GPU_OWNED.value],
+    )
+
+    assert cache._copy_fused_ok
+    assert (cache._copy_src_ptrs[1] == 0).all(), "GPU-owned layer row must stay 0"
+    assert (cache._copy_src_ptrs[0] != 0).all()
+
+
+def test_rebuild_preserves_resident_banks_and_resizes_only_the_slot_cache():
+    cache, sources = _make_owned_cache(num_layers=3, owned=(0,), head_shape=(99, 8))
+    before = cache.resident_banks[0]
+
+    cache.rebuild(12)
+
+    assert cache.resident_banks[0] is before
+    assert cache.resident_views(0)[0] is sources["gate_up"][0]
+    assert cache.bank_caches["gate_up"].shape == (12, 32, 8)  # from streaming layer 1
+
+
+def test_per_layer_rows_report_gpu_owned_layers_as_resident_with_no_miss_rate():
+    cache, _ = _make_owned_cache(num_layers=3, owned=(1,))
+    cache.collect_stats = True
+    cache.lru_stats[0, Stat.ACTIVE] = 10
+    cache.lru_stats[0, Stat.MISS] = 2
+    cache.lru_stats[0, Stat.CALLS] = 1
+
+    rows = cache.decode_miss_stats_per_layer()["per_layer"]
+
+    assert rows[0]["resident"] is False
+    assert rows[0]["miss_rate"] == pytest.approx(0.2)
+    # a resident layer never misses BY CONSTRUCTION; 0.0 would read as a perfect streaming
+    # layer to any future heuristic, so it must be null
+    assert rows[1]["resident"] is True
+    assert rows[1]["miss_rate"] is None
+    assert rows[1]["missing_per_step"] == 0.0
+
+
+def _make_owned_layer_and_cache(layer_id=1, num_layers=3, owned=(1,), prefill_overlap=False):
+    from freetoken.layers.moe import OffloadMoELayer
+
+    cache, sources = _make_owned_cache(
+        num_layers=num_layers, owned=owned, prefill_overlap=prefill_overlap
+    )
+    layer = OffloadMoELayer(
+        layer_id=layer_id, num_experts=4, top_k=2, hidden_size=8, intermediate_size=16
+    )
+    layer.offload_cache = cache
+    return layer, cache, sources
+
+
+def test_decode_forward_on_a_gpu_owned_layer_uses_raw_ids_and_resident_views(monkeypatch):
+    layer, cache, sources = _make_owned_layer_and_cache()
+    topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
+    topk_ids = torch.tensor([[2, 1]], dtype=torch.int32)
+    hidden_states = torch.randn(1, 8)
+    router_logits = torch.randn(1, 4)
+    calls = {}
+
+    monkeypatch.setattr(
+        "freetoken.layers.moe.fused_topk",
+        lambda *, hidden_states, gating_output, topk, renormalize: (topk_weights, topk_ids),
+    )
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("a GPU-owned layer must not touch the LRU")
+
+    monkeypatch.setattr(cache, "ensure_experts", unexpected)
+    monkeypatch.setattr(cache, "copy_missing", unexpected)
+    monkeypatch.setattr(cache, "materialize_layer", unexpected)
+
+    def fake_fused_decode(
+        hidden_states, w1, w2, got_topk_weights, got_topk_ids, activation,
+        apply_router_weight_on_input,
+    ):
+        calls["w1"] = w1
+        calls["w2"] = w2
+        calls["topk_ids"] = got_topk_ids.clone()
+        return hidden_states
+
+    monkeypatch.setattr("freetoken.layers.moe.fused_experts_decode_impl", fake_fused_decode)
+
+    out = layer.decode_forward(hidden_states, router_logits)
+
+    assert out is hidden_states
+    # position == expert id on a fully resident layer: the ids pass through UNMAPPED
+    assert calls["topk_ids"].tolist() == [[2, 1]]
+    assert calls["w1"] is sources["gate_up"][1]
+    assert calls["w2"] is sources["down"][1]
+    assert calls["w1"] is not cache.bank_caches["gate_up"]
+    # and the routing histogram still counts the layer
+    cache.collect_decode_freq = True
+    layer.decode_forward(hidden_states, router_logits)
+    assert cache.decode_freq[1].tolist() == [0, 1, 1, 0]
+
+
+def test_a_narrow_prefill_on_a_gpu_owned_layer_takes_the_same_owned_branch(monkeypatch):
+    # FREETOKEN_MOE_SMALL_PREFILL_ROWS routes narrow prefills through _decode_routed; the
+    # owned branch has to be correct there too. (The admission conditions themselves are
+    # covered by tests/moe/test_small_prefill_movement.py.)
+    layer, cache, sources = _make_owned_layer_and_cache()
+    topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
+    topk_ids = torch.tensor([[2, 1]], dtype=torch.int32)
+    hidden_states = torch.randn(1, 8)
+    calls = {}
+
+    monkeypatch.setattr(layer, "_use_decode_movement", lambda _hidden: True)
+    monkeypatch.setattr(cache, "materialize_layer", lambda *a, **k: pytest.fail("streamed"))
+
+    def fake_fused_decode(
+        hidden_states, w1, w2, got_topk_weights, got_topk_ids, activation,
+        apply_router_weight_on_input,
+    ):
+        calls["w1"] = w1
+        calls["topk_ids"] = got_topk_ids.clone()
+        return hidden_states
+
+    monkeypatch.setattr("freetoken.layers.moe.fused_experts_decode_impl", fake_fused_decode)
+
+    layer.routed_forward(hidden_states, topk_weights, topk_ids)
+
+    assert calls["w1"] is sources["gate_up"][1]
+    assert calls["topk_ids"].tolist() == [[2, 1]]
+
+
+def test_prefill_overlap_skips_a_gpu_owned_layer_and_still_alternates_buffers(monkeypatch):
+    # layers 0 and 2 stream (both land in buffer 0, layer_id % 2), layer 1 is resident.
+    # The owned layer borrows no buffer but must still pre-issue layer 2's copy, or the
+    # pipeline stalls one layer every time an owned layer sits in the middle.
+    from freetoken.layers.moe import OffloadMoELayer
+
+    cache, sources = _make_owned_cache(num_layers=3, owned=(1,), prefill_overlap=True)
+    layers = [
+        OffloadMoELayer(
+            layer_id=layer_id, num_experts=4, top_k=2, hidden_size=8, intermediate_size=16
+        )
+        for layer_id in range(3)
+    ]
+    for layer in layers:
+        layer.offload_cache = cache
+
+    topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
+    topk_ids = torch.tensor([[2, 1]], dtype=torch.int32)
+    hidden_states = torch.randn(1, 8)
+    router_logits = torch.randn(1, 4)
+    fused_calls = []
+
+    monkeypatch.setattr(
+        "freetoken.layers.moe.fused_topk",
+        lambda *, hidden_states, gating_output, topk, renormalize: (
+            topk_weights, topk_ids.clone()
+        ),
+    )
+
+    def fake_fused(
+        hidden_states, w1, w2, got_topk_weights, got_topk_ids, activation,
+        apply_router_weight_on_input,
+    ):
+        fused_calls.append({"w1_ptr": w1.data_ptr(), "w1": w1.clone(), "ids": got_topk_ids.clone()})
+        return hidden_states
+
+    monkeypatch.setattr("freetoken.layers.moe.fused_experts_impl", fake_fused)
+
+    out = hidden_states
+    for layer in layers:
+        out = layer.prefill_forward(out, router_logits)
+
+    # every layer computed against its OWN weights, ids unmapped throughout
+    for layer_id in range(3):
+        assert torch.equal(fused_calls[layer_id]["w1"], sources["gate_up"][layer_id])
+        assert fused_calls[layer_id]["ids"].tolist() == [[2, 1]]
+    # layers 0 and 2 share double buffer 0 (0 % 2 == 2 % 2), the owned layer reads its
+    # resident bank and never enters the buffers at all
+    assert fused_calls[0]["w1_ptr"] == fused_calls[2]["w1_ptr"]
+    assert fused_calls[1]["w1_ptr"] == sources["gate_up"][1].data_ptr()
+    assert cache._prefill_buffer_layer == [2, None]  # buffer 1 was never claimed
