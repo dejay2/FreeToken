@@ -53,6 +53,7 @@ def build_linear_mixer(config: ModelConfig, layer_id: int) -> BaseOP:
         # experts are quantized), so do not let expert_quant flip them to Fp8Block.
         expert_quant="none" if config.expert_quant == "fp8_block" else config.expert_quant,
         attn_quant=config.attn_quant,
+        dense_quant=config.dense_quant,
     )
 
 
