@@ -10,6 +10,7 @@ from freetoken.attention.base import AttnType
 VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "visual.")
 _VISION_TRUE = {"1", "true", "yes", "on"}
 _VISION_EXECUTION_MODES = {"gpu", "layer-stream"}
+_VISION_WEIGHTS_BACKINGS = {"ram", "mmap"}
 
 
 def vision_execution_mode() -> str:
@@ -32,6 +33,37 @@ def vision_load_enabled() -> bool:
     resident, never-quantized (bf16) GPU weights that text-only serving never touches, so we
     skip building and loading them unless ``FREETOKEN_LOAD_VISION=1`` is set."""
     return os.getenv("FREETOKEN_LOAD_VISION", "0").strip().lower() in _VISION_TRUE
+
+
+def vision_weights_backing() -> str:
+    """Return where the persistent picture weights live: ``ram`` (default) or ``mmap``.
+
+    ``ram`` is today's behavior: the 333 picture tensors are read into ordinary pageable
+    process memory at boot and held for the life of the engine. ``mmap`` maps their extent
+    of the checkpoint shard copy-on-write and installs zero-copy views instead, so the
+    ~856 MiB stays on the SSD (and in whatever page cache the OS chooses to keep) until a
+    picture request faults it in. Only the streamed encode can use that: it copies each
+    component into a GPU workspace, and a memcpy source may as well be a mapped page.
+    """
+    value = os.getenv("FREETOKEN_VISION_WEIGHTS", "ram").strip().lower()
+    if value not in _VISION_WEIGHTS_BACKINGS:
+        choices = ", ".join(sorted(_VISION_WEIGHTS_BACKINGS))
+        raise ValueError(
+            f"unsupported FREETOKEN_VISION_WEIGHTS={value!r}; expected one of: {choices}"
+        )
+    if value == "mmap":
+        if not vision_load_enabled():
+            raise ValueError(
+                "FREETOKEN_VISION_WEIGHTS=mmap needs picture input: set FREETOKEN_LOAD_VISION=1"
+            )
+        if vision_execution_mode() != "layer-stream":
+            # ``gpu`` copies every picture tensor to CUDA at load, so the mapping would be
+            # faulted once and then be dead address space. Reject rather than pretend.
+            raise ValueError(
+                "FREETOKEN_VISION_WEIGHTS=mmap needs FREETOKEN_VISION_EXECUTION=layer-stream, "
+                f"got {vision_execution_mode()!r}"
+            )
+    return value
 
 
 def embed_host_enabled() -> bool:
