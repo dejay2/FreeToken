@@ -48,6 +48,13 @@ baseline capture (0.250, 0.233, 0.217, 0.207, 0.196, 0.195) — 18.45 of the bas
 fetches per step, removed entirely. Per-step PCIe traffic went **down 11 %** while throughput
 went down 51 %. Whatever the candidate was losing, it was not spent moving experts.
 
+Caveat on that pair: the 103.45 comes from a chat8k-only capture and the 91.82 from run 2's
+mixed window (chat + short + picture requests), so the −11 % is indicative rather than
+controlled. The comparison that is properly controlled is **run 2 (91.8) against E2/E3 (106.2 /
+105.8)** — three mixed windows over near-identical request mixes on the same box, where the
+configuration doing 15 % *more* fetches per step runs 1.8× faster. Either way the sign is the
+one that kills H6.
+
 ## The experiments
 
 Four boots, one server at a time, `nvidia-smi` < 3 GB and a 60 s settle before each; only
