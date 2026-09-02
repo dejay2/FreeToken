@@ -606,6 +606,18 @@ class Scheduler(SchedulerIOMixin):
             vision_config = self.config.model_config.vision_config
             if vision_config is None:
                 raise ValueError("model picture configuration is not loaded")
+            # Earliest in-process signal that a picture is coming, and the encode weights
+            # may be a mapped, non-resident 856 MiB extent. The prefetch syscall returns
+            # while the reads continue, so issuing it here overlaps the read with the
+            # encode's own GPU work. Optional hook, and a failure only costs latency.
+            prefetch = getattr(model, "prefetch_picture_weights", None)
+            if prefetch is not None:
+                try:
+                    prefetch()
+                except Exception as exc:  # noqa: BLE001 - never fail a request over a hint
+                    logger.warning_rank0(
+                        "Picture weight prefetch failed for request %d: %s", msg.uid, exc
+                    )
 
             from freetoken.models.qwen4_exp.mrope import build_mrope_positions
 

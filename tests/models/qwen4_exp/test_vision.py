@@ -259,6 +259,97 @@ def test_layer_stream_rejects_deepstack_before_allocating_workspace():
     assert source._active_stream_workspace is None
 
 
+# --------------------------------------------------------------------------------------
+# Picture weights served from a mapping: the prefetch handshake
+# --------------------------------------------------------------------------------------
+
+
+class _RecordingSource:
+    """Stands in for ``MmapVisionWeights``: records the prefetch handshake, maps nothing."""
+
+    def __init__(self, calls: list[str], *, succeeds: bool = True) -> None:
+        self.calls = calls
+        self._succeeds = succeeds
+
+    def prefetch(self) -> bool:
+        self.calls.append("prefetch")
+        return self._succeeds
+
+    def release_prefetch(self) -> None:
+        self.calls.append("release")
+
+
+def test_picture_weight_prefetch_is_a_no_op_in_resident_mode():
+    """``ram`` mode attaches no source, and the encode must not care."""
+    source = _cpu_stream_source(_stream_config(depth=1))
+    assert source.prefetch_weights() is False
+    assert source.release_weight_prefetch() is None
+
+
+def test_attached_weight_source_receives_the_prefetch():
+    calls: list[str] = []
+    source = _cpu_stream_source(_stream_config(depth=1))
+    source.attach_weight_source(_RecordingSource(calls))
+
+    assert source.prefetch_weights() is True
+    source.release_weight_prefetch()
+    assert calls == ["prefetch", "release"]
+
+
+def test_a_failed_prefetch_is_reported_but_never_raises():
+    source = _cpu_stream_source(_stream_config(depth=1))
+    source.attach_weight_source(_RecordingSource([], succeeds=False))
+    assert source.prefetch_weights() is False
+
+
+def test_the_weight_source_is_invisible_to_the_state_dict():
+    """It hangs off a ``_``-prefixed attribute, so ``BaseOP.state_dict`` skips it and
+    ``load_state_dict``'s strict key check never sees it."""
+    source = _cpu_stream_source(_stream_config(depth=1))
+    before = set(source.state_dict())
+    source.attach_weight_source(_RecordingSource([]))
+
+    state = source.state_dict()
+    assert set(state) == before
+    assert all(isinstance(value, torch.Tensor) for value in state.values())
+
+
+def test_streamed_encode_prefetches_at_entry_and_releases_on_every_exit():
+    """The prefetch is the encode's first act -- in ``mmap`` mode the whole 856 MiB extent
+    may be non-resident and the syscall returns while the reads continue -- and it is
+    released however the encode ends, so the next picture issues its own."""
+    calls: list[str] = []
+    source = _cpu_stream_source(_stream_config(depth=1))
+    source.attach_weight_source(_RecordingSource(calls))
+
+    with pytest.raises(ValueError, match="requires a CUDA device"):
+        source.forward_layer_streamed(
+            torch.randn(16, 24),
+            torch.tensor([[1, 4, 4]], dtype=torch.long),
+            device=torch.device("cpu"),
+        )
+
+    assert calls == ["prefetch", "release"]
+    assert source._active_stream_workspace is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
+def test_streamed_encode_from_mapped_sources_prefetches_exactly_once():
+    torch.manual_seed(31)
+    calls: list[str] = []
+    source = _cpu_stream_source(_stream_config(depth=2))
+    source.attach_weight_source(_RecordingSource(calls))
+
+    features = source.forward_layer_streamed(
+        torch.randn(16, 24, dtype=torch.bfloat16),
+        torch.tensor([[1, 4, 4]], dtype=torch.long),
+        device=torch.device("cuda"),
+    )
+
+    assert features.device.type == "cuda"
+    assert calls == ["prefetch", "release"]
+
+
 def test_qwen_picture_encoding_owns_input_and_output_placement():
     calls = []
 

@@ -90,8 +90,36 @@ def test_qwen_picture_weight_report_records_exact_count_bytes_and_devices():
         "one": torch.zeros(2, 3, dtype=torch.bfloat16),
         "two": torch.zeros(5, dtype=torch.float32),
     }
-    model.visual = SimpleNamespace(state_dict=lambda: state)
+    model.visual = SimpleNamespace(state_dict=lambda: state, weight_backing=lambda: "ram")
 
     assert model.weight_placement_report() == (
-        "Picture weights: mode=layer-stream, tensors=2, bytes=32, devices=cpu"
+        "Picture weights: mode=layer-stream, backing=ram, tensors=2, bytes=32, devices=cpu"
     )
+
+
+def test_qwen_picture_weight_report_states_the_mapped_backing():
+    """Acceptance criterion 1: the boot log says which backing is live without a new probe."""
+    model = _model_shell("layer-stream")
+    state = {"one": torch.zeros(2, 3, dtype=torch.bfloat16)}
+    model.visual = SimpleNamespace(state_dict=lambda: state, weight_backing=lambda: "mmap")
+
+    assert model.weight_placement_report() == (
+        "Picture weights: mode=layer-stream, backing=mmap, tensors=1, bytes=12, devices=cpu"
+    )
+
+
+def test_prefetch_picture_weights_delegates_to_the_tower():
+    calls = []
+    model = _model_shell("layer-stream")
+    model.visual = SimpleNamespace(prefetch_weights=lambda: calls.append("prefetch"))
+
+    model.prefetch_picture_weights()
+
+    assert calls == ["prefetch"]
+
+
+def test_prefetch_picture_weights_is_a_no_op_on_a_text_only_model():
+    """A text-only boot builds no tower; the scheduler hook must still be safe to call."""
+    model = _model_shell("gpu")
+    assert not hasattr(model, "visual")
+    assert model.prefetch_picture_weights() is None
