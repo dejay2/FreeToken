@@ -11,8 +11,9 @@ The code here was not run against the GPU while it was written: a live server ow
 card throughout, and every test ran with `CUDA_VISIBLE_DEVICES=-1`. What needs the device
 is in the [operator live checklist](#operator-live-checklist) below, which was **run live
 on 2026-09-02** -- see `docs/research/measurements-gpu-owned-followups-live-2026-09-02.md`.
-Ten of the twelve checks pass; **L4 fails** (the headroom refusal names a size that cannot
-be typed) and L12 is inconclusive.
+Ten of the twelve checks pass; **L4 failed** (the headroom refusal named a size that could
+not be typed) and L12 is inconclusive. L4 is **fixed in 42e3134** and needs one live boot to
+confirm.
 
 ## Commits
 
@@ -26,6 +27,7 @@ be typed) and L12 is inconclusive.
 | 5 docs and criteria corrections | `1427088` | docs(moe): correct the RAM criterion and the -MoECacheSize floor |
 | 6 operator stop script | `72f5bc6` | feat(scripts): stop-qwen38-flash-next-windows.ps1 |
 | 7 refusal messages and `auto:N` | `709272c` | fix(moe): name the fix in both owned-layer refusals, and refuse a too-large auto:N |
+| L4 live-check failure (the refusal named an LRU count under the total's flag) | `42e3134` | fix(moe): the explicit-cache refusal quotes the typed total and names a total |
 
 `3b1cc69`, `6f2f807` and `9fdb2a7` are omp's; the rest are this session's. `c0bb740` is a
 review follow-up on omp's issue-1 commit and is described under issue 1 below.
@@ -267,7 +269,7 @@ time, and settle 45-60 s between servers.
 | L1 | The VRAM ledger block appears once, after the KV pool | boot with `-GpuOwnedLayers auto -MoECacheSize 6750`, grep the log for `VRAM ledger` | one block; weights / KV / GDN / owned / LRU / reserve / headroom / unaccounted / named total, KV row NOT 0.00 GiB | **PASS** (at 5781; 6750 is refused, see L4) — one block right after `Allocating 65536 tokens for KV cache`, KV row 1.55 GiB |
 | L2 | The ledger's numbers are the real ones | compare the ledger against `nvidia-smi` at `state: serving` and against `/v1/cache/status` | `unaccounted` positive and small (allocator slack + activations); if it is negative the plan is over the card | **PASS** — owned/LRU/KV rows reconcile to the byte with the geometry; `unaccounted` +3.03 GiB = exactly `(1-memory_ratio) x 30.25 GiB` |
 | L3 | The auto reserve is the right size on this box | boot `-MoECacheSize 0` (i.e. `--moe-cache-auto`) with speculation on, note the resolved slot count; check free VRAM at decode peak | >= ~1.5 GiB free at decode peak; no throughput cliff | **PASS** — 3,029 MiB free at decode peak with the reserve on; 1,112 MiB with it zeroed, and 9 % slower |
-| L4 | The headroom refusal fires and names a size that works | boot with an `-MoECacheSize` deliberately ~1000 slots too large | refuses at boot naming the largest slot count that fits; that number then boots | **FAIL** — it refuses (correctly, and already at 6750), but quotes the post-charge LRU as `--moe-cache-size` and names 2709, which is then refused by the 4096 floor; the size that works is 2709+3072=5781 |
+| L4 | The headroom refusal fires and names a size that works | boot with an `-MoECacheSize` deliberately ~1000 slots too large | refuses at boot naming the largest slot count that fits; that number then boots | **FAIL as measured, fixed in 42e3134, needs one live boot to confirm** — it refused (correctly, and already at 6750), but quoted the post-charge LRU as `--moe-cache-size` and named 2709, which the 4096 floor then refused; the size that works is 2709+3072=5781. The refusal now quotes 6750 and names 5781. Re-run: boot `-GpuOwnedLayers auto -MoECacheSize 6750`, paste the named size back into `-MoECacheSize`, expect SERVING |
 | L5 | `-MoEVramReserveBytes 0 -MoECacheHeadroomBytes 0` restores the old sizing | boot with both zeroed | boots at the pre-2026-09 slot count | **PASS** — auto resolves 4452 LRU + 3072 owned = 7,524 slot-equivalents = the whole 19.43 GiB MoE budget; free after init 3.14 GiB |
 | L6 | `/v1/cache/status` shows the reservation | `curl /v1/cache/status` with and without `-GpuOwnedLayers auto` | `gpu_owned_reserved_bytes` ~8.5e9 with, 0 without; `limits.moe_experts.max` lower with | **PASS** — 8,517,058,560 with (field absent on the pre-feature baseline); `moe_experts.max` 5427 vs 8499 |
 | L7 | The placement report is one block and names the owned layers | grep the boot log | one block containing `Expert placement: ... gpu_owned_layers=[0, 1, 2, 6, 7, 22] ... streaming_layers=42`, plus the PLE line with `backend=mmap`; the dedicated `MoE GPU-owned layers:` line still present | **PASS** — all five lines in one record, `PLE table: backend=mmap, mapped_bytes=51200245760`; dedicated line still one line above |
@@ -299,8 +301,10 @@ servers at a time; send test requests with `chat_template_kwargs.enable_thinking
 3. **The explicit-size refusal can block a boot that used to work.** That is the operator's
    stated preference ("fail loudly, never silently shrink"), but the first boot after this
    change with a hand-tuned `-MoECacheSize` may refuse. The message names the size that
-   fits, and `-MoEVramReserveBytes 0 -MoECacheHeadroomBytes 0` restores the old behaviour
-   (L4, L5).
+   fits -- as a TOTAL, in the unit `-MoECacheSize` takes, since 42e3134 -- and
+   `-MoEVramReserveBytes 0 -MoECacheHeadroomBytes 0` restores the old behaviour (L4, L5).
+   The check still runs after the ~40 s expert-bank read, because the per-slot byte count it
+   needs is measured off the loaded banks; the LRU-floor refusal fires immediately.
 4. **The orphan rule is blind to which tool spawned the child.** A `spawn_main` python
    command line says nothing about its parent's module, so a stale multiprocessing child of
    *any* python tool on the box matches. That is deliberate -- an orphan of the last server
