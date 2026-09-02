@@ -496,7 +496,13 @@ def load_expert_banks(
     # allocation) falls back to serial.
     from freetoken.moe.host_banks import requested_residency
 
-    with requested_residency(layer_residency, device=device) as residency_plan:
+    # expert_quant is declared to the plan so plan_gpu_owned() can refuse a GPU-owned request
+    # on a format whose provider was never reviewed for filling device banks in place.
+    with requested_residency(
+        layer_residency,
+        device=device,
+        expert_quant=getattr(model_config, "expert_quant", None),
+    ) as residency_plan:
         try:
             banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk,
                                         decode_target, layer_sink)

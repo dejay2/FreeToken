@@ -152,10 +152,14 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, Any]:
     mamba is the usable slot count (num_slots minus the reserved padding sink), matching the
     scheduler's reported totals. 0 for pools the model lacks; never raises.
     ``gpu_owned_layers`` are the MoE layer ids served from permanently resident VRAM banks
-    (--moe-gpu-owned-layers); [] when the flag is off."""
+    (--moe-gpu-owned-layers); [] when the flag is off. ``gpu_owned_reserved_bytes`` is the
+    VRAM those banks hold permanently, MEASURED from the resident tensors themselves -- it is
+    invisible in every other geometry field (``cache_budget_bytes`` was byte-identical with
+    and without six owned layers), which is how live run 2's oversubscription went unseen."""
     pools: Dict[str, Any] = {
         "num_pages": 0, "page_size": 0, "moe_cache_size": 0, "num_mamba_slots": 0,
         "swa_page_size": 0, "num_swa_pages": 0, "gpu_owned_layers": [],
+        "gpu_owned_reserved_bytes": 0,
     }
     try:
         config = engine.config
@@ -179,6 +183,13 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, Any]:
         if moe is not None:
             pools["moe_cache_size"] = int(moe.cache_size or 0)
             pools["gpu_owned_layers"] = sorted(getattr(moe, "gpu_owned_layer_ids", ()) or ())
+            pools["gpu_owned_reserved_bytes"] = int(
+                sum(
+                    t.numel() * t.element_size()
+                    for views in (getattr(moe, "resident_banks", None) or {}).values()
+                    for t in views
+                )
+            )
         lsp = engine.linear_state_pool
         if lsp is not None:
             pools["num_mamba_slots"] = max(0, int(lsp.num_slots or 0) - 1)

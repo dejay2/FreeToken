@@ -592,6 +592,32 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-vram-reserve-bytes",
+        type=int,
+        default=ServerArgs.moe_vram_reserve_bytes,
+        help=(
+            "VRAM the MoE expert cache must not spend because it is allocated AFTER the "
+            "cache is sized: the integrated MTP resident draft head (2.17 GiB measured on "
+            "an RTX 5090), the decode/spec/draft CUDA-graph pools and the vision "
+            "layer-stream workspace. Respected by both --moe-cache-auto and an explicit "
+            "--moe-cache-size. Default -1 = auto: 0.75 GiB for the graph pools plus 2.25 "
+            "GiB for the draft head when speculation is on (3 GiB together). 0 reserves "
+            "nothing, which restores the pre-2026-09 behaviour."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-cache-headroom-bytes",
+        type=int,
+        default=ServerArgs.moe_cache_headroom_bytes,
+        help=(
+            "Free VRAM the MoE cache must leave after every known reservation. An explicit "
+            "--moe-cache-size that leaves less refuses to boot, naming the largest slot "
+            "count that fits (never silently shrunk). Default 1.5 GiB."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hybrid-max-fetch",
         type=int,
         default=ServerArgs.moe_hybrid_max_fetch,

@@ -96,8 +96,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File `
   -VisionExecution layer-stream -EnableCacheReport -CollectRoutingStats
 ```
 
-Two corrections the 2026-09-02 run forced on this checklist; both are already applied above
+Three corrections the live runs forced on this checklist; all are already applied above
 and in the check table:
+
+0. **The RAM criterion named the wrong counter.** It asked for -7.9 GiB of *scheduler
+   private bytes*, which this design cannot deliver: the host expert banks are **mapped**
+   pages, not private commit (~103 GiB private across the four processes against ~167 GiB
+   of attributable commit; the loader reads 63.3 GiB of experts through the mmap path).
+   Never allocating six layers' banks removes *mapped* pages, so working set and
+   whole-system physical in use move by the full amount while private bytes does not move
+   at all: working set **-8.02 GiB**, physical in use **-7.50 GiB**, commit **-4.37 GiB**,
+   private bytes **+1.52 GiB**. Read working set and physical in use; treat commit as a
+   partial signal and private bytes as no signal. Run 2's row is a PASS on the corrected
+   criterion, not the FAIL the original wording produced. Detail in run 2's *Where the RAM
+   saving shows up*; the spec's section 9 table carries the same correction.
 
 1. **`-CollectRoutingStats` is required on both boots.** It is what passes
    `--moe-collect-decode-freq`, and without it `/v1/cache/routing` answers **409** -- the
@@ -125,7 +137,8 @@ from run 2; its baseline column is run 2's same-session restore boot of `D:\Free
 | check | pass criterion | baseline | candidate | verdict |
 |---|---|---|---|---|
 | boot log shows owned set, LRU size, MTP graphs 6/6 + 7/7 captured | yes | 6/6 + 7/7, 71 s to ready, free VRAM 4.58 GiB | `MoE GPU-owned layers: [0, 1, 2, 6, 7, 22] (6 x 1.32 GiB resident, no host bank); LRU cache 4400 slots for 42 streaming layers`; CUDA graph bs=1 captured; spec 6/6 in 2.485 s, draft 7/7 in 0.649 s; free VRAM 3.27 GiB; 64.2 s to serving | **PASS** |
-| scheduler private bytes and whole-system commit | -7.9 GiB +/- 0.3 | 98.48 GiB private / 213.74 GiB commit | 100.00 GiB private (**+1.52**) / 209.37 GiB commit (**-4.37**) | **FAIL** -- but the criterion names the wrong counter: the host expert banks are mapped pages, not private commit, so the saving cannot appear in private bytes. See run 2's *Where the RAM saving shows up*. |
+| scheduler working set (CORRECTED; was "private bytes") | -7.9 GiB +/- 0.5 | - | **-8.02 GiB** | **PASS** |
+| whole-system commit | lower; NOT the full 7.9 GiB | 213.74 GiB | 209.37 GiB (**-4.37**) | **PASS** |
 | whole-system physical in-use | -7.9 GiB +/- 0.5 | 87.83 GiB (empty ref 18.99 GiB) | 80.33 GiB (empty ref 20.84 GiB) = **-7.50 GiB** | **PASS** |
 | boot peak host RAM | <= baseline + 1.5 GiB | 215.45 GiB peak commit, 6.72 GiB min available | 209.16 GiB peak commit (**-6.29**), 14.33 GiB min available | **PASS** |
 | 8k-chat decode tok/s (same prompt as the sweep) | recorded; operator decides | 70.4 tok/s (run 1 fresh: 72.1) | **34.6 tok/s** | recorded -- **-50.9 %**, the finding of run 2 |

@@ -427,6 +427,9 @@ class Engine:
             self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
+        # After the host tables AND the offload cache: the block names the PLE backing one
+        # decided and the GPU-owned / CPU / streaming split the other did.
+        self._log_weight_placement_report(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
 
@@ -441,6 +444,9 @@ class Engine:
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
+        # Every term of the plan in one block, here because this is the first point where
+        # they are all known: the MoE cache was sized above, the KV pages just now.
+        self._log_vram_ledger(config)
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
@@ -612,11 +618,33 @@ class Engine:
         adopt = getattr(self.model, "adopt_weight_sources", None)
         if callable(adopt):
             adopt(config)
+
+    def _log_weight_placement_report(self, config: EngineConfig) -> None:
+        """Log ONE placement block: the model's own lines plus the expert placement.
+
+        Emitted from ``__init__`` rather than from ``_install_model_weights`` because half
+        of what it describes does not exist yet when the weights land: ``load_host_tables``
+        decides the PLE table's backing, and ``_init_offload_moe_cache`` decides which MoE
+        layers are GPU-owned, which stream and which decode on the CPU. The report used to
+        run twenty lines before either, so it could never name a GPU-owned layer -- the same
+        ordering bug the picture-weight backing had (977ec62), fixed the same way.
+
+        The dedicated ``MoE GPU-owned layers: ...`` boot line stays where it is: it is the
+        line an operator greps for, and it carries the resident GiB this block does not.
+        """
         placement_report = getattr(self.model, "weight_placement_report", None)
+        lines = []
         if callable(placement_report):
-            report = placement_report()
-            if report:
-                logger.info_rank0(report)
+            lines += [line for line in (placement_report() or "").splitlines() if line.strip()]
+        lines += _expert_placement_lines(
+            config,
+            gpu_owned_layers=getattr(self, "_gpu_owned_layer_ids", frozenset()),
+            cpu_layer_ids=getattr(
+                getattr(self, "moe_offload_cache", None), "cpu_layer_ids", frozenset()
+            ),
+        )
+        if lines:
+            logger.info_rank0("\n".join(lines))
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
@@ -656,6 +684,11 @@ class Engine:
         # GPU-owned layers hold a full expert layer of VRAM forever and leave the slot cache
         # entirely, exactly as state_pool_bytes accounts for the GDN pool.
         fixed_cache_size += gpu_owned_reservation_bytes(len(owned), num_experts, per_expert_bytes)
+        # ...and so does everything allocated AFTER the cache is sized (MTP resident draft
+        # head, graph pools, vision workspace) plus the free-VRAM headroom. Without this the
+        # greedy slot fill spends bytes the draft head is about to take, and the card starts
+        # paging at decode peak: measured 2x slowdown at 569 MiB free.
+        fixed_cache_size += self._post_cache_reserve(config)
         total_experts = (config.model_config.num_moe_layers - len(owned)) * num_experts
         moe_cache_size, num_pages, overlap = resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
@@ -693,6 +726,10 @@ class Engine:
         lru = _gpu_owned_lru_slots(config, len(owned))
         if lru == total:
             return
+        # Keep what the operator typed: from here on config.moe_cache_size is the LRU count,
+        # and a refusal that quotes it names a --moe-cache-size nobody passed (live boot A
+        # said "--moe-cache-size 3678" to an operator who typed 6750).
+        object.__setattr__(config, "_moe_cache_size_requested", total)
         object.__setattr__(config, "moe_cache_size", lru)
         logger.info_rank0(
             f"--moe-cache-size {total} is the total MoE expert-slot budget: "
@@ -700,9 +737,28 @@ class Engine:
             f"leaving {lru} for the streaming-layer LRU"
         )
 
-    def _check_gpu_owned_cache_fits(self, config: EngineConfig, banks) -> None:
-        """Explicit --moe-cache-size + the owned reservation must fit the same budget the
-        auto path solves against. Fails loudly (never shrinks) -- see spec section 6."""
+    def _post_cache_reserve(self, config: EngineConfig) -> int:
+        """:func:`_post_cache_reserved_bytes` with this boot's post-cache features filled in.
+
+        The only feature the auto reserve is conditional on is the resident MTP draft head:
+        integrated speculation (``--spec-decode`` / ``FREETOKEN_MTP_SPECULATE``) or a
+        resident MTP shadow observer. Everything else in the reserve (the decode/spec graph
+        pools, the vision workspace) is allocated on every boot.
+        """
+        shadow = getattr(self, "_mtp_shadow_config", None)
+        mtp_resident = bool(
+            getattr(getattr(config, "spec_decode", None), "enabled", False)
+        ) or bool(getattr(shadow, "enabled", False) and getattr(shadow, "resident", False))
+        return _post_cache_reserved_bytes(config, mtp_resident=mtp_resident)
+
+    def _check_explicit_cache_fits(self, config: EngineConfig, banks) -> None:
+        """An explicit --moe-cache-size plus the owned reservation plus everything allocated
+        after the cache must fit the same budget the auto path solves against. Fails loudly
+        (never shrinks) -- see spec section 6 and the 2026-09-02 speed diagnosis.
+
+        Runs for every explicit size, with or without --moe-gpu-owned-layers: the post-cache
+        reservation bug is general (the resident MTP draft head is 2.17 GiB on any boot).
+        """
         from freetoken.engine.cache_budget import (
             check_explicit_moe_cache_fits,
             expert_bytes_per_slot,
@@ -711,7 +767,7 @@ class Engine:
         from freetoken.utils import div_ceil
 
         owned = self._gpu_owned_layer_ids
-        if not owned or config.moe_cache_auto:
+        if config.moe_cache_auto or not config.moe_cache_size:
             return
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)
@@ -727,7 +783,71 @@ class Engine:
             budget_bytes=budget - kv_reserve_pages * cache_per_page,
             owned_layers=len(owned),
             num_experts=config.model_config.num_experts,
+            reserved_bytes=self._post_cache_reserve(config),
+            requested_total=getattr(config, "_moe_cache_size_requested", None),
         )
+
+    def _stash_vram_ledger_inputs(self, banks, gpu_owned_layer_ids: "frozenset[int]") -> None:
+        """Keep what only the MoE cache build knows, for the ledger printed further down.
+
+        The ledger cannot be printed here: ``num_pages`` is solved AFTER this cache exists
+        (the KV pool takes what the MoE cache left), so a ledger printed at cache-build time
+        reads 0 KV pages on every boot that did not pass ``--num-tokens``.
+        """
+        from freetoken.engine.cache_budget import expert_bytes_per_slot
+
+        self._vram_ledger_inputs = {
+            "per_expert_bytes": expert_bytes_per_slot(banks.sources, gpu_owned_layer_ids),
+            "gpu_owned_layers": tuple(sorted(gpu_owned_layer_ids)),
+        }
+
+    def _log_vram_ledger(self, config: EngineConfig) -> None:
+        """Print the whole VRAM plan as one block, so a boot that will page is visible in the
+        log instead of only in ``nvidia-smi`` at decode peak.
+
+        Called once the KV pool has been sized, so every term is the number the boot actually
+        took. Never fatal: a ledger is a log line, and a bad read must not kill a boot.
+        """
+        inputs = getattr(self, "_vram_ledger_inputs", None)
+        if not inputs:
+            return
+        try:
+            from freetoken.engine.cache_budget import (
+                format_vram_ledger,
+                gpu_owned_reservation_bytes,
+                resolve_vram_reserve_bytes,
+            )
+
+            per_expert_bytes = int(inputs["per_expert_bytes"])
+            owned = tuple(inputs["gpu_owned_layers"])
+            cache_per_page, kv_fixed, _page_tokens, _ = self._pool_cls.kv_cost(config)
+            declared = getattr(config, "moe_vram_reserve_bytes", -1)
+            shadow = getattr(self, "_mtp_shadow_config", None)
+            mtp_resident = bool(
+                getattr(getattr(config, "spec_decode", None), "enabled", False)
+            ) or bool(
+                getattr(shadow, "enabled", False) and getattr(shadow, "resident", False)
+            )
+            logger.info_rank0(
+                format_vram_ledger(
+                    total_bytes=int(self._baseline_free),
+                    weights_bytes=int(self._weights_bytes),
+                    kv_bytes=kv_fixed + int(getattr(self, "num_pages", 0) or 0) * cache_per_page,
+                    gdn_state_bytes=state_pool_bytes(config),
+                    gpu_owned_bytes=gpu_owned_reservation_bytes(
+                        len(owned), config.model_config.num_experts, per_expert_bytes
+                    ),
+                    gpu_owned_layers=owned,
+                    lru_slots=config.moe_cache_size,
+                    lru_bytes=config.moe_cache_size * per_expert_bytes,
+                    vram_reserve_bytes=resolve_vram_reserve_bytes(
+                        int(-1 if declared is None else declared), mtp_resident=mtp_resident
+                    ),
+                    headroom_bytes=int(getattr(config, "moe_cache_headroom_bytes", 0) or 0),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 -- a log block must never fail a boot
+            logger.info_rank0(f"VRAM ledger unavailable: {exc!r}")
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         # A model may fully own cache construction via make_offload_moe_cache.
@@ -851,7 +971,7 @@ class Engine:
                     f"num_pages={pages} (prefill_overlap={overlap})"
                 )
             else:
-                self._check_gpu_owned_cache_fits(config, banks)
+                self._check_explicit_cache_fits(config, banks)
             _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
             cache = OffloadMoeCache(
                 # Models with leading dense layers (GLM-4) only have experts on the MoE
@@ -888,6 +1008,7 @@ class Engine:
                         config.moe_cache_size,
                     )
                 )
+            self._stash_vram_ledger_inputs(banks, gpu_owned_layer_ids)
         else:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
@@ -1903,6 +2024,14 @@ def _parse_gpu_owned_layers_spec(spec: str, num_moe_layers: int) -> frozenset[in
                 f"--moe-gpu-owned-layers auto:{n} must be in [0, {num_moe_layers}]"
             )
         ranked = [i for i in GPU_OWNED_LAYER_RANK if i < num_moe_layers]
+        if n > len(ranked):
+            # A model deeper than the measured ranking: taking ranked[:n] would silently own
+            # len(ranked) layers instead of the n that were asked for.
+            raise ValueError(
+                f"--moe-gpu-owned-layers auto:{n} needs {n} entries, but the measured "
+                f"ranked list only covers {len(ranked)} of this model's {num_moe_layers} "
+                f"MoE layers. Name the layers explicitly, or lower N to {len(ranked)}"
+            )
         return frozenset(ranked[:n])
     try:
         return _parse_cpu_layers_spec(s, num_moe_layers)
@@ -1928,6 +2057,7 @@ def _resolve_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> froz
 def _validate_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int]:
     """Resolve and fully validate the owned set, or raise. Returns the empty set when off."""
     from freetoken.checkpoint.ftw import is_ftw_checkpoint
+    from freetoken.moe.host_banks import GPU_OWNED_EXPERT_QUANTS
 
     spec = config.moe_gpu_owned_layers
     if not spec:
@@ -1946,7 +2076,20 @@ def _validate_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> fro
     if clash:
         raise ValueError(
             f"--moe-gpu-owned-layers and --moe-cpu-layers name layers that are "
-            f"both GPU-owned and CPU layers: {clash}"
+            f"both GPU-owned and CPU layers: {clash} -- a layer cannot be both (an owned "
+            f"layer has no host bank for the CPU executor to read). Drop {clash} from one "
+            f"of the two flags"
+        )
+    expert_quant = getattr(config.model_config, "expert_quant", None)
+    if expert_quant is not None and expert_quant not in GPU_OWNED_EXPERT_QUANTS:
+        # Boot-time twin of the loader guard in host_banks.plan_gpu_owned: only the NVFP4
+        # providers are reviewed for filling an owned layer's device banks in place, and
+        # since 8a63977 an unreviewed one writes the device tensor without tripping an
+        # assert (status doc, residual risk 6). Refuse before the load, not after 40 s of it.
+        raise ValueError(
+            f"--moe-gpu-owned-layers needs NVFP4 expert banks; this checkpoint's expert "
+            f"quant format is {expert_quant!r} (supported: "
+            f"{sorted(GPU_OWNED_EXPERT_QUANTS)}). Drop the flag for this model"
         )
     if config.model_path and is_ftw_checkpoint(config.model_path):
         raise ValueError(
@@ -1972,6 +2115,68 @@ def _gpu_owned_lru_slots(config: EngineConfig, owned_layers: int) -> int:
         owned_layers=owned_layers,
         num_experts=num_experts,
         floor=2 * num_experts if config.moe_prefill_overlap else num_experts,
+    )
+
+
+def _expert_placement_lines(
+    config: EngineConfig,
+    *,
+    gpu_owned_layers: "frozenset[int]",
+    cpu_layer_ids: "frozenset[int]",
+) -> list[str]:
+    """The engine-owned half of the weight placement report.
+
+    Pure over the config and the two resolved layer sets, so the block can be pinned without
+    a device. ``streaming_layers`` is what is left once the GPU-owned and CPU layers are
+    taken out -- the layer count the LRU slots are actually shared between.
+    """
+    model_config = config.model_config
+    lines = []
+    # Only when there is something to say: "quant=none" on every bf16 boot would be noise,
+    # and a model with no MoE and no dense quantization keeps the block silent entirely.
+    dense_quant = getattr(model_config, "dense_quant", "none")
+    if dense_quant and dense_quant != "none":
+        lines.append(f"Dense weights: quant={dense_quant}")
+    num_moe_layers = int(getattr(model_config, "num_moe_layers", 0) or 0)
+    if not num_moe_layers or not is_offload_moe_backend(config.moe_backend):
+        return lines
+    owned = sorted(gpu_owned_layers or ())
+    cpu = sorted(cpu_layer_ids or ())
+    lines.append(
+        f"Expert placement: backend={config.moe_backend}, moe_layers={num_moe_layers}, "
+        f"experts={getattr(model_config, 'num_experts', 0)}, gpu_owned_layers={owned}, "
+        f"cpu_layers={cpu}, streaming_layers={num_moe_layers - len(owned) - len(cpu)}, "
+        f"lru_slots={config.moe_cache_size}"
+    )
+    return lines
+
+
+def _post_cache_reserved_bytes(config: EngineConfig, *, mtp_resident: bool) -> int:
+    """The declared post-cache VRAM reservation plus the required headroom.
+
+    The single place reservations made AFTER the MoE cache is sized are declared: the
+    integrated MTP resident draft head (2.17 GiB measured; built after
+    ``_init_offload_moe_cache`` on purpose), the decode/spec/draft CUDA-graph pools and the
+    vision layer-stream workspace. Read through ``getattr`` so a hand-built stub config
+    (tests, the shadow tooling) that predates the fields keeps the old behaviour.
+
+    ``mtp_resident`` says whether the draft head is part of THIS boot; at the ``-1`` auto
+    default its bytes are only reserved when something is going to allocate them.
+    """
+    from freetoken.engine.cache_budget import (
+        DEFAULT_MOE_CACHE_HEADROOM_BYTES,
+        post_cache_reserved_bytes,
+        resolve_vram_reserve_bytes,
+    )
+
+    declared = getattr(config, "moe_vram_reserve_bytes", -1)
+    return post_cache_reserved_bytes(
+        vram_reserve_bytes=resolve_vram_reserve_bytes(
+            int(-1 if declared is None else declared), mtp_resident=mtp_resident
+        ),
+        headroom_bytes=int(
+            getattr(config, "moe_cache_headroom_bytes", DEFAULT_MOE_CACHE_HEADROOM_BYTES) or 0
+        ),
     )
 
 

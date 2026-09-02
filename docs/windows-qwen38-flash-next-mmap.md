@@ -171,6 +171,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File `
   -MoECacheSize 6750
 ```
 
+`auto` therefore needs `-MoECacheSize` **>= 4096**: its six layers charge 6 x 512 = 3072
+slots, and the prefill-overlap floor keeps 2 x 512 = 1024 slots for the 42 streaming layers.
+Anything lower refuses to boot, naming the size to raise to:
+
+```
+ValueError: --moe-cache-size 4095 is the TOTAL expert-slot budget, and 6 GPU-owned MoE
+layer(s) charge 3072 slots of it (6 x 512 experts), leaving 1023 for the LRU -- but the
+streaming layers need at least 1024. Raise --moe-cache-size (launcher: -MoECacheSize) to at
+least 4096, or own fewer layers.
+```
+
+In general the floor is `512 * owned_layers + 1024` (or `+ 512` with prefill overlap off).
+It is a floor, not a recommendation: 4096 leaves 24 slots per streaming layer, and the
+measured working set is ~449 experts per layer. `-MoECacheSize 6750` is what the box was
+measured at.
+
 The boot log says exactly what happened:
 
 ```
@@ -189,6 +205,63 @@ which left the card 569 MiB free at decode peak and halved throughput even thoug
 cacheable streaming layer), and the `summary` block describes the streaming cache only.
 The flag needs `--moe-backend offload`, refuses to overlap with `--moe-cpu-layers`, and is
 not supported on an FTW packed checkpoint.
+
+
+### The VRAM ledger and the post-cache reserve
+
+The expert cache is sized before the engine allocates the resident MTP draft head (2.17 GiB
+measured), the CUDA-graph pools and the picture layer-stream workspace, so those bytes have
+to be reserved in advance or the card ends up oversubscribed at decode peak -- which is what
+halved throughput in live run 2 (569 MiB free, 70.4 -> 34.6 tok/s).
+
+| Launcher | Flag | Default |
+| --- | --- | --- |
+| `-MoEVramReserveBytes` | `--moe-vram-reserve-bytes` | `-1` = auto: 0.75 GiB for the graph pools, plus 2.25 GiB for the draft head when speculation is on |
+| `-MoECacheHeadroomBytes` | `--moe-cache-headroom-bytes` | `-1` = the engine default, 1.5 GiB of free VRAM left after every reservation |
+
+Both are respected by `--moe-cache-auto` (they join the fixed budget before the MoE-vs-KV
+split) **and** by an explicit `-MoECacheSize`, which refuses to boot rather than silently
+shrinking. The refusal quotes the **total you typed** and names the largest **total** that
+fits, so the size it names can be pasted straight back into `-MoECacheSize` (live boot A,
+2026-09-02, `-GpuOwnedLayers auto -MoECacheSize 6750`):
+
+```
+ValueError: --moe-cache-size 6750 (3678 LRU slots after 6 GPU-owned MoE layers take 3072,
+8517058560 B resident) plus 4831838208 B of post-cache reservations
+(--moe-vram-reserve-bytes + --moe-cache-headroom-bytes) needs 23546078208 B of the
+20861318737 B MoE budget. Either lower --moe-cache-size (launcher: -MoECacheSize) to 5781
+slots, or own at most 4 layer(s) at this cache size.
+```
+
+The parenthetical is the split, not a second budget: 6750 buys 3072 slots of GPU-owned
+residency and 3678 LRU slots. Both numbers the message hands you -- 6750 and 5781 -- are
+totals in the unit `-MoECacheSize` takes. This check needs the loaded bank geometry, so it
+fires after the expert-bank read (~40 s), not at config time; the LRU-floor refusal above
+fires immediately.
+
+Pass `-MoEVramReserveBytes 0 -MoECacheHeadroomBytes 0` to restore the pre-2026-09 sizing
+(nothing reserved) if a boot refuses a size you know fits.
+
+Once the KV pool is sized the boot log prints one **VRAM ledger** block naming every term
+of the plan, so a boot that will page is visible in the log rather than only in `nvidia-smi`
+at decode peak:
+
+```
+INFO VRAM ledger (30.42 GiB on the card):
+INFO   weights               13.10 GiB
+INFO   KV cache               4.21 GiB
+INFO   GDN state pool         0.42 GiB
+INFO   GPU-owned MoE layers   7.93 GiB (6 layers [0, 1, 2, 6, 7, 22])
+INFO   MoE LRU cache          9.49 GiB (3678 slots)
+INFO   post-cache reserve     3.00 GiB (MTP draft head, graphs, vision)
+INFO   headroom               1.50 GiB
+INFO   unaccounted           -9.23 GiB
+INFO   named total           39.65 GiB
+```
+
+`unaccounted` is what the ledger cannot name -- allocator slack and activations. A negative
+number means the plan is over the card: that is the number to read when a boot starts paging.
+(The figures above are illustrative, not a measured boot.)
 
 
 ### Expert routing statistics
@@ -386,17 +459,47 @@ enough because first-use kernels may need `nvcc.exe`.
 
 ### Port already occupied
 
-Inspect the local ports before stopping anything:
+The usual cause is a leftover `python.exe ... spawn_main` child: the launcher was killed
+from the console, its `multiprocessing` children outlived it as orphans, and they still
+hold the ZMQ side ports, so the next boot dies with
+
+```
+ZMQError: Address in use (tcp://127.0.0.1:2033)
+```
+
+Use the stop script rather than a `taskkill` by image name -- `ft.exe`, the FreeToken
+Desktop daemon on port 1900, also has `freetoken.cli serve` in its command line, and killing
+it takes the Windows runtime down with it:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+  .\scripts\stop-qwen38-flash-next-windows.ps1 -Port 2020
+```
+
+It selects `python.exe` / `pythonw.exe` running `freetoken.cli serve` on that port, every
+python descendant of those to any depth, and any orphaned `spawn_main` python whose parent
+no longer exists; it never touches a non-python process. It prints what it will kill, kills
+it, then waits (up to `-TimeoutSeconds`, default 120) until `nvidia-smi` reports less than
+`-VramFreeThresholdMB` (default 3072) in use **and** nothing is listening on the port or the
+nine ZMQ side ports above it, and reports which of the two is still holding. Exit code 0
+means settled; 1 means it timed out. `-Port 0` (the default) takes every FreeToken server on
+the box; `-DryRun` prints the selection and stops.
+
+Waiting matters: the card is only really free once the driver has torn the context down, and
+booting into a half-released card is how the last expert bank dies in `cudaHostRegister
+failed ... out of memory`.
+
+To inspect the ports by hand instead:
 
 ```powershell
 Get-NetTCPConnection -State Listen |
   Where-Object LocalPort -ge 2020 |
-  Where-Object LocalPort -le 2026 |
+  Where-Object LocalPort -le 2029 |
   Select-Object LocalAddress, LocalPort, OwningProcess
 ```
 
 Confirm the owning command is a stale FreeToken process before stopping it.
-The server uses the requested API port and nearby worker ports through `+6`.
+The server uses the requested API port and nearby worker ports through `+9`.
 
 ### First request is slower
 

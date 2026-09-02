@@ -83,9 +83,11 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-backend` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family backends) |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
+| `--moe-vram-reserve-bytes` | auto (-1) | VRAM the expert cache must not spend because it is allocated AFTER the cache is sized: the integrated MTP resident draft head (2.17 GiB measured), the CUDA-graph pools, the vision layer-stream workspace. Auto = 0.75 GiB of graph pools plus 2.25 GiB of draft head when speculation is on; 0 reserves nothing. Respected by `auto` and by an explicit `--moe-cache-size` |
+| `--moe-cache-headroom-bytes` | 1.5 GiB | Free VRAM the cache must leave after every reservation; an explicit `--moe-cache-size` that leaves less refuses to boot, naming the largest slot count that fits |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
-| `--moe-gpu-owned-layers` | off | With `offload`: MoE layers whose experts stay permanently resident in VRAM with no host bank (`0,1,2`, a count, a fraction, `auto`, or `auto:N`); each is CHARGED `num_experts` slots of `--moe-cache-size` (so total VRAM is unchanged) and returns one layer of host RAM |
+| `--moe-gpu-owned-layers` | off | With `offload`, NVFP4 experts only: MoE layers whose experts stay permanently resident in VRAM with no host bank (`0,1,2`, a count, a fraction, `auto` = the six measured hungriest, or `auto:N`); each is CHARGED `num_experts` slots of `--moe-cache-size` (so total VRAM is unchanged) and returns one layer of host RAM. `--moe-cache-size` must leave the streaming layers their overlap floor: `512 * owned + 1024` on this checkpoint, so `auto` needs >= 4096. `/v1/cache/routing` reports owned layers as `resident: true, miss_rate: null` |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |

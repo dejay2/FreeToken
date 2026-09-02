@@ -19,10 +19,29 @@ class _Recorder:
         self.lines.append(message % args if args else message)
 
 
+def _placement_config(**over):
+    """The engine-owned half of the placement report needs a config to read."""
+    model_config = SimpleNamespace(
+        dense_quant=over.pop("dense_quant", "none"),
+        num_moe_layers=over.pop("num_moe_layers", 0),
+        num_experts=over.pop("num_experts", 0),
+    )
+    return SimpleNamespace(
+        model_config=model_config,
+        moe_backend=over.pop("moe_backend", "fused"),
+        moe_cache_size=over.pop("moe_cache_size", 0),
+        **over,
+    )
+
+
 def test_weight_sources_are_adopted_before_the_placement_report(monkeypatch):
     """The report describes what the weight sources decided, so it has to run after they are
     adopted. It used to run twenty lines earlier than the adoption, which made every mmap
-    boot log ``backing=ram`` while the mapping was demonstrably live."""
+    boot log ``backing=ram`` while the mapping was demonstrably live.
+
+    Since the expert placement joined it, the report is emitted later still -- after the
+    host tables and the offload MoE cache exist -- so installing the weights logs nothing.
+    """
     order: list[str] = []
 
     class Model:
@@ -46,7 +65,10 @@ def test_weight_sources_are_adopted_before_the_placement_report(monkeypatch):
     engine.model = Model()
 
     Engine._install_model_weights(engine, SimpleNamespace())
+    assert order == ["load_state_dict", "adopt_weight_sources"]
+    assert recorder.lines == []
 
+    Engine._log_weight_placement_report(engine, _placement_config())
     assert order == ["load_state_dict", "adopt_weight_sources", "weight_placement_report"]
     assert recorder.lines == ["Picture weights: backing=mmap"]
 
@@ -60,6 +82,7 @@ def test_a_model_with_no_weight_sources_to_adopt_still_reports(monkeypatch):
     engine.model = SimpleNamespace(load_state_dict=lambda state: None)
 
     Engine._install_model_weights(engine, SimpleNamespace())
+    Engine._log_weight_placement_report(engine, _placement_config())
 
     assert recorder.lines == []
 
@@ -74,8 +97,51 @@ def test_an_empty_report_is_not_logged(monkeypatch):
     )
 
     Engine._install_model_weights(engine, SimpleNamespace())
+    Engine._log_weight_placement_report(engine, _placement_config())
 
     assert recorder.lines == []
+
+
+def test_the_placement_report_carries_the_expert_placement(monkeypatch):
+    """Issue 4: the report was emitted from _install_model_weights, twenty lines before the
+    offload cache existed, so it could never name a GPU-owned layer. One block now."""
+    recorder = _Recorder()
+    monkeypatch.setattr(engine_module, "logger", recorder)
+    engine = Engine.__new__(Engine)
+    engine.model = SimpleNamespace(
+        weight_placement_report=lambda: "Token embedding: host-resident, bytes=8, device=cpu"
+    )
+    engine._gpu_owned_layer_ids = frozenset({0, 1, 2, 6, 7, 22})
+    engine.moe_offload_cache = SimpleNamespace(cpu_layer_ids=frozenset())
+
+    Engine._log_weight_placement_report(
+        engine,
+        _placement_config(
+            dense_quant="int8", num_moe_layers=48, num_experts=512,
+            moe_backend="offload", moe_cache_size=3678,
+        ),
+    )
+
+    assert len(recorder.lines) == 1  # ONE block, not a line per subsystem
+    block = recorder.lines[0].splitlines()
+    assert block[0] == "Token embedding: host-resident, bytes=8, device=cpu"
+    assert "Dense weights: quant=int8" in block[1]
+    assert block[2] == (
+        "Expert placement: backend=offload, moe_layers=48, experts=512, "
+        "gpu_owned_layers=[0, 1, 2, 6, 7, 22], cpu_layers=[], streaming_layers=42, "
+        "lru_slots=3678"
+    )
+
+
+def test_a_dense_model_reports_no_expert_placement(monkeypatch):
+    recorder = _Recorder()
+    monkeypatch.setattr(engine_module, "logger", recorder)
+    engine = Engine.__new__(Engine)
+    engine.model = SimpleNamespace(weight_placement_report=lambda: "Picture weights: x")
+
+    Engine._log_weight_placement_report(engine, _placement_config(dense_quant="int8"))
+
+    assert recorder.lines == ["Picture weights: x\nDense weights: quant=int8"]
 
 
 def _model_state():
@@ -227,3 +293,19 @@ def test_adopt_weight_sources_is_a_no_op_on_a_text_only_model():
     model = _model_shell("gpu")
     assert not hasattr(model, "visual")
     assert model.adopt_weight_sources(SimpleNamespace(model_path="whatever")) is None
+
+
+def test_qwen_report_names_the_ple_table_backing():
+    """Issue 4: the PLE table is 47.7 GiB of the boot's host residency and had no line at
+    all. It can only be reported once load_host_tables has run, which is why the report
+    moved after it."""
+    model = _model_shell("gpu")
+    model._ple_placement = "backend=mmap, mapped_bytes=51204915200, layers=1"
+
+    assert model.weight_placement_report() == (
+        "PLE table: backend=mmap, mapped_bytes=51204915200, layers=1"
+    )
+
+
+def test_qwen_report_without_a_ple_table_says_nothing_about_one():
+    assert _model_shell("gpu").weight_placement_report() == ""

@@ -303,9 +303,11 @@ class _ResidencyPlan:
 
     Installed by ``load_expert_banks`` around the provider dispatch so every loader honors --moe-cpu-layers without a new parameter in each signature. ``applied`` flips once a settle point consults the plan."""
 
-    __slots__ = ("labels", "applied", "has_unpinned", "actual", "gpu_owned", "device")
+    __slots__ = (
+        "labels", "applied", "has_unpinned", "actual", "gpu_owned", "device", "expert_quant",
+    )
 
-    def __init__(self, labels: list[str], device=None):
+    def __init__(self, labels: list[str], device=None, expert_quant: str | None = None):
         self.labels = list(labels)
         self.applied = False
         self.has_unpinned = any(r != HostResidency.PINNED.value for r in labels)
@@ -316,6 +318,12 @@ class _ResidencyPlan:
             i for i, r in enumerate(labels) if r == HostResidency.GPU_OWNED.value
         )
         self.device = device
+        # The checkpoint's expert quant format, when the caller declared one. Only the NVFP4
+        # providers fill an owned layer's device banks correctly; every other provider writes
+        # straight through .fill/.tensor since 8a63977 removed the staging indirection, so a
+        # wrong-geometry load no longer trips an assert -- it may silently appear to work.
+        # ``None`` = undeclared (hand-built plans in tests and the shadow tooling), unchecked.
+        self.expert_quant = expert_quant
 
     def residency_for(self, layer_id: int) -> str:
         self.applied = True
@@ -330,15 +338,23 @@ class _ResidencyPlan:
 _requested_residency: _ResidencyPlan | None = None
 
 
+#: Expert quant formats whose providers are known to fill a GPU-owned layer's DEVICE banks
+#: correctly. Everything else is refused before a device tensor exists -- see
+#: :attr:`_ResidencyPlan.expert_quant`.
+GPU_OWNED_EXPERT_QUANTS = frozenset({"nvfp4"})
+
+
 @contextlib.contextmanager
-def requested_residency(labels: list[str] | None, device=None):
+def requested_residency(labels: list[str] | None, device=None, expert_quant: str | None = None):
     """Install the ambient per-layer residency plan for the enclosed bank load (``None`` = no plan, everything pins).
-    ``device`` is where GPU_OWNED layers' banks are allocated."""
+    ``device`` is where GPU_OWNED layers' banks are allocated. ``expert_quant`` is the
+    checkpoint's expert quant format, checked against :data:`GPU_OWNED_EXPERT_QUANTS` the
+    first time a loader asks for the owned set."""
     global _requested_residency
     if labels is None:
         yield None
         return
-    plan = _ResidencyPlan(labels, device)
+    plan = _ResidencyPlan(labels, device, expert_quant)
     prev, _requested_residency = _requested_residency, plan
     try:
         yield plan
@@ -351,11 +367,25 @@ def plan_gpu_owned() -> "tuple[frozenset[int], torch.device | None]":
 
     Consulting the plan for owned layers counts as applying it (``_echo_residency`` keys its
     "this loader ignored the request" failure on that), but only when there is an owned set
-    to honor -- a LOCKED-only plan is still only applied by a settle point."""
+    to honor -- a LOCKED-only plan is still only applied by a settle point.
+
+    This is the narrowest gate every provider's owned-bank allocation passes through, so it
+    is where a non-NVFP4 expert format is refused: since 8a63977 an owned bank IS its device
+    tensor, so an unreviewed provider writing through ``.fill``/``.tensor`` no longer trips an
+    assert and may silently appear to work on a row geometry the owned path was never checked
+    against (status doc, residual risk 6).
+    """
     plan = _requested_residency
     if plan is None:
         return frozenset(), None
     if plan.gpu_owned:
+        if plan.expert_quant is not None and plan.expert_quant not in GPU_OWNED_EXPERT_QUANTS:
+            raise ValueError(
+                f"--moe-gpu-owned-layers needs NVFP4 expert banks; this checkpoint's expert "
+                f"quant format is {plan.expert_quant!r}. Only the NVFP4 providers are "
+                f"reviewed for filling an owned layer's device banks in place "
+                f"(supported: {sorted(GPU_OWNED_EXPERT_QUANTS)}); drop the flag for this model"
+            )
         plan.applied = True
     return plan.gpu_owned, plan.device
 

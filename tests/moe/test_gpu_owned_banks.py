@@ -376,6 +376,95 @@ def test_cpu_moe_executor_refuses_cuda_bank_sources():
         _reject_cuda_sources(bad)
 
 
+# ------------------------------------------------------ the expert quant-format guard
+# Only the NVFP4 providers fill an owned layer's device banks correctly. Since 8a63977
+# removed the staging indirection, any other provider writes straight THROUGH .fill /
+# .tensor into the device tensor, so a wrong-geometry load no longer trips an assert -- it
+# may silently appear to work. Refuse the format instead of relying on that accident.
+
+
+def test_the_config_validator_refuses_a_non_nvfp4_expert_quant():
+    from freetoken.engine.engine import _validate_gpu_owned_layers
+
+    config = SimpleNamespace(
+        moe_gpu_owned_layers="auto:2",
+        moe_backend="offload",
+        moe_cpu_layers=None,
+        moe_cache_size=0,
+        moe_cache_auto=True,
+        moe_prefill_overlap=True,
+        model_path="",
+        model_config=SimpleNamespace(
+            num_moe_layers=48, num_experts=512, expert_quant="q4_0",
+        ),
+    )
+    with pytest.raises(ValueError) as excinfo:
+        _validate_gpu_owned_layers(config, 48)
+    message = str(excinfo.value)
+    assert "--moe-gpu-owned-layers" in message
+    assert "q4_0" in message  # the refusal names the format it found
+    assert "nvfp4" in message
+
+    config.model_config.expert_quant = "nvfp4"
+    assert _validate_gpu_owned_layers(config, 48) == frozenset({1, 6})
+
+
+def test_the_loader_refuses_owned_banks_for_a_non_nvfp4_provider():
+    """The load-time half: a fake provider that asks the ambient plan for owned layers must
+    be refused BEFORE any device tensor exists."""
+    labels = [hb.HostResidency.GPU_OWNED.value, hb.HostResidency.PINNED.value]
+
+    with hb.requested_residency(labels, device=CPU, expert_quant="q4_0"):
+        with pytest.raises(ValueError) as excinfo:
+            hb.plan_gpu_owned()
+        assert "q4_0" in str(excinfo.value)
+        with pytest.raises(ValueError, match="q4_0"):
+            hb.alloc_layer_banks(_SPECS, 2)
+
+    # ...and the NVFP4 providers still get their owned banks
+    with hb.requested_residency(labels, device=CPU, expert_quant="nvfp4"):
+        owned, device = hb.plan_gpu_owned()
+        assert owned == frozenset({0})
+        assert device == CPU
+        banks = hb.alloc_layer_banks(_SPECS, 2)
+        assert isinstance(banks["gate_up"][0], hb.GpuOwnedBank)
+        assert isinstance(banks["gate_up"][1], hb.HostBank)
+
+
+def test_a_plan_without_a_declared_quant_format_is_not_second_guessed():
+    """Hand-built plans (tests, the shadow tooling) declare no format and keep working."""
+    labels = [hb.HostResidency.GPU_OWNED.value, hb.HostResidency.PINNED.value]
+
+    with hb.requested_residency(labels, device=CPU):
+        assert hb.plan_gpu_owned() == (frozenset({0}), CPU)
+
+
+def test_load_expert_banks_refuses_owned_layers_for_a_non_nvfp4_checkpoint(monkeypatch):
+    """End to end through the real dispatch, with a provider that would have written the
+    device tensor: the refusal names the format and no bank is built."""
+    from freetoken.moe import expert_banks
+
+    built = []
+
+    def fake_provider(model_path, model_config, device, dtype, dummy, **kwargs):
+        built.append(model_path)
+        hb.alloc_layer_banks(_SPECS, model_config.num_moe_layers)
+        raise AssertionError("unreachable: the guard must fire first")
+
+    monkeypatch.setitem(expert_banks._PROVIDERS, "q4_0", fake_provider)
+    config = SimpleNamespace(
+        expert_quant="q4_0", num_moe_layers=2, num_experts=_E, architectures=["Fake"],
+    )
+    labels = [hb.HostResidency.GPU_OWNED.value, hb.HostResidency.PINNED.value]
+
+    with pytest.raises(ValueError) as excinfo:
+        expert_banks.load_expert_banks(
+            "", config, device=CPU, dtype=torch.float32, dummy=True,
+            parallel=False, layer_residency=labels,
+        )
+    assert "q4_0" in str(excinfo.value)
+
+
 if __name__ == "__main__":
     import sys
 
