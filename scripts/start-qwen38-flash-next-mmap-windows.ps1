@@ -72,7 +72,16 @@ param(
     # GET /v1/cache/routing (--moe-collect-decode-freq). Boot-time only: the counters are
     # device-side ops that have to exist before CUDA graph capture. Research knob -- it
     # adds one scatter_add_ per MoE layer per decode step.
-    [switch]$CollectRoutingStats
+    [switch]$CollectRoutingStats,
+
+    # MoE layers that keep every expert permanently resident in VRAM and allocate NO host
+    # bank at all (--moe-gpu-owned-layers). Each owned layer hands back 1.32 GiB of host RAM
+    # and costs 1.32 GiB of VRAM (about 512 LRU slots), so lower -MoECacheSize by ~512 per
+    # owned layer. 'auto' is the six hungriest layers measured on this box
+    # (docs/research/routing-skew-2026-09-02); 'auto:N' takes the first N; an explicit id
+    # list, a count or a fraction also work. Empty (the default) leaves the feature off.
+    # FREETOKEN_MOE_GPU_OWNED_LAYERS is the env fallback, read only here.
+    [string]$GpuOwnedLayers = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -151,6 +160,10 @@ else {
 # Switches only ever SET these; an operator who exported the env vars keeps them.
 if ($DenseQuant -ne '') { $env:FREETOKEN_DENSE_QUANT = $DenseQuant }
 if ($EmbedHost) { $env:FREETOKEN_EMBED_HOST = '1' }
+# the env var is a fallback for the parameter, never an override of it
+if (-not $GpuOwnedLayers -and $env:FREETOKEN_MOE_GPU_OWNED_LAYERS) {
+    $GpuOwnedLayers = $env:FREETOKEN_MOE_GPU_OWNED_LAYERS
+}
 $pathParts += $sourceDir
 $env:PYTHONPATH = ($pathParts -join ';') + $(if ($env:PYTHONPATH) { ";$env:PYTHONPATH" } else { '' })
 
@@ -160,6 +173,7 @@ Write-Host "  API:    http://127.0.0.1:$Port/v1"
 Write-Host "  Context tokens: $ContextTokens"
 Write-Host "  Active requests: $MaxRunningRequests"
 Write-Host "  MoE cache slots: $(if ($MoECacheSize -gt 0) { $MoECacheSize } else { 'auto' })"
+Write-Host "  GPU-owned MoE layers: $(if ($GpuOwnedLayers) { $GpuOwnedLayers } else { 'off' })"
 Write-Host "  Picture input: $($EnableVision.IsPresent)"
 Write-Host "  Picture execution: $(if ($EnableVision) { $VisionExecution } else { 'disabled' })"
 Write-Host "  Picture weights: $(if ($EnableVision) { $VisionWeights } else { 'disabled' })"
@@ -191,6 +205,9 @@ if ($EnableCacheReport) {
 }
 if ($CollectRoutingStats) {
     $serveArgs += '--moe-collect-decode-freq'
+}
+if ($GpuOwnedLayers) {
+    $serveArgs += @('--moe-gpu-owned-layers', $GpuOwnedLayers)
 }
 if ($CudaGraphMaxBS -ge 0) {
     $serveArgs += @('--cuda-graph-max-bs', "$CudaGraphMaxBS")

@@ -203,3 +203,39 @@ def test_the_boot_line_reports_the_owned_set_the_resident_bytes_and_the_lru():
         "MoE GPU-owned layers: [0, 1, 2, 6, 7, 22] (6 x 1.32 GiB resident, no host bank); "
         "LRU cache 4400 slots for 42 streaming layers"
     )
+
+
+# ------------------------------------------------------------------ the Windows launcher
+
+
+def _launcher_text() -> str:
+    from pathlib import Path
+
+    return (
+        Path(__file__).parents[2] / "scripts" / "start-qwen38-flash-next-mmap-windows.ps1"
+    ).read_text(encoding="utf-8")
+
+
+def test_the_launcher_exposes_gpu_owned_layers_and_defaults_to_off():
+    launcher = _launcher_text()
+
+    assert "[string]$GpuOwnedLayers = ''" in launcher
+    assert "$env:FREETOKEN_MOE_GPU_OWNED_LAYERS" in launcher
+    assert "'--moe-gpu-owned-layers', $GpuOwnedLayers" in launcher
+    assert "if ($GpuOwnedLayers) {" in launcher
+    # never a hard-coded set: the flag is only ever built from the parameter
+    assert "'--moe-gpu-owned-layers', 'auto'" not in launcher
+
+
+def test_the_launcher_banner_reports_the_owned_spec():
+    assert "GPU-owned MoE layers: $(if ($GpuOwnedLayers) { $GpuOwnedLayers } else { 'off' })" in _launcher_text()
+
+
+def test_the_docs_describe_the_flag():
+    from pathlib import Path
+
+    root = Path(__file__).parents[2]
+    assert "--moe-gpu-owned-layers" in (root / "docs" / "cli.md").read_text(encoding="utf-8")
+    windows = (root / "docs" / "windows-qwen38-flash-next-mmap.md").read_text(encoding="utf-8")
+    assert "### GPU-owned MoE layers" in windows
+    assert "-GpuOwnedLayers" in windows

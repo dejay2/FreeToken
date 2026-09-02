@@ -2782,7 +2782,7 @@ Claude-Session: https://claude.ai/code/session_01Hnf1bGBLU4HLq9uHPtNjwU
 
 The launcher is tested the way `-ExpertLoad` and `-CollectRoutingStats` already are (`tests/engine/test_expert_load_flag.py:56-63`, `tests/moe/test_routing_stats.py:58-69`): parse the script text and assert the parameter, the passthrough and the absence of a hard-coded value.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/engine/test_moe_gpu_owned_layers.py`:
 
@@ -2823,7 +2823,7 @@ def test_the_docs_describe_the_flag():
     assert "-GpuOwnedLayers" in windows
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -2833,7 +2833,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 
 Expected: 3 failures, each `AssertionError: assert "[string]$GpuOwnedLayers = ''" in '[CmdletBinding()]\nparam(\n...'` (and the equivalent for the banner and the docs assertions).
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `scripts/start-qwen38-flash-next-mmap-windows.ps1` -- add the parameter at the end of the `param(...)` block (after `[switch]$CollectRoutingStats`, line 75; remember the comma):
 
@@ -2930,7 +2930,7 @@ The flag needs `--moe-backend offload`, refuses to overlap with `--moe-cpu-layer
 not supported on an FTW packed checkpoint.
 ````
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -2944,7 +2944,7 @@ Then confirm the script still parses (this does NOT run it):
 $null = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\scripts\start-qwen38-flash-next-mmap-windows.ps1), [ref]$null, [ref]$null); "parsed"
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add scripts/start-qwen38-flash-next-mmap-windows.ps1 docs/cli.md docs/windows-qwen38-flash-next-mmap.md tests/engine/test_moe_gpu_owned_layers.py

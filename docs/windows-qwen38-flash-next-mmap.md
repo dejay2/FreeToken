@@ -137,6 +137,49 @@ no parallel provider; the boot log always names the build it took:
 INFO expert banks: slow path (parallel build)
 ```
 
+### GPU-owned MoE layers
+
+`-GpuOwnedLayers` passes `--moe-gpu-owned-layers`. The named MoE layers keep all 512
+experts permanently resident in VRAM and allocate **no pinned host bank at all**, so each
+one hands 1.322 GiB of host RAM back and costs 1.322 GiB of VRAM (about 512 LRU slots).
+Host RAM is the binding constraint on the tested system (95.6 GiB, ~89 GiB commit), and a
+pinned bank cannot be partially released on Windows -- never allocating it is the only way
+to give the RAM back.
+
+| Value | Meaning |
+| --- | --- |
+| *(empty)* | Off. The default. |
+| `auto` | The six hungriest layers by measured decode miss rate: `0, 1, 2, 6, 7, 22`. |
+| `auto:N` | The first N of that ranked list (`1, 6, 0, 2, 7, 22, 10, 13, 5, 18, ...`). |
+| `0,1,2` | An explicit MoE-layer id list. |
+| `6` / `0.125` | A count (evenly strided) or a fraction, as `--moe-cpu-layers` reads them. |
+
+The ranking comes from four decode captures on this box
+(`docs/research/routing-skew-2026-09-02/`) and is a fixed built-in list, not a runtime
+heuristic. Lower `-MoECacheSize` by roughly 512 slots per owned layer, or the server
+refuses to boot and names the size that would fit:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+  .\scripts\start-qwen38-flash-next-mmap-windows.ps1 `
+  -ModelPath $ModelPath `
+  -GpuOwnedLayers auto `
+  -MoECacheSize 4400
+```
+
+The boot log says exactly what happened:
+
+```
+INFO MoE GPU-owned layers: [0, 1, 2, 6, 7, 22] (6 x 1.32 GiB resident, no host bank); LRU cache 4400 slots for 42 streaming layers
+```
+
+`GET /v1/cache/routing` reports the owned layers as `resident: true` with a null
+`miss_rate` (a resident layer cannot miss, and reporting `0.0` would read as a perfectly
+cacheable streaming layer), and the `summary` block describes the streaming cache only.
+The flag needs `--moe-backend offload`, refuses to overlap with `--moe-cpu-layers`, and is
+not supported on an FTW packed checkpoint.
+
+
 ### Expert routing statistics
 
 `-CollectRoutingStats` boots with `--moe-collect-decode-freq`, which accumulates a
