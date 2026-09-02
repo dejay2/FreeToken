@@ -452,6 +452,13 @@ def load_ftw_banks(
 
     residency = layer_residency or [HostResidency.PINNED.value] * num_layers
     assert len(residency) == num_layers, (len(residency), num_layers)
+    if any(r == HostResidency.GPU_OWNED.value for r in residency):
+        # the FTW reader always reads into per-layer HostBanks (flat-region windowing needs
+        # a page-aligned host scratch); repacking it for VRAM residency is out of scope
+        raise ValueError(
+            "--moe-gpu-owned-layers is not supported on an FTW packed checkpoint; serve the "
+            "original checkpoint or drop the flag"
+        )
 
     # PINNED layers are born-pinned (cudaHostAlloc) where that wins (see born_pinned_default); LOCKED/PAGEABLE layers stay lazy mmaps
     born = born_pinned_default()

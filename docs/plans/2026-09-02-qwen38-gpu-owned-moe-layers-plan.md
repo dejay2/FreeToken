@@ -1632,7 +1632,7 @@ Claude-Session: https://claude.ai/code/session_01Hnf1bGBLU4HLq9uHPtNjwU
   - `bank_bytes_estimate(model_config, gpu_owned: int = 0)`
   - `freetoken.moe.cpu_executor._reject_cuda_sources(banks) -> None`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `tests/moe/test_gpu_owned_banks.py`:
 
@@ -1813,7 +1813,7 @@ if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -1826,7 +1826,7 @@ Expected: 9 failures. The first is
 tests fail with `AttributeError: module 'freetoken.moe.host_banks' has no attribute 'GpuOwnedStagingPool'`;
 the executor test with `ImportError: cannot import name '_reject_cuda_sources' from 'freetoken.moe.cpu_executor'`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/freetoken/moe/host_banks.py` -- add the `fill` property to `HostBank` (after the `residency` property, line 131):
 
@@ -2255,7 +2255,7 @@ and inside `_resolve_banks`, as its first statement after the docstring:
         if fmt == "bf16":
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 ```powershell
 $env:PYTHONPATH = 'D:\FreeToken\scripts\windows-ple-mmap;D:\FreeToken\python;D:\FreeToken\.local\pytest-site'
@@ -2263,7 +2263,7 @@ $env:CUDA_VISIBLE_DEVICES = '-1'
 & "$env:LOCALAPPDATA\FreeToken\venv\Scripts\python.exe" -m pytest tests/moe/test_gpu_owned_banks.py tests/moe/test_offload.py tests/moe/test_cpu_moe.py tests/checkpoint -q -p no:cacheprovider
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add python/freetoken/moe/host_banks.py python/freetoken/models/nvfp4_banks.py python/freetoken/moe/expert_banks.py python/freetoken/checkpoint/ftw.py python/freetoken/moe/cpu_executor.py tests/moe/test_gpu_owned_banks.py
