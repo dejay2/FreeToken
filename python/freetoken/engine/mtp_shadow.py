@@ -43,7 +43,6 @@ from freetoken.models.qwen4_exp.mtp_spike import (
 from freetoken.engine.spec_draft import build_shifted_pairs, build_shifted_rope_positions
 from freetoken.utils.torch_utils import torch_dtype
 
-_APPROVED_PRIVATE_ROOT = Path(r"D:\FreeToken-ple-mmap-vision\.local\mtp-spike")
 _GUARD_BYTES = 128 << 20
 # Excess filtered (temperature/top-k/top-p) TV between the oracle and fast checker:
 # only the component beyond-noise logit moves are responsible for (see
@@ -58,7 +57,7 @@ _MAX_SAMPLING_DIVERGENCE = 0.05
 class MTPShadowConfig:
     enabled: bool
     placement: str = "bf16"
-    private_root: Path = _APPROVED_PRIVATE_ROOT
+    private_root: Path | None = None
     depth: int = 3
     seed: int = 1729
     cpu_threads: int = 8
@@ -83,11 +82,15 @@ class MTPShadowConfig:
         placement = os.getenv("FREETOKEN_MTP_EXPERT_FORMAT", "bf16").strip().lower()
         if placement not in {"bf16", "nvfp4"}:
             raise ValueError("FREETOKEN_MTP_EXPERT_FORMAT must be bf16 or nvfp4")
-        root = Path(
-            os.getenv("FREETOKEN_MTP_PRIVATE_ROOT", str(_APPROVED_PRIVATE_ROOT))
-        ).resolve()
-        if os.path.normcase(str(root)) != os.path.normcase(str(_APPROVED_PRIVATE_ROOT.resolve())):
-            raise ValueError(f"MTP private root must be {_APPROVED_PRIVATE_ROOT}")
+        raw_root = os.getenv("FREETOKEN_MTP_PRIVATE_ROOT", "").strip()
+        if not raw_root:
+            raise ValueError(
+                "FREETOKEN_MTP_PRIVATE_ROOT must point at the private MTP spike root "
+                "(evidence/, prototypes/, weights/)"
+            )
+        root = Path(raw_root).resolve()
+        if not root.is_dir():
+            raise ValueError(f"MTP private root {root} is not a directory")
         depth = int(os.getenv("FREETOKEN_MTP_DEPTH", "3"))
         if depth not in {1, 2, 3}:
             raise ValueError("FREETOKEN_MTP_DEPTH must be 1, 2, or 3")
@@ -223,6 +226,7 @@ class MTPShadowObserver:
     def __init__(self, engine, config: MTPShadowConfig) -> None:
         self.engine = engine
         self.config = config
+        assert config.private_root is not None, "private_root must be set when enabled=True"
         self.device = engine.device
         self.target_ctx = engine.ctx
         self.target_model = engine.model
@@ -2147,3 +2151,4 @@ __all__ = [
     "speculative_accept",
     "tensor_sha256",
 ]
+

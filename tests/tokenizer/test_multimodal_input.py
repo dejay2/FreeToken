@@ -223,6 +223,7 @@ def test_text_only_processor_path_does_not_load_picture_packages():
     assert processor.processor is None
 
 
+@pytest.mark.needs_weights
 def test_real_qwen_processor_contract_when_model_is_configured():
     model_path = os.getenv("FREETOKEN_TEST_VISION_PROCESSOR")
     if not model_path:

@@ -404,7 +404,7 @@ def test_lru_gpu_cache_assigns_unique_slots_for_large_miss_batch():
     assert cache.src_indices[:256].tolist() == list(range(256))
 
 
-def test_adjust_config_converts_moe_cache_rate_to_cache_size():
+def test_adjust_config_converts_moe_cache_rate_to_cache_size(tmp_path):
     from types import SimpleNamespace
 
     from freetoken.distributed import DistributedInfo
@@ -412,7 +412,7 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size():
     from freetoken.engine.engine import _adjust_config
 
     config = EngineConfig(
-        model_path="/tmp/freetoken-test-model",
+        model_path=str(tmp_path / "model"),
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.float16,
         attention_backend="fi",

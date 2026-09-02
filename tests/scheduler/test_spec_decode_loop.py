@@ -1199,7 +1199,7 @@ def test_an_armed_conf_log_writes_one_well_formed_line_per_cycle(monkeypatch, tm
     stub._spec_conf_log().flush()  # the buffer is drained every 100 cycles or at exit
 
     (path,) = list(tmp_path.glob("conf-log-*.jsonl"))
-    (line,) = [json.loads(raw) for raw in path.read_text().splitlines()]
+    (line,) = [json.loads(raw) for raw in path.read_text(encoding="utf-8").splitlines()]
     assert set(line) == {
         "uid",
         "cached_len",
@@ -1248,7 +1248,7 @@ def test_the_conf_log_carries_the_draft_heads_confidence_when_the_head_reports_i
     stub._spec_conf_log().flush()
 
     (path,) = list(tmp_path.glob("conf-log-*.jsonl"))
-    (line,) = [json.loads(raw) for raw in path.read_text().splitlines()]
+    (line,) = [json.loads(raw) for raw in path.read_text(encoding="utf-8").splitlines()]
     assert line["draft_top1"] == pytest.approx([0.9, 0.8, 0.7])
     assert line["draft_top1_gap"] == pytest.approx([0.5, 0.4, 0.3])
 
@@ -1267,7 +1267,7 @@ def test_the_conf_log_buffers_rather_than_writing_a_line_at_a_time(monkeypatch, 
     assert not list(tmp_path.glob("conf-log-*.jsonl"))  # nothing on disk before a flush
     log.flush()
     (path,) = list(tmp_path.glob("conf-log-*.jsonl"))
-    assert len(path.read_text().splitlines()) == log.cycles
+    assert len(path.read_text(encoding="utf-8").splitlines()) == log.cycles
 
 
 def test_an_unarmed_probe_leaves_the_cycle_exactly_as_it_was():

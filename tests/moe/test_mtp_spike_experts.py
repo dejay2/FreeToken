@@ -350,6 +350,7 @@ def test_bank_contract_rejects_wrong_layout_and_dtype():
         MTPBF16ExpertBanks(gate.transpose(1, 2), down)
 
 
+@pytest.mark.needs_weights
 def test_real_bf16_banks_are_direct_file_backed_views():
     model = os.environ.get("FREETOKEN_QWEN38_MODEL_PATH")
     if not model or not Path(model).is_dir():

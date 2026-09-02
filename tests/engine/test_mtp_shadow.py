@@ -24,6 +24,12 @@ from freetoken.models.qwen4_exp.mtp_spike import (
 from tests.models.qwen4_exp.common import parsed_config
 
 
+@pytest.fixture(autouse=True)
+def _private_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("FREETOKEN_MTP_PRIVATE_ROOT", str(tmp_path))
+    return tmp_path
+
+
 def _engine_config(**overrides):
     values = dict(
         max_running_req=1,
@@ -71,15 +77,18 @@ def test_disabled_shadow_ignores_fast_verifier_settings(monkeypatch):
     assert config.verify_mode == "oracle"
 
 
-def test_shadow_config_rejects_scope_or_geometry_drift(monkeypatch):
+def test_shadow_config_rejects_scope_or_geometry_drift(monkeypatch, tmp_path):
     monkeypatch.setenv("FREETOKEN_MTP_SHADOW", "1")
-    monkeypatch.setenv("FREETOKEN_MTP_PRIVATE_ROOT", r"D:\other")
-    with pytest.raises(ValueError, match="private root"):
+    # Test missing FREETOKEN_MTP_PRIVATE_ROOT
+    monkeypatch.delenv("FREETOKEN_MTP_PRIVATE_ROOT", raising=False)
+    with pytest.raises(ValueError, match="FREETOKEN_MTP_PRIVATE_ROOT"):
         MTPShadowConfig.from_env(_engine_config())
-    monkeypatch.setenv(
-        "FREETOKEN_MTP_PRIVATE_ROOT",
-        r"D:\FreeToken-ple-mmap-vision\.local\mtp-spike",
-    )
+    # Test non-existent directory
+    monkeypatch.setenv("FREETOKEN_MTP_PRIVATE_ROOT", str(tmp_path / "missing"))
+    with pytest.raises(ValueError, match="not a directory"):
+        MTPShadowConfig.from_env(_engine_config())
+    # Test valid private root with geometry drift
+    monkeypatch.setenv("FREETOKEN_MTP_PRIVATE_ROOT", str(tmp_path))
     for field, value, message in (
         ("max_running_req", 2, "one active"),
         ("max_seq_len", 131_072, "262144"),

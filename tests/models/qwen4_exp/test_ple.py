@@ -458,6 +458,7 @@ def test_pinned_uva_zeroes_out_of_range_ids():
     assert torch.equal(rows[0], bank.tensor[0].cuda().to(torch.bfloat16))
 
 
+@pytest.mark.needs_weights
 @pytest.mark.skipif(
     not os.environ.get("FREETOKEN_QWEN4EXP_MODEL"), reason="needs FREETOKEN_QWEN4EXP_MODEL"
 )

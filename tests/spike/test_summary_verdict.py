@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import os
 from pathlib import Path
 
-ROOT = Path(r"D:\FreeToken-ple-mmap-vision\.local\mtp-spike\prototypes")
+import pytest
+
+_PRIVATE_ROOT = os.environ.get("FREETOKEN_MTP_PRIVATE_ROOT", "").strip()
+ROOT = Path(_PRIVATE_ROOT) / "prototypes" if _PRIVATE_ROOT else None
+pytestmark = pytest.mark.skipif(
+    ROOT is None or not ROOT.is_dir(),
+    reason="needs FREETOKEN_MTP_PRIVATE_ROOT pointing at the private MTP spike root",
+)
 
 
 def _load_summary():

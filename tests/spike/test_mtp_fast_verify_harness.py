@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 
 import pytest
 
-PRIVATE = Path(r"D:\FreeToken-ple-mmap-vision\.local\mtp-spike\prototypes")
+_PRIVATE_ROOT = os.environ.get("FREETOKEN_MTP_PRIVATE_ROOT", "").strip()
+PRIVATE = Path(_PRIVATE_ROOT) / "prototypes" if _PRIVATE_ROOT else None
+pytestmark = pytest.mark.skipif(
+    PRIVATE is None or not PRIVATE.is_dir(),
+    reason="needs FREETOKEN_MTP_PRIVATE_ROOT pointing at the private MTP spike root",
+)
 
 
 def _load(name: str):
@@ -110,9 +116,7 @@ def test_candidate_url_is_exactly_loopback_port_2030():
 
 
 def test_candidate_controls_disable_normal_decode_graphs():
-    launcher = Path(
-        r"D:\FreeToken-ple-mmap-mtp-spike\scripts\start-qwen38-flash-next-mmap-windows.ps1"
-    ).read_text(encoding="utf-8")
+    launcher = (Path(__file__).resolve().parents[2] / "scripts" / "start-qwen38-flash-next-mmap-windows.ps1").read_text(encoding="utf-8")
     matrix = (PRIVATE / "run_guarded_live_mtp_matrix.ps1").read_text(
         encoding="utf-8"
     )

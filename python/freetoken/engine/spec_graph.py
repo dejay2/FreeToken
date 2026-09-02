@@ -52,6 +52,7 @@ Sampling stays outside: the graph's outputs are fixed buffers the caller reads.
 from __future__ import annotations
 
 import gc
+import os
 import time
 import traceback
 from dataclasses import dataclass
@@ -67,9 +68,10 @@ logger = init_logger(__name__)
 
 _GRAPH_CAPTURE_RESERVE_FLOOR = 64 << 20
 # the graph runner has no config handle, so the capture-failure traceback lands in the
-# approved private evidence dir by absolute path; every write is best-effort
-_CAPTURE_FAILURE_EVIDENCE_DIR = Path(
-    r"D:\FreeToken-ple-mmap-vision\.local\mtp-spike\evidence"
+# private evidence dir if FREETOKEN_MTP_PRIVATE_ROOT is set; every write is best-effort
+_private_root_str = os.environ.get("FREETOKEN_MTP_PRIVATE_ROOT", "").strip()
+_CAPTURE_FAILURE_EVIDENCE_DIR = (
+    Path(_private_root_str) / "evidence" if _private_root_str else None
 )
 # a retryable capture (memory admission, a transient allocator failure) is worth another go on
 # a later cycle, but not every cycle: a doomed width would otherwise pay a warm-up forward per
@@ -672,16 +674,18 @@ class _FixedWidthGraphRunner:
             detail = " ".join(str(failure).split())[:300]
             reason = f"CAPTURE_FAILED:{type(failure).__name__}:{detail}"
             try:
-                _CAPTURE_FAILURE_EVIDENCE_DIR.joinpath(
-                    f"capture-failure-tb-width{width}.txt"
-                ).write_text(
-                    "".join(
-                        traceback.format_exception(
-                            type(failure), failure, failure.__traceback__
-                        )
-                    ),
-                    encoding="utf-8",
-                )
+                if _CAPTURE_FAILURE_EVIDENCE_DIR is not None:
+                    _CAPTURE_FAILURE_EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+                    _CAPTURE_FAILURE_EVIDENCE_DIR.joinpath(
+                        f"capture-failure-tb-width{width}.txt"
+                    ).write_text(
+                        "".join(
+                            traceback.format_exception(
+                                type(failure), failure, failure.__traceback__
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
             except Exception:
                 pass
             if entered_capture:
