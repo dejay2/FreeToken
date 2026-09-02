@@ -137,9 +137,9 @@ class HostBank:
     def fill(self) -> torch.Tensor:
         """Where a loader writes this bank's rows.
 
-        Identical to :attr:`tensor` for a host bank; :class:`GpuOwnedBank` redirects it to a
-        shared pinned staging layer, so the assignment loops read the same attribute either
-        way and stay one code path."""
+        Identical to :attr:`tensor` here, and also for :class:`GpuOwnedBank` (whose tensor
+        already lives on the device): the attribute exists so the assignment loops stay one
+        code path whichever kind of bank a layer got."""
         return self.tensor
 
     def memoryview(self) -> memoryview:
@@ -219,106 +219,42 @@ def _os_lock(addr: int, nbytes: int) -> None:
     _os_locked_total += nbytes
 
 
-class GpuOwnedStagingPool:
-    """Reusable pinned staging layers for GPU-owned MoE layers.
-
-    A GPU-owned layer has no host bank, but the shard readers fill it one expert tensor at a
-    time (``num_experts * 6`` separate assignments for NVFP4), and writing those straight to
-    VRAM would be that many small pageable H2D copies. So the fill lands in a pinned staging
-    LAYER and the layer-completion sink issues one ``copy_(non_blocking=True)`` per bank kind.
-
-    The parallel reader may deliver several owned layers' rows interleaved, so up to ``cap``
-    staging layers are handed out at once and a further request blocks (back-pressure) until
-    one is returned -- choice (a) of spec section 4.2, cap 2: boot pays at most 2 x one layer
-    of extra host RAM (2.6 GiB for Qwen3.8), released after the last owned layer. A slot is
-    reusable only once the CUDA event recording its staging -> device copy has completed.
-
-    Staging banks are born pinned (``backing="cuda"``) on a CUDA device: they are written
-    many times, so the pin-after-fill trick does not apply and a plain mmap could not feed an
-    async copy. Allocation happens under the pool lock, at most ``cap`` times per load.
-    """
-
-    def __init__(
-        self,
-        specs: dict[str, tuple[tuple[int, ...], torch.dtype]],
-        *,
-        cap: int = 2,
-        device: "torch.device | None" = None,
-    ) -> None:
-        self.specs = dict(specs)
-        self.cap = cap
-        self.device = device
-        self._free: list[tuple[dict[str, HostBank], object]] = []
-        self._inflight: dict[int, dict[str, HostBank]] = {}
-        self._live = 0
-        self._cv = threading.Condition()
-
-    def fill_view(self, layer_id: int, name: str) -> torch.Tensor:
-        """The staging tensor ``layer_id``'s ``name`` bank is filled through, acquiring a
-        staging layer on first touch. Thread-safe: the parallel reader writes one layer from
-        many threads."""
-        with self._cv:
-            staging = self._inflight.get(layer_id)
-            if staging is None:
-                staging = self._acquire_locked()
-                self._inflight[layer_id] = staging
-        return staging[name].tensor
-
-    def _acquire_locked(self) -> dict[str, HostBank]:
-        while not self._free and self._live >= self.cap:
-            self._cv.wait()
-        if self._free:
-            staging, event = self._free.pop()
-            if event is not None:
-                event.synchronize()  # its previous layer's H2D must land before we overwrite
-            return staging
-        self._live += 1
-        backing = "cuda" if (self.device is not None and self.device.type == "cuda") else "mmap"
-        return {
-            name: HostBank(shape, dtype, backing=backing)
-            for name, (shape, dtype) in self.specs.items()
-        }
-
-    def flush(self, layer_id: int, device_banks: dict[str, torch.Tensor]) -> None:
-        """Copy the completed staging layer into its device banks and return the slot."""
-        with self._cv:
-            staging = self._inflight.pop(layer_id, None)
-        assert staging is not None, f"GPU-owned layer {layer_id} never acquired staging"
-        for name, dst in device_banks.items():
-            dst.copy_(staging[name].tensor, non_blocking=True)
-        event = None
-        if self.device is not None and self.device.type == "cuda":
-            event = torch.cuda.Event()
-            event.record()
-        with self._cv:
-            self._free.append((staging, event))
-            self._cv.notify()
-
-
 class GpuOwnedBank:
-    """One bank kind of a GPU-owned MoE layer: the device tensor consumers read, plus the
-    reusable pinned staging tensor the loader fills through.
+    """One bank kind of a GPU-owned MoE layer: the device tensor consumers read, which is
+    also the tensor the loader writes.
 
     Duck-types the two attributes the loaders touch on a :class:`HostBank` -- ``tensor``
-    (what the bank IS, here already on the device) and ``fill`` (where to write). There are
-    no host pages, so ``pin``/``lock``/``release`` have no meaning: the layer-completion sink
-    flushes staging into ``tensor`` instead of settling (see :meth:`PinPipeline.__call__`),
-    and :func:`_settle` refuses this label outright.
+    (what the bank IS, here already on the device) and ``fill`` (where to write) -- so the
+    placement loops stay one code path. They are the SAME tensor here: every
+    ``fill[expert] = row`` is a synchronous pageable H2D copy issued by the placement
+    thread itself. Six owned layers of Qwen3.8 are 7.9 GiB of such copies, a few seconds
+    of boot, and that is the price of two properties nothing else gave us:
+
+    * The engine loads weights inside ``torch.inference_mode()``, which is THREAD-LOCAL.
+      The device banks are therefore inference tensors, and only the loading thread may
+      write them. The first design staged through a pinned host layer and flushed it on
+      the :class:`PinPipeline` drain thread, which is not in inference mode: every flush
+      raised ``"Inplace update to inference tensor outside InferenceMode is not allowed"``.
+    * The NVFP4 placement loop is single-threaded (the parallel reader parallelises the
+      byte reads and yields to one consumer), so ANY bounded per-layer resource it has to
+      wait for deadlocks as soon as the reader interleaves more owned layers than the
+      bound: the only thread that could release a slot is the one that is blocked.
+
+    Both were observed live on 2026-09-02
+    (``docs/research/measurements-gpu-owned-layers-2026-09-02.md``). There are no host
+    pages, so ``pin``/``lock``/``release`` have no meaning: the layer-completion sink
+    settles nothing for this label (see :meth:`PinPipeline.__call__`) and :func:`_settle`
+    refuses it outright.
     """
 
-    __slots__ = ("tensor", "pool", "layer_id", "name")
+    __slots__ = ("tensor",)
 
-    def __init__(
-        self, tensor: torch.Tensor, pool: GpuOwnedStagingPool, layer_id: int, name: str
-    ) -> None:
+    def __init__(self, tensor: torch.Tensor) -> None:
         self.tensor = tensor
-        self.pool = pool
-        self.layer_id = layer_id
-        self.name = name
 
     @property
     def fill(self) -> torch.Tensor:
-        return self.pool.fill_view(self.layer_id, self.name)
+        return self.tensor
 
     @property
     def residency(self) -> HostResidency:
@@ -342,8 +278,8 @@ def alloc_layer_banks(
     ``HostBank`` per layer per name.
 
     ``gpu_owned`` layer ids get NO host bank at all: their entry is a :class:`GpuOwnedBank`
-    holding the ``[num_experts, ...]`` tensor on ``device`` plus the shared
-    :class:`GpuOwnedStagingPool` it is filled through. The per-layer list keeps length
+    wrapping the ``[num_experts, ...]`` tensor on ``device``, which the loader fills in
+    place (see that class for why there is no staging). The per-layer list keeps length
     ``num_layers`` and every entry still has ``size(0) == num_experts``, so downstream
     consumers are unchanged. ``None`` (the default) reads the set and the device from the
     ambient :func:`requested_residency` plan, so every provider honors
@@ -352,16 +288,11 @@ def alloc_layer_banks(
     """
     if gpu_owned is None:
         gpu_owned, device = plan_gpu_owned()
-    pool = GpuOwnedStagingPool(specs, device=device) if gpu_owned else None
     banks: dict[str, list] = {name: [] for name in specs}
     for layer_id in range(num_layers):
         for name, (shape, dtype) in specs.items():
             if layer_id in gpu_owned:
-                banks[name].append(
-                    GpuOwnedBank(
-                        torch.empty(shape, dtype=dtype, device=device), pool, layer_id, name
-                    )
-                )
+                banks[name].append(GpuOwnedBank(torch.empty(shape, dtype=dtype, device=device)))
             else:
                 banks[name].append(HostBank(shape, dtype))
     return banks
@@ -495,11 +426,14 @@ class PinPipeline:
             if item is None:
                 return
             if self._exc is not None:
-                continue  # drain without settling after a failure
+                # Drain without settling after a failure. Safe to swallow the rest only
+                # because NOTHING blocks on this thread: submitters never wait for a slot,
+                # a token or an event, so a stored exception can strand no one and is
+                # simply re-raised by wait()/__exit__. (It could, before GPU-owned layers
+                # stopped staging through here; that made a settle failure a silent hang --
+                # docs/research/measurements-gpu-owned-layers-2026-09-02.md.)
+                continue
             try:
-                if callable(item):
-                    item()  # GPU-owned layer flush; runs on THIS thread, which set the device
-                    continue
                 bank, residency, plan, layer_id = item
                 _settle(bank, residency)
                 if plan is not None and residency == HostResidency.LOCKED.value:
@@ -507,26 +441,18 @@ class PinPipeline:
             except BaseException as exc:  # surfaced by wait()/__exit__
                 self._exc = exc
 
-    def submit_flush(self, fn) -> None:
-        """Queue a zero-argument callable to run on the drain thread (which has the creator's
-        CUDA device set and serializes against the settles already queued)."""
-        self._q.put(fn)
-
     def submit(self, bank: HostBank, residency: str = HostResidency.PINNED.value,
                plan=None, layer_id: int | None = None) -> None:
         self._q.put((bank, residency, plan, layer_id))
 
     def __call__(self, layer_id: int, banks: dict[str, HostBank]) -> None:
         """Layer-completion sink: queue every bank of the completed layer at its ambient :func:`requested_residency` label.
-        A GPU_OWNED layer has no host pages to settle -- its staging layer is flushed into the device banks instead, and the staging slot returns to the pool."""
+        A GPU_OWNED layer is already finished when it gets here -- the loader filled its device tensor in place -- and it has no host pages, so there is nothing to settle and nothing to queue. Consulting the plan still marks it applied, and the tracker still counted the layer, so the loaders' ``placed`` asserts are unaffected."""
         plan = _requested_residency
         residency = (
             HostResidency.PINNED.value if plan is None else plan.residency_for(layer_id)
         )
         if residency == HostResidency.GPU_OWNED.value:
-            pool = next(iter(banks.values())).pool
-            device_banks = {name: bank.tensor for name, bank in banks.items()}
-            self.submit_flush(lambda: pool.flush(layer_id, device_banks))
             return
         for bank in banks.values():
             self.submit(bank, residency, plan, layer_id)

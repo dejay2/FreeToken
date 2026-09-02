@@ -91,8 +91,9 @@ def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int):
     commit. Caller fills each layer's ``.fill`` then settles it (per-layer, via
     ``PinPipeline``, as its writes complete).
 
-    GPU-owned layers (the ambient ``requested_residency`` plan) get a device tensor plus a
-    shared pinned staging layer instead of a host bank; see ``alloc_layer_banks``."""
+    GPU-owned layers (the ambient ``requested_residency`` plan) get a device tensor instead
+    of a host bank and the placement loop fills it directly; see ``alloc_layer_banks`` and
+    ``GpuOwnedBank``."""
     from freetoken.moe.host_banks import alloc_layer_banks
 
     fp8 = torch.float8_e4m3fn
@@ -178,8 +179,8 @@ def load_nvfp4_expert_source_banks(
         drop_page_cache(path)
 
     _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
-    # bank OBJECTS, not tensors: a GPU-owned layer's ``.fill`` resolves to a shared staging
-    # view only at write time, and its ``.tensor`` already lives on the device.
+    # bank OBJECTS, not tensors: for a GPU-owned layer ``.fill`` IS the device tensor, so
+    # each assignment below is a direct H2D copy issued by this (the placement) thread.
     gate_up_packed = _hb["gate_up_packed"]
     gate_up_scale = _hb["gate_up_scale"]
     gate_up_global = _hb["gate_up_global"]
@@ -298,8 +299,8 @@ def load_nvfp4_expert_source_banks_parallel(
         drop_page_cache(path)
 
     _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
-    # bank OBJECTS, not tensors: a GPU-owned layer's ``.fill`` resolves to a shared staging
-    # view only at write time, and its ``.tensor`` already lives on the device.
+    # bank OBJECTS, not tensors: for a GPU-owned layer ``.fill`` IS the device tensor, so
+    # each assignment below is a direct H2D copy issued by this (the placement) thread.
     gate_up_packed = _hb["gate_up_packed"]
     gate_up_scale = _hb["gate_up_scale"]
     gate_up_global = _hb["gate_up_global"]
