@@ -83,7 +83,14 @@ def _store(tmp_path: Path, kv, state, *, mode="ram", idle_ms=0):
     )
 
 
-def _manager(tmp_path: Path, *, mode="ram", idle_ms=0, num_pages=8):
+def _manager(
+    tmp_path: Path,
+    *,
+    mode="ram",
+    idle_ms=0,
+    num_pages=8,
+    park_consensus=None,
+):
     kv, state = _pools(num_pages)
     table = torch.zeros(3, num_pages * 4, dtype=torch.int32)
     store = _store(tmp_path, kv, state, mode=mode, idle_ms=idle_ms)
@@ -95,6 +102,7 @@ def _manager(tmp_path: Path, *, mode="ram", idle_ms=0, num_pages=8):
         linear_state_pool=state,
         swa_pool=kv,
         park_store=store,
+        park_consensus=park_consensus,
     )
     return cm, kv, state
 
@@ -211,6 +219,58 @@ def test_idle_park_frees_only_after_the_copy_and_restore_is_byte_identical(tmp_p
     status = cm.park_status()
     assert status["hits"] == 1
     assert status["last_restore_ms"] >= 0
+
+
+def test_tp_target_disagreement_falls_back_to_the_empty_hybrid_match(tmp_path: Path):
+    observations = []
+
+    def disagree(payload: bytes) -> bool:
+        observations.append(payload)
+        return False
+
+    cm, kv, state = _manager(tmp_path, park_consensus=disagree)
+    tokens, *_ = _install_prefix(cm, kv, state)
+
+    matched = cm.match_req(_pending(tokens))
+
+    assert matched.cuda_handle.cached_len == 0
+    assert observations == [b"target:8"]
+
+
+def test_tp_restore_disagreement_discards_the_local_restore(tmp_path: Path):
+    observations = []
+
+    def disagree_after_restore(payload: bytes) -> bool:
+        observations.append(payload)
+        return payload != b"restore:1"
+
+    cm, kv, state = _manager(tmp_path, park_consensus=disagree_after_restore)
+    tokens = torch.arange(8, dtype=torch.int32)
+    pages = torch.tensor([0, 4], dtype=torch.int32)
+    source_slot = state.alloc(1)[0]
+    assert cm.park_store.save(tokens, pages, source_slot)
+    state.free(source_slot)
+
+    matched = cm.match_req(_pending(tokens))
+
+    assert matched.cuda_handle.cached_len == 0
+    assert observations == [b"target:8", b"ready:1", b"restore:1"]
+    assert len(cm.free_slots) == cm.num_pages
+    assert state.num_free_slots == state.num_slots - 1
+
+
+def test_tp_live_rank_participates_in_restore_consensus(tmp_path: Path):
+    observations = []
+    cm, kv, state = _manager(
+        tmp_path,
+        park_consensus=lambda payload: observations.append(payload) or True,
+    )
+    tokens, *_ = _install_prefix(cm, kv, state)
+
+    matched = cm.match_req(_pending(tokens))
+
+    assert matched.cuda_handle.cached_len == 8
+    assert observations == [b"target:8", b"ready:1", b"restore:1"]
 
 
 def test_live_gpu_match_is_not_replaced_by_the_same_parked_prefix(tmp_path: Path):
@@ -386,6 +446,42 @@ def test_rebuild_parks_unlocked_prefix_before_discarding_the_tree(tmp_path: Path
     cm.rebuild(cm.num_pages, new_table)
     assert cm.park_store.lookup(tokens) is not None
     assert state.num_free_slots == state.num_slots - 1
+
+
+def test_scheduler_tp_consensus_rejects_any_rank_mismatch(monkeypatch):
+    from freetoken.scheduler.scheduler import Scheduler
+
+    class Work:
+        def wait(self):
+            return None
+
+    class Group:
+        def __init__(self):
+            self.broadcasts = []
+
+        def broadcast(self, tensor, root):
+            self.broadcasts.append((tensor.clone(), root))
+            return Work()
+
+    scheduler = object.__new__(Scheduler)
+    scheduler.tp_cpu_group = Group()
+    mismatch = False
+
+    def all_reduce(value, *, op, group):
+        assert op is torch.distributed.ReduceOp.MIN
+        assert group is scheduler.tp_cpu_group
+        if mismatch:
+            value.zero_()
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    assert scheduler._park_consensus(b"target:8192:abcd")
+    mismatch = True
+    assert not scheduler._park_consensus(b"restore:1")
+    encoded, root = scheduler.tp_cpu_group.broadcasts[0]
+    assert root == 0
+    assert encoded[0].item() == len(b"target:8192:abcd")
+    assert bytes(encoded[1 : 1 + encoded[0]].tolist()) == b"target:8192:abcd"
 
 
 def test_scheduler_prepares_parking_before_engine_reallocates_cache(

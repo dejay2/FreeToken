@@ -31,7 +31,8 @@ _SWA_RETAIN_GAP = 16
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
-                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, park_store=None):
+                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, park_store=None,
+                 park_consensus=None):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -64,6 +65,7 @@ class CacheManager:
         if park_store is not None and not self.is_hybrid:
             raise ValueError("KV parking is supported only by the hybrid radix cache")
         self.park_store = park_store
+        self.park_consensus = park_consensus
         self._pending_parks = []
         self._temporary_lease_depth = 0
 
@@ -95,7 +97,7 @@ class CacheManager:
             return SWARadixCache(device, page_size, self.sliding_window_size)
         return create_prefix_cache(device=device, type=type, page_size=page_size)
 
-    def _restore_parked(self, input_ids: torch.Tensor, live_match):
+    def _lookup_parked(self, input_ids: torch.Tensor, live_match):
         if self.park_store is None or len(input_ids) < self.park_store.min_tokens:
             return None
         live_cached_len = live_match.cached_len
@@ -106,43 +108,73 @@ class CacheManager:
         # Keep one page for the current turn's uncached tail and ask the store for the longest
         # entry that can fit. A too-large parked prefix must not hide a shorter usable one.
         max_len = max(live_cached_len, self.available_size - self.page_size)
-        entry = self.park_store.lookup(
+        return self.park_store.lookup(
             input_ids,
             min_len=live_cached_len + margin,
             max_len=max_len,
         )
-        if entry is None:
-            return None
+
+    def _restore_parked(self, input_ids: torch.Tensor, live_match, entry):
+        needs_restore = entry is not None
+        live_cached_len = live_match.cached_len
+        pages = None
+        slot = None
+        suffix_indices = None
         # Allocation may park or evict unlocked leaves. Protect the live match while the missing
         # suffix is materialized so a failed restore can safely return the original handle.
-        self.prefix_cache.inc_lock(live_match.node)
+        if needs_restore:
+            self.prefix_cache.inc_lock(live_match.node)
         try:
-            self.ensure_mamba_slots(1)
-            if self.linear_state_pool.num_free_slots < 1:
-                return None
-            live_pages = live_cached_len // self.page_size
-            suffix_pages = entry.token_count // self.page_size - live_pages
-            pages = self._allocate(suffix_pages)
-            slot = self.linear_state_pool.alloc(1)[0]
-            suffix_indices = self._page_to_token(pages)
+            ready = True
+            if needs_restore:
+                self.ensure_mamba_slots(1)
+                ready = self.linear_state_pool.num_free_slots >= 1
+            agreed = (
+                self.park_consensus(f"ready:{int(ready)}".encode())
+                if self.park_consensus is not None
+                else ready
+            )
+            if not ready or not agreed:
+                return None, self.park_consensus is None
+
+            restored = True
+            if needs_restore:
+                try:
+                    live_pages = live_cached_len // self.page_size
+                    suffix_pages = entry.token_count // self.page_size - live_pages
+                    pages = self._allocate(suffix_pages)
+                    slot = self.linear_state_pool.alloc(1)[0]
+                    suffix_indices = self._page_to_token(pages)
+                    self.park_store.restore(
+                        entry, pages, slot, page_offset=live_pages
+                    )
+                except Exception:
+                    restored = False
+            agreed = (
+                self.park_consensus(f"restore:{int(restored)}".encode())
+                if self.park_consensus is not None
+                else restored
+            )
+            if not restored or not agreed:
+                if slot is not None:
+                    self.linear_state_pool.free(slot)
+                if suffix_indices is not None:
+                    self._free(suffix_indices)
+                return None, self.park_consensus is None
+            if not needs_restore:
+                return live_match, True
+
             indices = torch.cat([live_match.kv_indices, suffix_indices])
-            try:
-                self.park_store.restore(
-                    entry, pages, slot, page_offset=live_pages
-                )
-            except Exception:
-                self.linear_state_pool.free(slot)
-                self._free(suffix_indices)
-                return None
             prefix_len, mamba_exist = self.prefix_cache.insert(
                 entry.token_ids, indices, slot
             )
             self._free(indices[live_cached_len:prefix_len])
             if mamba_exist:
                 self.linear_state_pool.free(slot)
-            return self.prefix_cache.match_prefix(input_ids)
+            return self.prefix_cache.match_prefix(input_ids), True
         finally:
-            self.prefix_cache.dec_lock(live_match.node)
+            if needs_restore:
+                self.prefix_cache.dec_lock(live_match.node)
 
     def match_req(self, req: PendingReq) -> MatchResult:
         input_len = req.input_len
@@ -162,9 +194,25 @@ class CacheManager:
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
             m = self.prefix_cache.match_prefix(ids)
-            restored = self._restore_parked(ids, m)
-            if restored is not None and restored.cached_len > m.cached_len:
-                m = restored
+            entry = self._lookup_parked(ids, m)
+            target_len = entry.token_count if entry is not None else m.cached_len
+            target_agreed = True
+            if self.park_consensus is not None:
+                # The request tokens are already identical across TP ranks. Compare only the best
+                # reusable length: persistent entry keys include the rank-specific layout digest.
+                target_agreed = self.park_consensus(f"target:{target_len}".encode())
+                if not target_agreed:
+                    m = self.prefix_cache.match_prefix(ids[:0])
+                    entry = None
+            if target_agreed and (
+                entry is not None
+                or (self.park_consensus is not None and target_len > 0)
+            ):
+                restored, restore_agreed = self._restore_parked(ids, m, entry)
+                if not restore_agreed:
+                    m = self.prefix_cache.match_prefix(ids[:0])
+                elif restored is not None and restored.cached_len > m.cached_len:
+                    m = restored
             return MatchResult(
                 HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
         return self.prefix_cache.match_prefix(ids)

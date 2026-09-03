@@ -110,6 +110,11 @@ class Scheduler(SchedulerIOMixin):
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
             park_store=park_store,
+            park_consensus=(
+                self._park_consensus
+                if park_store is not None and config.tp_info.size > 1
+                else None
+            ),
         )
         if self.engine.mtp_shadow_observer is not None:
             self.engine.mtp_shadow_observer.bind_cache_manager(self.cache_manager)
@@ -169,6 +174,24 @@ class Scheduler(SchedulerIOMixin):
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
+
+    def _park_consensus(self, payload: bytes) -> bool:
+        """Return true only when every TP rank supplied the same parking decision."""
+        if len(payload) > 63:
+            raise ValueError("KV parking consensus payload exceeds 63 bytes")
+        local = torch.zeros(64, dtype=torch.uint8)
+        local[0] = len(payload)
+        if payload:
+            local[1 : 1 + len(payload)] = torch.tensor(tuple(payload), dtype=torch.uint8)
+        primary = local.clone()
+        self.tp_cpu_group.broadcast(primary, root=0).wait()
+        agreed = torch.tensor([int(torch.equal(local, primary))], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            agreed,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.tp_cpu_group,
+        )
+        return bool(agreed.item())
 
     def _send_park_status(self) -> None:
         if self.cache_manager.park_store is None:
