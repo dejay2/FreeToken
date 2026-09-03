@@ -238,7 +238,7 @@ class Scheduler(SchedulerIOMixin):
         # The old pools are the only source for parking. Snapshot eligible prefixes before the
         # engine reallocates them, then rebuild the radix tree against the new page table below.
         if (
-            self.cache_manager.park_store is not None
+            getattr(self.cache_manager, "park_store", None) is not None
             and (num_pages is not None or num_mamba_slots is not None)
         ):
             self.cache_manager.prepare_rebuild()
@@ -529,7 +529,9 @@ class Scheduler(SchedulerIOMixin):
             generated_tokens=generated_tokens,
         )
         self.send_result(reply)
-        self._send_park_status()
+        send_park_status = getattr(self, "_send_park_status", None)
+        if send_park_status is not None:
+            send_park_status()
 
     def _emit_step_tokens(
         self, req: Req, tokens: torch.Tensor, *, settled: bool = False
