@@ -148,8 +148,10 @@ radix cache.
 Both stores compare the full token IDs after their rolling content hash, so a collision or stale
 checkpoint/layout entry is a miss, not incorrect output. The Windows launcher always passes the
 selected mode explicitly, so `-KVPark off` overrides an inherited `FREETOKEN_KV_PARK`.
-`GET /v1/cache/status` reports the mode, parked entry count and bytes, hits, misses, and the latest
-restore time under `parking`.
+`GET /v1/cache/status` reports the mode, parked entry count and bytes, hits, misses, the latest
+restore time, whether the store disabled itself, and `last_error` (the newest failure text, `null`
+while nothing has failed) under `parking`. A parking failure is always logged at warning level too;
+it never turns the feature off quietly.
 
 Parking currently applies only to the hybrid QSA/GDN radix cache. Picture/private prefixes remain
 uncached. A parked hit must beat the live GPU match by one page in RAM mode or 4096 tokens in SSD

@@ -16,6 +16,7 @@ truth; no full SSD entry remains in RAM.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -330,6 +331,7 @@ class ParkStore:
         self._misses = 0
         self._last_restore_ms = 0.0
         self._disabled = False
+        self._last_error: str | None = None
         self._lock = RLock()
         self._window_lock = Lock()
         self._stream = None
@@ -338,6 +340,23 @@ class ParkStore:
         self._worker: Thread | None = None
         self._reserved_bytes = 0
         self._closed = False
+        # Inference mode, the current CUDA device and the current CUDA stream are all THREAD-LOCAL,
+        # and the serving process builds this store inside torch.inference_mode() (launch.py) with
+        # the scheduler's metadata stream current (scheduler.py torch.cuda.set_stream). The pinned
+        # windows allocated below are therefore inference tensors, and on 2026-09-03 the save
+        # worker -- a plain Thread -- raised "Inplace update to inference tensor outside
+        # InferenceMode is not allowed" on its very first write, so ssd parking disabled itself
+        # before writing one payload. Same defect class as the GPU-owned bank fill (8a63977):
+        # there the write moved back onto the loader's thread; here the worker IS the writer, so
+        # it re-enters the caller's context instead. Capturing the stream also makes the copy
+        # helpers' wait_stream() fence against the scheduler's real producer stream rather than
+        # the worker thread's default stream.
+        self._caller_inference_mode = torch.is_inference_mode_enabled()
+        self._caller_stream = (
+            torch.cuda.current_stream(kv_pool.device)
+            if kv_pool.device.type == "cuda"
+            else None
+        )
         try:
             if kv_pool.device.type == "cuda":
                 self._stream = torch.cuda.Stream(device=kv_pool.device)
@@ -360,6 +379,7 @@ class ParkStore:
             self._stream = None
             self._windows = None
             self._entries.clear()
+            self.note_error(f"{mode} store setup failed: {exc!r}")
             logger.warning(
                 f"KV parking disabled during {mode} store setup: {exc!r}"
             )
@@ -726,9 +746,20 @@ class ParkStore:
             return pending
 
     def _worker_loop(self) -> None:
+        """Re-enter the constructing thread's context, then drain saves under it.
+
+        See ``__init__``: inference mode, CUDA device and CUDA stream are thread-local, so a bare
+        worker thread cannot write the pinned windows the scheduler's inference mode created."""
+        with contextlib.ExitStack() as caller_context:
+            if self.kv_pool.device.type == "cuda":
+                torch.cuda.set_device(self.kv_pool.device)
+                if self._caller_stream is not None:
+                    caller_context.enter_context(torch.cuda.stream(self._caller_stream))
+            caller_context.enter_context(torch.inference_mode(self._caller_inference_mode))
+            self._drain_saves()
+
+    def _drain_saves(self) -> None:
         assert self._save_queue is not None
-        if self.kv_pool.device.type == "cuda":
-            torch.cuda.set_device(self.kv_pool.device)
         while True:
             pending = self._save_queue.get()
             try:
@@ -745,6 +776,7 @@ class ParkStore:
                 )
             except Exception as exc:
                 pending.error = exc
+                self.note_error(f"background {self.mode} save failed: {exc!r}")
                 logger.warning(f"KV parking background save failed: {exc!r}")
             finally:
                 if pending is not None:
@@ -847,6 +879,7 @@ class ParkStore:
                 _on_copied()
             with self._lock:
                 self._disabled = True
+                self._last_error = f"{self.mode} save failed: {exc!r}"
             logger.warning(
                 f"KV parking disabled after {self.mode} save failed: {exc!r}"
             )
@@ -1212,7 +1245,16 @@ class ParkStore:
                 "misses": self._misses,
                 "last_restore_ms": self._last_restore_ms,
                 "disabled": self._disabled,
+                "last_error": self._last_error,
             }
+
+    def note_error(self, message: str) -> None:
+        """Record the newest parking failure for ``/v1/cache/status``.
+
+        The 2026-09-03 live run lost a whole ssd session to a failure that only ever appeared in
+        the server log: the status line said mode ssd, zero entries, and nothing about why."""
+        with self._lock:
+            self._last_error = str(message)
 
     def flush(self) -> None:
         if self._save_queue is not None:

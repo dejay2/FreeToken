@@ -397,6 +397,37 @@ def test_active_store_owns_one_bounded_worker_and_close_stops_it(tmp_path: Path)
     assert not worker.is_alive()
 
 
+@pytest.mark.parametrize("mode", ["ram", "ssd"])
+def test_background_save_runs_in_the_callers_inference_mode(tmp_path: Path, mode: str):
+    # The serving process builds the store inside torch.inference_mode() (launch.py:79), and
+    # inference mode is THREAD-LOCAL: the ssd windows are then inference tensors and a plain
+    # worker thread's first in-place write into one raised "Inplace update to inference tensor
+    # outside InferenceMode is not allowed" on 2026-09-03, so ssd parking disabled itself on its
+    # first save and never wrote a payload.
+    with torch.inference_mode():
+        kv_pool, state_pool = _qsa_pool(), _state_pool()
+        slot = state_pool.alloc(1)[0]
+        pages = torch.tensor([0, 4], dtype=torch.int32)
+        _fill_entry(kv_pool, state_pool, pages, slot)
+        store = _store(mode, tmp_path, kv_pool, state_pool)
+        if mode == "ssd":
+            assert store._windows is not None
+            assert store._windows[0].is_inference()
+
+        pending = store.offer(torch.arange(8, dtype=torch.int32), pages, slot)
+        try:
+            assert pending is not None
+            assert pending.done.wait(timeout=10)
+            assert pending.error is None
+            assert pending.success
+            status = store.status()
+            assert status["disabled"] is False
+            assert status["last_error"] is None
+            assert status["parked_count"] == 1
+        finally:
+            store.close()
+
+
 def test_offer_does_not_wait_for_an_inflight_device_copy(tmp_path: Path, monkeypatch):
     kv_pool, state_pool = _qsa_pool(), _state_pool()
     slots = state_pool.alloc(2)
@@ -863,6 +894,7 @@ def test_ssd_pinned_window_failure_disables_store_without_failing_boot(
     monkeypatch.setattr(ParkStore, "_allocate_window", fail_window)
     store = _store("ssd", tmp_path, kv_pool, state_pool)
     assert store.status()["disabled"] is True
+    assert "pin quota exhausted" in str(store.status()["last_error"])
     assert store.lookup(torch.arange(8, dtype=torch.int32)) is None
     store.close()
 
@@ -898,6 +930,7 @@ def test_save_failure_waits_for_private_copy_stream_before_releasing_sources(
         _on_copied=lambda: released_after_sync.append(stream.synchronize_calls),
     )
     assert released_after_sync == [1]
+    assert "mid-copy failed" in str(store.status()["last_error"])
     store.close()
 
 

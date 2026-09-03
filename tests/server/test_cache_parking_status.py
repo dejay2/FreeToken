@@ -15,6 +15,7 @@ def test_cache_status_exposes_latest_parking_metrics(monkeypatch):
         "misses": 1,
         "last_restore_ms": 17.5,
         "disabled": False,
+        "last_error": None,
     }
     state = SimpleNamespace(
         maintenance_state="serving",

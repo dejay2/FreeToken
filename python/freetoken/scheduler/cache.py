@@ -7,10 +7,12 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 from freetoken.core import Req
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
-from freetoken.utils import align_down, div_ceil
+from freetoken.utils import align_down, div_ceil, init_logger
 
 if TYPE_CHECKING:
     from .utils import PendingReq
+
+logger = init_logger(__name__)
 
 # Proactive out-of-window free_swa runs every `interval` forwards (== sglang SWA_EVICTION_INTERVAL).
 def _swa_eviction_interval() -> int:
@@ -148,7 +150,11 @@ class CacheManager:
                     self.park_store.restore(
                         entry, pages, slot, page_offset=live_pages
                     )
-                except Exception:
+                except Exception as exc:
+                    # A restore that quietly becomes a cold prefill is invisible from outside:
+                    # ParkStore.restore has already dropped the entry, so only the counters move.
+                    logger.warning(f"KV park restore failed, using a cold prefill: {exc!r}")
+                    self.park_store.note_error(f"restore failed: {exc!r}")
                     restored = False
             agreed = (
                 self.park_consensus(f"restore:{int(restored)}".encode())
@@ -330,6 +336,7 @@ class CacheManager:
                 "misses": 0,
                 "last_restore_ms": 0.0,
                 "disabled": False,
+                "last_error": None,
             }
         return self.park_store.status()
 

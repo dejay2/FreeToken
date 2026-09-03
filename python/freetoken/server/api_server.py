@@ -175,6 +175,9 @@ class FrontendManager:
             "misses": 0,
             "last_restore_ms": 0.0,
             "disabled": False,
+            # Newest parking failure text, so a store that disabled itself says why here and not
+            # only in the server log (2026-09-03: ssd parking failed silently for a whole run).
+            "last_error": None,
         }
     )
     # Startup-selected main QSA K/V storage, delivered with the backend's measured byte cost.
@@ -894,6 +897,7 @@ async def cache_status():
                 "misses": 0,
                 "last_restore_ms": 0.0,
                 "disabled": False,
+                "last_error": None,
             },
         ),
     }
