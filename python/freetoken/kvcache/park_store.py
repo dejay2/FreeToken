@@ -97,6 +97,57 @@ def _tokens_cpu(input_ids: torch.Tensor) -> torch.Tensor:
     return input_ids.detach().to(device="cpu", dtype=torch.int32).contiguous().clone()
 
 
+def _temp_writer_pid(filename: str) -> int | None:
+    """Return the writer PID only for this store's two exact hidden temp-name shapes."""
+    parts = filename.split(".")
+    if len(parts) != 4 or parts[0] or parts[3] != "tmp" or not parts[2].isdigit():
+        return None
+    owner = parts[1]
+    if owner != "park" and (
+        len(owner) != 32 or any(ch not in "0123456789abcdef" for ch in owner)
+    ):
+        return None
+    pid = int(parts[2])
+    return pid if 0 < pid <= 0xFFFFFFFF else None
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Check a temp-file owner without sending a signal on Windows."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            # Access denied still means the process exists; INVALID_PARAMETER means no such PID.
+            return ctypes.get_last_error() != 87
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return True
+            return exit_code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def rolling_page_keys(
     input_ids: torch.Tensor, page_size: int, fingerprint: str
 ) -> list[str]:
@@ -160,22 +211,35 @@ def build_model_fingerprint(
     config_path = root / "config.json"
     if config_path.is_file():
         identity.append({"file": config_path.name, "sha256": file_hash(config_path)})
-    index_candidates = sorted(root.glob("*.safetensors.index.json"))
     shard_paths: set[Path] = set()
-    for index_path in index_candidates:
-        identity.append({"file": index_path.name, "sha256": file_hash(index_path)})
+    ftw_index = root / "freetoken_weight.json"
+    if ftw_index.is_file():
+        # FTW is the loader's source of truth when present; bind persistent KV to its index and
+        # every referenced freetoken-*.ftw shard rather than any leftover safetensors beside it.
+        identity.append({"file": ftw_index.name, "sha256": file_hash(ftw_index)})
         try:
-            index_doc = json.loads(index_path.read_text(encoding="utf-8"))
-            shard_paths.update(
-                root / str(name)
-                for name in set(index_doc.get("weight_map", {}).values())
-            )
+            index_doc = json.loads(ftw_index.read_text(encoding="utf-8"))
+            shard_paths.update(root / str(row["file"]) for row in index_doc.get("shards", []))
         except Exception:
             # The loader will report malformed checkpoint metadata. The fingerprint remains stable
             # and distinct through the index file's own digest.
             pass
-    if not index_candidates:
-        shard_paths.update(root.glob("*.safetensors"))
+    else:
+        index_candidates = sorted(root.glob("*.safetensors.index.json"))
+        for index_path in index_candidates:
+            identity.append({"file": index_path.name, "sha256": file_hash(index_path)})
+            try:
+                index_doc = json.loads(index_path.read_text(encoding="utf-8"))
+                shard_paths.update(
+                    root / str(name)
+                    for name in set(index_doc.get("weight_map", {}).values())
+                )
+            except Exception:
+                # The loader will report malformed checkpoint metadata. The fingerprint remains
+                # stable and distinct through the index file's own digest.
+                pass
+        if not index_candidates:
+            shard_paths.update(root.glob("*.safetensors"))
     for shard in sorted(shard_paths):
         try:
             stat = shard.stat()
@@ -312,14 +376,11 @@ class ParkStore:
         ).expanduser()
         if mode == "ssd":
             directory /= f"tp-{config.tp_info.rank:04d}-of-{config.tp_info.size:04d}"
-        # Engine weight loading resolves Hub ids internally but intentionally leaves the public
-        # model id in config. Resolve it again from the local cache so a new Hub revision gets a
-        # different snapshot path and cannot reuse the previous revision's persistent KV.
-        from freetoken.utils.hf import download_hf_weight
-
-        resolved_model_path = download_hf_weight(config.model_path)
+        # Scheduler pins a Hub id to one immutable snapshot before Engine loading. Reuse that exact
+        # path here: resolving a mutable branch again could fingerprint a newer revision than the
+        # weights and PLE/GDN sibling state that produced the parked bytes.
         fingerprint = build_model_fingerprint(
-            model_path=resolved_model_path,
+            model_path=config.model_path,
             page_size=config.page_size,
             tp_rank=config.tp_info.rank,
             tp_size=config.tp_info.size,
@@ -1055,7 +1116,17 @@ class ParkStore:
             path=path,
         )
 
+    def _remove_stale_temp_files(self) -> None:
+        # A hard kill bypasses each writer's finally block. Keep another live process's file, but
+        # remove dead-writer snapshots before admitting new bytes so repeated interrupted saves
+        # cannot grow beyond the configured SSD budget across restarts.
+        for path in self.ssd_dir.iterdir():
+            pid = _temp_writer_pid(path.name)
+            if pid is not None and path.is_file() and not _pid_is_alive(pid):
+                path.unlink()
+
     def _load_or_scan(self) -> None:
+        self._remove_stale_temp_files()
         manifest = self.ssd_dir / "park.json"
         paths: list[tuple[Path, int | None]] = []
         try:

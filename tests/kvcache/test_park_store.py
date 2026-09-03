@@ -238,7 +238,55 @@ def test_model_fingerprint_rejects_same_size_same_mtime_shard_replacement(
     assert before != after
 
 
-def test_from_config_resolves_hub_id_before_fingerprinting(
+def test_model_fingerprint_tracks_ftw_index_and_referenced_shards(tmp_path: Path):
+    shard = tmp_path / "freetoken-00000.ftw"
+    shard.write_bytes(b"AAAA")
+    index = tmp_path / "freetoken_weight.json"
+    index.write_text(
+        json.dumps(
+            {
+                "format": "freetoken_weight",
+                "version": 1,
+                "shards": [{"file": shard.name, "global_off": 0, "nbytes": 4}],
+                "tensors": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+
+    before = build_model_fingerprint(
+        model_path=str(tmp_path),
+        page_size=4,
+        tp_rank=0,
+        tp_size=1,
+        kv_pool=kv_pool,
+        state_pool=state_pool,
+    )
+    shard.write_bytes(b"BBBB")
+    after_shard = build_model_fingerprint(
+        model_path=str(tmp_path),
+        page_size=4,
+        tp_rank=0,
+        tp_size=1,
+        kv_pool=kv_pool,
+        state_pool=state_pool,
+    )
+    index.write_text(index.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    after_index = build_model_fingerprint(
+        model_path=str(tmp_path),
+        page_size=4,
+        tp_rank=0,
+        tp_size=1,
+        kv_pool=kv_pool,
+        state_pool=state_pool,
+    )
+
+    assert before != after_shard
+    assert after_shard != after_index
+
+
+def test_from_config_uses_pre_resolved_checkpoint_without_hub_lookup(
     tmp_path: Path, monkeypatch
 ):
     from freetoken.distributed.info import DistributedInfo
@@ -246,13 +294,11 @@ def test_from_config_resolves_hub_id_before_fingerprinting(
     resolved = tmp_path / "snapshot"
     resolved.mkdir()
     (resolved / "model.safetensors").write_bytes(b"checkpoint")
-    calls = []
 
-    def resolve(model_path):
-        calls.append(model_path)
-        return str(resolved)
+    def unexpected_resolve(_model_path):
+        raise AssertionError("ParkStore must reuse the snapshot pinned before Engine loading")
 
-    monkeypatch.setattr("freetoken.utils.hf.download_hf_weight", resolve)
+    monkeypatch.setattr("freetoken.utils.hf.download_hf_weight", unexpected_resolve)
     kv_pool, state_pool = _qsa_pool(), _state_pool()
     config = SimpleNamespace(
         kv_park="ram",
@@ -262,7 +308,7 @@ def test_from_config_resolves_hub_id_before_fingerprinting(
         kv_park_ram_gib=1,
         kv_park_ssd_gib=1,
         kv_park_window_mib=1,
-        model_path="org/model",
+        model_path=str(resolved),
         page_size=4,
         tp_info=DistributedInfo(rank=0, size=1),
     )
@@ -277,7 +323,6 @@ def test_from_config_resolves_hub_id_before_fingerprinting(
             kv_pool=kv_pool,
             state_pool=state_pool,
         )
-        assert calls == ["org/model"]
         assert store.fingerprint == expected
     finally:
         store.close()
@@ -658,6 +703,27 @@ def test_ssd_manifest_cannot_delete_a_file_outside_the_store(tmp_path: Path):
         assert outside.read_text(encoding="utf-8") == "keep me"
     finally:
         reopened.close()
+
+
+def test_ssd_startup_removes_only_dead_writer_temp_files(tmp_path: Path, monkeypatch):
+    dead = tmp_path / f".{'a' * 32}.123.tmp"
+    live = tmp_path / f".{'b' * 32}.456.tmp"
+    unrelated = tmp_path / ".not-a-park.789.tmp"
+    dead.write_bytes(b"incomplete")
+    live.write_bytes(b"in progress")
+    unrelated.write_bytes(b"unrelated")
+    monkeypatch.setattr(
+        "freetoken.kvcache.park_store._pid_is_alive",
+        lambda pid: pid == 456,
+    )
+
+    store = _store("ssd", tmp_path, _qsa_pool(), _state_pool())
+    try:
+        assert not dead.exists()
+        assert live.read_bytes() == b"in progress"
+        assert unrelated.read_bytes() == b"unrelated"
+    finally:
+        store.close()
 
 
 def test_ssd_payload_checksum_rejects_corruption_before_restore(tmp_path: Path):

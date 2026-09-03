@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from freetoken.engine import EngineConfig
 
@@ -9,6 +9,21 @@ def _get_pid_suffix() -> str:
     import os
 
     return f".pid={os.getpid()}"
+
+
+def pin_kv_park_model_path(config: "SchedulerConfig") -> "SchedulerConfig":
+    """Pin one Hub snapshot before Engine loads any bytes used by persistent KV."""
+    if config.kv_park == "off":
+        return config
+    from freetoken.utils.hf import download_hf_snapshot
+
+    resolved = download_hf_snapshot(config.model_path)
+    if resolved == config.model_path:
+        return config
+    # A fresh frozen config also drops any cached Hub-derived model_config from the mutable id.
+    # Engine weights, PLE/GDN sibling state, tokenizer, and ParkStore fingerprint then all read the
+    # same immutable snapshot directory even if the Hub branch advances while this process boots.
+    return replace(config, model_path=resolved)
 
 
 @dataclass(frozen=True)

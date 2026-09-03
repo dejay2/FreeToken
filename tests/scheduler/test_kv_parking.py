@@ -24,6 +24,117 @@ def _tp(monkeypatch):
     )
 
 
+def test_complete_hub_snapshot_pin_downloads_metadata_and_weights(monkeypatch):
+    import freetoken.utils.hf as hf
+    from freetoken.utils.hf import download_hf_snapshot
+
+    calls = []
+
+    def snapshot(model_path, **kwargs):
+        calls.append((model_path, kwargs))
+        return "snapshot/revision-a"
+
+    monkeypatch.setattr("freetoken.utils.hf.snapshot_download", snapshot)
+
+    assert download_hf_snapshot("org/model") == "snapshot/revision-a"
+    assert calls == [("org/model", {"tqdm_class": hf.DisabledTqdm})]
+
+
+def test_parking_pins_one_complete_hub_snapshot_before_engine_loading(
+    tmp_path: Path, monkeypatch
+):
+    from freetoken.distributed.info import DistributedInfo
+    from freetoken.scheduler.config import SchedulerConfig, pin_kv_park_model_path
+
+    resolved = tmp_path / "snapshots" / "revision-a"
+    resolved.mkdir(parents=True)
+    calls = []
+
+    def resolve(model_path):
+        calls.append(model_path)
+        return str(resolved)
+
+    monkeypatch.setattr(
+        "freetoken.utils.hf.download_hf_snapshot", resolve, raising=False
+    )
+    monkeypatch.setattr(
+        "freetoken.utils.hf.download_hf_weight",
+        lambda _model_path: (_ for _ in ()).throw(
+            AssertionError("the pin must include config and tokenizer files, not weights alone")
+        ),
+    )
+    original = SchedulerConfig(
+        model_path="org/model",
+        tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.bfloat16,
+        kv_park="ssd",
+    )
+
+    pinned = pin_kv_park_model_path(original)
+
+    assert calls == ["org/model"]
+    assert original.model_path == "org/model"
+    assert pinned.model_path == str(resolved)
+    assert pinned is not original
+
+
+def test_off_mode_does_not_resolve_a_hub_snapshot(monkeypatch):
+    from freetoken.distributed.info import DistributedInfo
+    from freetoken.scheduler.config import SchedulerConfig, pin_kv_park_model_path
+
+    def unexpected_resolve(_model_path):
+        raise AssertionError("off mode must not resolve or download a model")
+
+    monkeypatch.setattr("freetoken.utils.hf.download_hf_weight", unexpected_resolve)
+    config = SchedulerConfig(
+        model_path="org/model",
+        tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.bfloat16,
+        kv_park="off",
+    )
+
+    assert pin_kv_park_model_path(config) is config
+
+
+def test_server_pins_snapshot_before_every_model_derived_option(monkeypatch):
+    import freetoken.server.args as args_module
+
+    calls = []
+
+    def pin(model_path, mode):
+        calls.append(("pin", model_path, mode))
+        return "snapshot/revision-a"
+
+    def load_config(model_path):
+        calls.append(("config", model_path))
+        return SimpleNamespace(
+            to_dict=lambda: {
+                "torch_dtype": "bfloat16",
+                "model_type": "qwen3_5",
+            }
+        )
+
+    monkeypatch.setattr(
+        args_module, "pin_kv_park_model_path_value", pin, raising=False
+    )
+    monkeypatch.setattr("freetoken.utils.cached_load_hf_config", load_config)
+
+    config, _ = args_module.parse_args(
+        ["--model-path", "org/model", "--kv-park", "ssd"]
+    )
+
+    assert config.model_path == "snapshot/revision-a"
+    assert config.dtype == torch.bfloat16
+    assert config.tool_call_parser == "qwen3_coder"
+    assert config.reasoning_parser == "qwen3"
+    assert calls == [
+        ("pin", "org/model", "ssd"),
+        ("config", "snapshot/revision-a"),
+        ("config", "snapshot/revision-a"),
+        ("config", "snapshot/revision-a"),
+    ]
+
+
 def _pools(num_pages: int = 8):
     kv = QSAKVCache(
         num_kv_heads=1,

@@ -43,7 +43,7 @@ from freetoken.utils import (
 )
 
 from .cache import CacheManager
-from .config import SchedulerConfig
+from .config import SchedulerConfig, pin_kv_park_model_path
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
@@ -78,6 +78,7 @@ class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
 
+        config = pin_kv_park_model_path(config)
         self.engine = Engine(config)
 
         # use another stream to overlap metadata processing with computation
