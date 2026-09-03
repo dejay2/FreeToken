@@ -874,6 +874,9 @@ def cache_geometry(state: Any) -> dict:
 @app.get("/v1/cache/status")
 async def cache_status():
     state = get_global_state()
+    # Status-only monitors may be the first caller. Start the shared reply listener so
+    # CacheParkStatusMsg snapshots can reach this otherwise read-only route.
+    state._create_listener_once()
     return {
         "state": state.maintenance_state,
         "last_rebuild": state.last_rebuild,

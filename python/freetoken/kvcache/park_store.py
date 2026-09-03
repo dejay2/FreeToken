@@ -525,7 +525,12 @@ class ParkStore:
                 )
                 return False
 
-    def lookup(self, input_ids: torch.Tensor, min_len: int = 0) -> ParkedEntry | None:
+    def lookup(
+        self,
+        input_ids: torch.Tensor,
+        min_len: int = 0,
+        max_len: int | None = None,
+    ) -> ParkedEntry | None:
         with self._lock:
             tokens = _tokens_cpu(input_ids)
             keys = rolling_page_keys(tokens, self.page_size, self.fingerprint)
@@ -533,6 +538,8 @@ class ParkStore:
                 token_count = page_number * self.page_size
                 if token_count < max(self.min_tokens, min_len):
                     break
+                if max_len is not None and token_count > max_len:
+                    continue
                 key = keys[page_number - 1]
                 entry = self._entries.get(key)
                 if entry is None:
@@ -548,25 +555,35 @@ class ParkStore:
             return None
 
     def _read_payload_cpu(
-        self, entry: ParkedEntry, views: Sequence[torch.Tensor], payload_offset: int
+        self,
+        entry: ParkedEntry,
+        views: Sequence[torch.Tensor],
+        payload_offset: int,
+        source_offset: int,
+        length: int,
     ) -> None:
         assert entry.path is not None and self._windows is not None
         with entry.path.open("rb", buffering=0) as handle:
-            handle.seek(payload_offset)
-            offset = 0
+            handle.seek(payload_offset + source_offset)
+            copied = 0
             chunk = 0
-            while offset < entry.payload_bytes:
-                length = min(self.pinned_window_bytes, entry.payload_bytes - offset)
+            while copied < length:
+                chunk_length = min(self.pinned_window_bytes, length - copied)
                 window = self._windows[chunk % 2]
-                got = handle.readinto(memoryview(window[:length].numpy()).cast("B"))
-                if got != length:
+                got = handle.readinto(memoryview(window[:chunk_length].numpy()).cast("B"))
+                if got != chunk_length:
                     raise ParkEntryRejected(f"short KV park payload read: {entry.path}")
-                self._copy_window_to_span(window, offset, length, views)
-                offset += length
+                self._copy_window_to_span(window, copied, chunk_length, views)
+                copied += chunk_length
                 chunk += 1
 
     def _read_payload_cuda(
-        self, entry: ParkedEntry, views: Sequence[torch.Tensor], payload_offset: int
+        self,
+        entry: ParkedEntry,
+        views: Sequence[torch.Tensor],
+        payload_offset: int,
+        source_offset: int,
+        length: int,
     ) -> None:
         assert entry.path is not None and self._windows is not None and self._stream is not None
         reader = None
@@ -577,33 +594,35 @@ class ParkStore:
                 reader = UnbufferedReader(str(entry.path))
             handle = None if reader is not None else entry.path.open("rb", buffering=0)
             if handle is not None:
-                handle.seek(payload_offset)
+                handle.seek(payload_offset + source_offset)
             events: list[torch.cuda.Event | None] = [None, None]
-            offset = 0
+            copied = 0
             chunk = 0
-            while offset < entry.payload_bytes:
+            while copied < length:
                 index = chunk % 2
                 event = events[index]
                 if event is not None:
                     event.synchronize()
-                length = min(self.pinned_window_bytes, entry.payload_bytes - offset)
+                chunk_length = min(self.pinned_window_bytes, length - copied)
                 window = self._windows[index]
                 if reader is not None:
                     got = reader.read_into(
-                        memoryview(window[:length].numpy()).cast("B"),
-                        payload_offset + offset,
-                        length,
+                        memoryview(window[:chunk_length].numpy()).cast("B"),
+                        payload_offset + source_offset + copied,
+                        chunk_length,
                     )
                 else:
-                    got = handle.readinto(memoryview(window[:length].numpy()).cast("B"))
-                if got != length:
+                    got = handle.readinto(
+                        memoryview(window[:chunk_length].numpy()).cast("B")
+                    )
+                if got != chunk_length:
                     raise ParkEntryRejected(f"short KV park payload read: {entry.path}")
                 with torch.cuda.stream(self._stream):
-                    self._copy_window_to_span(window, offset, length, views)
+                    self._copy_window_to_span(window, copied, chunk_length, views)
                     done = torch.cuda.Event(enable_timing=False)
                     done.record(self._stream)
                     events[index] = done
-                offset += length
+                copied += chunk_length
                 chunk += 1
             self._stream.synchronize()
         finally:
@@ -613,27 +632,47 @@ class ParkStore:
                 handle.close()
 
     def restore(
-        self, entry: ParkedEntry, page_bases: torch.Tensor, state_slot: int
+        self,
+        entry: ParkedEntry,
+        page_bases: torch.Tensor,
+        state_slot: int,
+        *,
+        page_offset: int = 0,
     ) -> None:
-        """Restore a matched entry into newly-owned pages and one newly-owned state slot."""
+        """Restore a parked page suffix plus the complete state into newly-owned storage."""
         started = time.perf_counter()
         with self._lock:
+            total_pages = entry.token_count // self.page_size
+            if page_offset < 0 or page_offset > total_pages:
+                raise ValueError("restore page offset is outside the parked entry")
             bases = page_bases.detach().to(device="cpu", dtype=torch.int32).flatten()
-            if len(bases) != entry.token_count // self.page_size:
-                raise ValueError("restore target page count does not match parked entry")
+            if len(bases) != total_pages - page_offset:
+                raise ValueError("restore target page count does not match parked suffix")
             views = self._entry_views(bases, state_slot)
-            if sum(_tensor_nbytes(view) for view in views) != entry.payload_bytes:
-                raise ParkEntryRejected("restore target layout does not match parked payload")
+            per_page_views = self.kv_pool.page_byte_views(0)
+            per_page_bytes = sum(_tensor_nbytes(view) for view in per_page_views)
+            state_views = self.state_pool.slot_byte_views(self.state_pool.padding_slot)
+            state_bytes = sum(_tensor_nbytes(view) for view in state_views)
+            source_offset = page_offset * per_page_bytes
+            suffix_bytes = (total_pages - page_offset) * per_page_bytes + state_bytes
+            if sum(_tensor_nbytes(view) for view in views) != suffix_bytes:
+                raise ParkEntryRejected("restore target layout does not match parked suffix")
             try:
                 if entry.ram_tensors is not None:
-                    if len(entry.ram_tensors) != len(views):
+                    page_view_count = len(per_page_views)
+                    page_end = total_pages * page_view_count
+                    sources = (
+                        entry.ram_tensors[page_offset * page_view_count : page_end]
+                        + entry.ram_tensors[page_end:]
+                    )
+                    if len(sources) != len(views):
                         raise ParkEntryRejected("RAM parked view count changed")
                     if self._stream is None:
-                        for source, target in zip(entry.ram_tensors, views, strict=True):
+                        for source, target in zip(sources, views, strict=True):
                             target.copy_(source)
                     else:
                         with torch.cuda.stream(self._stream):
-                            for source, target in zip(entry.ram_tensors, views, strict=True):
+                            for source, target in zip(sources, views, strict=True):
                                 target.copy_(source, non_blocking=True)
                         self._stream.synchronize()
                 else:
@@ -645,10 +684,16 @@ class ParkStore:
                         raise ParkEntryRejected("SSD parked token verification failed")
                     payload_offset = int(meta["payload_offset"])
                     if self._stream is None:
-                        self._read_payload_cpu(entry, views, payload_offset)
+                        self._read_payload_cpu(
+                            entry, views, payload_offset, source_offset, suffix_bytes
+                        )
                     else:
-                        self._read_payload_cuda(entry, views, payload_offset)
+                        self._read_payload_cuda(
+                            entry, views, payload_offset, source_offset, suffix_bytes
+                        )
             except Exception:
+                if self._stream is not None:
+                    self._stream.synchronize()
                 self._drop_entry(entry.key)
                 raise
             finally:

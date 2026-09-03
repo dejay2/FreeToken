@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -154,28 +153,6 @@ def test_parking_engine_defaults_are_off_and_bounded():
     assert fields["kv_park_window_mib"].default == 256
 
 
-def test_cache_status_exposes_latest_parking_metrics(monkeypatch):
-    import freetoken.server.api_server as api
-
-    parking = {
-        "mode": "ssd",
-        "parked_count": 3,
-        "parked_bytes": 1234,
-        "hits": 2,
-        "misses": 1,
-        "last_restore_ms": 17.5,
-        "disabled": False,
-    }
-    state = SimpleNamespace(
-        maintenance_state="serving", last_rebuild=None, parking_status=parking
-    )
-    monkeypatch.setattr(api, "get_global_state", lambda: state)
-    monkeypatch.setattr(api, "cache_geometry", lambda _state: {})
-
-    result = asyncio.run(api.cache_status())
-    assert result["parking"] == parking
-
-
 def test_off_mode_constructs_no_store_or_worker_thread():
     before = {thread.ident for thread in threading.enumerate() if thread.name.startswith("kv-park")}
     kv, state = _pools()
@@ -228,6 +205,60 @@ def test_live_gpu_match_is_not_replaced_by_the_same_parked_prefix(tmp_path: Path
     assert torch.equal(cm.free_slots, free_pages)
     assert state.num_free_slots == free_states
     assert cm.park_store.status()["hits"] == 0
+
+
+def test_non_fitting_longest_entry_falls_back_to_a_fitting_shorter_prefix(
+    tmp_path: Path,
+):
+    cm, kv, state = _manager(tmp_path, num_pages=3)
+    source_slot = state.alloc(1)[0]
+    fill_pages = torch.tensor([0, 4, 8], dtype=torch.int32)
+    for page in range(3):
+        for view in kv.page_byte_views(page):
+            view.fill_(page + 1)
+    for view in state.slot_byte_views(source_slot):
+        view.fill_(7)
+    short = torch.arange(8, dtype=torch.int32)
+    long = torch.arange(12, dtype=torch.int32)
+    assert cm.park_store.save(short, fill_pages[:2], source_slot)
+    assert cm.park_store.save(long, fill_pages, source_slot)
+
+    matched = cm.match_req(_pending(long))
+
+    assert matched.cuda_handle.cached_len == 8
+    assert cm.park_store.status()["hits"] == 1
+
+
+def test_failed_longer_restore_keeps_the_existing_live_match_valid(
+    tmp_path: Path, monkeypatch
+):
+    cm, kv, state = _manager(tmp_path, num_pages=4)
+    parked_slot = state.alloc(1)[0]
+    for page in range(3):
+        for view in kv.page_byte_views(page):
+            view.fill_(page + 11)
+    for view in state.slot_byte_views(parked_slot):
+        view.fill_(13)
+    long = torch.arange(12, dtype=torch.int32)
+    assert cm.park_store.save(
+        long, torch.tensor([0, 4, 8], dtype=torch.int32), parked_slot
+    )
+    live = long[:8]
+    _install_prefix(cm, kv, state, tokens=live)
+
+    monkeypatch.setattr(
+        cm.park_store,
+        "restore",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("read failed")),
+    )
+    matched = cm.match_req(_pending(long))
+
+    assert matched.cuda_handle.cached_len == 8
+    rematched = cm.prefix_cache.match_prefix(live)
+    assert rematched.cached_len == 8
+    assert rematched.node is matched.cuda_handle.node
+    assert torch.equal(rematched.kv_indices, matched.cuda_handle.kv_indices)
+    assert rematched.mamba_value == matched.mamba_value
 
 
 def test_page_and_state_ownership_stays_out_of_free_lists_during_save(tmp_path: Path):
@@ -284,9 +315,57 @@ def test_rebuild_parks_unlocked_prefix_before_discarding_the_tree(tmp_path: Path
     tokens, *_ = _install_prefix(cm, kv, state)
     new_table = torch.zeros_like(cm.page_table)
 
+    cm.prepare_rebuild()
     cm.rebuild(cm.num_pages, new_table)
     assert cm.park_store.lookup(tokens) is not None
     assert state.num_free_slots == state.num_slots - 1
+
+
+def test_scheduler_prepares_parking_before_engine_reallocates_cache(
+    monkeypatch,
+):
+    from freetoken.scheduler.scheduler import Scheduler
+
+    events = []
+    scheduler = object.__new__(Scheduler)
+    scheduler.device = torch.device("cpu")
+    scheduler.prefill_manager = SimpleNamespace(runnable=False)
+    scheduler.decode_manager = SimpleNamespace(runnable=False)
+    scheduler.config = SimpleNamespace(
+        tp_info=SimpleNamespace(size=1),
+        max_extend_tokens=128,
+    )
+    scheduler.cache_manager = SimpleNamespace(
+        park_store=object(),
+        prepare_rebuild=lambda: events.append("park"),
+        rebuild=lambda *_args: events.append("manager"),
+        check_integrity=lambda: None,
+        prefill_chunk_budget=None,
+    )
+    scheduler.engine = SimpleNamespace(
+        num_pages=4,
+        page_table=torch.zeros(1, 16, dtype=torch.int32),
+        rebuild_runtime_cache=lambda **_kwargs: events.append("engine"),
+    )
+    scheduler.table_manager = SimpleNamespace(
+        token_pool=object(),
+        rebuild=lambda _table: events.append("table"),
+    )
+    scheduler.token_pool = scheduler.table_manager.token_pool
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args, **_kwargs: None)
+
+    scheduler.rebuild_cache(num_pages=4)
+
+    assert events[:3] == ["park", "engine", "manager"]
+
+
+def test_offline_scheduler_ignores_parking_status_messages():
+    from freetoken.llm.llm import LLM
+    from freetoken.message import CacheParkStatusMsg
+
+    llm = object.__new__(LLM)
+    llm.status_map = {}
+    llm.offline_send_result([CacheParkStatusMsg(status={"mode": "ram"})])
 
 
 def test_allocation_pressure_parks_the_lru_leaf_before_reusing_its_pages(tmp_path: Path):

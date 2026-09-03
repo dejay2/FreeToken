@@ -223,6 +223,39 @@ def test_ssd_pinned_window_failure_disables_store_without_failing_boot(
     store.close()
 
 
+def test_restore_failure_waits_for_private_copy_stream_before_releasing_targets(
+    tmp_path: Path, monkeypatch
+):
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    pages = torch.tensor([0, 4], dtype=torch.int32)
+    source_slot, target_slot = state_pool.alloc(2)
+    _fill_entry(kv_pool, state_pool, pages, source_slot)
+    tokens = torch.arange(8, dtype=torch.int32)
+    store = _store("ssd", tmp_path, kv_pool, state_pool)
+    assert store.save(tokens, pages, source_slot)
+    entry = store.lookup(tokens)
+    assert entry is not None
+
+    class FakeStream:
+        def __init__(self):
+            self.synchronize_calls = 0
+
+        def synchronize(self):
+            self.synchronize_calls += 1
+
+    stream = FakeStream()
+    store._stream = stream
+    monkeypatch.setattr(
+        store,
+        "_read_payload_cuda",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("mid-copy read failed")),
+    )
+
+    with pytest.raises(OSError, match="mid-copy"):
+        store.restore(entry, torch.tensor([8, 12], dtype=torch.int32), target_slot)
+    assert stream.synchronize_calls == 1
+
+
 def test_fingerprint_mismatch_is_rejected_on_startup(tmp_path: Path):
     kv_pool, state_pool = _qsa_pool(), _state_pool()
     pages = torch.tensor([0, 4], dtype=torch.int32)

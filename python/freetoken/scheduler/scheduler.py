@@ -204,6 +204,13 @@ class Scheduler(SchedulerIOMixin):
         torch.cuda.synchronize(self.device)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
+        # The old pools are the only source for parking. Snapshot eligible prefixes before the
+        # engine reallocates them, then rebuild the radix tree against the new page table below.
+        if (
+            self.cache_manager.park_store is not None
+            and (num_pages is not None or num_mamba_slots is not None)
+        ):
+            self.cache_manager.prepare_rebuild()
         self.engine.rebuild_runtime_cache(
             moe_cache_size=moe_cache_size, num_pages=num_pages, num_mamba_slots=num_mamba_slots,
             num_swa_pages=num_swa_pages,

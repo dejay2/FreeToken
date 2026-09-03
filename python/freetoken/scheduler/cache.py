@@ -94,39 +94,54 @@ class CacheManager:
             return SWARadixCache(device, page_size, self.sliding_window_size)
         return create_prefix_cache(device=device, type=type, page_size=page_size)
 
-    def _restore_parked(self, input_ids: torch.Tensor, live_cached_len: int):
+    def _restore_parked(self, input_ids: torch.Tensor, live_match):
         if self.park_store is None or len(input_ids) < self.park_store.min_tokens:
             return None
+        live_cached_len = live_match.cached_len
         # Restoring must buy enough extra prefill to repay the measured transfer: 4,096 tokens
         # from SSD, one page from pinned RAM. This also prevents an on-card match from being
         # pointlessly replaced by the same immutable entry retained in the park store.
         margin = 4096 if self.park_store.mode == "ssd" else self.page_size
-        entry = self.park_store.lookup(input_ids, min_len=live_cached_len + margin)
+        # Keep one page for the current turn's uncached tail and ask the store for the longest
+        # entry that can fit. A too-large parked prefix must not hide a shorter usable one.
+        max_len = max(live_cached_len, self.available_size - self.page_size)
+        entry = self.park_store.lookup(
+            input_ids,
+            min_len=live_cached_len + margin,
+            max_len=max_len,
+        )
         if entry is None:
             return None
-        # Leave one page for the current turn's uncached tail. A cold prefill is the only safe
-        # fallback when materializing the parked prefix itself would consume the whole pool.
-        if entry.token_count + self.page_size > self.available_size:
-            return None
-        self.ensure_mamba_slots(1)
-        if self.linear_state_pool.num_free_slots < 1:
-            return None
-        pages = self._allocate(entry.token_count // self.page_size)
-        slot = self.linear_state_pool.alloc(1)[0]
-        indices = self._page_to_token(pages)
+        # Allocation may park or evict unlocked leaves. Protect the live match while the missing
+        # suffix is materialized so a failed restore can safely return the original handle.
+        self.prefix_cache.inc_lock(live_match.node)
         try:
-            self.park_store.restore(entry, pages, slot)
-        except Exception:
-            self.linear_state_pool.free(slot)
-            self._free(indices)
-            return None
-        prefix_len, mamba_exist = self.prefix_cache.insert(
-            entry.token_ids, indices, slot
-        )
-        self._free(indices[:prefix_len])
-        if mamba_exist:
-            self.linear_state_pool.free(slot)
-        return self.prefix_cache.match_prefix(input_ids)
+            self.ensure_mamba_slots(1)
+            if self.linear_state_pool.num_free_slots < 1:
+                return None
+            live_pages = live_cached_len // self.page_size
+            suffix_pages = entry.token_count // self.page_size - live_pages
+            pages = self._allocate(suffix_pages)
+            slot = self.linear_state_pool.alloc(1)[0]
+            suffix_indices = self._page_to_token(pages)
+            indices = torch.cat([live_match.kv_indices, suffix_indices])
+            try:
+                self.park_store.restore(
+                    entry, pages, slot, page_offset=live_pages
+                )
+            except Exception:
+                self.linear_state_pool.free(slot)
+                self._free(suffix_indices)
+                return None
+            prefix_len, mamba_exist = self.prefix_cache.insert(
+                entry.token_ids, indices, slot
+            )
+            self._free(indices[live_cached_len:prefix_len])
+            if mamba_exist:
+                self.linear_state_pool.free(slot)
+            return self.prefix_cache.match_prefix(input_ids)
+        finally:
+            self.prefix_cache.dec_lock(live_match.node)
 
     def match_req(self, req: PendingReq) -> MatchResult:
         input_len = req.input_len
@@ -146,7 +161,7 @@ class CacheManager:
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
             m = self.prefix_cache.match_prefix(ids)
-            restored = self._restore_parked(ids, m.cached_len)
+            restored = self._restore_parked(ids, m)
             if restored is not None and restored.cached_len > m.cached_len:
                 m = restored
             return MatchResult(
@@ -695,16 +710,19 @@ class CacheManager:
         if self.page_size > 1:
             assert torch.all(self.free_slots % self.page_size == 0)
 
+    def prepare_rebuild(self) -> None:
+        """Park every eligible hybrid prefix before the engine tears down its pools."""
+        if self.park_store is not None:
+            while self._park_lru():
+                pass
+
     def rebuild(self, num_pages: int, page_table: torch.Tensor) -> None:
         """Re-point the page table and reset page accounting + prefix cache IN PLACE.
 
         Idle-only: assumes no request holds a live handle. Builds a brand-new prefix
         cache (RadixPrefixCache.reset() is an unimplemented stub) rather than mutating
-        the old one.
+        the old one. Call prepare_rebuild() before the engine destroys an old parked pool.
         """
-        if self.park_store is not None:
-            while self._park_lru():
-                pass
         device = page_table.device
         self.device = device
         self.num_pages = num_pages
