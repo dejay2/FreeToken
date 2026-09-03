@@ -123,16 +123,27 @@ Choose `--kv-park off|ram|ssd`, `FREETOKEN_KV_PARK`, or the Windows launcher's `
 | `--kv-park-idle-ms` | `FREETOKEN_KV_PARK_IDLE_MS` / `-KVParkIdleMs` | `0` | Park at the first idle scheduler point; raise it to retain recent prefixes on the GPU. |
 | `--kv-park-min-tokens` | `FREETOKEN_KV_PARK_MIN_TOKENS` / `-KVParkMinTokens` | `8192` | Smallest prefix worth parking; it must be a multiple of the model's page size. |
 | `--kv-park-ram-gib` | `FREETOKEN_KV_PARK_RAM_GIB` / `-KVParkRAMGiB` | `2` | LRU budget for full entries in page-locked host RAM. |
-| `--kv-park-ssd-dir` | `FREETOKEN_KV_PARK_SSD_DIR` / `-KVParkSSDDir` | `~/.cache/freetoken/kv-park` | Persistent SSD entry directory. |
-| `--kv-park-ssd-gib` | `FREETOKEN_KV_PARK_SSD_GIB` / `-KVParkSSDGiB` | `32` | On-disk LRU budget. |
-| `--kv-park-window-mib` | `FREETOKEN_KV_PARK_WINDOW_MIB` / `-KVParkWindowMiB` | `256` | Size of each of two page-locked SSD transfer windows (512 MiB resident by default). |
+| `--kv-park-ssd-dir` | `FREETOKEN_KV_PARK_SSD_DIR` / `-KVParkSSDDir` | `~/.cache/freetoken/kv-park` | Persistent SSD root; tensor-parallel ranks use separate subdirectories. |
+| `--kv-park-ssd-gib` | `FREETOKEN_KV_PARK_SSD_GIB` / `-KVParkSSDGiB` | `32` | On-disk LRU budget per tensor-parallel rank. |
+| `--kv-park-window-mib` | `FREETOKEN_KV_PARK_WINDOW_MIB` / `-KVParkWindowMiB` | `256` | Size of each of two page-locked SSD windows: one writer and one checksum/restore reader (512 MiB total by default). |
 
 `ram` retains exact QSA K/V, compressed-index, FP8-scale (when enabled), GDN and PLE sibling-state
-bytes until its RAM LRU drops them. `ssd` keeps those bytes in fingerprinted files with an atomic
-manifest; files survive a server restart and restore through only the bounded two-window buffer.
-Both stores verify the full token IDs after their rolling content hash, so a collision or stale
-checkpoint/layout file is a miss, not incorrect output. `GET /v1/cache/status` reports the mode,
-parked entry count and bytes, hits, misses, and the latest restore time under `parking`.
+bytes until its RAM LRU drops them. A single bounded background worker performs the copy/write;
+the scheduler keeps source pages and the state slot owned until device-to-host copying finishes.
+A full worker queue falls back to ordinary cache eviction instead of blocking request admission.
+
+`ssd` keeps the same bytes in version-2 files with a 4-KiB header, SHA-256 payload checksum, and
+atomic manifest. Files survive a server restart; a missing or invalid manifest is rebuilt by
+scanning valid headers. Checksum verification and restore use the dedicated bounded read window,
+while later manifest work may finish after the source GPU storage is released. Each tensor-parallel
+rank has its own files, and ranks agree on the reusable length and restore result before installing
+a parked prefix in the normal hybrid radix cache.
+
+Both stores compare the full token IDs after their rolling content hash, so a collision or stale
+checkpoint/layout entry is a miss, not incorrect output. The Windows launcher always passes the
+selected mode explicitly, so `-KVPark off` overrides an inherited `FREETOKEN_KV_PARK`.
+`GET /v1/cache/status` reports the mode, parked entry count and bytes, hits, misses, and the latest
+restore time under `parking`.
 
 Parking currently applies only to the hybrid QSA/GDN radix cache. Picture/private prefixes remain
 uncached. A parked hit must beat the live GPU match by one page in RAM mode or 4096 tokens in SSD

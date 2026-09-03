@@ -6,11 +6,11 @@ exact bytes returned by ``QSAKVCache.page_byte_views`` plus one complete
 any page or state slot to a free list, then a later match restores into ordinary newly-allocated
 pages and inserts the prefix into the unchanged hybrid radix tree.
 
-The SSD format uses a 4-KiB header, verbatim int32 token ids, and a 4-KiB-aligned payload.  Every
-read validates the model/layout fingerprint and the token ids, so stale files or a rolling-hash
-collision become a cache miss rather than a numerics change.  SSD reads use the same bounded,
-double-buffered pinned-window shape measured by ``scripts/bench/kv_parking_bench.py``; the file is
-the source of truth and no full parked entry remains resident in host RAM.
+The SSD format uses a versioned 4-KiB header, verbatim int32 token ids, a SHA-256 payload digest,
+and a 4-KiB-aligned payload. Every read validates the model/layout fingerprint, token ids, and
+payload, so stale or damaged files and rolling-hash collisions become misses rather than numerics
+changes. Two bounded pinned windows have fixed roles: one serves the background writer and one
+serves checksum/restore reads. The file is the source of truth; no full SSD entry remains in RAM.
 """
 
 from __future__ import annotations
