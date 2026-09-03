@@ -60,6 +60,16 @@ For More details:
 
 This fork (github.com/dejay2/FreeToken) tracks upstream FlashML-org/FreeToken and adds three features developed and tested on Windows 11 with an RTX 5090 for Qwen3.8-Flash-Next-NVFP4. The branch `mtp-upstream-merge` contains the upstream main branch plus this work.
 
+### Full-context and concurrency budget
+
+The Windows launcher defaults to a 262,144-token context and KV pool with four
+active requests. On the tested RTX 5090, the machine-local `boot-2020.ps1` recipe
+uses BF16 with **4,188 total expert slots** and **1,116 streaming-LRU slots**, and
+turns integrated MTP off because MTP accepts only one active request. Four chats
+share the pool, so their worst-case equal share is 65,536 total prompt-plus-answer
+tokens each. See the [Windows guide](docs/windows-qwen38-flash-next-mmap.md) for the
+FP8 comparison and the budget assumptions.
+
 ### PLE table backends
 
 Qwen3.8-Flash-Next has a 47.7 GiB n-gram (PLE) lookup table. Choose where it lives with `--ple-backend` or the launcher's parameter:

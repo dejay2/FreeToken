@@ -64,10 +64,14 @@ The defaults are:
 
 - `127.0.0.1:2020` only;
 - `--ple-backend mmap`;
-- full 262,144-token usable context;
-- automatic GPU expert-cache sizing;
-- one active request, with extra requests queued;
+- a 262,144-token context and a 262,144-token KV pool;
+- automatic GPU expert-cache sizing (`-MoECacheSize 0`);
+- four active requests, with additional requests queued;
 - parallel (cache-bypassing) expert loading (`-ExpertLoad`).
+
+The machine-local `boot-2020.ps1` recipe pins the full-context BF16 budget shown below
+and turns integrated MTP off. The generic launcher keeps the expert total automatic so
+an operator can choose the total for the selected KV storage mode.
 
 Do not change the host to a public address unless authentication and network
 security are added separately.
@@ -80,26 +84,54 @@ The smaller KV allocation leaves room for 6,002 experts on the GPU:
 powershell -NoProfile -ExecutionPolicy Bypass -File `
   .\scripts\start-qwen38-flash-next-mmap-windows.ps1 `
   -ModelPath $ModelPath `
-  -ContextTokens 50048
+  -ContextTokens 50048 `
+  -KVCacheTokens 50048
 ```
 
 FreeToken allocates 782 pages of 64 tokens (50,048 total). One page is reserved,
 so 49,984 tokens are usable by requests.
 
-### Full 256K allocation
+### Full 256K / four-request allocation
 
-The default reserves the model's full advertised context and leaves room for
-4,063 GPU-resident experts:
+The full-context recipe reserves 262,144 tokens for the shared KV pool and allows
+four active requests. The machine-local `boot-2020.ps1` uses the BF16 row below:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File `
   .\scripts\start-qwen38-flash-next-mmap-windows.ps1 `
   -ModelPath $ModelPath `
-  -ContextTokens 262144
+  -ContextTokens 262144 `
+  -KVCacheTokens 262144 `
+  -MaxRunningRequests 4 `
+  -MoECacheSize 4188 `
+  -GpuOwnedLayers auto `
+  -KVDtype bf16 `
+  -CudaGraphMaxBS 4
 ```
 
-FreeToken allocates 4,097 pages (262,208 total). After the reserved page,
-262,144 tokens are usable.
+| KV storage | Context / pool tokens | Active requests | Total expert slots | Streaming LRU slots | Decode estimate |
+|---|---:|---:|---:|---:|---:|
+| BF16 (default) | 262,144 / 262,144 | 4 | **4,188** | **1,116** | **~60.2 tok/s** |
+| FP8 (optional) | 262,144 / 262,144 | 4 | **5,350** | **2,278** | **~67.0 tok/s** |
+
+The total includes the 3,072 slot-equivalents charged to six GPU-owned layers.
+The LRU number is what remains for streaming layers. These token-rate figures are
+estimates from linear interpolation of the 2026-09-02 cache sweep, whose 6,750-slot
+reference measured 73.1 tok/s; see
+[`measurements-moe-cache-sweep-2026-09-02.md`](research/measurements-moe-cache-sweep-2026-09-02.md).
+They are not a new live measurement, so recheck `/v1/cache/status` and one decode
+on the target machine before treating them as a guarantee.
+
+One chat may use nearly the whole 262,144-token model and pool limit when it is
+alone. Four active chats have a worst-case equal share of `262144 / 4 = 65,536`
+total tokens each. Prompt tokens plus answer tokens must fit that share; the pool
+is shared, not four separate full-length pools.
+
+Integrated MTP is a one-request feature. The four-request recipe turns it off before
+launch, including the resident draft head, so inherited MTP settings cannot reject
+the configuration or consume its VRAM budget. FP8 remains an optional experiment:
+BF16 is the default, and an FP8 boot must use the 5,350-slot line only after its
+live quality check passes.
 
 ### Expert loading
 
@@ -366,6 +398,10 @@ These are controlled throughput measurements, not model-quality tests. Raw
 request-level data is in
 [`benchmarks/qwen38-flash-next-rtx5090-windows-mmap.json`](../benchmarks/qwen38-flash-next-rtx5090-windows-mmap.json).
 
+These historical runs predate the four-request BF16/FP8 budget above and retain
+their original one-request settings. Use the full-context table above for the
+current recipe; keep this section for the measured 50K-versus-256K reference.
+
 ### Memory split and startup
 
 | Setting | Total KV pool | Usable context | GPU-cached experts | Fresh startup |
@@ -512,7 +548,9 @@ slower. Wait for `state: serving` and warm up once before comparing throughput.
 - FreeToken Desktop is required as the Windows engine delivery mechanism.
 - The server is command-line only and cannot be configured in Desktop.
 - This path is text-only as tested; image request parts are not supported here.
-- The default allows one active request because a 32 GB GPU has little headroom.
+- The full-context recipe allows four active requests only within the shared 262,144-token pool;
+  four worst-case equal shares are 65,536 total tokens each.
+- Integrated MTP remains a one-request feature and is disabled by the four-request recipe.
 - The compatibility bridge is Windows-specific and not an official FreeToken
   standalone package.
 - Performance is one machine/configuration, not a general RTX 5090 guarantee.

@@ -11,7 +11,7 @@ param(
     [int]$ContextTokens = 262144,
 
     [ValidateRange(1, 16)]
-    [int]$MaxRunningRequests = 1,
+    [int]$MaxRunningRequests = 4,
 
     [string]$DesktopPython = (Join-Path $env:LOCALAPPDATA 'FreeToken\venv\Scripts\python.exe'),
 
@@ -49,10 +49,10 @@ param(
     [ValidateRange(0, 1048576)]
     [int]$MoECacheSize = 0,
 
-    # Hard KV-pool capacity in tokens (--num-tokens); 0 keeps the default sizing, where
-    # the pool grows into free memory and -ContextTokens is only a floor.
+    # Hard KV-pool capacity in tokens (--num-tokens). The default reserves the model's
+    # full 262,144-token context; pass 0 to return to automatic sizing.
     [ValidateRange(0, 4194304)]
-    [int]$KVCacheTokens = 0,
+    [int]$KVCacheTokens = 262144,
 
     # How the MoE expert banks are read into host RAM (--expert-load). 'parallel' is the
     # cache-bypassing multi-threaded reader (FILE_FLAG_NO_BUFFERING on Windows); 'serial' is
