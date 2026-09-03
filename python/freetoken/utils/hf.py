@@ -224,6 +224,21 @@ def _weight_allow_patterns(repo_id: str) -> list[str]:
     return shards or ["*.safetensors"]
 
 
+def download_hf_snapshot(model_path: str) -> str:
+    """Resolve one immutable Hub snapshot containing every model and tokenizer asset."""
+    if os.path.isdir(model_path):
+        return model_path
+    try:
+        # Parking persists bytes across restarts, so every producer and consumer must share one
+        # revision. A weights-only allow-list would leave config/tokenizer files to be resolved
+        # later from a mutable branch and could also produce an incomplete local snapshot.
+        return snapshot_download(model_path, tqdm_class=DisabledTqdm)
+    except Exception as e:
+        raise ValueError(
+            f"Model path '{model_path}' is neither a local directory nor a valid model ID: {e}"
+        )
+
+
 def download_hf_weight(model_path: str) -> str:
     if os.path.isdir(model_path):
         return model_path

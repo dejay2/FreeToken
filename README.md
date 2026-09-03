@@ -134,10 +134,12 @@ A full worker queue falls back to ordinary cache eviction instead of blocking re
 
 `ssd` keeps the same bytes in version-2 files with a 4-KiB header, SHA-256 payload checksum, and
 atomic manifest. Files survive a server restart; a missing or invalid manifest is rebuilt by
-scanning valid headers. Checksum verification and restore use the dedicated bounded read window,
-while later manifest work may finish after the source GPU storage is released. Each tensor-parallel
-rank has its own files, and ranks agree on the reusable length and restore result before installing
-a parked prefix in the normal hybrid radix cache.
+scanning valid headers, and incomplete temp files left by dead writers are removed before new
+writes begin. The persistent fingerprint pins one Hub snapshot before model loading and covers the
+active safetensors or FTW index and referenced shards. Checksum verification and restore use the
+dedicated bounded read window, while later manifest work may finish after the source GPU storage is
+released. Each tensor-parallel rank has its own files, and ranks agree on the reusable length and
+restore result before installing a parked prefix in the normal hybrid radix cache.
 
 Both stores compare the full token IDs after their rolling content hash, so a collision or stale
 checkpoint/layout entry is a miss, not incorrect output. The Windows launcher always passes the

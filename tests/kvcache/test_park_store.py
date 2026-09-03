@@ -298,6 +298,7 @@ def test_from_config_uses_pre_resolved_checkpoint_without_hub_lookup(
     def unexpected_resolve(_model_path):
         raise AssertionError("ParkStore must reuse the snapshot pinned before Engine loading")
 
+    monkeypatch.setattr("freetoken.utils.hf.download_hf_snapshot", unexpected_resolve)
     monkeypatch.setattr("freetoken.utils.hf.download_hf_weight", unexpected_resolve)
     kv_pool, state_pool = _qsa_pool(), _state_pool()
     config = SimpleNamespace(

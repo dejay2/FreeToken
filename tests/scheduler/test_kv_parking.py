@@ -85,7 +85,7 @@ def test_off_mode_does_not_resolve_a_hub_snapshot(monkeypatch):
     def unexpected_resolve(_model_path):
         raise AssertionError("off mode must not resolve or download a model")
 
-    monkeypatch.setattr("freetoken.utils.hf.download_hf_weight", unexpected_resolve)
+    monkeypatch.setattr("freetoken.utils.hf.download_hf_snapshot", unexpected_resolve)
     config = SchedulerConfig(
         model_path="org/model",
         tp_info=DistributedInfo(rank=0, size=1),
@@ -124,6 +124,7 @@ def test_server_pins_snapshot_before_every_model_derived_option(monkeypatch):
     )
 
     assert config.model_path == "snapshot/revision-a"
+    assert config.served_model_name == "model"
     assert config.dtype == torch.bfloat16
     assert config.tool_call_parser == "qwen3_coder"
     assert config.reasoning_parser == "qwen3"

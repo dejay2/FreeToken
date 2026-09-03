@@ -8,6 +8,7 @@ from typing import List, Tuple
 import torch
 from freetoken.distributed import DistributedInfo
 from freetoken.scheduler import SchedulerConfig
+from freetoken.scheduler.config import pin_kv_park_model_path_value
 from freetoken.utils import init_logger
 
 
@@ -803,6 +804,24 @@ def parse_args(
             os.path.basename(os.path.normpath(kwargs["model_path"])) or kwargs["model_path"]
         )
 
+    if kwargs["model_source"] == "modelscope":
+        model_path = kwargs["model_path"]
+        if not os.path.isdir(model_path):
+            from modelscope import snapshot_download
+
+            ignore_patterns = []
+            if kwargs["use_dummy_weight"]:
+                ignore_patterns = ["*.bin", "*.safetensors", "*.pt", "*.ckpt"]
+            model_path = snapshot_download(model_path, ignore_patterns=ignore_patterns)
+            kwargs["model_path"] = model_path
+    del kwargs["model_source"]
+
+    # Parking survives this boot, so pin the complete Hub snapshot before dtype, parser, API,
+    # tokenizer, or scheduler configuration reads anything model-derived from a mutable branch.
+    kwargs["model_path"] = pin_kv_park_model_path_value(
+        kwargs["model_path"], kwargs["kv_park"]
+    )
+
     if kwargs["tool_call_parser"] == "auto":
         kwargs["tool_call_parser"] = _infer_tool_call_parser(kwargs["model_path"])
 
@@ -824,18 +843,6 @@ def parse_args(
     )
     if is_offload_moe_backend(kwargs["moe_backend"]) and _no_cache_flag:
         kwargs["moe_cache_auto"] = True
-
-    if kwargs["model_source"] == "modelscope":
-        model_path = kwargs["model_path"]
-        if not os.path.isdir(model_path):
-            from modelscope import snapshot_download
-
-            ignore_patterns = []
-            if kwargs["use_dummy_weight"]:
-                ignore_patterns = ["*.bin", "*.safetensors", "*.pt", "*.ckpt"]
-            model_path = snapshot_download(model_path, ignore_patterns=ignore_patterns)
-            kwargs["model_path"] = model_path
-    del kwargs["model_source"]
 
     # "auto" (or an unspecified dtype) resolves to the checkpoint's dtype. Multimodal /
     # hybrid configs (e.g. Qwen3.5-MoE) keep it under ``text_config`` and use the newer

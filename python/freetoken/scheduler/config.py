@@ -11,13 +11,18 @@ def _get_pid_suffix() -> str:
     return f".pid={os.getpid()}"
 
 
-def pin_kv_park_model_path(config: "SchedulerConfig") -> "SchedulerConfig":
-    """Pin one Hub snapshot before Engine loads any bytes used by persistent KV."""
-    if config.kv_park == "off":
-        return config
+def pin_kv_park_model_path_value(model_path: str, mode: str) -> str:
+    """Resolve the one complete checkpoint snapshot used by every parking process."""
+    if mode == "off":
+        return model_path
     from freetoken.utils.hf import download_hf_snapshot
 
-    resolved = download_hf_snapshot(config.model_path)
+    return download_hf_snapshot(model_path)
+
+
+def pin_kv_park_model_path(config: "SchedulerConfig") -> "SchedulerConfig":
+    """Pin one Hub snapshot before Engine loads any bytes used by persistent KV."""
+    resolved = pin_kv_park_model_path_value(config.model_path, config.kv_park)
     if resolved == config.model_path:
         return config
     # A fresh frozen config also drops any cached Hub-derived model_config from the mutable id.
