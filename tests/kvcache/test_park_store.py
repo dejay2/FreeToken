@@ -351,6 +351,34 @@ def test_async_ram_offers_respect_the_configured_byte_budget(
         store.close()
 
 
+def test_sync_ram_save_evicts_before_allocating_its_replacement(
+    tmp_path: Path, monkeypatch
+):
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    pages = torch.tensor([0, 4], dtype=torch.int32)
+    slot = state_pool.alloc(1)[0]
+    probe = _store("ram", tmp_path, kv_pool, state_pool)
+    one_entry = probe.storage_bytes(8)
+    probe.close()
+    store = _store(
+        "ram",
+        tmp_path,
+        kv_pool,
+        state_pool,
+        ram_budget_bytes=one_entry + 64,
+    )
+    assert store.save(torch.arange(8, dtype=torch.int32), pages, slot)
+    real_copy = store._copy_to_ram
+
+    def checked_copy(views):
+        assert store.status()["parked_count"] == 0
+        return real_copy(views)
+
+    monkeypatch.setattr(store, "_copy_to_ram", checked_copy)
+    assert store.save(torch.arange(100, 108, dtype=torch.int32), pages, slot)
+    store.close()
+
+
 def test_ssd_source_copy_completes_before_manifest_update(
     tmp_path: Path, monkeypatch
 ):
@@ -559,6 +587,40 @@ def test_ssd_pinned_window_failure_disables_store_without_failing_boot(
     store = _store("ssd", tmp_path, kv_pool, state_pool)
     assert store.status()["disabled"] is True
     assert store.lookup(torch.arange(8, dtype=torch.int32)) is None
+    store.close()
+
+
+def test_save_failure_waits_for_private_copy_stream_before_releasing_sources(
+    tmp_path: Path, monkeypatch
+):
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    pages = torch.tensor([0, 4], dtype=torch.int32)
+    slot = state_pool.alloc(1)[0]
+    store = _store("ram", tmp_path, kv_pool, state_pool)
+
+    class FakeStream:
+        def __init__(self):
+            self.synchronize_calls = 0
+
+        def synchronize(self):
+            self.synchronize_calls += 1
+
+    stream = FakeStream()
+    store._stream = stream
+    monkeypatch.setattr(
+        store,
+        "_copy_to_ram",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("mid-copy failed")),
+    )
+    released_after_sync = []
+
+    assert not store.save(
+        torch.arange(8, dtype=torch.int32),
+        pages,
+        slot,
+        _on_copied=lambda: released_after_sync.append(stream.synchronize_calls),
+    )
+    assert released_after_sync == [1]
     store.close()
 
 

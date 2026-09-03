@@ -740,6 +740,10 @@ class ParkStore:
                 if _on_copied is not None:
                     _on_copied()
                 return False
+            before = len(self._entries)
+            self._evict_to_fit(needed)
+            if self.mode == "ssd" and len(self._entries) != before:
+                self._write_manifest()
         views = self._entry_views(bases, state_slot)
         payload = sum(_tensor_nbytes(view) for view in views)
         expected = self.payload_bytes(len(tokens))
@@ -776,6 +780,10 @@ class ParkStore:
                     self._write_manifest()
             return True
         except Exception as exc:
+            # A failed enqueue/copy can still leave work on the private CUDA stream. Fence it
+            # before copy_done lets the scheduler recycle and overwrite the source pages.
+            if self._stream is not None:
+                self._stream.synchronize()
             if _on_copied is not None:
                 _on_copied()
             with self._lock:

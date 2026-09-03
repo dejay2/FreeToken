@@ -50,6 +50,7 @@ class HybridMatch(NamedTuple):
 class EvictResult(NamedTuple):
     kv_indices: torch.Tensor      # KV page indices to free
     mamba_slots: List[int]        # GDN state slots to free
+    lock_node: Optional[RadixTreeNode] = None  # shared source path pinned during async copy
 
 
 class ParkCandidate(NamedTuple):
@@ -169,8 +170,8 @@ class HybridRadixCache:
         """Unlocked, snapshot-bearing leaves in LRU order, with complete path contents.
 
         Copying uses the complete root-to-leaf path because the leaf snapshot resumes the GDN
-        recurrence at that exact boundary.  ``detach_parked`` is deliberately separate: the
-        scheduler completes device-to-host copying before either allocator sees the pages/slot.
+        recurrence at that exact boundary. ``detach_parked`` removes the leaf but pins any shared
+        ancestor path until the scheduler receives the device-to-host completion signal.
         """
         out = []
         for node in self._leaves():
@@ -206,8 +207,14 @@ class HybridRadixCache:
         mamba: List[int] = []
         self.full_evictable -= node.length
         self._free_node_mamba(node, mamba)
-        self._cascade_tombstone_leaves(self._unlink(node), kv)
-        return EvictResult(torch.cat(kv), mamba)
+        survivor, _ = self._cascade_tombstone_leaves(self._unlink(node), kv)
+        lock_node = None
+        if not survivor.is_root():
+            # The parked payload also reads every ancestor KV page. A sibling may be evicted while
+            # that D2H is in flight, so keep the surviving shared path out of the free list.
+            self.inc_lock(survivor)
+            lock_node = survivor
+        return EvictResult(torch.cat(kv), mamba, lock_node)
 
     def evict_full(self, num_tokens: int) -> EvictResult:
         """Evict KV tokens by LRU over UNLOCKED LEAF nodes (an internal node's KV is a prefix

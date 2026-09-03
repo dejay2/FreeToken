@@ -248,6 +248,8 @@ class CacheManager:
         if not evicted.mamba_slots:
             return False
         if pending is None:
+            if evicted.lock_node is not None:
+                self.prefix_cache.dec_lock(evicted.lock_node)
             self.linear_state_pool.free(evicted.mamba_slots)
             self._free(evicted.kv_indices)
         else:
@@ -269,6 +271,8 @@ class CacheManager:
             if not pending.copy_done.is_set():
                 kept.append((pending, evicted))
                 continue
+            if evicted.lock_node is not None:
+                self.prefix_cache.dec_lock(evicted.lock_node)
             self.linear_state_pool.free(evicted.mamba_slots)
             self._free(evicted.kv_indices)
             drained += 1

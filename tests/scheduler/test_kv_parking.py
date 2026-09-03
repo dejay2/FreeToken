@@ -194,6 +194,49 @@ def test_async_park_keeps_sources_owned_until_copy_completion(tmp_path: Path, mo
     assert slot in state._free_slots
 
 
+def test_async_park_protects_shared_ancestor_pages_until_copy_completion(
+    tmp_path: Path, monkeypatch
+):
+    cm, kv, state = _manager(tmp_path)
+    first_tokens, _pages, first_indices, _slot, *_ = _install_prefix(cm, kv, state)
+    second_tokens = torch.cat(
+        [first_tokens[:4], torch.arange(100, 104, dtype=torch.int32)]
+    )
+    second_page = cm._allocate(1)
+    second_indices = torch.cat(
+        [first_indices[:4], cm._page_to_token(second_page)]
+    )
+    second_slot = state.alloc(1)[0]
+    _, existed = cm.prefix_cache.insert(second_tokens, second_indices, second_slot)
+    assert not existed
+
+    class Pending:
+        def __init__(self):
+            self.copy_done = threading.Event()
+
+        def wait_copied(self):
+            self.copy_done.wait()
+
+    pending = Pending()
+    monkeypatch.setattr(cm.park_store, "offer", lambda *_args: pending)
+    candidate = next(
+        item
+        for item in cm.prefix_cache.park_candidates()
+        if torch.equal(item.input_ids, first_tokens)
+    )
+    assert cm._park_candidate(candidate)
+
+    before_copy = cm.prefix_cache.evict_full(10**9)
+    shared = set(first_indices[:4].tolist())
+    assert shared.isdisjoint(set(before_copy.kv_indices.tolist()))
+
+    pending.copy_done.set()
+    cm.drain_pending_parks()
+    after_copy = cm.prefix_cache.evict_full(10**9)
+    assert shared.issubset(set(after_copy.kv_indices.tolist()))
+    cm.close()
+
+
 def test_idle_park_frees_only_after_the_copy_and_restore_is_byte_identical(tmp_path: Path):
     cm, kv, state = _manager(tmp_path)
     tokens, _pages, _indices, slot, expected_kv, expected_state = _install_prefix(cm, kv, state)
