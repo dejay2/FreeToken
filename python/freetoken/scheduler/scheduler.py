@@ -23,6 +23,7 @@ from freetoken.message import (
     AbortBackendMsg,
     BaseBackendMsg,
     BatchBackendMsg,
+    CacheParkStatusMsg,
     CacheRebuildBackendMsg,
     CacheRebuildResultMsg,
     DetokenizeMsg,
@@ -93,6 +94,13 @@ class Scheduler(SchedulerIOMixin):
         # virtual full-token coordinate; model-specific tiers ride the plug-ins -- DSV4's
         # window/cmp/idx shadows via swa_pool, Gemma's swa via swa_pool, GDN state via
         # linear_state_pool. No model supplies its own manager.
+        park_store = None
+        if config.kv_park != "off":
+            from freetoken.kvcache.park_store import ParkStore
+
+            park_store = ParkStore.from_config(
+                config, self.engine.kv_cache, self.engine.linear_state_pool
+            )
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type,
             linear_state_pool=self.engine.linear_state_pool,
@@ -101,6 +109,7 @@ class Scheduler(SchedulerIOMixin):
                 (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
+            park_store=park_store,
         )
         if self.engine.mtp_shadow_observer is not None:
             self.engine.mtp_shadow_observer.bind_cache_manager(self.cache_manager)
@@ -150,6 +159,7 @@ class Scheduler(SchedulerIOMixin):
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
         self.config = config
+        self._last_park_status = None
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
@@ -159,10 +169,20 @@ class Scheduler(SchedulerIOMixin):
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
 
+    def _send_park_status(self) -> None:
+        if self.cache_manager.park_store is None:
+            return
+        status = self.cache_manager.park_status()
+        if status != self._last_park_status:
+            self.send_result([CacheParkStatusMsg(status=status)])
+            self._last_park_status = status
+
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
+        self.cache_manager.park_idle()
         self.cache_manager.check_integrity()
+        self._send_park_status()
 
     @torch.inference_mode()
     def rebuild_cache(
@@ -470,6 +490,7 @@ class Scheduler(SchedulerIOMixin):
             generated_tokens=generated_tokens,
         )
         self.send_result(reply)
+        self._send_park_status()
 
     def _emit_step_tokens(
         self, req: Req, tokens: torch.Tensor, *, settled: bool = False

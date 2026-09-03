@@ -22,6 +22,7 @@ from freetoken.message import (
     BaseFrontendMsg,
     BaseTokenizerMsg,
     BatchFrontendMsg,
+    CacheParkStatusReply,
     CacheRebuildMsg,
     CacheRebuildReply,
     RoutingStatsMsg,
@@ -163,6 +164,19 @@ class FrontendManager:
     # Runtime metrics for /v1/stats: throughput sliding window + last-known kv/mamba/vram
     # snapshot, fed from every UserReply in listen().
     stats: Any = None
+    # Scheduler snapshots after idle parking and restore. Off is a real zero-cost mode, so the
+    # API has a useful answer before the first active-mode snapshot arrives.
+    parking_status: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "mode": "off",
+            "parked_count": 0,
+            "parked_bytes": 0,
+            "hits": 0,
+            "misses": 0,
+            "last_restore_ms": 0.0,
+            "disabled": False,
+        }
+    )
     # Optional backend metadata delivered once on the ack path at ready: per-unit cache VRAM
     # costs {"kv_bytes_per_token", "moe_bytes_per_expert", "mamba_bytes_per_slot"}. None until
     # the ("meta", …) ack arrives (or forever, on an engine build that doesn't emit one).
@@ -205,6 +219,7 @@ class FrontendManager:
     def __post_init__(self) -> None:
         if self.stats is None:
             self.stats = StatsTracker()
+        self.parking_status["mode"] = getattr(self.config, "kv_park", "off")
 
     def frontend_tokenizer(self) -> Any:
         """Lazily build and cache the frontend-side tokenizer used by count_tokens (see the
@@ -248,6 +263,9 @@ class FrontendManager:
     async def listen(self):
         while True:
             msg = await self.recv_tokenizer.get()
+            if isinstance(msg, CacheParkStatusReply):
+                self.parking_status = dict(msg.status)
+                continue
             if isinstance(msg, CacheRebuildReply):
                 self._resolve_rebuild(msg)
                 continue
@@ -853,6 +871,19 @@ async def cache_status():
         "state": state.maintenance_state,
         "last_rebuild": state.last_rebuild,
         "geometry": cache_geometry(state),
+        "parking": getattr(
+            state,
+            "parking_status",
+            {
+                "mode": "off",
+                "parked_count": 0,
+                "parked_bytes": 0,
+                "hits": 0,
+                "misses": 0,
+                "last_restore_ms": 0.0,
+                "disabled": False,
+            },
+        ),
     }
 
 

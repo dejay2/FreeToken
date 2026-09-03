@@ -52,6 +52,14 @@ class EvictResult(NamedTuple):
     mamba_slots: List[int]        # GDN state slots to free
 
 
+class ParkCandidate(NamedTuple):
+    input_ids: torch.Tensor       # complete root-to-leaf token sequence
+    kv_indices: torch.Tensor      # complete root-to-leaf KV sequence
+    mamba_slot: int               # complete GDN/PLE snapshot at the leaf boundary
+    timestamp: int                # leaf LRU timestamp
+    node: RadixTreeNode           # identity used for copy-then-detach
+
+
 class HybridRadixCache:
     def __init__(self, device: torch.device, page_size: int) -> None:
         from freetoken.kernel.fla.chunk import CHUNK_SIZE
@@ -145,6 +153,50 @@ class HybridRadixCache:
             cur = cur.parent
 
     # ---------------------------------------------------------------- eviction (dual)
+    def park_candidates(self) -> List[ParkCandidate]:
+        """Unlocked, snapshot-bearing leaves in LRU order, with complete path contents.
+
+        Copying uses the complete root-to-leaf path because the leaf snapshot resumes the GDN
+        recurrence at that exact boundary.  ``detach_parked`` is deliberately separate: the
+        scheduler completes device-to-host copying before either allocator sees the pages/slot.
+        """
+        out = []
+        for node in self._leaves():
+            if (
+                node.ref_count == 0
+                and node.mamba_ref_count == 0
+                and node.mamba_value is not None
+            ):
+                out.append(
+                    ParkCandidate(
+                        self._collect_keys(node),
+                        self._collect_kv(node),
+                        node.mamba_value,
+                        node.timestamp,
+                        node,
+                    )
+                )
+        out.sort(key=lambda candidate: candidate.timestamp)
+        return out
+
+    def detach_parked(self, candidate: ParkCandidate) -> EvictResult:
+        """Remove a leaf after its bytes are safely parked and return allocator ownership."""
+        node = candidate.node
+        if (
+            node.is_root()
+            or not node.is_leaf()
+            or node.ref_count != 0
+            or node.mamba_ref_count != 0
+            or node.mamba_value != candidate.mamba_slot
+        ):
+            return EvictResult(self.empty, [])
+        kv = [node.value]
+        mamba: List[int] = []
+        self.full_evictable -= node.length
+        self._free_node_mamba(node, mamba)
+        self._cascade_tombstone_leaves(self._unlink(node), kv)
+        return EvictResult(torch.cat(kv), mamba)
+
     def evict_full(self, num_tokens: int) -> EvictResult:
         """Evict KV tokens by LRU over UNLOCKED LEAF nodes (an internal node's KV is a prefix
         dependency for all descendants). Frees each evicted node's snapshot too."""
@@ -252,6 +304,15 @@ class HybridRadixCache:
         vals.reverse()
         return torch.cat(vals) if vals else self.empty
 
+    def _collect_keys(self, node: RadixTreeNode) -> torch.Tensor:
+        keys: List[torch.Tensor] = []
+        n = node
+        while not n.is_root():
+            keys.append(n._key)
+            n = n.parent
+        keys.reverse()
+        return torch.cat(keys) if keys else self.empty
+
     def _leaves(self) -> List[RadixTreeNode]:
         out, stack = [], [self.root]
         while stack:
@@ -291,4 +352,10 @@ class HybridRadixCache:
         return node, prefix_len
 
 
-__all__ = ["HybridRadixCache", "HybridMatch", "EvictResult", "HybridCacheHandle"]
+__all__ = [
+    "HybridRadixCache",
+    "HybridMatch",
+    "EvictResult",
+    "ParkCandidate",
+    "HybridCacheHandle",
+]

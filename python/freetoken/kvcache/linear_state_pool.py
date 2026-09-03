@@ -228,6 +228,22 @@ class LinearStatePool:
     def device(self) -> torch.device:
         return self._device
 
+    def slot_byte_views(self, slot: int) -> tuple[torch.Tensor, ...]:
+        """Contiguous tensors that together contain a complete recurrent-state snapshot."""
+        if slot < 0 or slot >= self._num_slots:
+            raise IndexError(f"linear-state slot {slot} outside [0, {self._num_slots})")
+        views = [
+            self.conv_states[layer, slot]
+            for layer in range(int(self.conv_states.shape[0]))
+        ]
+        views.extend(
+            self.recurrent_states[layer, slot]
+            for layer in range(int(self.recurrent_states.shape[0]))
+        )
+        for state in self.slot_states.values():
+            views.extend(state[layer, slot] for layer in range(int(state.shape[0])))
+        return tuple(views)
+
     def bytes_per_slot(self) -> int:
         """Total state bytes for one request (all linear layers)."""
         per = (

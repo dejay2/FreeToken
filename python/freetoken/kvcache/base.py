@@ -194,7 +194,8 @@ class MatchResult(NamedTuple):
     # Hybrid (GDN) models: the restored GDN state snapshot slot for this prefix (None = cold /
     # non-hybrid). Surfaced by HybridRadixCache via CacheManager.match_req.
     mamba_value: int | None = None
-    # TODO: support HiCache
+    # Host/SSD ParkStore restores are materialized into ordinary pages/state before this result;
+    # callers therefore keep the same device-handle contract and need no residency branch.
 
 
 class BasePrefixCache(ABC):

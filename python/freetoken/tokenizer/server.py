@@ -20,6 +20,8 @@ from freetoken.message import (
     BatchBackendMsg,
     BatchFrontendMsg,
     BatchTokenizerMsg,
+    CacheParkStatusMsg,
+    CacheParkStatusReply,
     CacheRebuildBackendMsg,
     CacheRebuildMsg,
     CacheRebuildReply,
@@ -404,9 +406,11 @@ def tokenize_worker(
             prompt_admitted_msg = [m for m in pending_msg if isinstance(m, PromptAdmittedMsg)]
             error_reply_msg = [m for m in pending_msg if isinstance(m, ErrorReplyMsg)]
             # Control messages are pure passthrough (no tokenization): CacheRebuildMsg /
-            # RoutingStatsMsg (api -> scheduler) and their *ResultMsg replies (scheduler -> api).
+            # RoutingStatsMsg (api -> scheduler) and status/result replies (scheduler -> api).
             for m in pending_msg:
-                if isinstance(m, CacheRebuildMsg):
+                if isinstance(m, CacheParkStatusMsg):
+                    send_frontend.put(CacheParkStatusReply(status=m.status))
+                elif isinstance(m, CacheRebuildMsg):
                     send_backend.put(
                         CacheRebuildBackendMsg(
                             request_id=m.request_id,
@@ -443,6 +447,7 @@ def tokenize_worker(
                 isinstance(
                     m,
                     (
+                        CacheParkStatusMsg,
                         CacheRebuildMsg,
                         CacheRebuildResultMsg,
                         ErrorReplyMsg,

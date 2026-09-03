@@ -31,7 +31,7 @@ _SWA_RETAIN_GAP = 16
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
-                 linear_state_pool=None, swa_pool=None, sliding_window_size=None):
+                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, park_store=None):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -61,6 +61,10 @@ class CacheManager:
         self.page_table = page_table
         self.page_size = page_size
         self.cache_type = type
+        if park_store is not None and not self.is_hybrid:
+            raise ValueError("KV parking is supported only by the hybrid radix cache")
+        self.park_store = park_store
+        self._temporary_lease_depth = 0
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
@@ -90,6 +94,40 @@ class CacheManager:
             return SWARadixCache(device, page_size, self.sliding_window_size)
         return create_prefix_cache(device=device, type=type, page_size=page_size)
 
+    def _restore_parked(self, input_ids: torch.Tensor, live_cached_len: int):
+        if self.park_store is None or len(input_ids) < self.park_store.min_tokens:
+            return None
+        # Restoring must buy enough extra prefill to repay the measured transfer: 4,096 tokens
+        # from SSD, one page from pinned RAM. This also prevents an on-card match from being
+        # pointlessly replaced by the same immutable entry retained in the park store.
+        margin = 4096 if self.park_store.mode == "ssd" else self.page_size
+        entry = self.park_store.lookup(input_ids, min_len=live_cached_len + margin)
+        if entry is None:
+            return None
+        # Leave one page for the current turn's uncached tail. A cold prefill is the only safe
+        # fallback when materializing the parked prefix itself would consume the whole pool.
+        if entry.token_count + self.page_size > self.available_size:
+            return None
+        self.ensure_mamba_slots(1)
+        if self.linear_state_pool.num_free_slots < 1:
+            return None
+        pages = self._allocate(entry.token_count // self.page_size)
+        slot = self.linear_state_pool.alloc(1)[0]
+        indices = self._page_to_token(pages)
+        try:
+            self.park_store.restore(entry, pages, slot)
+        except Exception:
+            self.linear_state_pool.free(slot)
+            self._free(indices)
+            return None
+        prefix_len, mamba_exist = self.prefix_cache.insert(
+            entry.token_ids, indices, slot
+        )
+        self._free(indices[:prefix_len])
+        if mamba_exist:
+            self.linear_state_pool.free(slot)
+        return self.prefix_cache.match_prefix(input_ids)
+
     def match_req(self, req: PendingReq) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
@@ -108,6 +146,9 @@ class CacheManager:
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
             m = self.prefix_cache.match_prefix(ids)
+            restored = self._restore_parked(ids, m.cached_len)
+            if restored is not None and restored.cached_len > m.cached_len:
+                m = restored
             return MatchResult(
                 HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
         return self.prefix_cache.match_prefix(ids)
@@ -122,6 +163,60 @@ class CacheManager:
     def mamba_available_size(self) -> int:
         """Hybrid only: free GDN state slots + evictable (unlocked) tree snapshots."""
         return self.linear_state_pool.num_free_slots + self.prefix_cache.mamba_evictable_size
+
+    def _park_candidate(self, candidate) -> bool:
+        if self.park_store is None or self._temporary_lease_depth:
+            return False
+        page_bases = candidate.kv_indices[:: self.page_size]
+        if not self.park_store.save(
+            candidate.input_ids, page_bases, candidate.mamba_slot
+        ):
+            return False
+        evicted = self.prefix_cache.detach_parked(candidate)
+        if not evicted.mamba_slots:
+            return False
+        # ``save`` has completed its device-to-host copy before either free-list changes.
+        self.linear_state_pool.free(evicted.mamba_slots)
+        self._free(evicted.kv_indices)
+        return True
+
+    def _park_lru(self) -> bool:
+        if self.park_store is None or self._temporary_lease_depth:
+            return False
+        for candidate in self.prefix_cache.park_candidates():
+            if self._park_candidate(candidate):
+                return True
+        return False
+
+    def park_idle(self, *, now_ns: int | None = None) -> int:
+        """Park every eligible leaf older than the configured delay; idle scheduler only."""
+        if self.park_store is None or self._temporary_lease_depth:
+            return 0
+        if now_ns is None:
+            import time
+
+            now_ns = time.monotonic_ns()
+        threshold = self.park_store.idle_ms * 1_000_000
+        parked = 0
+        for candidate in self.prefix_cache.park_candidates():
+            if now_ns - candidate.timestamp < threshold:
+                continue
+            if self._park_candidate(candidate):
+                parked += 1
+        return parked
+
+    def park_status(self) -> dict[str, int | float | str | bool]:
+        if self.park_store is None:
+            return {
+                "mode": "off",
+                "parked_count": 0,
+                "parked_bytes": 0,
+                "hits": 0,
+                "misses": 0,
+                "last_restore_ms": 0.0,
+                "disabled": False,
+            }
+        return self.park_store.status()
 
     @property
     def swa_available_size(self) -> int:
@@ -146,6 +241,8 @@ class CacheManager:
         """Free GDN state slots until >= ``n`` are available by tombstoning LRU tree snapshots
         (evict_mamba), returning their slots + any freed KV to the pools."""
         while self.linear_state_pool.num_free_slots < n:
+            if self._park_lru():
+                continue
             er = self.prefix_cache.evict_mamba(n - self.linear_state_pool.num_free_slots)
             if not er.mamba_slots:
                 break
@@ -605,6 +702,9 @@ class CacheManager:
         cache (RadixPrefixCache.reset() is an unimplemented stub) rather than mutating
         the old one.
         """
+        if self.park_store is not None:
+            while self._park_lru():
+                pass
         device = page_table.device
         self.device = device
         self.num_pages = num_pages
@@ -672,17 +772,26 @@ class CacheManager:
 
         self.free_slots = self.free_slots[needed_pages:]
         expected_remainder = before[needed_pages:]
+        self._temporary_lease_depth += 1
         try:
             yield pages
         finally:
-            if not torch.equal(self.free_slots, expected_remainder):
-                raise RuntimeError(
-                    "MTP temporary page lease observed allocator mutation"
-                )
-            self.free_slots = before
+            try:
+                if not torch.equal(self.free_slots, expected_remainder):
+                    raise RuntimeError(
+                        "MTP temporary page lease observed allocator mutation"
+                    )
+                self.free_slots = before
+            finally:
+                self._temporary_lease_depth -= 1
 
     def _allocate(self, needed_pages: int) -> torch.Tensor:
-        if needed_pages > (free_pages := len(self.free_slots)):
+        free_pages = len(self.free_slots)
+        if needed_pages > free_pages and self.is_hybrid and self.park_store is not None:
+            while needed_pages > len(self.free_slots) and self._park_lru():
+                pass
+            free_pages = len(self.free_slots)
+        if needed_pages > free_pages:
             need = (needed_pages - free_pages) * self.page_size
             if self.is_swa:
                 # Evicting KV leaf nodes drops their swa slots too -> return both pools.

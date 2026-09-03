@@ -54,6 +54,29 @@ param(
     [ValidateRange(0, 4194304)]
     [int]$KVCacheTokens = 262144,
 
+    # Move completed QSA KV plus its GDN/PLE snapshot outside VRAM between turns. Off passes
+    # no parking flags, so it constructs no store, CUDA stream, pinned buffers or directory.
+    [ValidateSet('off', 'ram', 'ssd')]
+    [string]$KVPark = 'off',
+
+    [ValidateRange(0, 86400000)]
+    [int]$KVParkIdleMs = 0,
+
+    [ValidateRange(64, 4194304)]
+    [int]$KVParkMinTokens = 8192,
+
+    [ValidateRange(0.125, 128)]
+    [double]$KVParkRAMGiB = 2.0,
+
+    [string]$KVParkSSDDir = '~/.cache/freetoken/kv-park',
+
+    [ValidateRange(0.125, 8192)]
+    [double]$KVParkSSDGiB = 32.0,
+
+    # SSD keeps files as truth; these are two bounded pinned staging windows, not full copies.
+    [ValidateRange(1, 4096)]
+    [int]$KVParkWindowMiB = 256,
+
     # How the MoE expert banks are read into host RAM (--expert-load). 'parallel' is the
     # cache-bypassing multi-threaded reader (FILE_FLAG_NO_BUFFERING on Windows); 'serial' is
     # the older one-shard-at-a-time read; 'auto' lets the loader pick (it resolves to
@@ -195,6 +218,9 @@ Write-Host "  GPU-owned MoE layers: $(if ($GpuOwnedLayers) { $GpuOwnedLayers } e
 Write-Host "  Picture input: $($EnableVision.IsPresent)"
 Write-Host "  Picture execution: $(if ($EnableVision) { $VisionExecution } else { 'disabled' })"
 Write-Host "  Picture weights: $(if ($EnableVision) { $VisionWeights } else { 'disabled' })"
+if ($KVPark -ne 'off') {
+    Write-Host "  KV parking: $KVPark (idle $KVParkIdleMs ms, minimum $KVParkMinTokens tokens)"
+}
 Write-Host 'FreeToken Desktop supplies the Windows runtime but does not need to be open.'
 
 # --moe-cache-size and --moe-cache-auto are mutually exclusive; an explicit size opts out
@@ -218,6 +244,17 @@ $serveArgs = @(
     '--kv-reserve-tokens', "$ContextTokens",
     '--expert-load', $ExpertLoad
 )
+if ($KVPark -ne 'off') {
+    $serveArgs += @(
+        '--kv-park', $KVPark,
+        '--kv-park-idle-ms', "$KVParkIdleMs",
+        '--kv-park-min-tokens', "$KVParkMinTokens",
+        '--kv-park-ram-gib', "$KVParkRAMGiB",
+        '--kv-park-ssd-dir', $KVParkSSDDir,
+        '--kv-park-ssd-gib', "$KVParkSSDGiB",
+        '--kv-park-window-mib', "$KVParkWindowMiB"
+    )
+}
 if ($EnableCacheReport) {
     $serveArgs += '--enable-cache-report'
 }

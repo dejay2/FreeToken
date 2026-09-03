@@ -75,6 +75,15 @@ class EnvClassSingleton:
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state
     # pool at some precision cost on the long recurrence (mirrors SGLang's mamba_ssm_dtype).
     MAMBA_SSM_DTYPE = EnvStr("float32")
+    # Completed hybrid prefixes may be parked outside VRAM. No store, stream, pinned memory or
+    # directory exists while mode is off; the remaining values are boot-time bounds when enabled.
+    KV_PARK = EnvStr("off")
+    KV_PARK_IDLE_MS = EnvInt(0)
+    KV_PARK_MIN_TOKENS = EnvInt(8192)
+    KV_PARK_RAM_GIB = EnvFloat(2.0)
+    KV_PARK_SSD_DIR = EnvStr("~/.cache/freetoken/kv-park")
+    KV_PARK_SSD_GIB = EnvFloat(32.0)
+    KV_PARK_WINDOW_MIB = EnvInt(256)
 
     def __new__(cls):
         # single instance

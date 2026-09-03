@@ -190,6 +190,36 @@ class QSAKVCache(MHAKVCache):
                 )
         return per_token * config.page_size, fixed, config.page_size, 0
 
+    def page_byte_views(self, page_id: int) -> tuple[torch.Tensor, ...]:
+        """Contiguous tensors that together contain every persistent byte for one QSA page.
+
+        The compressed-index rows use ``page_size // index_ratio`` storage rows per page.  The
+        per-request pending rings are scratch rather than committed prefix state, so they are not
+        parked.  FP8 scale rows, when present, travel with the K/V bytes they decode.
+        """
+        num_pages = int(self._kv_buffer.shape[2])
+        if page_id < 0 or page_id >= num_pages:
+            raise IndexError(f"QSA page {page_id} outside [0, {num_pages})")
+        views = [
+            self._kv_buffer[kv, layer, page_id]
+            for kv in range(int(self._kv_buffer.shape[0]))
+            for layer in range(int(self._kv_buffer.shape[1]))
+        ]
+        rows = self._page_size // self._index_ratio
+        first = page_id * rows
+        views.extend(
+            self._cmp_k_buffer[layer, first : first + rows]
+            for layer in range(self._num_index_layers)
+        )
+        scale_buffer = getattr(self, "_kv_scale_buffer", None)
+        if scale_buffer is not None:
+            views.extend(
+                scale_buffer[kv, layer, page_id]
+                for kv in range(int(scale_buffer.shape[0]))
+                for layer in range(int(scale_buffer.shape[1]))
+            )
+        return tuple(views)
+
     def unit_bytes(self) -> tuple[int, int]:
         # Only the shadow slab scales with pages, and only its non-scratch rows; the ring and
         # the scratch rows are the fixed term kv_cost reports separately.

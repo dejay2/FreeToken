@@ -308,6 +308,16 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    # Complete QSA + GDN/PLE prefixes can leave VRAM between turns. Off constructs nothing;
+    # enabled modes are bounded independently because RAM owns full entries while SSD owns only
+    # two staging windows plus files under its disk LRU.
+    kv_park: str = "off"
+    kv_park_idle_ms: int = 0
+    kv_park_min_tokens: int = 8192
+    kv_park_ram_gib: float = 2.0
+    kv_park_ssd_dir: str = "~/.cache/freetoken/kv-park"
+    kv_park_ssd_gib: float = 32.0
+    kv_park_window_mib: int = 256
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_backend: str = "auto"

@@ -93,6 +93,13 @@ class AbortMsg(BaseTokenizerMsg):
 
 
 @dataclass
+class CacheParkStatusMsg(BaseTokenizerMsg):
+    """Scheduler -> detokenizer snapshot for GET /v1/cache/status."""
+
+    status: dict
+
+
+@dataclass
 class CacheRebuildMsg(BaseTokenizerMsg):
     # api server -> tokenizer worker (pure passthrough to CacheRebuildBackendMsg).
     request_id: str

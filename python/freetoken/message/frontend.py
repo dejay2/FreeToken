@@ -59,6 +59,13 @@ class UserReply(BaseFrontendMsg):
 
 
 @dataclass
+class CacheParkStatusReply(BaseFrontendMsg):
+    """Detokenizer -> API snapshot for GET /v1/cache/status."""
+
+    status: dict
+
+
+@dataclass
 class CacheRebuildReply(BaseFrontendMsg):
     # detokenizer worker -> api server: result of a /v1/cache/rebuild request.
     request_id: str

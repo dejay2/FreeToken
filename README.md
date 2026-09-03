@@ -82,6 +82,36 @@ Qwen3.8-Flash-Next has a 47.7 GiB n-gram (PLE) lookup table. Choose where it liv
 
 The launcher script `start-qwen38-flash-next-mmap-windows.ps1` defaults to `--ple-backend mmap`.
 
+### KV prefix parking
+
+Hybrid QSA/GDN conversations can keep completed prefixes outside GPU memory and restore them on
+the next matching turn instead of recomputing. The feature is **off by default**. In `off` mode
+FreeToken constructs no parking store, copy stream, page-locked buffer, worker thread, directory,
+or manifest, and the existing cache paths do not add a device synchronization.
+
+Choose `--kv-park off|ram|ssd`, `FREETOKEN_KV_PARK`, or the Windows launcher's `-KVPark`:
+
+| Setting | Environment / Windows launcher | Default | Meaning |
+|---|---|---:|---|
+| `--kv-park-idle-ms` | `FREETOKEN_KV_PARK_IDLE_MS` / `-KVParkIdleMs` | `0` | Park at the first idle scheduler point; raise it to retain recent prefixes on the GPU. |
+| `--kv-park-min-tokens` | `FREETOKEN_KV_PARK_MIN_TOKENS` / `-KVParkMinTokens` | `8192` | Smallest prefix worth parking; it must be a multiple of the model's page size. |
+| `--kv-park-ram-gib` | `FREETOKEN_KV_PARK_RAM_GIB` / `-KVParkRAMGiB` | `2` | LRU budget for full entries in page-locked host RAM. |
+| `--kv-park-ssd-dir` | `FREETOKEN_KV_PARK_SSD_DIR` / `-KVParkSSDDir` | `~/.cache/freetoken/kv-park` | Persistent SSD entry directory. |
+| `--kv-park-ssd-gib` | `FREETOKEN_KV_PARK_SSD_GIB` / `-KVParkSSDGiB` | `32` | On-disk LRU budget. |
+| `--kv-park-window-mib` | `FREETOKEN_KV_PARK_WINDOW_MIB` / `-KVParkWindowMiB` | `256` | Size of each of two page-locked SSD transfer windows (512 MiB resident by default). |
+
+`ram` retains exact QSA K/V, compressed-index, FP8-scale (when enabled), GDN and PLE sibling-state
+bytes until its RAM LRU drops them. `ssd` keeps those bytes in fingerprinted files with an atomic
+manifest; files survive a server restart and restore through only the bounded two-window buffer.
+Both stores verify the full token IDs after their rolling content hash, so a collision or stale
+checkpoint/layout file is a miss, not incorrect output. `GET /v1/cache/status` reports the mode,
+parked entry count and bytes, hits, misses, and the latest restore time under `parking`.
+
+Parking currently applies only to the hybrid QSA/GDN radix cache. Picture/private prefixes remain
+uncached. A parked hit must beat the live GPU match by one page in RAM mode or 4096 tokens in SSD
+mode (the measured transfer break-even), and restore leaves one GPU page for the current turn's
+tail; otherwise FreeToken uses an ordinary cold prefill.
+
 ### Still-picture (vision) serving
 
 Vision support is opt-in and disabled by default. Enable it with environment variables or launcher flags:

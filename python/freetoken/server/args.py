@@ -113,6 +113,24 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _nonnegative_int(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+        if n < 0:
+            raise argparse.ArgumentTypeError("must be >= 0")
+        return n
+
+    def _positive_float(value: str) -> float:
+        try:
+            n = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a positive number") from exc
+        if n <= 0:
+            raise argparse.ArgumentTypeError("must be > 0")
+        return n
+
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
         from freetoken.gpu_select import gpu_arg
 
@@ -224,6 +242,48 @@ def parse_args(
         default="auto",
         choices=["auto", "float16", "bfloat16", "float32"],
         help="Data type for model weights and activations. 'auto' will use FP16 for FP32/FP16 models and BF16 for BF16 models.",
+    )
+
+    parser.add_argument(
+        "--kv-park",
+        default=os.getenv("FREETOKEN_KV_PARK", ServerArgs.kv_park).strip().lower(),
+        choices=["off", "ram", "ssd"],
+        help="Park completed hybrid KV/GDN prefixes outside VRAM (default: off).",
+    )
+    parser.add_argument(
+        "--kv-park-idle-ms",
+        type=_nonnegative_int,
+        default=os.getenv("FREETOKEN_KV_PARK_IDLE_MS", str(ServerArgs.kv_park_idle_ms)),
+        help="Idle time before an eligible completed prefix is parked (default: 0 ms).",
+    )
+    parser.add_argument(
+        "--kv-park-min-tokens",
+        type=_positive_int,
+        default=os.getenv("FREETOKEN_KV_PARK_MIN_TOKENS", str(ServerArgs.kv_park_min_tokens)),
+        help="Smallest page-aligned prefix worth parking (default: 8192 tokens).",
+    )
+    parser.add_argument(
+        "--kv-park-ram-gib",
+        type=_positive_float,
+        default=os.getenv("FREETOKEN_KV_PARK_RAM_GIB", str(ServerArgs.kv_park_ram_gib)),
+        help="LRU budget for full page-locked RAM entries (default: 2 GiB).",
+    )
+    parser.add_argument(
+        "--kv-park-ssd-dir",
+        default=os.getenv("FREETOKEN_KV_PARK_SSD_DIR", ServerArgs.kv_park_ssd_dir),
+        help="Persistent directory for SSD parked entries.",
+    )
+    parser.add_argument(
+        "--kv-park-ssd-gib",
+        type=_positive_float,
+        default=os.getenv("FREETOKEN_KV_PARK_SSD_GIB", str(ServerArgs.kv_park_ssd_gib)),
+        help="SSD entry LRU budget (default: 32 GiB).",
+    )
+    parser.add_argument(
+        "--kv-park-window-mib",
+        type=_positive_int,
+        default=os.getenv("FREETOKEN_KV_PARK_WINDOW_MIB", str(ServerArgs.kv_park_window_mib)),
+        help="Size of each of the two page-locked SSD staging windows (default: 256 MiB).",
     )
 
     parser.add_argument(
