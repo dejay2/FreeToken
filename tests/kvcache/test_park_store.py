@@ -202,6 +202,87 @@ def test_model_fingerprint_tracks_referenced_shard_identity(tmp_path: Path):
     assert before != after
 
 
+def test_model_fingerprint_rejects_same_size_same_mtime_shard_replacement(
+    tmp_path: Path,
+):
+    import os
+
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"AAAA")
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    before = build_model_fingerprint(
+        model_path=str(tmp_path),
+        page_size=4,
+        tp_rank=0,
+        tp_size=1,
+        kv_pool=kv_pool,
+        state_pool=state_pool,
+    )
+    old_mtime = shard.stat().st_mtime_ns
+    replacement = tmp_path / "replacement.tmp"
+    replacement.write_bytes(b"BBBB")
+    os.replace(replacement, shard)
+    os.utime(shard, ns=(old_mtime, old_mtime))
+    assert shard.stat().st_size == 4
+    assert shard.stat().st_mtime_ns == old_mtime
+
+    after = build_model_fingerprint(
+        model_path=str(tmp_path),
+        page_size=4,
+        tp_rank=0,
+        tp_size=1,
+        kv_pool=kv_pool,
+        state_pool=state_pool,
+    )
+
+    assert before != after
+
+
+def test_from_config_resolves_hub_id_before_fingerprinting(
+    tmp_path: Path, monkeypatch
+):
+    from freetoken.distributed.info import DistributedInfo
+
+    resolved = tmp_path / "snapshot"
+    resolved.mkdir()
+    (resolved / "model.safetensors").write_bytes(b"checkpoint")
+    calls = []
+
+    def resolve(model_path):
+        calls.append(model_path)
+        return str(resolved)
+
+    monkeypatch.setattr("freetoken.utils.hf.download_hf_weight", resolve)
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    config = SimpleNamespace(
+        kv_park="ram",
+        kv_park_ssd_dir=str(tmp_path / "parks"),
+        kv_park_min_tokens=8,
+        kv_park_idle_ms=0,
+        kv_park_ram_gib=1,
+        kv_park_ssd_gib=1,
+        kv_park_window_mib=1,
+        model_path="org/model",
+        page_size=4,
+        tp_info=DistributedInfo(rank=0, size=1),
+    )
+
+    store = ParkStore.from_config(config, kv_pool, state_pool)
+    try:
+        expected = build_model_fingerprint(
+            model_path=str(resolved),
+            page_size=4,
+            tp_rank=0,
+            tp_size=1,
+            kv_pool=kv_pool,
+            state_pool=state_pool,
+        )
+        assert calls == ["org/model"]
+        assert store.fingerprint == expected
+    finally:
+        store.close()
+
+
 def test_ssd_store_is_scoped_by_tensor_parallel_rank(tmp_path: Path):
     from freetoken.distributed.info import DistributedInfo
 
@@ -550,6 +631,33 @@ def test_ssd_manifest_uses_restart_stable_wall_clock_lru(tmp_path: Path):
     manifest = json.loads((tmp_path / "park.json").read_text(encoding="utf-8"))
     last_used = manifest["entries"][0]["last_used_ns"]
     assert before <= last_used <= after
+
+
+def test_ssd_manifest_cannot_delete_a_file_outside_the_store(tmp_path: Path):
+    root = tmp_path / "parks"
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep me", encoding="utf-8")
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    first = _store("ssd", root, kv_pool, state_pool)
+    first.close()
+    (root / "park.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "fingerprint": "model-A",
+                "entries": [
+                    {"file": "../outside.txt", "last_used_ns": 1}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    reopened = _store("ssd", root, kv_pool, state_pool)
+    try:
+        assert outside.read_text(encoding="utf-8") == "keep me"
+    finally:
+        reopened.close()
 
 
 def test_ssd_payload_checksum_rejects_corruption_before_restore(tmp_path: Path):

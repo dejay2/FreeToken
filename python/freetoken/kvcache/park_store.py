@@ -137,6 +137,25 @@ def build_model_fingerprint(
                 digest.update(chunk)
         return digest.hexdigest()
 
+    def shard_sample_hash(path: Path, size: int) -> str:
+        """Cheap content identity without rereading an entire frontier checkpoint at boot."""
+        sample_bytes = 64 << 10
+        offsets = sorted(
+            {
+                0,
+                max(0, size // 2 - sample_bytes // 2),
+                max(0, size - sample_bytes),
+            }
+        )
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for offset in offsets:
+                handle.seek(offset)
+                chunk = handle.read(min(sample_bytes, size - offset))
+                digest.update(struct.pack("<QQ", offset, len(chunk)))
+                digest.update(chunk)
+        return digest.hexdigest()
+
     identity: list[dict[str, int | str]] = []
     config_path = root / "config.json"
     if config_path.is_file():
@@ -163,13 +182,18 @@ def build_model_fingerprint(
         except OSError:
             identity.append({"file": shard.name, "missing": 1})
             continue
-        # Full shard hashing would reread a frontier checkpoint at every boot. Names, byte sizes,
-        # and nanosecond mtimes are the same cheap source identity used by checkpoint conversion.
+        # Full shard hashing would reread a frontier checkpoint at every boot. File identity,
+        # change time, and fixed content samples still reject normal same-size/mtime deployment
+        # replacements without pulling hundreds of GiB through the page cache.
         identity.append(
             {
                 "file": shard.name,
                 "size": stat.st_size,
                 "mtime_ns": stat.st_mtime_ns,
+                "ctime_ns": stat.st_ctime_ns,
+                "device": stat.st_dev,
+                "inode": stat.st_ino,
+                "sample_sha256": shard_sample_hash(shard, stat.st_size),
             }
         )
     page_layout = [
@@ -288,8 +312,14 @@ class ParkStore:
         ).expanduser()
         if mode == "ssd":
             directory /= f"tp-{config.tp_info.rank:04d}-of-{config.tp_info.size:04d}"
+        # Engine weight loading resolves Hub ids internally but intentionally leaves the public
+        # model id in config. Resolve it again from the local cache so a new Hub revision gets a
+        # different snapshot path and cannot reuse the previous revision's persistent KV.
+        from freetoken.utils.hf import download_hf_weight
+
+        resolved_model_path = download_hf_weight(config.model_path)
         fingerprint = build_model_fingerprint(
-            model_path=config.model_path,
+            model_path=resolved_model_path,
             page_size=config.page_size,
             tp_rank=config.tp_info.rank,
             tp_size=config.tp_info.size,
@@ -1033,7 +1063,17 @@ class ParkStore:
             if doc.get("version") != _VERSION or doc.get("fingerprint") != self.fingerprint:
                 raise ValueError("manifest version/fingerprint mismatch")
             for row in doc.get("entries", []):
-                paths.append((self.ssd_dir / str(row["file"]), int(row["last_used_ns"])))
+                filename = str(row["file"])
+                candidate = Path(filename)
+                stem = candidate.stem
+                if (
+                    candidate.name != filename
+                    or candidate.suffix != ".park"
+                    or len(stem) != 32
+                    or any(ch not in "0123456789abcdef" for ch in stem)
+                ):
+                    raise ValueError("manifest entry escapes the KV parking directory")
+                paths.append((self.ssd_dir / filename, int(row["last_used_ns"])))
         except Exception:
             paths = [(path, None) for path in sorted(self.ssd_dir.glob("*.park"))]
         seen: set[Path] = set()
