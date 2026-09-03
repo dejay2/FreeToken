@@ -128,7 +128,7 @@ Choose `--kv-park off|ram|ssd`, `FREETOKEN_KV_PARK`, or the Windows launcher's `
 | `--kv-park-ram-gib` | `FREETOKEN_KV_PARK_RAM_GIB` / `-KVParkRAMGiB` | `2` | LRU budget for full entries in page-locked host RAM. |
 | `--kv-park-ssd-dir` | `FREETOKEN_KV_PARK_SSD_DIR` / `-KVParkSSDDir` | `~/.cache/freetoken/kv-park` | Persistent SSD root; tensor-parallel ranks use separate subdirectories. |
 | `--kv-park-ssd-gib` | `FREETOKEN_KV_PARK_SSD_GIB` / `-KVParkSSDGiB` | `32` | On-disk LRU budget per tensor-parallel rank. |
-| `--kv-park-window-mib` | `FREETOKEN_KV_PARK_WINDOW_MIB` / `-KVParkWindowMiB` | `256` | Size of each of two page-locked SSD windows: one writer and one checksum/restore reader (512 MiB total by default). |
+| `--kv-park-window-mib` | `FREETOKEN_KV_PARK_WINDOW_MIB` / `-KVParkWindowMiB` | `256` | Size of each of two shared page-locked SSD windows; restore alternates both to overlap disk reads with GPU copies (512 MiB total by default). |
 
 `ram` retains exact QSA K/V, compressed-index, FP8-scale (when enabled), GDN and PLE sibling-state
 bytes until its RAM LRU drops them. A single bounded background worker performs the copy/write;
@@ -139,10 +139,11 @@ A full worker queue falls back to ordinary cache eviction instead of blocking re
 atomic manifest. Files survive a server restart; a missing or invalid manifest is rebuilt by
 scanning valid headers, and incomplete temp files left by dead writers are removed before new
 writes begin. The persistent fingerprint pins one Hub snapshot before model loading and covers the
-active safetensors or FTW index and referenced shards. Checksum verification and restore use the
-dedicated bounded read window, while later manifest work may finish after the source GPU storage is
-released. Each tensor-parallel rank has its own files, and ranks agree on the reusable length and
-restore result before installing a parked prefix in the normal hybrid radix cache.
+active safetensors or FTW index and referenced shards. One payload pass both verifies the checksum
+and feeds restore through the two alternating windows, while later manifest work may finish after
+the source GPU storage is released. Each tensor-parallel rank has its own files, and ranks agree
+on the reusable length and restore result before installing a parked prefix in the normal hybrid
+radix cache.
 
 Both stores compare the full token IDs after their rolling content hash, so a collision or stale
 checkpoint/layout entry is a miss, not incorrect output. The Windows launcher always passes the

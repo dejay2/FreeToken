@@ -9,8 +9,9 @@ pages and inserts the prefix into the unchanged hybrid radix tree.
 The SSD format uses a versioned 4-KiB header, verbatim int32 token ids, a SHA-256 payload digest,
 and a 4-KiB-aligned payload. Every read validates the model/layout fingerprint, token ids, and
 payload, so stale or damaged files and rolling-hash collisions become misses rather than numerics
-changes. Two bounded pinned windows have fixed roles: one serves the background writer and one
-serves checksum/restore reads. The file is the source of truth; no full SSD entry remains in RAM.
+changes. Restore alternates two bounded pinned windows so disk read N+1 overlaps H2D copy N; the
+background writer yields those shared windows while a restore is active. The file is the source of
+truth; no full SSD entry remains in RAM.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Full, Queue
-from threading import Event, RLock, Thread
+from threading import Event, Lock, RLock, Thread
 from typing import Iterable, Sequence
 
 import torch
@@ -330,6 +331,7 @@ class ParkStore:
         self._last_restore_ms = 0.0
         self._disabled = False
         self._lock = RLock()
+        self._window_lock = Lock()
         self._stream = None
         self._windows: tuple[torch.Tensor, torch.Tensor] | None = None
         self._save_queue: Queue[PendingPark | None] | None = None
@@ -593,40 +595,6 @@ class ParkStore:
             # ordinary reader is slower/cacheable but preserves correctness and bootability.
             return None
 
-    def _verify_payload_checksum(
-        self, entry: ParkedEntry, payload_offset: int
-    ) -> None:
-        assert entry.path is not None and self._windows is not None
-        expected = entry.payload_sha256
-        if expected is None:
-            raise ParkEntryRejected(f"KV park payload checksum missing: {entry.path}")
-        digest = hashlib.sha256()
-        reader = self._unbuffered_reader(entry.path)
-        handle = None if reader is not None else entry.path.open("rb", buffering=0)
-        try:
-            if handle is not None:
-                handle.seek(payload_offset)
-            copied = 0
-            while copied < entry.payload_bytes:
-                length = min(self.pinned_window_bytes, entry.payload_bytes - copied)
-                window = self._windows[1]
-                raw = memoryview(window[:length].numpy()).cast("B")
-                if reader is not None:
-                    got = reader.read_into(raw, payload_offset + copied, length)
-                else:
-                    got = handle.readinto(raw)
-                if got != length:
-                    raise ParkEntryRejected(f"short KV park payload read: {entry.path}")
-                digest.update(raw)
-                copied += length
-        finally:
-            if reader is not None:
-                reader.close()
-            if handle is not None:
-                handle.close()
-        if digest.hexdigest() != expected:
-            raise ParkEntryRejected(f"KV park payload checksum mismatch: {entry.path}")
-
     def _write_ssd(
         self,
         *,
@@ -653,26 +621,26 @@ class ParkStore:
                 handle.write(header)
                 handle.write(memoryview(tokens.numpy()).cast("B"))
                 handle.write(bytes(payload_offset - _HEADER_BYTES - _tensor_nbytes(tokens)))
-                for chunk, offset in enumerate(
-                    range(0, payload_bytes, self.pinned_window_bytes)
-                ):
-                    # Window 0 belongs to the writer; restore/checksum use window 1. Keeping the
-                    # roles disjoint lets the scheduler restore while the worker writes.
-                    window = self._windows[0]
-                    length = min(self.pinned_window_bytes, payload_bytes - offset)
-                    if self._stream is None:
-                        self._copy_span_to_window(views, offset, length, window)
-                    else:
-                        current = torch.cuda.current_stream(self.kv_pool.device)
-                        self._stream.wait_stream(current)
-                        with torch.cuda.stream(self._stream):
+                for offset in range(0, payload_bytes, self.pinned_window_bytes):
+                    # A restore owns both windows for its complete double-buffered pass. The writer
+                    # takes one window for one chunk at a time, so a waiting restore is delayed by at
+                    # most one bounded D2H-plus-write span rather than a multi-GiB file.
+                    with self._window_lock:
+                        window = self._windows[0]
+                        length = min(self.pinned_window_bytes, payload_bytes - offset)
+                        if self._stream is None:
                             self._copy_span_to_window(views, offset, length, window)
-                        self._stream.synchronize()
-                    if offset + length == payload_bytes and on_source_copied is not None:
-                        on_source_copied()
-                    raw = memoryview(window[:length].numpy()).cast("B")
-                    payload_digest.update(raw)
-                    handle.write(raw)
+                        else:
+                            current = torch.cuda.current_stream(self.kv_pool.device)
+                            self._stream.wait_stream(current)
+                            with torch.cuda.stream(self._stream):
+                                self._copy_span_to_window(views, offset, length, window)
+                            self._stream.synchronize()
+                        if offset + length == payload_bytes and on_source_copied is not None:
+                            on_source_copied()
+                        raw = memoryview(window[:length].numpy()).cast("B")
+                        payload_digest.update(raw)
+                        handle.write(raw)
                 checksum = payload_digest.hexdigest()
                 handle.seek(0)
                 handle.write(
@@ -913,6 +881,35 @@ class ParkStore:
             self._misses += 1
             return None
 
+    @staticmethod
+    def _copy_restored_chunk(
+        window: torch.Tensor,
+        chunk_offset: int,
+        chunk_length: int,
+        source_offset: int,
+        length: int,
+        views: Sequence[torch.Tensor],
+    ) -> bool:
+        restore_start = max(chunk_offset, source_offset)
+        restore_stop = min(chunk_offset + chunk_length, source_offset + length)
+        if restore_start >= restore_stop:
+            return False
+        window_offset = restore_start - chunk_offset
+        restore_length = restore_stop - restore_start
+        ParkStore._copy_window_to_span(
+            window[window_offset : window_offset + restore_length],
+            restore_start - source_offset,
+            restore_length,
+            views,
+        )
+        return True
+
+    @staticmethod
+    def _expected_payload_checksum(entry: ParkedEntry) -> str:
+        if entry.payload_sha256 is None:
+            raise ParkEntryRejected(f"KV park payload checksum missing: {entry.path}")
+        return entry.payload_sha256
+
     def _read_payload_cpu(
         self,
         entry: ParkedEntry,
@@ -922,19 +919,35 @@ class ParkStore:
         length: int,
     ) -> None:
         assert entry.path is not None and self._windows is not None
-        with entry.path.open("rb", buffering=0) as handle:
-            handle.seek(payload_offset + source_offset)
-            copied = 0
-            chunk = 0
-            while copied < length:
-                chunk_length = min(self.pinned_window_bytes, length - copied)
-                window = self._windows[1]
-                got = handle.readinto(memoryview(window[:chunk_length].numpy()).cast("B"))
-                if got != chunk_length:
-                    raise ParkEntryRejected(f"short KV park payload read: {entry.path}")
-                self._copy_window_to_span(window, copied, chunk_length, views)
-                copied += chunk_length
-                chunk += 1
+        expected = self._expected_payload_checksum(entry)
+        digest = hashlib.sha256()
+        with self._window_lock:
+            with entry.path.open("rb", buffering=0) as handle:
+                handle.seek(payload_offset)
+                for chunk, offset in enumerate(
+                    range(0, entry.payload_bytes, self.pinned_window_bytes)
+                ):
+                    chunk_length = min(
+                        self.pinned_window_bytes, entry.payload_bytes - offset
+                    )
+                    window = self._windows[chunk % len(self._windows)]
+                    raw = memoryview(window[:chunk_length].numpy()).cast("B")
+                    got = handle.readinto(raw)
+                    if got != chunk_length:
+                        raise ParkEntryRejected(
+                            f"short KV park payload read: {entry.path}"
+                        )
+                    digest.update(raw)
+                    self._copy_restored_chunk(
+                        window,
+                        offset,
+                        chunk_length,
+                        source_offset,
+                        length,
+                        views,
+                    )
+        if digest.hexdigest() != expected:
+            raise ParkEntryRejected(f"KV park payload checksum mismatch: {entry.path}")
 
     def _read_payload_cuda(
         self,
@@ -945,46 +958,67 @@ class ParkStore:
         length: int,
     ) -> None:
         assert entry.path is not None and self._windows is not None and self._stream is not None
-        reader = self._unbuffered_reader(entry.path)
-        try:
-            handle = None if reader is not None else entry.path.open("rb", buffering=0)
-            if handle is not None:
-                handle.seek(payload_offset + source_offset)
-            events: list[torch.cuda.Event | None] = [None, None]
-            copied = 0
-            chunk = 0
-            while copied < length:
-                index = 1
-                event = events[index]
-                if event is not None:
-                    event.synchronize()
-                chunk_length = min(self.pinned_window_bytes, length - copied)
-                window = self._windows[index]
+        expected = self._expected_payload_checksum(entry)
+        digest = hashlib.sha256()
+        reader = None
+        handle = None
+        with self._window_lock:
+            try:
+                reader = self._unbuffered_reader(entry.path)
+                handle = None if reader is not None else entry.path.open("rb", buffering=0)
+                if handle is not None:
+                    handle.seek(payload_offset)
+                events: list[torch.cuda.Event | None] = [None] * len(self._windows)
+                for chunk, offset in enumerate(
+                    range(0, entry.payload_bytes, self.pinned_window_bytes)
+                ):
+                    index = chunk % len(self._windows)
+                    event = events[index]
+                    if event is not None:
+                        # Only wait when this tray is about to be reused. Reading into the other
+                        # tray meanwhile overlaps disk block N+1 with H2D block N, matching M1.
+                        event.synchronize()
+                    chunk_length = min(
+                        self.pinned_window_bytes, entry.payload_bytes - offset
+                    )
+                    window = self._windows[index]
+                    raw = memoryview(window[:chunk_length].numpy()).cast("B")
+                    if reader is not None:
+                        got = reader.read_into(
+                            raw,
+                            payload_offset + offset,
+                            chunk_length,
+                        )
+                    else:
+                        got = handle.readinto(raw)
+                    if got != chunk_length:
+                        raise ParkEntryRejected(
+                            f"short KV park payload read: {entry.path}"
+                        )
+                    digest.update(raw)
+                    with torch.cuda.stream(self._stream):
+                        copied = self._copy_restored_chunk(
+                            window,
+                            offset,
+                            chunk_length,
+                            source_offset,
+                            length,
+                            views,
+                        )
+                        if copied:
+                            done = torch.cuda.Event(enable_timing=False)
+                            done.record(self._stream)
+                            events[index] = done
+                        else:
+                            events[index] = None
+                self._stream.synchronize()
+            finally:
                 if reader is not None:
-                    got = reader.read_into(
-                        memoryview(window[:chunk_length].numpy()).cast("B"),
-                        payload_offset + source_offset + copied,
-                        chunk_length,
-                    )
-                else:
-                    got = handle.readinto(
-                        memoryview(window[:chunk_length].numpy()).cast("B")
-                    )
-                if got != chunk_length:
-                    raise ParkEntryRejected(f"short KV park payload read: {entry.path}")
-                with torch.cuda.stream(self._stream):
-                    self._copy_window_to_span(window, copied, chunk_length, views)
-                    done = torch.cuda.Event(enable_timing=False)
-                    done.record(self._stream)
-                    events[index] = done
-                copied += chunk_length
-                chunk += 1
-            self._stream.synchronize()
-        finally:
-            if reader is not None:
-                reader.close()
-            if "handle" in locals() and handle is not None:
-                handle.close()
+                    reader.close()
+                if handle is not None:
+                    handle.close()
+        if digest.hexdigest() != expected:
+            raise ParkEntryRejected(f"KV park payload checksum mismatch: {entry.path}")
 
     def restore(
         self,
@@ -1033,7 +1067,6 @@ class ParkStore:
                     if not torch.equal(disk_tokens, entry.token_ids):
                         raise ParkEntryRejected("SSD parked token verification failed")
                     payload_offset = int(meta["payload_offset"])
-                    self._verify_payload_checksum(entry, payload_offset)
                     if self._stream is None:
                         self._read_payload_cpu(
                             entry, views, payload_offset, source_offset, suffix_bytes

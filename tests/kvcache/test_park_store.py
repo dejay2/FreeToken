@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 from pathlib import Path
@@ -727,7 +728,108 @@ def test_ssd_startup_removes_only_dead_writer_temp_files(tmp_path: Path, monkeyp
         store.close()
 
 
-def test_ssd_payload_checksum_rejects_corruption_before_restore(tmp_path: Path):
+def _record_fake_cuda_restore_io(monkeypatch, store: ParkStore, entry):
+    assert entry.path is not None and store._windows is not None
+    file_bytes = entry.path.read_bytes()
+    reads: list[tuple[int, int]] = []
+    window_indices: list[int] = []
+    window_ptrs = [int(window.data_ptr()) for window in store._windows]
+
+    class FakeReader:
+        def read_into(self, buffer, offset, length):
+            ptr = int(torch.frombuffer(buffer, dtype=torch.uint8).data_ptr())
+            window_indices.append(window_ptrs.index(ptr))
+            chunk = file_bytes[offset : offset + length]
+            buffer[: len(chunk)] = chunk
+            reads.append((offset, len(chunk)))
+            return len(chunk)
+
+        def close(self):
+            pass
+
+    class FakeEvent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def record(self, _stream):
+            pass
+
+        def synchronize(self):
+            pass
+
+    class FakeStream:
+        def synchronize(self):
+            pass
+
+    store.pinned_window_bytes = 64
+    store._stream = FakeStream()
+    monkeypatch.setattr(store, "_unbuffered_reader", lambda _path: FakeReader())
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: contextlib.nullcontext())
+    return reads, window_indices
+
+
+def test_ssd_restore_reads_each_payload_block_once_while_checking_integrity(
+    tmp_path: Path, monkeypatch
+):
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    source_pages = torch.tensor([0, 4], dtype=torch.int32)
+    source_slot, target_slot = state_pool.alloc(2)
+    kv_expected, state_expected = _fill_entry(kv_pool, state_pool, source_pages, source_slot)
+    tokens = torch.arange(8, dtype=torch.int32)
+    store = _store("ssd", tmp_path, kv_pool, state_pool)
+    assert store.save(tokens, source_pages, source_slot)
+    entry = store.lookup(tokens)
+    assert entry is not None and entry.path is not None
+    payload_offset = int(store._parse_header(entry.path)["payload_offset"])
+    reads, _window_indices = _record_fake_cuda_restore_io(monkeypatch, store, entry)
+
+    try:
+        store.restore(
+            entry,
+            torch.tensor([8], dtype=torch.int32),
+            target_slot,
+            page_offset=1,
+        )
+        expected_reads = [
+            (payload_offset + offset, min(64, entry.payload_bytes - offset))
+            for offset in range(0, entry.payload_bytes, 64)
+        ]
+        assert reads == expected_reads
+        views_per_page = len(kv_pool.page_byte_views(0))
+        _assert_entry_equal(
+            kv_pool,
+            state_pool,
+            torch.tensor([8], dtype=torch.int32),
+            target_slot,
+            kv_expected[views_per_page:],
+            state_expected,
+        )
+    finally:
+        store.close()
+
+
+def test_ssd_cuda_restore_alternates_both_pinned_windows(tmp_path: Path, monkeypatch):
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    source_pages = torch.tensor([0, 4], dtype=torch.int32)
+    source_slot, target_slot = state_pool.alloc(2)
+    _fill_entry(kv_pool, state_pool, source_pages, source_slot)
+    tokens = torch.arange(8, dtype=torch.int32)
+    store = _store("ssd", tmp_path, kv_pool, state_pool)
+    assert store.save(tokens, source_pages, source_slot)
+    entry = store.lookup(tokens)
+    assert entry is not None
+    _reads, window_indices = _record_fake_cuda_restore_io(monkeypatch, store, entry)
+
+    try:
+        store.restore(entry, torch.tensor([8, 12], dtype=torch.int32), target_slot)
+        assert len(window_indices) >= 4
+        assert window_indices == [index % 2 for index in range(len(window_indices))]
+    finally:
+        store.close()
+
+
+def test_ssd_payload_checksum_rejects_corruption_during_restore(tmp_path: Path):
     kv_pool, state_pool = _qsa_pool(), _state_pool()
     source_pages = torch.tensor([0, 4], dtype=torch.int32)
     source_slot, target_slot = state_pool.alloc(2)
