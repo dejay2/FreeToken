@@ -102,6 +102,105 @@ def test_bf16_default_keeps_the_existing_pool_layout():
     assert pool.v_scale(1) is None
 
 
+def test_bf16_default_keeps_pre_fp8_allocations_and_launch_signature(monkeypatch):
+    import freetoken.kernel.triton.qsa.attend as attend
+
+    allocations = []
+    original_empty = torch.empty
+    original_zeros = torch.zeros
+
+    def record(kind, factory, *size, **kwargs):
+        shape = tuple(size[0]) if len(size) == 1 and isinstance(size[0], (tuple, list)) else tuple(size)
+        allocations.append((kind, shape, kwargs.get("dtype"), torch.device(kwargs["device"])))
+        return factory(*size, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", lambda *size, **kwargs: record(
+        "empty", original_empty, *size, **kwargs
+    ))
+    monkeypatch.setattr(torch, "zeros", lambda *size, **kwargs: record(
+        "zeros", original_zeros, *size, **kwargs
+    ))
+
+    pool = _pool()
+
+    assert allocations == [
+        ("empty", (2, 4, 4, 64, 2, 64), torch.bfloat16, DEV),
+        ("zeros", (4, 68, 32), torch.bfloat16, DEV),
+        ("zeros", (4, 4, 4, 32), torch.bfloat16, DEV),
+        ("zeros", (4, 4, 4, 3), torch.int64, DEV),
+    ]
+    assert pool.k_scale(1) is None
+    assert pool.v_scale(1) is None
+    monkeypatch.setattr(torch, "empty", original_empty)
+    monkeypatch.setattr(torch, "zeros", original_zeros)
+
+    class LaunchRecorder:
+        def __getitem__(self, grid):
+            self.grid = grid
+            return self
+
+        def __call__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    launch = LaunchRecorder()
+    monkeypatch.setattr(attend, "_qsa_sparse_paged_gqa_splitk_kernel", launch)
+    q = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    k_cache = torch.empty((1, 64, 2, 16), dtype=torch.bfloat16)
+    v_cache = torch.empty_like(k_cache)
+    logical_indices = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
+    block_table = torch.tensor([[0]], dtype=torch.int32)
+    token_to_req = torch.tensor([0], dtype=torch.int32)
+    out = torch.empty_like(q)
+
+    assert attend.qsa_sparse_paged_attention(
+        q, k_cache, v_cache, logical_indices, block_table, token_to_req, out
+    ) is out
+    assert launch.grid == (1, 2, 1)
+    assert tuple(map(id, launch.args[:9])) == tuple(map(id, (
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        out,
+        out,
+        out,
+    )))
+    assert launch.args[9:] == (
+        q.stride(0),
+        q.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        logical_indices.stride(0),
+        block_table.stride(0),
+        out.stride(0),
+        out.stride(1),
+        q.shape[0],
+        k_cache.shape[0],
+        block_table.shape[0],
+    )
+    assert launch.kwargs == {
+        "TOPK": 4,
+        "PAGE_SIZE": 64,
+        "PAGE_TABLE_WIDTH": 1,
+        "GROUP_SIZE": 2,
+        "HEAD_DIM": 16,
+        "NUM_QUERY_HEADS": 4,
+        "NUM_SPLITS": 1,
+        "NUM_TILES": 1,
+        "BLOCK_M": 2,
+        "BLOCK_N": 16,
+        "num_warps": 4,
+        "num_stages": 2,
+    }
+
+
 def test_fp8_changes_only_main_kv_and_allocates_per_token_head_scales():
     pool = _pool(torch.float8_e4m3fn)
 

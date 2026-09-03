@@ -212,6 +212,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._step_scratch_retired: list[torch.Tensor] | None = None
         self.step_seq_len_source: torch.Tensor | None = None
         self.capture_bs: List[int] = []
+        if self.kvcache.kv_dtype is torch.float8_e4m3fn:
+            # Select the scaled path once at boot. BF16 keeps the pre-FP8 method and kernel call
+            # unchanged, including its argument list and lack of scale accessors.
+            self.qsa_forward = self._qsa_forward_fp8
 
     @staticmethod
     def _qsa_group(config: ModelConfig):
@@ -461,6 +465,45 @@ class QSASparseAttnBackend(BaseAttnBackend):
             if isinstance(capture, dict):
                 capture[slot] = self._mtp_last_selected_blocks.detach().clone()
         return qsa_sparse_paged_attention(
+            q,
+            self.kvcache.k_cache(layer_id),
+            self.kvcache.v_cache(layer_id),
+            indices,
+            md.block_table,
+            md.token_to_req,
+            torch.empty_like(q),
+        )
+
+    def _qsa_forward_fp8(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        index,
+        layer_id: int,
+        batch: Batch,
+    ) -> torch.Tensor:
+        from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention_fp8
+
+        md = batch.attn_metadata
+        assert isinstance(md, QSASparseMetadata)
+        slot = self._idx_slot[layer_id]
+        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        if md.block_table is None:
+            self._snapshot_decode(md, batch)
+        if slot == 0 or md.cmp_rows is None:
+            self._plan_index_writes(md, batch)
+
+        self._update_index_cache(index, md, slot)
+        saved = getattr(batch, "mtp_qsa_saved_blocks", None)
+        if isinstance(saved, dict) and slot in saved:
+            indices = self._expand_selected_blocks(saved[slot], md)
+        else:
+            indices = self._select(index, md, slot)
+            capture = getattr(batch, "mtp_qsa_capture_blocks", None)
+            if isinstance(capture, dict):
+                capture[slot] = self._mtp_last_selected_blocks.detach().clone()
+        return qsa_sparse_paged_attention_fp8(
             q,
             self.kvcache.k_cache(layer_id),
             self.kvcache.v_cache(layer_id),

@@ -76,7 +76,10 @@ def test_fp8_store_quantizes_each_token_head_and_scatters_its_scale():
 
 @requires_cuda
 def test_fp8_sparse_attention_dequantizes_scales_with_masking_and_split_k():
-    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+    from freetoken.kernel.triton.qsa import (
+        qsa_sparse_paged_attention,
+        qsa_sparse_paged_attention_fp8,
+    )
 
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(73)
@@ -102,7 +105,7 @@ def test_fp8_sparse_attention_dequantizes_scales_with_masking_and_split_k():
     expected = qsa_sparse_paged_attention(
         q, k, v, selected, block_table, token_to_req
     )
-    got = qsa_sparse_paged_attention(
+    got = qsa_sparse_paged_attention_fp8(
         q, k_fp8, v_fp8, selected, block_table, token_to_req,
         k_scale=k_scale, v_scale=v_scale,
     )
@@ -148,7 +151,7 @@ def test_fp8_qsa_backend_matches_its_bf16_dense_oracle():
 @requires_cuda
 def test_fp8_store_and_attention_replay_in_one_cuda_graph():
     """The startup-selected pointers and dtypes stay fixed across decode replays."""
-    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention_fp8
 
     config = parsed_config()
     fixture = Fixture(config, num_pages=8, kv_dtype=torch.float8_e4m3fn)
@@ -166,7 +169,7 @@ def test_fp8_store_and_attention_replay_in_one_cuda_graph():
 
     def run():
         pool.store_kv(k, v, out_loc, layer_id)
-        return qsa_sparse_paged_attention(
+        return qsa_sparse_paged_attention_fp8(
             q, pool.k_cache(layer_id), pool.v_cache(layer_id), selected,
             block_table, token_to_req, out,
             k_scale=pool.k_scale(layer_id), v_scale=pool.v_scale(layer_id),
