@@ -73,8 +73,11 @@ class ZmqPullQueue(Generic[T]):
     def decode(self, raw: bytes) -> T:
         return self.decoder(msgpack.unpackb(raw, raw=False))
 
+    def poll(self, timeout_ms: int) -> bool:
+        return self.socket.poll(timeout=timeout_ms) != 0
+
     def empty(self) -> bool:
-        return self.socket.poll(timeout=0) == 0
+        return not self.poll(0)
 
     def stop(self):
         self.socket.close()
@@ -143,8 +146,11 @@ class ZmqSubQueue(Generic[T]):
         event = self.socket.recv()
         return self.decoder(msgpack.unpackb(event, raw=False))
 
+    def poll(self, timeout_ms: int) -> bool:
+        return self.socket.poll(timeout=timeout_ms) != 0
+
     def empty(self) -> bool:
-        return self.socket.poll(timeout=0) == 0
+        return not self.poll(0)
 
     def stop(self):
         self.socket.close()

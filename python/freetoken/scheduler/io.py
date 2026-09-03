@@ -67,6 +67,16 @@ class SchedulerIOMixin:
     def run_when_idle(self):
         raise NotImplementedError("should be implemented")
 
+    def idle_poll_timeout_ms(self) -> int | None:
+        return None
+
+    def _wait_from_queue(self, queue, *, raw: bool = False):
+        while True:
+            self.run_when_idle()
+            timeout_ms = self.idle_poll_timeout_ms()
+            if timeout_ms is None or queue.poll(timeout_ms):
+                return queue.get_raw() if raw else queue.get()
+
     def offline_receive_msg(self, blocking: bool = False) -> List[BaseBackendMsg]:
         raise NotImplementedError("should be implemented")
 
@@ -79,8 +89,7 @@ class SchedulerIOMixin:
     def _recv_msg_single_rank(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
-            self.run_when_idle()
-            pending_msgs.append(self._recv_from_tokenizer.get())
+            pending_msgs.append(self._wait_from_queue(self._recv_from_tokenizer))
         while not self._recv_from_tokenizer.empty():
             pending_msgs.append(self._recv_from_tokenizer.get())
         return pending_msgs
@@ -88,8 +97,7 @@ class SchedulerIOMixin:
     def _recv_msg_multi_rank0(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
-            self.run_when_idle()
-            raw = self._recv_from_tokenizer.get_raw()
+            raw = self._wait_from_queue(self._recv_from_tokenizer, raw=True)
             self._send_into_ranks.put_raw(raw)
             pending_msgs.append(self._recv_from_tokenizer.decode(raw))
 
@@ -109,8 +117,7 @@ class SchedulerIOMixin:
     def _recv_msg_multi_rank1(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
-            self.run_when_idle()
-            pending_msgs.append(self._recv_from_rank0.get())
+            pending_msgs.append(self._wait_from_queue(self._recv_from_rank0))
 
         # ensure all ranks have the same number of raw messages
         dst_tensor = torch.tensor(-1)

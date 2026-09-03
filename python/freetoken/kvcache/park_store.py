@@ -21,9 +21,10 @@ import os
 import struct
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from threading import RLock
+from queue import Full, Queue
+from threading import Event, RLock, Thread
 from typing import Iterable, Sequence
 
 import torch
@@ -33,7 +34,7 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 _MAGIC = b"FTKVPARK"
-_VERSION = 1
+_VERSION = 2
 _HEADER_BYTES = 4096
 _ALIGNMENT = 4096
 _COPY_BYTES = 32 << 20
@@ -51,8 +52,31 @@ class ParkedEntry:
     payload_bytes: int
     total_bytes: int
     last_used_ns: int
+    payload_sha256: str | None = None
     path: Path | None = None
-    ram_tensors: tuple[torch.Tensor, ...] | None = None
+    ram_buffer: torch.Tensor | None = None
+
+
+@dataclass
+class PendingPark:
+    """One background save whose source pages stay owned until ``copy_done``."""
+
+    token_ids: torch.Tensor
+    page_bases: torch.Tensor
+    state_slot: int
+    source_ready: object | None = None
+    reserved_bytes: int = 0
+    copy_done: Event = field(default_factory=Event)
+    done: Event = field(default_factory=Event)
+    success: bool = False
+    error: Exception | None = None
+
+    def wait_copied(self) -> None:
+        self.copy_done.wait()
+
+    def wait(self) -> bool:
+        self.done.wait()
+        return self.success
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
@@ -98,37 +122,72 @@ def build_model_fingerprint(
     *,
     model_path: str,
     page_size: int,
+    tp_rank: int,
     tp_size: int,
     kv_pool,
     state_pool,
 ) -> str:
     """Stable digest of the checkpoint identity and every parked byte-layout dimension."""
     root = Path(model_path).expanduser().resolve()
-    index_candidates = sorted(root.glob("*.safetensors.index.json"))
-    identity_file = index_candidates[0] if index_candidates else root / "config.json"
-    identity_hash = "missing"
-    if identity_file.is_file():
+
+    def file_hash(path: Path) -> str:
         digest = hashlib.sha256()
-        with identity_file.open("rb") as handle:
+        with path.open("rb") as handle:
             while chunk := handle.read(1 << 20):
                 digest.update(chunk)
-        identity_hash = digest.hexdigest()
-    qsa_shape = tuple(int(v) for v in kv_pool._kv_buffer.shape)
-    cmp_shape = tuple(int(v) for v in kv_pool._cmp_k_buffer.shape)
-    state_shapes = [
+        return digest.hexdigest()
+
+    identity: list[dict[str, int | str]] = []
+    config_path = root / "config.json"
+    if config_path.is_file():
+        identity.append({"file": config_path.name, "sha256": file_hash(config_path)})
+    index_candidates = sorted(root.glob("*.safetensors.index.json"))
+    shard_paths: set[Path] = set()
+    for index_path in index_candidates:
+        identity.append({"file": index_path.name, "sha256": file_hash(index_path)})
+        try:
+            index_doc = json.loads(index_path.read_text(encoding="utf-8"))
+            shard_paths.update(
+                root / str(name)
+                for name in set(index_doc.get("weight_map", {}).values())
+            )
+        except Exception:
+            # The loader will report malformed checkpoint metadata. The fingerprint remains stable
+            # and distinct through the index file's own digest.
+            pass
+    if not index_candidates:
+        shard_paths.update(root.glob("*.safetensors"))
+    for shard in sorted(shard_paths):
+        try:
+            stat = shard.stat()
+        except OSError:
+            identity.append({"file": shard.name, "missing": 1})
+            continue
+        # Full shard hashing would reread a frontier checkpoint at every boot. Names, byte sizes,
+        # and nanosecond mtimes are the same cheap source identity used by checkpoint conversion.
+        identity.append(
+            {
+                "file": shard.name,
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+        )
+    page_layout = [
+        (tuple(int(v) for v in view.shape), str(view.dtype))
+        for view in kv_pool.page_byte_views(0)
+    ]
+    state_layout = [
         (tuple(int(v) for v in view.shape), str(view.dtype))
         for view in state_pool.slot_byte_views(state_pool.padding_slot)
     ]
     doc = {
         "checkpoint": str(root),
-        "checkpoint_index_sha256": identity_hash,
+        "checkpoint_identity": identity,
         "page_size": int(page_size),
         "index_ratio": int(kv_pool.index_ratio),
-        "kv_dtype": str(kv_pool.dtype),
-        "index_dtype": str(kv_pool._index_dtype),
-        "kv_shape": qsa_shape,
-        "cmp_shape": cmp_shape,
-        "state_shapes": state_shapes,
+        "page_layout": page_layout,
+        "state_layout": state_layout,
+        "tp_rank": int(tp_rank),
         "tp_size": int(tp_size),
     }
     return hashlib.sha256(
@@ -185,6 +244,10 @@ class ParkStore:
         self._lock = RLock()
         self._stream = None
         self._windows: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._save_queue: Queue[PendingPark | None] | None = None
+        self._worker: Thread | None = None
+        self._reserved_bytes = 0
+        self._closed = False
         try:
             if kv_pool.device.type == "cuda":
                 self._stream = torch.cuda.Stream(device=kv_pool.device)
@@ -195,6 +258,13 @@ class ParkStore:
                     self._allocate_window(self.pinned_window_bytes),
                 )
                 self._load_or_scan()
+            self._save_queue = Queue(maxsize=2)
+            self._worker = Thread(
+                target=self._worker_loop,
+                name=f"kv-park-{mode}",
+                daemon=True,
+            )
+            self._worker.start()
         except Exception as exc:
             self._disabled = True
             self._stream = None
@@ -213,12 +283,15 @@ class ParkStore:
             raise ValueError(f"--kv-park must be off, ram or ssd; got {mode!r}")
         if not isinstance(kv_pool, QSAKVCache) or state_pool is None:
             raise ValueError("--kv-park currently needs a QSA + GDN hybrid cache")
-        directory = str(
-            getattr(config, "kv_park_ssd_dir", "~/.cache/freetoken/kv-park")
-        )
+        directory = Path(
+            str(getattr(config, "kv_park_ssd_dir", "~/.cache/freetoken/kv-park"))
+        ).expanduser()
+        if mode == "ssd":
+            directory /= f"tp-{config.tp_info.rank:04d}-of-{config.tp_info.size:04d}"
         fingerprint = build_model_fingerprint(
             model_path=config.model_path,
             page_size=config.page_size,
+            tp_rank=config.tp_info.rank,
             tp_size=config.tp_info.size,
             kv_pool=kv_pool,
             state_pool=state_pool,
@@ -240,13 +313,9 @@ class ParkStore:
     def payload_bytes(self, token_count: int) -> int:
         if token_count < 0 or token_count % self.page_size:
             raise ValueError("park token_count must be page aligned")
-        page_zero = self.kv_pool.page_byte_views(0)
-        per_page = sum(_tensor_nbytes(view) for view in page_zero)
-        state = sum(
-            _tensor_nbytes(view)
-            for view in self.state_pool.slot_byte_views(self.state_pool.padding_slot)
-        )
-        return token_count // self.page_size * per_page + state
+        kv_per_token, _ = self.kv_pool.unit_bytes()
+        state = self.state_pool.bytes_per_slot()
+        return token_count * int(kv_per_token) + int(state)
 
     def storage_bytes(self, token_count: int) -> int:
         payload = self.payload_bytes(token_count)
@@ -280,27 +349,23 @@ class ParkStore:
         # Keep the parent allocation alive; a tensor slice owns its storage, including the slack.
         return window
 
-    def _copy_to_ram(self, views: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
-        host: list[torch.Tensor] = []
-        for view in views:
-            if view.device.type == "cuda":
-                from freetoken.kernel.pinned import alloc_pinned_tensor
+    def _copy_to_ram(self, views: Sequence[torch.Tensor]) -> torch.Tensor:
+        payload_bytes = sum(_tensor_nbytes(view) for view in views)
+        if self.kv_pool.device.type == "cuda":
+            from freetoken.kernel.pinned import alloc_pinned_tensor
 
-                out = alloc_pinned_tensor(*view.shape, dtype=view.dtype)
-            else:
-                out = torch.empty_like(view, device="cpu")
-            host.append(out)
+            host = alloc_pinned_tensor(payload_bytes, dtype=torch.uint8)
+        else:
+            host = torch.empty(payload_bytes, dtype=torch.uint8)
         if self._stream is None:
-            for source, target in zip(views, host, strict=True):
-                target.copy_(source)
+            self._copy_span_to_window(views, 0, payload_bytes, host)
         else:
             current = torch.cuda.current_stream(self.kv_pool.device)
             self._stream.wait_stream(current)
             with torch.cuda.stream(self._stream):
-                for source, target in zip(views, host, strict=True):
-                    target.copy_(source, non_blocking=True)
+                self._copy_span_to_window(views, 0, payload_bytes, host)
             self._stream.synchronize()
-        return tuple(host)
+        return host
 
     @staticmethod
     def _copy_span_to_window(
@@ -351,7 +416,13 @@ class ParkStore:
             raise RuntimeError(f"park destination ended {remaining} bytes short")
 
     def _header(
-        self, *, key: str, token_count: int, payload_bytes: int, payload_offset: int
+        self,
+        *,
+        key: str,
+        token_count: int,
+        payload_bytes: int,
+        payload_offset: int,
+        payload_sha256: str,
     ) -> bytes:
         meta = json.dumps(
             {
@@ -362,6 +433,7 @@ class ParkStore:
                 "page_size": self.page_size,
                 "payload_bytes": payload_bytes,
                 "payload_offset": payload_offset,
+                "payload_sha256": payload_sha256,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -390,6 +462,13 @@ class ParkStore:
         token_count = int(meta.get("token_count", 0))
         payload_bytes = int(meta.get("payload_bytes", -1))
         payload_offset = int(meta.get("payload_offset", -1))
+        payload_sha256 = meta.get("payload_sha256")
+        if (
+            not isinstance(payload_sha256, str)
+            or len(payload_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in payload_sha256)
+        ):
+            raise ParkEntryRejected(f"invalid KV park payload checksum: {path}")
         if token_count < self.min_tokens or token_count % self.page_size:
             raise ParkEntryRejected(f"invalid KV park token count: {path}")
         if payload_bytes != self.payload_bytes(token_count):
@@ -408,6 +487,55 @@ class ParkStore:
             raise ParkEntryRejected(f"short KV park token list: {path}")
         return torch.frombuffer(raw, dtype=torch.int32).clone()
 
+    @staticmethod
+    def _unbuffered_reader(path: Path):
+        if sys.platform != "win32":
+            return None
+        from freetoken.moe import win_io
+
+        if not win_io.enabled():
+            return None
+        try:
+            return win_io.UnbufferedReader(str(path))
+        except OSError:
+            # Network, compressed, and unusual Windows volumes can refuse NO_BUFFERING. The
+            # ordinary reader is slower/cacheable but preserves correctness and bootability.
+            return None
+
+    def _verify_payload_checksum(
+        self, entry: ParkedEntry, payload_offset: int
+    ) -> None:
+        assert entry.path is not None and self._windows is not None
+        expected = entry.payload_sha256
+        if expected is None:
+            raise ParkEntryRejected(f"KV park payload checksum missing: {entry.path}")
+        digest = hashlib.sha256()
+        reader = self._unbuffered_reader(entry.path)
+        handle = None if reader is not None else entry.path.open("rb", buffering=0)
+        try:
+            if handle is not None:
+                handle.seek(payload_offset)
+            copied = 0
+            while copied < entry.payload_bytes:
+                length = min(self.pinned_window_bytes, entry.payload_bytes - copied)
+                window = self._windows[1]
+                raw = memoryview(window[:length].numpy()).cast("B")
+                if reader is not None:
+                    got = reader.read_into(raw, payload_offset + copied, length)
+                else:
+                    got = handle.readinto(raw)
+                if got != length:
+                    raise ParkEntryRejected(f"short KV park payload read: {entry.path}")
+                digest.update(raw)
+                copied += length
+        finally:
+            if reader is not None:
+                reader.close()
+            if handle is not None:
+                handle.close()
+        if digest.hexdigest() != expected:
+            raise ParkEntryRejected(f"KV park payload checksum mismatch: {entry.path}")
+
     def _write_ssd(
         self,
         *,
@@ -415,6 +543,7 @@ class ParkStore:
         tokens: torch.Tensor,
         views: Sequence[torch.Tensor],
         payload_bytes: int,
+        on_source_copied=None,
     ) -> ParkedEntry:
         assert self._windows is not None
         payload_offset = _align_up(_HEADER_BYTES + _tensor_nbytes(tokens))
@@ -425,16 +554,20 @@ class ParkStore:
             token_count=len(tokens),
             payload_bytes=payload_bytes,
             payload_offset=payload_offset,
+            payload_sha256="0" * 64,
         )
+        payload_digest = hashlib.sha256()
         try:
-            with temp.open("wb", buffering=0) as handle:
+            with temp.open("w+b", buffering=0) as handle:
                 handle.write(header)
                 handle.write(memoryview(tokens.numpy()).cast("B"))
                 handle.write(bytes(payload_offset - _HEADER_BYTES - _tensor_nbytes(tokens)))
                 for chunk, offset in enumerate(
                     range(0, payload_bytes, self.pinned_window_bytes)
                 ):
-                    window = self._windows[chunk % 2]
+                    # Window 0 belongs to the writer; restore/checksum use window 1. Keeping the
+                    # roles disjoint lets the scheduler restore while the worker writes.
+                    window = self._windows[0]
                     length = min(self.pinned_window_bytes, payload_bytes - offset)
                     if self._stream is None:
                         self._copy_span_to_window(views, offset, length, window)
@@ -444,13 +577,28 @@ class ParkStore:
                         with torch.cuda.stream(self._stream):
                             self._copy_span_to_window(views, offset, length, window)
                         self._stream.synchronize()
-                    handle.write(memoryview(window[:length].numpy()).cast("B"))
+                    if offset + length == payload_bytes and on_source_copied is not None:
+                        on_source_copied()
+                    raw = memoryview(window[:length].numpy()).cast("B")
+                    payload_digest.update(raw)
+                    handle.write(raw)
+                checksum = payload_digest.hexdigest()
+                handle.seek(0)
+                handle.write(
+                    self._header(
+                        key=key,
+                        token_count=len(tokens),
+                        payload_bytes=payload_bytes,
+                        payload_offset=payload_offset,
+                        payload_sha256=checksum,
+                    )
+                )
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp, final)
         finally:
             temp.unlink(missing_ok=True)
-        now = time.monotonic_ns()
+        now = time.time_ns()
         return ParkedEntry(
             key=key,
             token_ids=tokens,
@@ -458,72 +606,184 @@ class ParkStore:
             payload_bytes=payload_bytes,
             total_bytes=final.stat().st_size,
             last_used_ns=now,
+            payload_sha256=checksum,
             path=final,
         )
 
-    def save(
+    def offer(
         self, input_ids: torch.Tensor, page_bases: torch.Tensor, state_slot: int
-    ) -> bool:
-        """Copy one complete entry before its source pages/state are released.
-
-        Returns ``False`` when the entry is below the floor, exceeds its tier's whole budget, or
-        parking was disabled after an allocation/IO failure.  A duplicate key is a successful
-        no-op: the existing immutable copy remains the source of truth.
-        """
+    ) -> PendingPark | None:
+        """Queue a save without blocking the scheduler; ``None`` means fall back to eviction."""
         with self._lock:
-            if self._disabled:
-                return False
+            if self._disabled or self._closed or self._save_queue is None:
+                return None
             tokens = _tokens_cpu(input_ids)
             if len(tokens) < self.min_tokens or len(tokens) % self.page_size:
-                return False
-            bases = page_bases.detach().to(device="cpu", dtype=torch.int32).flatten()
+                return None
+            bases = page_bases.detach().to(device="cpu", dtype=torch.int32).flatten().clone()
             if len(bases) != len(tokens) // self.page_size:
                 raise ValueError(
                     f"park got {len(bases)} page bases for {len(tokens)} tokens"
                 )
-            key = rolling_page_keys(tokens, self.page_size, self.fingerprint)[-1]
-            existing = self._entries.get(key)
-            if existing is not None:
-                if torch.equal(existing.token_ids, tokens):
-                    existing.last_used_ns = time.monotonic_ns()
-                    return True
-                self._drop_entry(key)
-            views = self._entry_views(bases, state_slot)
-            payload = sum(_tensor_nbytes(view) for view in views)
-            expected = self.payload_bytes(len(tokens))
-            if payload != expected:
-                raise RuntimeError(f"KV park payload {payload} != expected {expected}")
             needed = self.storage_bytes(len(tokens))
             budget = self.ram_budget_bytes if self.mode == "ram" else self.disk_budget_bytes
             if needed > budget:
-                return False
-            self._evict_to_fit(needed)
+                return None
+            key = rolling_page_keys(tokens, self.page_size, self.fingerprint)[-1]
+            existing = self._entries.get(key)
+            if existing is not None and torch.equal(existing.token_ids, tokens):
+                existing.last_used_ns = time.time_ns()
+                pending = PendingPark(tokens, bases, int(state_slot))
+                pending.success = True
+                pending.copy_done.set()
+                pending.done.set()
+                return pending
+            if self._save_queue.full():
+                return None
+            before = len(self._entries)
+            self._evict_to_fit(self._reserved_bytes + needed)
+            if self.mode == "ssd" and len(self._entries) != before:
+                self._write_manifest()
+            occupied = sum(entry.total_bytes for entry in self._entries.values())
+            if occupied + self._reserved_bytes + needed > budget:
+                return None
+            source_ready = None
+            if self._stream is not None:
+                source_ready = torch.cuda.Event(enable_timing=False)
+                source_ready.record(torch.cuda.current_stream(self.kv_pool.device))
+            pending = PendingPark(
+                tokens,
+                bases,
+                int(state_slot),
+                source_ready,
+                reserved_bytes=needed,
+            )
+            self._reserved_bytes += needed
             try:
-                if self.mode == "ram":
-                    tensors = self._copy_to_ram(views)
-                    entry = ParkedEntry(
-                        key=key,
-                        token_ids=tokens,
-                        token_count=len(tokens),
-                        payload_bytes=payload,
-                        total_bytes=needed,
-                        last_used_ns=time.monotonic_ns(),
-                        ram_tensors=tensors,
-                    )
-                else:
-                    entry = self._write_ssd(
-                        key=key, tokens=tokens, views=views, payload_bytes=payload
-                    )
+                self._save_queue.put_nowait(pending)
+            except Full:
+                self._reserved_bytes -= needed
+                return None
+            return pending
+
+    def _worker_loop(self) -> None:
+        assert self._save_queue is not None
+        if self.kv_pool.device.type == "cuda":
+            torch.cuda.set_device(self.kv_pool.device)
+        while True:
+            pending = self._save_queue.get()
+            try:
+                if pending is None:
+                    return
+                if pending.source_ready is not None:
+                    assert self._stream is not None
+                    self._stream.wait_event(pending.source_ready)
+                pending.success = self.save(
+                    pending.token_ids,
+                    pending.page_bases,
+                    pending.state_slot,
+                    _on_copied=pending.copy_done.set,
+                )
+            except Exception as exc:
+                pending.error = exc
+                logger.warning(f"KV parking background save failed: {exc!r}")
+            finally:
+                if pending is not None:
+                    # save() currently completes every D2H before returning. Source ownership may
+                    # move back to the allocators even when the later store operation failed.
+                    pending.copy_done.set()
+                    with self._lock:
+                        self._reserved_bytes -= pending.reserved_bytes
+                    pending.done.set()
+                self._save_queue.task_done()
+
+    def save(
+        self,
+        input_ids: torch.Tensor,
+        page_bases: torch.Tensor,
+        state_slot: int,
+        *,
+        _on_copied=None,
+    ) -> bool:
+        """Copy one complete entry before its source pages/state are released.
+
+        The potentially multi-second copy/write runs outside ``_lock`` so a worker can never
+        block the scheduler's next non-blocking offer or status read.
+        """
+        tokens = _tokens_cpu(input_ids)
+        if len(tokens) < self.min_tokens or len(tokens) % self.page_size:
+            if _on_copied is not None:
+                _on_copied()
+            return False
+        bases = page_bases.detach().to(device="cpu", dtype=torch.int32).flatten().clone()
+        if len(bases) != len(tokens) // self.page_size:
+            raise ValueError(
+                f"park got {len(bases)} page bases for {len(tokens)} tokens"
+            )
+        key = rolling_page_keys(tokens, self.page_size, self.fingerprint)[-1]
+        needed = self.storage_bytes(len(tokens))
+        budget = self.ram_budget_bytes if self.mode == "ram" else self.disk_budget_bytes
+        with self._lock:
+            if self._disabled:
+                if _on_copied is not None:
+                    _on_copied()
+                return False
+            existing = self._entries.get(key)
+            if existing is not None:
+                if torch.equal(existing.token_ids, tokens):
+                    existing.last_used_ns = time.time_ns()
+                    if _on_copied is not None:
+                        _on_copied()
+                    return True
+                self._drop_entry(key)
+            if needed > budget:
+                if _on_copied is not None:
+                    _on_copied()
+                return False
+        views = self._entry_views(bases, state_slot)
+        payload = sum(_tensor_nbytes(view) for view in views)
+        expected = self.payload_bytes(len(tokens))
+        if payload != expected:
+            raise RuntimeError(f"KV park payload {payload} != expected {expected}")
+        try:
+            if self.mode == "ram":
+                buffer = self._copy_to_ram(views)
+                if _on_copied is not None:
+                    _on_copied()
+                entry = ParkedEntry(
+                    key=key,
+                    token_ids=tokens,
+                    token_count=len(tokens),
+                    payload_bytes=payload,
+                    total_bytes=needed,
+                    last_used_ns=time.time_ns(),
+                    ram_buffer=buffer,
+                )
+            else:
+                entry = self._write_ssd(
+                    key=key,
+                    tokens=tokens,
+                    views=views,
+                    payload_bytes=payload,
+                    on_source_copied=_on_copied,
+                )
+                if _on_copied is not None:
+                    _on_copied()
+            with self._lock:
+                self._evict_to_fit(needed)
                 self._entries[key] = entry
                 if self.mode == "ssd":
                     self._write_manifest()
-                return True
-            except Exception as exc:
+            return True
+        except Exception as exc:
+            if _on_copied is not None:
+                _on_copied()
+            with self._lock:
                 self._disabled = True
-                logger.warning(
-                    f"KV parking disabled after {self.mode} save failed: {exc!r}"
-                )
-                return False
+            logger.warning(
+                f"KV parking disabled after {self.mode} save failed: {exc!r}"
+            )
+            return False
 
     def lookup(
         self,
@@ -548,7 +808,7 @@ class ParkStore:
                     self._drop_entry(key)
                     self._misses += 1
                     return None
-                entry.last_used_ns = time.monotonic_ns()
+                entry.last_used_ns = time.time_ns()
                 self._hits += 1
                 return entry
             self._misses += 1
@@ -569,7 +829,7 @@ class ParkStore:
             chunk = 0
             while copied < length:
                 chunk_length = min(self.pinned_window_bytes, length - copied)
-                window = self._windows[chunk % 2]
+                window = self._windows[1]
                 got = handle.readinto(memoryview(window[:chunk_length].numpy()).cast("B"))
                 if got != chunk_length:
                     raise ParkEntryRejected(f"short KV park payload read: {entry.path}")
@@ -586,12 +846,8 @@ class ParkStore:
         length: int,
     ) -> None:
         assert entry.path is not None and self._windows is not None and self._stream is not None
-        reader = None
+        reader = self._unbuffered_reader(entry.path)
         try:
-            if sys.platform == "win32":
-                from freetoken.moe.win_io import UnbufferedReader
-
-                reader = UnbufferedReader(str(entry.path))
             handle = None if reader is not None else entry.path.open("rb", buffering=0)
             if handle is not None:
                 handle.seek(payload_offset + source_offset)
@@ -599,7 +855,7 @@ class ParkStore:
             copied = 0
             chunk = 0
             while copied < length:
-                index = chunk % 2
+                index = 1
                 event = events[index]
                 if event is not None:
                     event.synchronize()
@@ -658,22 +914,17 @@ class ParkStore:
             if sum(_tensor_nbytes(view) for view in views) != suffix_bytes:
                 raise ParkEntryRejected("restore target layout does not match parked suffix")
             try:
-                if entry.ram_tensors is not None:
-                    page_view_count = len(per_page_views)
-                    page_end = total_pages * page_view_count
-                    sources = (
-                        entry.ram_tensors[page_offset * page_view_count : page_end]
-                        + entry.ram_tensors[page_end:]
-                    )
-                    if len(sources) != len(views):
-                        raise ParkEntryRejected("RAM parked view count changed")
+                if entry.ram_buffer is not None:
+                    if entry.ram_buffer.numel() != entry.payload_bytes:
+                        raise ParkEntryRejected("RAM parked payload size changed")
+                    source = entry.ram_buffer[
+                        source_offset : source_offset + suffix_bytes
+                    ]
                     if self._stream is None:
-                        for source, target in zip(sources, views, strict=True):
-                            target.copy_(source)
+                        self._copy_window_to_span(source, 0, suffix_bytes, views)
                     else:
                         with torch.cuda.stream(self._stream):
-                            for source, target in zip(sources, views, strict=True):
-                                target.copy_(source, non_blocking=True)
+                            self._copy_window_to_span(source, 0, suffix_bytes, views)
                         self._stream.synchronize()
                 else:
                     if entry.path is None:
@@ -683,6 +934,7 @@ class ParkStore:
                     if not torch.equal(disk_tokens, entry.token_ids):
                         raise ParkEntryRejected("SSD parked token verification failed")
                     payload_offset = int(meta["payload_offset"])
+                    self._verify_payload_checksum(entry, payload_offset)
                     if self._stream is None:
                         self._read_payload_cpu(
                             entry, views, payload_offset, source_offset, suffix_bytes
@@ -722,6 +974,7 @@ class ParkStore:
                     "file": entry.path.name,
                     "token_count": entry.token_count,
                     "payload_bytes": entry.payload_bytes,
+                    "payload_sha256": entry.payload_sha256,
                     "total_bytes": entry.total_bytes,
                     "last_used_ns": entry.last_used_ns,
                 }
@@ -760,6 +1013,7 @@ class ParkStore:
             payload_bytes=int(meta["payload_bytes"]),
             total_bytes=path.stat().st_size,
             last_used_ns=last_used_ns or path.stat().st_mtime_ns,
+            payload_sha256=str(meta["payload_sha256"]),
             path=path,
         )
 
@@ -808,7 +1062,20 @@ class ParkStore:
                 "disabled": self._disabled,
             }
 
+    def flush(self) -> None:
+        if self._save_queue is not None:
+            self._save_queue.join()
+
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        queue = self._save_queue
+        worker = self._worker
+        if queue is not None and worker is not None:
+            queue.join()
+            queue.put(None)
+            worker.join()
         with self._lock:
             if self.mode == "ssd":
                 self._write_manifest()

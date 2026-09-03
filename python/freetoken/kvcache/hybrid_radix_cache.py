@@ -153,6 +153,18 @@ class HybridRadixCache:
             cur = cur.parent
 
     # ---------------------------------------------------------------- eviction (dual)
+    def oldest_park_timestamp(self) -> int | None:
+        timestamps = [
+            node.timestamp
+            for node in self._leaves()
+            if (
+                node.ref_count == 0
+                and node.mamba_ref_count == 0
+                and node.mamba_value is not None
+            )
+        ]
+        return min(timestamps, default=None)
+
     def park_candidates(self) -> List[ParkCandidate]:
         """Unlocked, snapshot-bearing leaves in LRU order, with complete path contents.
 

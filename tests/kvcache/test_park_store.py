@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from freetoken.kvcache.linear_state_pool import LinearStatePool
-from freetoken.kvcache.park_store import ParkStore, rolling_page_keys
+from freetoken.kvcache.park_store import (
+    ParkEntryRejected,
+    ParkStore,
+    build_model_fingerprint,
+    rolling_page_keys,
+)
 from freetoken.kvcache.qsa_pool import QSAKVCache
 from freetoken.models.config import LinearGatedDeltaGroupConfig, SlotStateSpec
 
@@ -137,6 +144,95 @@ def _store(
     )
 
 
+def test_model_fingerprint_ignores_runtime_pool_capacity(tmp_path: Path):
+    state_pool = _state_pool()
+    small = build_model_fingerprint(
+        model_path=str(tmp_path),
+        page_size=4,
+        tp_rank=0,
+        tp_size=1,
+        kv_pool=_qsa_pool(6),
+        state_pool=state_pool,
+    )
+    large = build_model_fingerprint(
+        model_path=str(tmp_path),
+        page_size=4,
+        tp_rank=0,
+        tp_size=1,
+        kv_pool=_qsa_pool(8),
+        state_pool=state_pool,
+    )
+
+    assert small == large
+
+
+def test_model_fingerprint_tracks_referenced_shard_identity(tmp_path: Path):
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    shard.write_bytes(b"AAAA")
+    index = tmp_path / "model.safetensors.index.json"
+    index.write_text(
+        json.dumps({"weight_map": {"x": shard.name}}), encoding="utf-8"
+    )
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+
+    before = build_model_fingerprint(
+        model_path=str(tmp_path),
+        page_size=4,
+        tp_rank=0,
+        tp_size=1,
+        kv_pool=kv_pool,
+        state_pool=state_pool,
+    )
+    prior = shard.stat().st_mtime_ns
+    shard.write_bytes(b"BBBB")
+    shard.touch()
+    if shard.stat().st_mtime_ns == prior:
+        import os
+
+        os.utime(shard, ns=(prior + 1_000_000_000, prior + 1_000_000_000))
+    after = build_model_fingerprint(
+        model_path=str(tmp_path),
+        page_size=4,
+        tp_rank=0,
+        tp_size=1,
+        kv_pool=kv_pool,
+        state_pool=state_pool,
+    )
+
+    assert before != after
+
+
+def test_ssd_store_is_scoped_by_tensor_parallel_rank(tmp_path: Path):
+    from freetoken.distributed.info import DistributedInfo
+
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    base = tmp_path / "parks"
+
+    def config(rank):
+        return SimpleNamespace(
+            kv_park="ssd",
+            kv_park_ssd_dir=str(base),
+            kv_park_min_tokens=8,
+            kv_park_idle_ms=0,
+            kv_park_ram_gib=1,
+            kv_park_ssd_gib=1,
+            kv_park_window_mib=1,
+            model_path=str(tmp_path),
+            page_size=4,
+            tp_info=DistributedInfo(rank=rank, size=2),
+        )
+
+    rank0 = ParkStore.from_config(config(0), kv_pool, state_pool)
+    rank1 = ParkStore.from_config(config(1), kv_pool, state_pool)
+    try:
+        assert rank0.ssd_dir == base / "tp-0000-of-0002"
+        assert rank1.ssd_dir == base / "tp-0001-of-0002"
+        assert rank0.fingerprint != rank1.fingerprint
+    finally:
+        rank0.close()
+        rank1.close()
+
+
 def test_rolling_keys_are_prefix_chained_and_model_scoped():
     tokens = torch.arange(12, dtype=torch.int32)
     keys = rolling_page_keys(tokens, page_size=4, fingerprint="model-A")
@@ -146,6 +242,175 @@ def test_rolling_keys_are_prefix_chained_and_model_scoped():
     changed = tokens.clone()
     changed[1] += 100
     assert keys[0] != rolling_page_keys(changed, page_size=4, fingerprint="model-A")[0]
+
+
+def test_active_store_owns_one_bounded_worker_and_close_stops_it(tmp_path: Path):
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    before = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("kv-park-")
+    }
+
+    store = _store("ram", tmp_path, kv_pool, state_pool)
+
+    worker = store._worker
+    assert worker.name == "kv-park-ram"
+    assert worker.is_alive()
+    assert store._save_queue.maxsize == 2
+    current = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("kv-park-")
+    }
+    assert current - before == {worker.ident}
+
+    store.close()
+    assert not worker.is_alive()
+
+
+def test_offer_does_not_wait_for_an_inflight_device_copy(tmp_path: Path, monkeypatch):
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    slots = state_pool.alloc(2)
+    store = _store("ram", tmp_path, kv_pool, state_pool)
+    started = threading.Event()
+    release = threading.Event()
+    real_copy = store._copy_to_ram
+
+    def blocked_copy(views):
+        started.set()
+        release.wait()
+        return real_copy(views)
+
+    monkeypatch.setattr(store, "_copy_to_ram", blocked_copy)
+    first = store.offer(
+        torch.arange(8, dtype=torch.int32),
+        torch.tensor([0, 4], dtype=torch.int32),
+        slots[0],
+    )
+    assert first is not None and started.wait(timeout=1)
+
+    result = []
+    caller = threading.Thread(
+        target=lambda: result.append(
+            store.offer(
+                torch.arange(100, 108, dtype=torch.int32),
+                torch.tensor([8, 12], dtype=torch.int32),
+                slots[1],
+            )
+        )
+    )
+    caller.start()
+    caller.join(timeout=0.1)
+    try:
+        assert not caller.is_alive(), "offer blocked behind the worker's device copy"
+    finally:
+        release.set()
+        caller.join(timeout=1)
+        store.close()
+
+
+def test_async_ram_offers_respect_the_configured_byte_budget(
+    tmp_path: Path, monkeypatch
+):
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    pages = torch.tensor([0, 4], dtype=torch.int32)
+    slots = state_pool.alloc(2)
+    probe = _store("ram", tmp_path, kv_pool, state_pool)
+    one_entry = probe.storage_bytes(8)
+    probe.close()
+    store = _store(
+        "ram",
+        tmp_path,
+        kv_pool,
+        state_pool,
+        ram_budget_bytes=one_entry + 64,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    real_copy = store._copy_to_ram
+
+    def blocked_copy(views):
+        started.set()
+        release.wait()
+        return real_copy(views)
+
+    monkeypatch.setattr(store, "_copy_to_ram", blocked_copy)
+    first = store.offer(torch.arange(8, dtype=torch.int32), pages, slots[0])
+    assert first is not None and started.wait(timeout=1)
+    try:
+        assert (
+            store.offer(
+                torch.arange(100, 108, dtype=torch.int32), pages, slots[1]
+            )
+            is None
+        )
+    finally:
+        release.set()
+        first.wait()
+        store.close()
+
+
+def test_ssd_source_copy_completes_before_manifest_update(
+    tmp_path: Path, monkeypatch
+):
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    slot = state_pool.alloc(1)[0]
+    store = _store("ssd", tmp_path, kv_pool, state_pool)
+    manifest_started = threading.Event()
+    release = threading.Event()
+    real_manifest = store._write_manifest
+
+    def blocked_manifest():
+        manifest_started.set()
+        release.wait()
+        real_manifest()
+
+    monkeypatch.setattr(store, "_write_manifest", blocked_manifest)
+    pending = store.offer(
+        torch.arange(8, dtype=torch.int32),
+        torch.tensor([0, 4], dtype=torch.int32),
+        slot,
+    )
+    assert pending is not None and manifest_started.wait(timeout=1)
+    try:
+        assert pending.copy_done.is_set()
+    finally:
+        release.set()
+        pending.wait()
+        store.close()
+
+
+def test_payload_size_uses_independent_pool_accounting(tmp_path: Path, monkeypatch):
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    store = _store("ram", tmp_path, kv_pool, state_pool)
+    expected = 2 * kv_pool.unit_bytes()[0] * 4 + state_pool.bytes_per_slot()
+    monkeypatch.setattr(
+        kv_pool,
+        "page_byte_views",
+        lambda _page: (_ for _ in ()).throw(AssertionError("read byte views")),
+    )
+
+    assert store.payload_bytes(8) == expected
+    store.close()
+
+
+def test_ram_entry_uses_one_contiguous_host_buffer(tmp_path: Path):
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    pages = torch.tensor([0, 4], dtype=torch.int32)
+    slot = state_pool.alloc(1)[0]
+    _fill_entry(kv_pool, state_pool, pages, slot)
+    tokens = torch.arange(8, dtype=torch.int32)
+    store = _store("ram", tmp_path, kv_pool, state_pool)
+
+    assert store.save(tokens, pages, slot)
+    entry = store.lookup(tokens)
+
+    assert entry is not None
+    assert entry.ram_buffer is not None
+    assert entry.ram_buffer.dtype is torch.uint8
+    assert entry.ram_buffer.numel() == store.payload_bytes(len(tokens))
+    store.close()
 
 
 def test_ram_round_trip_preserves_qsa_and_all_linear_state_bytes(tmp_path: Path):
@@ -205,7 +470,81 @@ def test_ssd_round_trip_rebuilds_index_without_manifest(tmp_path: Path):
     )
     header = next(tmp_path.glob("*.park")).read_bytes()[:16]
     assert header.startswith(b"FTKVPARK")
-    assert json.loads((tmp_path / "park.json").read_text(encoding="utf-8"))["version"] == 1
+    assert json.loads((tmp_path / "park.json").read_text(encoding="utf-8"))["version"] == 2
+
+
+def test_ssd_reader_honors_unbuffered_gate_and_falls_back(
+    tmp_path: Path, monkeypatch
+):
+    import freetoken.kvcache.park_store as park_module
+    import freetoken.moe.win_io as win_io
+
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    store = _store("ssd", tmp_path, kv_pool, state_pool)
+    path = tmp_path / "probe.park"
+    path.write_bytes(b"")
+    calls = []
+    monkeypatch.setattr(park_module.sys, "platform", "win32")
+    monkeypatch.setattr(win_io, "enabled", lambda: False)
+    monkeypatch.setattr(
+        win_io,
+        "UnbufferedReader",
+        lambda *_args, **_kwargs: calls.append("open"),
+    )
+    assert store._unbuffered_reader(path) is None
+    assert calls == []
+
+    monkeypatch.setattr(win_io, "enabled", lambda: True)
+
+    def unsupported(*_args, **_kwargs):
+        calls.append("open")
+        raise OSError("volume refuses no-buffering")
+
+    monkeypatch.setattr(win_io, "UnbufferedReader", unsupported)
+    assert store._unbuffered_reader(path) is None
+    assert calls == ["open"]
+    store.close()
+
+
+def test_ssd_manifest_uses_restart_stable_wall_clock_lru(tmp_path: Path):
+    import time
+
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    pages = torch.tensor([0, 4], dtype=torch.int32)
+    slot = state_pool.alloc(1)[0]
+    _fill_entry(kv_pool, state_pool, pages, slot)
+    store = _store("ssd", tmp_path, kv_pool, state_pool)
+    before = time.time_ns()
+    assert store.save(torch.arange(8, dtype=torch.int32), pages, slot)
+    after = time.time_ns()
+    store.close()
+
+    manifest = json.loads((tmp_path / "park.json").read_text(encoding="utf-8"))
+    last_used = manifest["entries"][0]["last_used_ns"]
+    assert before <= last_used <= after
+
+
+def test_ssd_payload_checksum_rejects_corruption_before_restore(tmp_path: Path):
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    source_pages = torch.tensor([0, 4], dtype=torch.int32)
+    source_slot, target_slot = state_pool.alloc(2)
+    _fill_entry(kv_pool, state_pool, source_pages, source_slot)
+    tokens = torch.arange(8, dtype=torch.int32)
+    store = _store("ssd", tmp_path, kv_pool, state_pool)
+    assert store.save(tokens, source_pages, source_slot)
+    entry = store.lookup(tokens)
+    assert entry is not None and entry.path is not None
+    meta = store._parse_header(entry.path)
+    with entry.path.open("r+b") as handle:
+        handle.seek(int(meta["payload_offset"]) + 3)
+        original = handle.read(1)
+        handle.seek(-1, 1)
+        handle.write(bytes([original[0] ^ 0xFF]))
+
+    with pytest.raises(ParkEntryRejected, match="checksum"):
+        store.restore(entry, torch.tensor([8, 12], dtype=torch.int32), target_slot)
+    assert store.lookup(tokens) is None
+    store.close()
 
 
 def test_ssd_pinned_window_failure_disables_store_without_failing_boot(

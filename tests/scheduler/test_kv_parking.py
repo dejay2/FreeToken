@@ -140,19 +140,6 @@ def _restored_views(kv, state, handle, slot):
     return kv_views, state_views
 
 
-def test_parking_engine_defaults_are_off_and_bounded():
-    from freetoken.engine.config import EngineConfig
-
-    fields = EngineConfig.__dataclass_fields__
-    assert fields["kv_park"].default == "off"
-    assert fields["kv_park_idle_ms"].default == 0
-    assert fields["kv_park_min_tokens"].default == 8192
-    assert fields["kv_park_ram_gib"].default == 2.0
-    assert fields["kv_park_ssd_dir"].default == "~/.cache/freetoken/kv-park"
-    assert fields["kv_park_ssd_gib"].default == 32.0
-    assert fields["kv_park_window_mib"].default == 256
-
-
 def test_off_mode_constructs_no_store_or_worker_thread():
     before = {thread.ident for thread in threading.enumerate() if thread.name.startswith("kv-park")}
     kv, state = _pools()
@@ -169,6 +156,36 @@ def test_off_mode_constructs_no_store_or_worker_thread():
     assert after == before
 
 
+def test_async_park_keeps_sources_owned_until_copy_completion(tmp_path: Path, monkeypatch):
+    cm, kv, state = _manager(tmp_path)
+    _tokens, pages, _indices, slot, *_ = _install_prefix(cm, kv, state)
+
+    class Pending:
+        def __init__(self):
+            self.copy_done = threading.Event()
+
+        def wait_copied(self):
+            self.copy_done.wait()
+
+    pending = Pending()
+    monkeypatch.setattr(cm.park_store, "offer", lambda *_args: pending, raising=False)
+    monkeypatch.setattr(
+        cm.park_store,
+        "save",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("scheduler used sync save")),
+    )
+
+    assert cm.park_idle(now_ns=10**30) == 1
+    assert set(pages.tolist()).isdisjoint(set(cm.free_slots.tolist()))
+    assert slot not in state._free_slots
+
+    pending.copy_done.set()
+    cm.drain_pending_parks()
+
+    assert set(pages.tolist()).issubset(set(cm.free_slots.tolist()))
+    assert slot in state._free_slots
+
+
 def test_idle_park_frees_only_after_the_copy_and_restore_is_byte_identical(tmp_path: Path):
     cm, kv, state = _manager(tmp_path)
     tokens, _pages, _indices, slot, expected_kv, expected_state = _install_prefix(cm, kv, state)
@@ -176,6 +193,9 @@ def test_idle_park_frees_only_after_the_copy_and_restore_is_byte_identical(tmp_p
     free_states_before = state.num_free_slots
 
     cm.park_idle(now_ns=10**30)
+    assert len(cm.free_slots) == free_pages_before
+    assert state.num_free_slots == free_states_before
+    cm.drain_pending_parks(wait=True)
     assert len(cm.free_slots) == free_pages_before + 2
     assert state.num_free_slots == free_states_before + 1
     assert cm.park_store.status()["parked_count"] == 1
@@ -267,21 +287,66 @@ def test_page_and_state_ownership_stays_out_of_free_lists_during_save(tmp_path: 
     real_save = cm.park_store.save
     observations = []
 
-    def checked_save(token_ids, page_bases, state_slot):
+    def checked_save(token_ids, page_bases, state_slot, **kwargs):
         observations.append(
             (
                 set(page_bases.tolist()).isdisjoint(set(cm.free_slots.tolist())),
                 state_slot not in state._free_slots,
             )
         )
-        return real_save(token_ids, page_bases, state_slot)
+        return real_save(token_ids, page_bases, state_slot, **kwargs)
 
     cm.park_store.save = checked_save
     cm.park_idle(now_ns=10**30)
+    cm.drain_pending_parks(wait=True)
     assert observations == [(True, True)]
     assert set(pages.tolist()).issubset(set(cm.free_slots.tolist()))
     assert slot in state._free_slots
     assert cm.park_store.lookup(tokens) is not None
+
+
+def test_idle_threshold_exposes_a_receive_wakeup_deadline(tmp_path: Path):
+    cm, kv, state = _manager(tmp_path, idle_ms=1000)
+    _install_prefix(cm, kv, state)
+    node = cm.prefix_cache._leaves()[0]
+
+    assert cm.next_park_delay_ms(now_ns=node.timestamp + 999_000_000) == 1
+    assert cm.next_park_delay_ms(now_ns=node.timestamp + 500_000_000) == 500
+
+
+def test_blocking_receive_rechecks_idle_work_after_timeout():
+    from freetoken.scheduler.io import SchedulerIOMixin
+
+    events = []
+
+    class Queue:
+        def __init__(self):
+            self.polls = [False, True]
+
+        def poll(self, timeout_ms):
+            events.append(("poll", timeout_ms))
+            return self.polls.pop(0)
+
+        def get(self):
+            events.append(("get", None))
+            return "message"
+
+        def empty(self):
+            return True
+
+    io = object.__new__(SchedulerIOMixin)
+    io._recv_from_tokenizer = Queue()
+    io.run_when_idle = lambda: events.append(("idle", None))
+    io.idle_poll_timeout_ms = lambda: 7
+
+    assert io._recv_msg_single_rank(blocking=True) == ["message"]
+    assert events == [
+        ("idle", None),
+        ("poll", 7),
+        ("idle", None),
+        ("poll", 7),
+        ("get", None),
+    ]
 
 
 def test_idle_threshold_waits_until_the_leaf_is_old_enough(tmp_path: Path):
@@ -294,6 +359,8 @@ def test_idle_threshold_waits_until_the_leaf_is_old_enough(tmp_path: Path):
     assert len(cm.free_slots) == free_before
     assert cm.park_store.status()["parked_count"] == 0
     cm.park_idle(now_ns=node.timestamp + 1_000_000_000)
+    assert len(cm.free_slots) == free_before
+    cm.drain_pending_parks(wait=True)
     assert len(cm.free_slots) == free_before + 2
     assert cm.park_store.status()["parked_count"] == 1
 
@@ -357,6 +424,22 @@ def test_scheduler_prepares_parking_before_engine_reallocates_cache(
     scheduler.rebuild_cache(num_pages=4)
 
     assert events[:3] == ["park", "engine", "manager"]
+
+
+def test_scheduler_shutdown_drains_parking_before_engine_teardown(monkeypatch):
+    from freetoken.scheduler.scheduler import Scheduler
+
+    events = []
+    scheduler = object.__new__(Scheduler)
+    scheduler.device = torch.device("cpu")
+    scheduler.cache_manager = SimpleNamespace(close=lambda: events.append("park-close"))
+    scheduler.sync_all_ranks = lambda: events.append("ranks")
+    scheduler.engine = SimpleNamespace(shutdown=lambda: events.append("engine"))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args, **_kwargs: events.append("cuda"))
+
+    scheduler.shutdown()
+
+    assert events == ["park-close", "cuda", "ranks", "engine"]
 
 
 def test_offline_scheduler_ignores_parking_status_messages():

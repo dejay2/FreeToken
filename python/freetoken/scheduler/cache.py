@@ -64,6 +64,7 @@ class CacheManager:
         if park_store is not None and not self.is_hybrid:
             raise ValueError("KV parking is supported only by the hybrid radix cache")
         self.park_store = park_store
+        self._pending_parks = []
         self._temporary_lease_depth = 0
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
@@ -179,27 +180,58 @@ class CacheManager:
         """Hybrid only: free GDN state slots + evictable (unlocked) tree snapshots."""
         return self.linear_state_pool.num_free_slots + self.prefix_cache.mamba_evictable_size
 
-    def _park_candidate(self, candidate) -> bool:
+    def _park_candidate(self, candidate, *, synchronous: bool = False) -> bool:
         if self.park_store is None or self._temporary_lease_depth:
             return False
         page_bases = candidate.kv_indices[:: self.page_size]
-        if not self.park_store.save(
-            candidate.input_ids, page_bases, candidate.mamba_slot
-        ):
-            return False
+        if synchronous:
+            if not self.park_store.save(
+                candidate.input_ids, page_bases, candidate.mamba_slot
+            ):
+                return False
+            pending = None
+        else:
+            pending = self.park_store.offer(
+                candidate.input_ids, page_bases, candidate.mamba_slot
+            )
+            if pending is None:
+                return False
         evicted = self.prefix_cache.detach_parked(candidate)
         if not evicted.mamba_slots:
             return False
-        # ``save`` has completed its device-to-host copy before either free-list changes.
-        self.linear_state_pool.free(evicted.mamba_slots)
-        self._free(evicted.kv_indices)
+        if pending is None:
+            self.linear_state_pool.free(evicted.mamba_slots)
+            self._free(evicted.kv_indices)
+        else:
+            # The radix node is gone, but its physical pages/state remain exclusively owned here
+            # until the worker's D2H completion signal makes them safe to reissue.
+            self._pending_parks.append((pending, evicted))
+            self.drain_pending_parks()
         return True
 
-    def _park_lru(self) -> bool:
+    def drain_pending_parks(self, *, wait: bool = False) -> int:
+        """Return copied sources to their allocators; never mutate free lists inside an MTP lease."""
+        if self._temporary_lease_depth:
+            return 0
+        kept = []
+        drained = 0
+        for pending, evicted in self._pending_parks:
+            if wait:
+                pending.wait_copied()
+            if not pending.copy_done.is_set():
+                kept.append((pending, evicted))
+                continue
+            self.linear_state_pool.free(evicted.mamba_slots)
+            self._free(evicted.kv_indices)
+            drained += 1
+        self._pending_parks = kept
+        return drained
+
+    def _park_lru(self, *, synchronous: bool = False) -> bool:
         if self.park_store is None or self._temporary_lease_depth:
             return False
         for candidate in self.prefix_cache.park_candidates():
-            if self._park_candidate(candidate):
+            if self._park_candidate(candidate, synchronous=synchronous):
                 return True
         return False
 
@@ -219,6 +251,22 @@ class CacheManager:
             if self._park_candidate(candidate):
                 parked += 1
         return parked
+
+    def next_park_delay_ms(self, *, now_ns: int | None = None) -> int | None:
+        """Milliseconds until idle parking or a pending-copy poll; ``None`` can block forever."""
+        if self.park_store is None:
+            return None
+        if self._pending_parks:
+            return 10
+        timestamp = self.prefix_cache.oldest_park_timestamp()
+        if timestamp is None:
+            return None
+        if now_ns is None:
+            import time
+
+            now_ns = time.monotonic_ns()
+        remaining = self.park_store.idle_ms * 1_000_000 - (now_ns - timestamp)
+        return max(1, (remaining + 999_999) // 1_000_000)
 
     def park_status(self) -> dict[str, int | float | str | bool]:
         if self.park_store is None:
@@ -255,14 +303,20 @@ class CacheManager:
     def ensure_mamba_slots(self, n: int) -> None:
         """Free GDN state slots until >= ``n`` are available by tombstoning LRU tree snapshots
         (evict_mamba), returning their slots + any freed KV to the pools."""
+        self.drain_pending_parks()
         while self.linear_state_pool.num_free_slots < n:
             if self._park_lru():
+                self.drain_pending_parks()
                 continue
             er = self.prefix_cache.evict_mamba(n - self.linear_state_pool.num_free_slots)
-            if not er.mamba_slots:
-                break
-            self.linear_state_pool.free(er.mamba_slots)
-            self._free(er.kv_indices)
+            if er.mamba_slots:
+                self.linear_state_pool.free(er.mamba_slots)
+                self._free(er.kv_indices)
+                continue
+            if self._pending_parks:
+                self.drain_pending_parks(wait=True)
+                continue
+            break
 
     def snapshot_toolcall_anchor(self, reqs: List[Req]) -> None:
         """Freeze each decoding request's GDN state at its tool-call anchor, into the ping-pong
@@ -671,6 +725,10 @@ class CacheManager:
         req.linear_slot_idx = None
 
     def check_integrity(self) -> None:
+        pending_pages = sum(
+            len(evicted.kv_indices) // self.page_size
+            for _pending, evicted in self._pending_parks
+        )
         if self.is_hybrid:
             pc = self.prefix_cache
             pc.check_integrity()  # structural: every snapshot node owns a slot, refs >= 0
@@ -679,9 +737,12 @@ class CacheManager:
             # exceed the (non-padding) pool capacity; the remainder is held by running requests.
             pool = self.linear_state_pool
             tree_slots = pc.mamba_evictable_size + pc.mamba_protected
-            assert pool.num_free_slots + tree_slots <= pool.num_slots - 1, (
-                f"GDN-slot leak: free({pool.num_free_slots}) + tree({tree_slots}) > "
-                f"capacity({pool.num_slots - 1})"
+            pending_slots = sum(
+                len(evicted.mamba_slots) for _pending, evicted in self._pending_parks
+            )
+            assert pool.num_free_slots + tree_slots + pending_slots <= pool.num_slots - 1, (
+                f"GDN-slot leak: free({pool.num_free_slots}) + tree({tree_slots}) + "
+                f"pending({pending_slots}) > capacity({pool.num_slots - 1})"
             )
         elif self.is_swa:
             pc = self.prefix_cache
@@ -701,19 +762,28 @@ class CacheManager:
         else:
             self.prefix_cache.check_integrity()
             cache_pages = self.prefix_cache.size_info.total_size // self.page_size
-        if len(self.free_slots) + cache_pages != self.num_pages:
+        if len(self.free_slots) + cache_pages + pending_pages != self.num_pages:
             raise RuntimeError(
                 "CacheManager integrity check failed:"
                 f" free_pages({len(self.free_slots)}) +"
-                f" cache_pages({cache_pages}) != num_pages({self.num_pages})"
+                f" cache_pages({cache_pages}) + pending_pages({pending_pages})"
+                f" != num_pages({self.num_pages})"
             )
         if self.page_size > 1:
             assert torch.all(self.free_slots % self.page_size == 0)
 
+    def close(self) -> None:
+        if self.park_store is None:
+            return
+        self.drain_pending_parks(wait=True)
+        self.park_store.close()
+
     def prepare_rebuild(self) -> None:
         """Park every eligible hybrid prefix before the engine tears down its pools."""
         if self.park_store is not None:
-            while self._park_lru():
+            self.drain_pending_parks(wait=True)
+            self.park_store.flush()
+            while self._park_lru(synchronous=True):
                 pass
 
     def rebuild(self, num_pages: int, page_table: torch.Tensor) -> None:
@@ -804,13 +874,20 @@ class CacheManager:
                 self._temporary_lease_depth -= 1
 
     def _allocate(self, needed_pages: int) -> torch.Tensor:
-        free_pages = len(self.free_slots)
-        if needed_pages > free_pages and self.is_hybrid and self.park_store is not None:
+        if self.park_store is not None:
+            self.drain_pending_parks()
+        if (
+            needed_pages > len(self.free_slots)
+            and self.is_hybrid
+            and self.park_store is not None
+        ):
+            # Queue cold leaves while the worker has room. Their source pages remain pending,
+            # so ordinary eviction below may reclaim a different leaf rather than wait for SSD.
             while needed_pages > len(self.free_slots) and self._park_lru():
                 pass
-            free_pages = len(self.free_slots)
-        if needed_pages > free_pages:
-            need = (needed_pages - free_pages) * self.page_size
+            self.drain_pending_parks()
+        if needed_pages > len(self.free_slots):
+            need = (needed_pages - len(self.free_slots)) * self.page_size
             if self.is_swa:
                 # Evicting KV leaf nodes drops their swa slots too -> return both pools.
                 ev = self.prefix_cache.evict_full(need)
@@ -825,7 +902,11 @@ class CacheManager:
             else:
                 evicted = self.prefix_cache.evict(need)
             self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
-            assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
+        if needed_pages > len(self.free_slots) and self._pending_parks:
+            # Only wait when no ordinary evictable leaf can satisfy the request. The wait ends at
+            # D2H completion, never at the later SSD manifest update.
+            self.drain_pending_parks(wait=True)
+        assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
         allocated = self.free_slots[:needed_pages]
         self.free_slots = self.free_slots[needed_pages:]
         return allocated

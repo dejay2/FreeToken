@@ -59,8 +59,8 @@ param(
     [ValidateSet('bf16', 'fp8')]
     [string]$KVDtype = 'bf16',
 
-    # Move completed QSA KV plus its GDN/PLE snapshot outside VRAM between turns. Off passes
-    # no parking flags, so it constructs no store, CUDA stream, pinned buffers or directory.
+    # Move completed QSA KV plus its GDN/PLE snapshot outside VRAM between turns. The launcher
+    # passes even 'off' explicitly so an inherited FREETOKEN_KV_PARK cannot override this choice.
     [ValidateSet('off', 'ram', 'ssd')]
     [string]$KVPark = 'off',
 
@@ -253,9 +253,9 @@ $serveArgs = @(
 if ($KVDtype -eq 'fp8') {
     $serveArgs += @('--kv-dtype', 'fp8')
 }
+$serveArgs += @('--kv-park', $KVPark)
 if ($KVPark -ne 'off') {
     $serveArgs += @(
-        '--kv-park', $KVPark,
         '--kv-park-idle-ms', "$KVParkIdleMs",
         '--kv-park-min-tokens', "$KVParkMinTokens",
         '--kv-park-ram-gib', "$KVParkRAMGiB",

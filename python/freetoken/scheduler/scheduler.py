@@ -160,6 +160,7 @@ class Scheduler(SchedulerIOMixin):
         )
         self.config = config
         self._last_park_status = None
+        self._idle_wait_logged = False
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
@@ -177,10 +178,17 @@ class Scheduler(SchedulerIOMixin):
             self.send_result([CacheParkStatusMsg(status=status)])
             self._last_park_status = status
 
+    def idle_poll_timeout_ms(self) -> int | None:
+        return self.cache_manager.next_park_delay_ms()
+
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
-        logger.info_rank0("Scheduler is idle, waiting for new reqs...")
+        if not self._idle_wait_logged:
+            logger.info_rank0("Scheduler is idle, waiting for new reqs...")
+            self._idle_wait_logged = True
+        self.cache_manager.drain_pending_parks()
         self.cache_manager.park_idle()
+        self.cache_manager.drain_pending_parks()
         self.cache_manager.check_integrity()
         self._send_park_status()
 
@@ -389,6 +397,7 @@ class Scheduler(SchedulerIOMixin):
                 diag.profile_step()
 
     def shutdown(self) -> None:
+        self.cache_manager.close()
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
@@ -690,6 +699,7 @@ class Scheduler(SchedulerIOMixin):
             msg.mm_token_type_ids = None
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
+        self._idle_wait_logged = False
         if isinstance(msg, BatchBackendMsg):
             for msg in msg.data:
                 self._process_one_msg(msg)
