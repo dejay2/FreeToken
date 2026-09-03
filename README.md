@@ -67,8 +67,11 @@ active requests. On the tested RTX 5090, the machine-local `boot-2020.ps1` recip
 uses BF16 with **4,188 total expert slots** and **1,116 streaming-LRU slots**, and
 turns integrated MTP off because MTP accepts only one active request. Four chats
 share the pool, so their worst-case equal share is 65,536 total prompt-plus-answer
-tokens each. See the [Windows guide](docs/windows-qwen38-flash-next-mmap.md) for the
-FP8 comparison and the budget assumptions.
+tokens each. The optional FP8 recipe uses **5,332 total expert slots** and **2,260
+streaming-LRU slots**. Its corrected ledger is 13,248 B/token × 262,144 tokens,
+with page rounding, the post-cache reserve, and headroom subtracted per
+`cache_budget.py`. See the [Windows guide](docs/windows-qwen38-flash-next-mmap.md)
+for the full comparison and budget assumptions.
 
 ### Experimental FP8 QSA KV storage
 

@@ -112,7 +112,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File `
 | KV storage | Context / pool tokens | Active requests | Total expert slots | Streaming LRU slots | Decode estimate |
 |---|---:|---:|---:|---:|---:|
 | BF16 (default) | 262,144 / 262,144 | 4 | **4,188** | **1,116** | **~60.2 tok/s** |
-| FP8 (optional) | 262,144 / 262,144 | 4 | **5,350** | **2,278** | **~67.0 tok/s** |
+| FP8 (optional) | 262,144 / 262,144 | 4 | **5,332** | **2,260** | **~67.0 tok/s** |
 
 The total includes the 3,072 slot-equivalents charged to six GPU-owned layers.
 The LRU number is what remains for streaming layers. These token-rate figures are
@@ -130,8 +130,10 @@ is shared, not four separate full-length pools.
 Integrated MTP is a one-request feature. The four-request recipe turns it off before
 launch, including the resident draft head, so inherited MTP settings cannot reject
 the configuration or consume its VRAM budget. FP8 remains an optional experiment:
-BF16 is the default, and an FP8 boot must use the 5,350-slot line only after its
-live quality check passes.
+BF16 is the default, and an FP8 boot must use the 5,332-slot line (2,260 streaming-LRU
+slots) only after its live quality check passes. The corrected FP8 ledger charges
+13,248 B/token × 262,144 tokens, then accounts for page rounding and subtracts the
+post-cache reserve and headroom in `cache_budget.py`; the resulting safe total is 5,332.
 
 ### Expert loading
 
@@ -547,7 +549,9 @@ slower. Wait for `state: serving` and warm up once before comparing throughput.
 - PR #279 is unmerged at the time of this measurement.
 - FreeToken Desktop is required as the Windows engine delivery mechanism.
 - The server is command-line only and cannot be configured in Desktop.
-- This path is text-only as tested; image request parts are not supported here.
+- The machine-local `boot-2020.ps1` recipe enables still-picture input with `-EnableVision`,
+  `-VisionWeights mmap`, and `-VisionExecution layer-stream`; the generic command above
+  remains text-only unless those flags are added.
 - The full-context recipe allows four active requests only within the shared 262,144-token pool;
   four worst-case equal shares are 65,536 total tokens each.
 - Integrated MTP remains a one-request feature and is disabled by the four-request recipe.
