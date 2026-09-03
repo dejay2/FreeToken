@@ -245,6 +245,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-dtype",
+        default=os.getenv("FREETOKEN_KV_DTYPE", ServerArgs.kv_dtype).strip().lower(),
+        choices=["bf16", "fp8"],
+        help=(
+            "Main QSA K/V storage dtype. fp8 uses E4M3 with per-token, per-head scales; "
+            "the compressed QSA index remains BF16. Also settable with FREETOKEN_KV_DTYPE."
+        ),
+    )
+
+    parser.add_argument(
         "--kv-park",
         default=os.getenv("FREETOKEN_KV_PARK", ServerArgs.kv_park).strip().lower(),
         choices=["off", "ram", "ssd"],
@@ -761,6 +771,12 @@ def parse_args(
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+
+    if kwargs["kv_dtype"] not in ("bf16", "fp8"):
+        parser.error(
+            "FREETOKEN_KV_DTYPE must be one of {bf16,fp8}, got "
+            f"{kwargs['kv_dtype']!r}"
+        )
 
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):

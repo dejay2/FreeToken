@@ -308,6 +308,8 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    # Main QSA K/V storage. The compressed QSA index and every non-QSA pool keep ``dtype``.
+    kv_dtype: str = "bf16"
     # Complete QSA + GDN/PLE prefixes can leave VRAM between turns. Off constructs nothing;
     # enabled modes are bounded independently because RAM owns full entries while SSD owns only
     # two staging windows plus files under its disk LRU.

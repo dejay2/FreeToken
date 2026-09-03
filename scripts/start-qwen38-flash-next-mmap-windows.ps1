@@ -54,6 +54,11 @@ param(
     [ValidateRange(0, 4194304)]
     [int]$KVCacheTokens = 262144,
 
+    # Main QSA K/V storage. BF16 is the unchanged default and passes no new engine argument;
+    # FP8 uses E4M3 plus per-token/head scales while the compressed QSA index stays BF16.
+    [ValidateSet('bf16', 'fp8')]
+    [string]$KVDtype = 'bf16',
+
     # Move completed QSA KV plus its GDN/PLE snapshot outside VRAM between turns. Off passes
     # no parking flags, so it constructs no store, CUDA stream, pinned buffers or directory.
     [ValidateSet('off', 'ram', 'ssd')]
@@ -213,6 +218,7 @@ Write-Host "  Model:  $resolvedModel"
 Write-Host "  API:    http://127.0.0.1:$Port/v1"
 Write-Host "  Context tokens: $ContextTokens"
 Write-Host "  Active requests: $MaxRunningRequests"
+Write-Host "  KV dtype: $KVDtype"
 Write-Host "  MoE cache slots: $(if ($MoECacheSize -gt 0) { $MoECacheSize } else { 'auto' })"
 Write-Host "  GPU-owned MoE layers: $(if ($GpuOwnedLayers) { $GpuOwnedLayers } else { 'off' })"
 Write-Host "  Picture input: $($EnableVision.IsPresent)"
@@ -244,6 +250,9 @@ $serveArgs = @(
     '--kv-reserve-tokens', "$ContextTokens",
     '--expert-load', $ExpertLoad
 )
+if ($KVDtype -eq 'fp8') {
+    $serveArgs += @('--kv-dtype', 'fp8')
+}
 if ($KVPark -ne 'off') {
     $serveArgs += @(
         '--kv-park', $KVPark,

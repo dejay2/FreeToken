@@ -177,6 +177,9 @@ class FrontendManager:
             "disabled": False,
         }
     )
+    # Startup-selected main QSA K/V storage, delivered with the backend's measured byte cost.
+    # Falls back to the parsed config until the ("meta", …) ack arrives.
+    kv_dtype: str = "bf16"
     # Optional backend metadata delivered once on the ack path at ready: per-unit cache VRAM
     # costs {"kv_bytes_per_token", "moe_bytes_per_expert", "mamba_bytes_per_slot"}. None until
     # the ("meta", …) ack arrives (or forever, on an engine build that doesn't emit one).
@@ -220,6 +223,7 @@ class FrontendManager:
         if self.stats is None:
             self.stats = StatsTracker()
         self.parking_status["mode"] = getattr(self.config, "kv_park", "off")
+        self.kv_dtype = str(getattr(self.config, "kv_dtype", "bf16"))
 
     def frontend_tokenizer(self) -> Any:
         """Lazily build and cache the frontend-side tokenizer used by count_tokens (see the
@@ -816,6 +820,9 @@ def cache_geometry(state: Any) -> dict:
     geo = {
         "num_pages": num_pages,
         "page_size": page_size,
+        "kv_dtype": str(
+            getattr(state, "kv_dtype", None) or getattr(config, "kv_dtype", "bf16")
+        ),
         "moe_cache_size": moe_cache_size,
         "num_mamba_slots": num_mamba_slots,
         "num_experts": num_experts,
@@ -1115,6 +1122,9 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         # (unit_bytes + the limits block + the pre-first-chat pool seed). Unpack the extras
         # aside so unit_bytes keeps its original three-key shape; unknown keys, if any, are inert.
         meta = dict(meta or {})
+        _GLOBAL_STATE.kv_dtype = str(
+            meta.pop("kv_dtype", getattr(_GLOBAL_STATE.config, "kv_dtype", "bf16"))
+        )
         _GLOBAL_STATE.free_vram_bytes = int(meta.pop("free_vram_bytes", 0) or 0)
         _GLOBAL_STATE.cache_floors = meta.pop("floors", None)
         _GLOBAL_STATE.cache_pools = meta.pop("pools", None)

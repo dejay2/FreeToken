@@ -66,6 +66,7 @@ class QSAKVCache(MHAKVCache):
         num_req_slots: int,
         ring_capacity: int | None = None,
         layer_ids: Sequence[int] | None = None,
+        kv_dtype: torch.dtype | None = None,
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -92,17 +93,24 @@ class QSAKVCache(MHAKVCache):
         self._ring_capacity = ring_capacity
         self._index_dtype = dtype
         self._page_size = page_size
+        self._kv_storage_dtype = dtype if kv_dtype is None else kv_dtype
+        if self._kv_storage_dtype not in (dtype, torch.float8_e4m3fn):
+            raise ValueError(
+                f"QSA main K/V supports {dtype} or float8_e4m3fn, got "
+                f"{self._kv_storage_dtype}"
+            )
         super().__init__(
             num_kv_heads=num_kv_heads,
             num_layers=num_layers,
             head_dim=head_dim,
             num_pages=num_pages,
             page_size=page_size,
-            dtype=dtype,
+            dtype=self._kv_storage_dtype,
             device=device,
             layer_ids=layer_ids,
         )
         self._zero_kv_slabs()
+        self._alloc_scale_tiers()
         self._alloc_index_tiers(num_pages)
 
     def _zero_kv_slabs(self) -> None:
@@ -110,6 +118,23 @@ class QSAKVCache(MHAKVCache):
         # torch.empty's recycled NaN/Inf bit patterns), but a zeroed slab keeps any future
         # unmasked read finite instead of model-poisoning. One memset per (re)allocation.
         self._kv_buffer.zero_()
+
+    def _alloc_scale_tiers(self) -> None:
+        if self._kv_storage_dtype is not torch.float8_e4m3fn:
+            self._kv_scale_buffer = None
+            self._k_scale_buffer = None
+            self._v_scale_buffer = None
+            return
+        # One FP32 scalar per stored token and local KV head, separately for K and V. This is
+        # 2 * Hkv * 4 bytes per QSA layer per token: 192 B/token at the shipping 12-layer,
+        # 2-head geometry. Main E4M3 K/V costs 12,288 B/token and the unchanged BF16 compressed
+        # index costs 768 B/token, for 13,248 B/token total (versus 25,344 B/token in BF16).
+        shape = self._kv_buffer.shape[:-1]
+        self._kv_scale_buffer = torch.zeros(
+            shape, dtype=torch.float32, device=self._device
+        )
+        self._k_scale_buffer = self._kv_scale_buffer[0]
+        self._v_scale_buffer = self._kv_scale_buffer[1]
 
     def _alloc_index_tiers(self, num_pages: int) -> None:
         # ZERO-initialized: the score kernel reads whole rows of blocks unmasked and relies on
@@ -149,14 +174,21 @@ class QSAKVCache(MHAKVCache):
         self._cmp_k_buffer = None
         self._pending_ring = None
         self._pending_position_ring = None
+        self._kv_scale_buffer = None
+        self._k_scale_buffer = None
+        self._v_scale_buffer = None
         super().rebuild(num_pages)
         self._zero_kv_slabs()
         try:
+            self._alloc_scale_tiers()
             self._alloc_index_tiers(num_pages)
         except Exception:
             self._kv_buffer = None
             self._k_buffer = None
             self._v_buffer = None
+            self._kv_scale_buffer = None
+            self._k_scale_buffer = None
+            self._v_scale_buffer = None
             raise
 
     @classmethod
@@ -231,7 +263,47 @@ class QSAKVCache(MHAKVCache):
             * self._index_head_dim
             * self._index_dtype.itemsize
         )
-        return kv + slab // tokens, swa
+        scales = 0
+        if self._kv_scale_buffer is not None:
+            scales = self._kv_scale_buffer.numel() * self._kv_scale_buffer.element_size()
+        return kv + (slab + scales) // tokens, swa
+
+    def store_kv(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out_loc: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        if self._kv_scale_buffer is None:
+            # Keep the default path literally identical: the same raw-copy kernel, arguments,
+            # and destination layout as before the FP8 switch existed.
+            return super().store_kv(k, v, out_loc, layer_id)
+
+        from freetoken.kernel.triton.store_fp8 import store_fp8_cache
+
+        dense = self._dense(layer_id)
+        store_fp8_cache(
+            self._k_buffer[dense].view(self._storage_shape),
+            self._v_buffer[dense].view(self._storage_shape),
+            self._k_scale_buffer[dense].view(self._storage_shape[:2]),
+            self._v_scale_buffer[dense].view(self._storage_shape[:2]),
+            out_loc,
+            k,
+            v,
+        )
+
+    def k_scale(self, index: int) -> torch.Tensor | None:
+        """Per-token, per-KV-head K scales, or ``None`` for the byte-identical BF16 path."""
+        if self._k_scale_buffer is None:
+            return None
+        return self._k_scale_buffer[self._dense(index)]
+
+    def v_scale(self, index: int) -> torch.Tensor | None:
+        """Per-token, per-KV-head V scales, or ``None`` for the byte-identical BF16 path."""
+        if self._v_scale_buffer is None:
+            return None
+        return self._v_scale_buffer[self._dense(index)]
 
     def cmp_k_cache(self, slot: int) -> torch.Tensor:
         """Compressed index keys of one sparse layer: ``[rows, index_head_dim]``."""
@@ -266,6 +338,15 @@ class QSAKVCache(MHAKVCache):
     @property
     def num_req_slots(self) -> int:
         return self._num_req_slots
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """QSA compute/index dtype; main K/V storage may use :attr:`kv_dtype`."""
+        return self._index_dtype
+
+    @property
+    def kv_dtype(self) -> torch.dtype:
+        return self._kv_storage_dtype
 
 
 __all__ = ["QSAKVCache"]

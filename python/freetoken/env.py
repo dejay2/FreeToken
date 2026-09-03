@@ -75,6 +75,8 @@ class EnvClassSingleton:
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state
     # pool at some precision cost on the long recurrence (mirrors SGLang's mamba_ssm_dtype).
     MAMBA_SSM_DTYPE = EnvStr("float32")
+    # Main QSA K/V storage: bf16 (default) | fp8. The compressed index stays bf16.
+    KV_DTYPE = EnvStr("bf16")
     # Completed hybrid prefixes may be parked outside VRAM. No store, stream, pinned memory or
     # directory exists while mode is off; the remaining values are boot-time bounds when enabled.
     KV_PARK = EnvStr("off")

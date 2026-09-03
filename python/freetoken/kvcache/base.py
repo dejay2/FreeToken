@@ -17,21 +17,33 @@ class CacheRebuildRejected(Exception):
 
 
 def spec_kv_bytes_per_token(spec, config) -> int:
-    """One paged-KV group's bytes per token: (1|2 slabs) x head_dim x local kv heads x dtype
-    x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
-    per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
-    branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
-    hardcodes; keep the two in lockstep if the slab dtype ever changes.)
+    """One paged-KV group's true bytes per token, including any index and FP8 scales.
 
-    ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
-    ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
+    QSA may store its main K/V in E4M3 while its compressed index stays at two bytes. The FP8
+    online writer gives every token and local KV head an FP32 K scale and FP32 V scale, adding
+    ``2 * local_kv_heads * 4 * qsa_layers`` bytes/token. Per-token scales avoid changing a
+    scale after earlier rows have been written (which would invalidate those stored bytes).
+    All other pool families continue to price their main slabs at the engine compute dtype.
+
+    ``index_ratio`` > 1 stores one index key per token group; its ring and scratch rows are
+    fixed-size and priced in the owning pool's ``kv_cost``."""
+    from freetoken.attention import AttnType
+
+    local_kv_heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
+    fp8_qsa = (
+        spec.attn_type is AttnType.QSA
+        and str(getattr(config, "kv_dtype", "bf16")).lower() == "fp8"
+    )
+    element_bytes = 1 if fp8_qsa else config.dtype.itemsize
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
-        * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
+        * local_kv_heads
+        * element_bytes
         * spec.num_layers
     )
+    if fp8_qsa:
+        per_token += 2 * local_kv_heads * torch.float32.itemsize * spec.num_layers
     return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
 
 

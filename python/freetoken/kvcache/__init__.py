@@ -80,12 +80,24 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
     the pool). Single factory entry for all pool families, DSV4 included."""
+    import torch
+
     from .dsv4_cost_model import _dsv4_pool_sizes
     from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
     from .dsv4_paged_pool import DSV4PagedKVCache
 
     model_config = config.model_config
-    if resolve_pool_class(model_config) is DSV4PagedKVCache:
+    pool_cls = resolve_pool_class(model_config)
+    kv_mode = str(getattr(config, "kv_dtype", "bf16")).lower()
+    if kv_mode not in ("bf16", "fp8"):
+        raise ValueError(f"unknown KV dtype {kv_mode!r}; expected bf16 or fp8")
+    if kv_mode == "fp8":
+        from .qsa_pool import QSAKVCache
+
+        if pool_cls is not QSAKVCache:
+            raise ValueError("FP8 KV storage is supported only by the QSA pool")
+    kv_dtype = torch.float8_e4m3fn if kv_mode == "fp8" else dtype
+    if pool_cls is DSV4PagedKVCache:
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is
         # the only DSV4-specific piece (the swa_pool plug-in: window tier + cmp/idx/state
         # shadows). Sizing reads dsv4_args, never the group spec.
@@ -116,6 +128,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         num_swa_tokens=num_swa_tokens,
         device=device,
         dtype=dtype,
+        kv_dtype=kv_dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
         # A speculative step writes `depth` extra pending-ring rows per forward; the ring is
         # addressed by `position % ring_capacity`, so a ratio-wide ring would alias them onto
@@ -134,6 +147,7 @@ def create_kvcache_pool(
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
     num_speculative_tokens: int = 0,
+    kv_dtype: torch.dtype | None = None,
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -217,6 +231,7 @@ def create_kvcache_pool(
             num_req_slots=num_req_slots,
             ring_capacity=ring_capacity,
             layer_ids=spec.layer_ids,
+            kv_dtype=kv_dtype,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:

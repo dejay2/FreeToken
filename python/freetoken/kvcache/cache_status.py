@@ -205,6 +205,9 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
     Best-effort/total -- each piece independently degrades to 0/{} and this never raises
     (it runs on readiness)."""
     meta: Dict[str, Any] = dict(compute_cache_unit_bytes(engine))
+    # Startup-only: the mode and the measured live-pool byte cost travel together, so status
+    # cannot label a 13,248 B/token FP8 pool as BF16 (or vice versa).
+    meta["kv_dtype"] = str(getattr(engine.config, "kv_dtype", "bf16"))
     meta["free_vram_bytes"] = _pool_budget_free_vram_bytes(engine)
     meta["floors"] = compute_cache_floors(engine)
     meta["pools"] = compute_cache_pools(engine)

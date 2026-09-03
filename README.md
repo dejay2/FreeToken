@@ -70,6 +70,33 @@ share the pool, so their worst-case equal share is 65,536 total prompt-plus-answ
 tokens each. See the [Windows guide](docs/windows-qwen38-flash-next-mmap.md) for the
 FP8 comparison and the budget assumptions.
 
+### Experimental FP8 QSA KV storage
+
+Main QSA K/V storage is BF16 by default. Select the experimental E4M3 path at server startup
+with `--kv-dtype fp8`, `FREETOKEN_KV_DTYPE=fp8`, or the Windows launcher's `-KVDtype fp8`.
+The unset/`bf16` path allocates the original tensors and uses the original raw-copy store. FP8 is
+currently accepted only for the QSA pool and requires a CUDA GPU with native E4M3 support
+(compute capability 8.9 or newer); other cache families reject it instead of silently changing
+their storage.
+
+The compressed QSA index remains BF16, so `qsa/score.py` and its selected-token path are unchanged.
+Each main K/V write chooses a separate FP32 scale for every stored token and local KV head, then
+stores `clamp(value / scale, -448, 448)` as E4M3. This online layout never changes the scale of an
+older cache row. At the shipping TP1 geometry (12 QSA layers, 2 KV heads, width 256), its exact
+paged costs are:
+
+| Main QSA K/V mode | Main K+V | BF16 compressed index | K/V scale metadata | Total per token |
+|---|---:|---:|---:|---:|
+| BF16 (default) | 24,576 B | 768 B | 0 B | **25,344 B** |
+| FP8 E4M3 | 12,288 B | 768 B | 192 B | **13,248 B** |
+
+The layer-3 capture measured 2.20654501% aggregate output relative-L2 error and 3.78707871%
+worst-head error with per-head scaling; E4M3 arithmetic predicts about 2.4% aggregate rounding
+error. These numbers justify defect-detection bounds, not production acceptance: the offline
+selection proxy matched captured production selection only 29.4921875%. Final acceptance still
+requires the first 48 temperature-0 generated tokens to match BF16 exactly and a coherent answer
+to a 250,000-plus-token prompt. Until that live check passes, BF16 remains the supported default.
+
 ### PLE table backends
 
 Qwen3.8-Flash-Next has a 47.7 GiB n-gram (PLE) lookup table. Choose where it lives with `--ple-backend` or the launcher's parameter:
