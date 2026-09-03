@@ -74,7 +74,10 @@ accept 47-48 while still requiring the two runs to agree.
 Aggregate, profile A fully warm: wall **4.047 s**, 188 completion tokens,
 **46.45 completion tok/s**, 33,008 total tokens, **8,155 total tok/s**, peak active
 requests 4. Across 11 runs the aggregate ranged 25.4-49.5 completion tok/s purely by cache
-warmth; the cold first run is the low end.
+warmth. R3's warm re-runs land at 31.4-43.5 tok/s, inside that spread; a **fully cold**
+run, in which all four prompts are new to the server, aggregates **15.50 completion tok/s**.
+The honest range over cold and warm together is therefore **15.5-49.5 completion tok/s**:
+15.5 cold, 25.4-49.5 warm, with the highest figures needing a fully warm prefix cache.
 
 Profile C (FP8) fully warm: wall **3.93 s**, **47.81 completion tok/s**, **8,395 total
 tok/s** — **+2.9%** over BF16. The sizing note's interpolated sweep predicted 60.2 tok/s
@@ -90,7 +93,7 @@ The baseline is the same two turns with parking off.
 |---|---:|---:|---:|---:|---|---|
 | off | 0 | 0 | 0 | 0.0 | (baseline) `maple syrup\|cobalt paint` | — |
 | ram | 1 | 1,778,471,176 | 1 | **683.47** | yes, sha `67369f51…eb21` | **works** |
-| ssd | 0 | 0 | 0 | 0.0 | yes (parking never engaged) | **fails to engage** |
+| ssd | 1 | 1,778,479,112 | 1 | **1,882.45** | yes, sha `67369f51…eb21` | **works** (after `2ce6403`) |
 
 With parking off every counter in the `/v1/cache/status` `parking` block stayed at zero
 through both turns, which is the live confirmation that the off path builds no store.
@@ -102,24 +105,27 @@ for the RAM copy at 65,536 tokens; the live restore is 22x that, because the liv
 does the lookup, page and state allocation, radix insert and tensor-parallel consensus that
 the prototype did not. It is still well inside the 1,883 ms gate.
 
-**SSD mode never parks anything on this build.** The first save fails and parking disables
-itself:
+**SSD mode works end to end since `2ce6403`.** As first measured here it never parked
+anything: `ParkStore.__init__` allocates its two pinned windows on the scheduler thread, which
+runs inside `torch.inference_mode()`, so they are inference tensors, while the background save
+worker ran on a plain thread with no such context and its first in-place write into a window
+raised `RuntimeError('Inplace update to inference tensor outside InferenceMode is not
+allowed.')`. Parking then disabled itself fail-safe: manifest directory created, no payload
+written, answers still correct. RAM mode escaped it because its per-entry host buffer is
+allocated on the worker thread itself.
 
-```text
-KV parking disabled after ssd save failed: RuntimeError('Inplace update to inference tensor
-outside InferenceMode is not allowed. You can make a clone to get a normal tensor before
-doing inplace update.')
-```
+`2ce6403` makes the save worker re-enter the constructing thread's context — device, ambient
+CUDA stream and inference mode — before draining the queue, and records failures in
+`last_error` on `/v1/cache/status` instead of one log line. Re-measured live on profile B:
+**1,778,479,112 bytes** parked for a 65,600-token prefix, one restore in **1,882.45 ms**,
+second turn 3.92 s against 18.27 s cold, and the answer byte-identical to the parking-off
+baseline (sha `67369f51…eb21`); `disabled` false and `last_error` null throughout.
 
-Reproduced on two separate boots. `ParkStore.__init__` allocates the two pinned windows
-inside the scheduler's inference-mode setup, so they are inference tensors, while the
-background save runs on a plain thread with no inference-mode context and its first in-place
-write into a window raises. RAM mode escapes this because its per-entry host buffer is
-allocated on the worker thread itself. The failure is fail-safe: parking switches off, the
-manifest directory is created but no payload file is written, and serving continues to
-produce correct answers. Fixing it means entering `torch.inference_mode()` in the parking
-worker loop, or allocating the windows outside inference mode; that repair is not part of
-this measurement run.
+The restore passes P0's 1,883 ms gate by **0.6 ms**. It is also ~6x the bench prototype's
+317 ms for SSD at 65,536 tokens — the same prototype-to-live gap RAM shows (31 ms against
+683 ms), so the cost is the surrounding lookup, page and state allocation, radix insert and
+tensor-parallel consensus, not the disk read. A longer parked prefix will exceed the gate, so
+SSD restore wants tuning (or the gate wants raising on evidence) before it is defaulted on.
 
 ## FP8 KV gate
 
@@ -140,13 +146,16 @@ generation to continue past the end of the answer. BF16 continues with
 `<|im_start|><|im_end|>\n…` and FP8 with `<|im_end|>\n<|endoftext|>…`; BF16 emitted 47
 tokens and FP8 45.
 
-Two things follow. First, by the letter of the gate FP8 fails, and that is the verdict
-recorded here. Second, the gate as written measures the wrong thing: the post-turn junk is
-the most numerically fragile part of the output, and it is not stable even within BF16 — a
-cache-hit BF16 run and a cold BF16 run produce different tails on the same prompt. A gate
-that compared the answer up to the end-of-turn token would have passed FP8, and would still
-have caught a real regression in the answer itself. Whoever revisits FP8 should redefine the
-gate before re-running it.
+Stated plainly: **the answer itself is identical to BF16** (`maple-7319|cobalt-4826`, both
+ends of a 250k-token prompt, in order) and FP8 is **+2.9%** faster. What fails is the gate's
+48-token window, which reaches past `<|im_end|>` into padding that only exists because the
+request sets `ignore_eos`. That tail is the most numerically fragile part of the output and is
+not stable even within BF16 — a cache-hit BF16 run and a cold BF16 run produce different tails
+on the same prompt — so the gate is comparing the one part of the output that carries no
+information. **Recommendation: redefine the gate as "identical up to and including
+`<|im_end|>`"** and re-run; the existing evidence already passes on that reading, and such a
+gate would still catch a real regression in the answer. Until that decision is made the
+recorded verdict stays FAIL and **the FP8 KV switch stays off by default**.
 
 FP8 also costs accuracy that the offline work already predicted: measured aggregate
 relative-L2 of the FP8 attention output against BF16 sits at 3.3-4.2% (median 3.6%) over 24
@@ -159,14 +168,29 @@ FP8 was only 2.9% faster, so the default boot stays.
 
 ## Follow-ups
 
-1. SSD parking cannot park: the parking worker thread needs the inference-mode context its
-   pinned windows were allocated under. Until then only `ram` is usable, and `ram` is limited
-   on this box by host RAM, not by the setting.
+1. **Fixed by `2ce6403`** — the parking save worker now re-enters its caller's inference
+   mode, device and stream, and both `ram` and `ssd` park and restore live. `ram` remains
+   limited on this box by host RAM, not by the setting; see follow-up 5 for `ssd`.
 2. The two live drivers assert exactly 48 completion tokens; the server reports 47. Corrected
    in the drivers, but the same assumption may exist elsewhere.
 3. `tests/models/qwen4_exp/test_qsa_fp8_kernels.py::test_fp8_sparse_attention_dequantizes_scales_with_masking_and_split_k`
    fails about one run in three: it seeds a generator for Q/K/V but selects its columns with
    the global CUDA RNG, and its 4% aggregate ceiling sits inside the natural 3.3-4.2% spread.
-4. Once, one of four concurrent replies carried another request's marker text (HTTP 200,
-   correct token count). It did not recur in 40 further concurrent requests and no cause was
-   established. Worth watching if four-request serving is used in anger.
+4. **Withdrawn — not a routing defect.** One early four-request run appeared to carry another
+   request's marker text. D1 traced it: the probe's four secrets differed by a single digit,
+   which is below the model's discrimination threshold once a mixed prefill batch perturbs the
+   numbers, and incrementing that digit is the model's own strongest continuation. Nothing
+   crossed between requests — every solo re-issue against the same warm cache answered
+   correctly. With distinct-word secrets the failure disappears: **0 mismatches in 200 normal
+   runs, 0 in 60 distinct-word runs, 0 in R3's 20 further runs**. Profile A also runs none of
+   today's new code (parking and FP8 are both gated off). The corrected probe is
+   `scripts/bench/kv_concurrency_distinct.py`.
+5. **SSD restore tuning.** 1,882.45 ms against an 1,883 ms gate is no margin; the cost is the
+   live lookup/allocate/radix-insert/consensus path, not the read.
+6. **FP8 gate redefinition.** Cut the gate at `<|im_end|>` instead of 48 forced tokens, then
+   re-run before FP8 is judged.
+7. **Packed-batch logit perturbation.** D1 measured that a mixed batch changes the token run
+   for essentially every request in it (15/15 with distinct-word prompts) while solo answers
+   are stable. Worth an experiment to bound how far greedy decoding can move with batch shape.
+8. **Settings web page with restart**, so parking mode, FP8 KV and the other switches can be
+   changed without hand-editing a launch command. Owner-approved as a separate job.
