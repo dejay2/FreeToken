@@ -2418,16 +2418,10 @@ def _adjust_config(config: EngineConfig):
     _validate_ple_backend(config, model_config)
     if is_moe and expert_quant == "exl3":
         if config.cuda_graph_max_bs != 0 or config.cuda_graph_bs is not None:
-            logger.info_rank0(
-                "EXL3 reconstruct-first expert proof disables CUDA graphs; "
-                "ordinary BF16 expert work is not graph-safe yet"
+            raise ValueError(
+                "EXL3 reconstruct-first expert proof requires CUDA graphs to be disabled; "
+                "pass --cuda-graph-max-bs 0."
             )
-            # A non-None explicit batch list wins over max_bs in GraphRunner, so clear it
-            # whenever present; leave an already-zero maximum untouched.
-            if config.cuda_graph_bs is not None:
-                override("cuda_graph_bs", None)
-            if config.cuda_graph_max_bs != 0:
-                override("cuda_graph_max_bs", 0)
     elif config.cuda_graph_max_bs is None:
         override("cuda_graph_max_bs", config.max_running_req)
 

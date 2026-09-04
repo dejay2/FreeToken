@@ -40,8 +40,29 @@ def _config(**overrides):
     return config
 
 
-def test_exl3_auto_selects_offload_and_disables_graphs(monkeypatch):
-    import freetoken.engine.engine as engine
+@pytest.mark.parametrize(
+    ("cuda_graph_bs", "cuda_graph_max_bs"),
+    [([1, 2], 4), (None, None), ([1], 0)],
+)
+def test_exl3_rejects_cuda_graph_settings_with_exact_off_flag(
+    cuda_graph_bs, cuda_graph_max_bs
+):
+    from freetoken.engine.engine import _adjust_config
+
+    config = _config(
+        moe_backend="offload",
+        cuda_graph_bs=cuda_graph_bs,
+        cuda_graph_max_bs=cuda_graph_max_bs,
+    )
+
+    with pytest.raises(ValueError, match=r"pass --cuda-graph-max-bs 0"):
+        _adjust_config(config)
+
+    assert config.cuda_graph_bs == cuda_graph_bs
+    assert config.cuda_graph_max_bs == cuda_graph_max_bs
+
+
+def test_exl3_graphs_off_pass_through_untouched_and_auto_select_offload(monkeypatch):
     from freetoken.engine.engine import _adjust_config
 
     import freetoken.moe.bench_profile as bench_profile
@@ -50,33 +71,15 @@ def test_exl3_auto_selects_offload_and_disables_graphs(monkeypatch):
         pytest.fail("EXL3 auto selection must not consult the hybrid benchmark")
 
     monkeypatch.setattr(bench_profile, "load_backend_recommendation", unexpected_bench_call)
-    messages = []
-    monkeypatch.setattr(engine.logger, "info_rank0", messages.append)
-    config = _config(moe_backend="auto", cuda_graph_bs=[1, 2], cuda_graph_max_bs=4)
+    config = _config(moe_backend="auto", cuda_graph_bs=None, cuda_graph_max_bs=0)
 
     _adjust_config(config)
 
-    assert any("ordinary BF16 expert work is not graph-safe yet" in message for message in messages)
     assert config.moe_backend == "offload"
     assert config.moe_cache_auto is True
     assert config.cuda_graph_bs is None
     assert config.cuda_graph_max_bs == 0
     assert config.model_config.moe_backend == "offload"
-
-
-def test_exl3_graph_override_leaves_already_zero_maximum_and_no_list_untouched(monkeypatch):
-    import freetoken.engine.engine as engine
-    from freetoken.engine.engine import _adjust_config
-
-    messages = []
-    monkeypatch.setattr(engine.logger, "info_rank0", messages.append)
-    config = _config(moe_backend="offload", cuda_graph_bs=None, cuda_graph_max_bs=0)
-
-    _adjust_config(config)
-
-    assert not any("ordinary BF16 expert work is not graph-safe yet" in message for message in messages)
-    assert config.cuda_graph_bs is None
-    assert config.cuda_graph_max_bs == 0
 
 
 @pytest.mark.parametrize("backend", ["cpu", "hybrid", "fused"])
