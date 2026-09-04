@@ -10,6 +10,11 @@ checkout source on PYTHONPATH, and records all output in the user's local
 FreeToken log directory. The helper stays torch-free; the Windows compatibility
 shim belongs to the GPU server launcher, not this control page.
 #>
+[CmdletBinding()]
+param(
+    # 2031 avoids engine worker ports 2020-2029; measured by the stop script's port sweep.
+    [int]$Port = 2031
+)
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -41,13 +46,22 @@ Push-Location $repoRoot
 try {
     # The helper is deliberately a foreground child: Task Scheduler owns this wrapper,
     # while Tee-Object-style line writes keep failures visible after a hidden launch.
-    & $pythonExe -m freetoken.daemon.settings --port 2021 *>&1 |
-        ForEach-Object {
-            $line = [string]$_
-            Add-Content -LiteralPath $logPath -Value $line
-            Write-Output $line
-        }
-    $exitCode = $LASTEXITCODE
+    # Uvicorn writes normal startup messages to stderr; Continue prevents PowerShell 5.1
+    # from turning those messages into terminating NativeCommandError records.
+    $childErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $pythonExe -m freetoken.daemon.settings --port $Port --job-id settings-helper *>&1 |
+            ForEach-Object {
+                $line = [string]$_
+                Add-Content -LiteralPath $logPath -Value $line
+                Write-Output $line
+            }
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $childErrorAction
+    }
 }
 catch {
     $message = "settings helper failed: $($_.Exception.Message)"

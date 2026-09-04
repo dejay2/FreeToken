@@ -14,7 +14,8 @@ from .profiles_manager import ProfilesManager
 def _parser() -> argparse.ArgumentParser:
     paths = default_paths()
     parser = argparse.ArgumentParser(description="FreeToken Windows settings helper")
-    parser.add_argument("--port", type=int, default=int(os.environ.get("FREETOKEN_SETTINGS_PORT", "2021")))
+    # 2031 avoids engine worker ports 2020-2029; measured by the stop script's port sweep.
+    parser.add_argument("--port", type=int, default=int(os.environ.get("FREETOKEN_SETTINGS_PORT", "2031")))
     parser.add_argument("--boot-file", default=str(paths["boot"]), help="PowerShell boot file to edit")
     parser.add_argument("--stop-script", default=str(paths["stop"]), help="PowerShell stop script")
     parser.add_argument("--log-file", default=str(paths["log"]), help="Captured server log")
