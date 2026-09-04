@@ -93,7 +93,7 @@ The baseline is the same two turns with parking off.
 |---|---:|---:|---:|---:|---|---|
 | off | 0 | 0 | 0 | 0.0 | (baseline) `maple syrup\|cobalt paint` | — |
 | ram | 1 | 1,778,471,176 | 1 | **683.47** | yes, sha `67369f51…eb21` | **works** |
-| ssd | 1 | 1,778,479,112 | 1 | **1,882.45** | yes, sha `67369f51…eb21` | **works** (after `2ce6403`) |
+| ssd | 1 | 1,778,479,112 | 1 | **1,882.45** | yes, sha `67369f51…eb21` | **works** (after `2ce6403`); **1,106.62** after the 2026-09-04 restore fix |
 
 With parking off every counter in the `/v1/cache/status` `parking` block stayed at zero
 through both turns, which is the live confirmation that the off path builds no store.
@@ -121,7 +121,8 @@ CUDA stream and inference mode — before draining the queue, and records failur
 second turn 3.92 s against 18.27 s cold, and the answer byte-identical to the parking-off
 baseline (sha `67369f51…eb21`); `disabled` false and `last_error` null throughout.
 
-The restore passes P0's 1,883 ms gate by **0.6 ms**. It is also ~6x the bench prototype's
+The restore passes P0's 1,883 ms gate by **0.6 ms** (776 ms after the 2026-09-04 fix; see the
+addendum). It is also ~6x the bench prototype's
 317 ms for SSD at 65,536 tokens — the same prototype-to-live gap RAM shows (31 ms against
 683 ms), so the cost is the surrounding lookup, page and state allocation, radix insert and
 tensor-parallel consensus, not the disk read. A longer parked prefix will exceed the gate, so
@@ -166,6 +167,59 @@ draws of the kernel test's shape, against the ~2.4% E4M3 arithmetic prediction.
 Profile A (BF16, parking off, four requests, 262,144-token context). The FP8 gate failed and
 FP8 was only 2.9% faster, so the default boot stays.
 
+## Addendum 2026-09-04: where the SSD restore's time actually went
+
+Follow-up 5 asked why a live SSD restore of a 65,600-token prefix took 1,882.45 ms when the
+M1 bench moved the same 1.655 GiB in 317 ms. `last_restore_ms` is timed inside
+`ParkStore.restore` alone, so the scheduler's page allocation, GDN slot allocation, radix
+insert and TP consensus are *not* in that number: every extra millisecond was inside the
+store. `park_store.py` now records a per-step breakdown and publishes it on
+`/v1/cache/status` as `parking.last_restore_breakdown_ms`.
+
+Measured live on profile B, same two-turn chat, 1,778,479,112 parked bytes,
+36,974 byte views (1,025 pages x 36 tensors, plus the GDN state):
+
+| step | before (ms) | after (ms) | what it is |
+|---|---:|---:|---|
+| `hash_ms` | 660.5 | 117.8 | SHA-256 of the payload, in the read loop |
+| `copy_ms` | 503.8 | 365.8 | the 36,974 pinned-window -> device copies |
+| `read_ms` | 301.5 | 305.0 | unbuffered `ReadFile`, 5.3 GiB/s — the only step the bench also pays |
+| `views_ms` | 105.7 | 170.9 | building the byte views of the destination |
+| `sync_ms` + `header_ms` + `tray_wait_ms` | 2.3 | 2.6 | stream fence, header/token check, window hand-off |
+| **`total_ms`** | **1,574.5** | **1,106.6** | |
+
+The 1,574.5 ms "before" is this box on 2026-09-04; 2026-09-03 measured 1,882.45 ms for the
+same work, so the run-to-run spread is real and the gate margin was always the concern.
+
+**The dominant cause was the checksum, not the disk.** One thread hashes 2.40 GiB/s here, so
+a single sequential `hashlib.sha256` over 1.655 GiB costs ~690 ms — more than twice the
+304 ms read it protects — and it sat on the critical path between each read and its H2D copy.
+The M1 bench never paid it: the bench verifies *after* its timer stops.
+
+Two fixes, both inside `park_store.py`, both with parking still off by default:
+
+1. **Chunked, parallel payload digest** (`_ChunkedDigest`, on-disk `_VERSION` 3). The digest
+   is SHA-256 over the concatenated SHA-256 digests of fixed 32 MiB payload slices, hashed in
+   an eight-thread pool. `hashlib` releases the GIL above 2 KiB, so eight threads reach
+   18.3 GiB/s (1 -> 2.40, 4 -> 9.1, 8 -> 18.3, 16 -> 27.4 GiB/s on this 32-thread box). The
+   slice size is fixed rather than tied to `--kv-park-window-mib`, so a store booted with a
+   different window size still verifies an older file. Version 2 files are rejected on scan
+   and deleted, which is the intended upgrade path.
+2. **Precomputed byte views** (`_ByteSpan`). The copy walk restarted at view 0 for every
+   pinned-window chunk and rebuilt a byte view for every view it skipped — about 166,000
+   torch calls per seven-chunk restore. Building the flattened views and their cumulative
+   offsets once and binary-searching the first view of each chunk removes that walk
+   (isolated offline: 320 ms -> 180-240 ms).
+
+Result: **1,882 ms (2026-09-03) / 1,574 ms (2026-09-04 re-measure) -> 1,107 ms**, and the
+restored second turn is still byte-identical to the parking-off baseline
+(sha `67369f51...eb21`). Against P0's 1,883 ms gate the margin goes from 0.6 ms to 776 ms.
+
+What is left is the floor the bench also has: 305 ms of disk read plus 366 ms of per-view H2D
+copies. Coalescing those copies would need the parked payload laid out layer-major instead of
+page-major, which only helps when the destination pages are contiguous — they come from a
+free list and generally are not. Not pursued.
+
 ## Follow-ups
 
 1. **Fixed by `2ce6403`** — the parking save worker now re-enters its caller's inference
@@ -185,8 +239,12 @@ FP8 was only 2.9% faster, so the default boot stays.
    runs, 0 in 60 distinct-word runs, 0 in R3's 20 further runs**. Profile A also runs none of
    today's new code (parking and FP8 are both gated off). The corrected probe is
    `scripts/bench/kv_concurrency_distinct.py`.
-5. **SSD restore tuning.** 1,882.45 ms against an 1,883 ms gate is no margin; the cost is the
-   live lookup/allocate/radix-insert/consensus path, not the read.
+5. **Fixed 2026-09-04 — SSD restore tuning.** The cost was not the lookup/allocate/radix-insert/
+   consensus path (that is outside `last_restore_ms`) and not the read. It was the sequential
+   SHA-256 of the payload inside the read loop, plus a per-window-chunk view walk that
+   restarted at view 0 every time. A chunked parallel digest and precomputed byte views take
+   the same restore to **1,107 ms**, with the answer still byte-identical. See the
+   2026-09-04 addendum above.
 6. **FP8 gate redefinition.** Cut the gate at `<|im_end|>` instead of 48 forced tokens, then
    re-run before FP8 is judged.
 7. **Packed-batch logit perturbation.** D1 measured that a mixed batch changes the token run
