@@ -821,7 +821,7 @@
       if (!response.ok) { setNotice(body.detail || 'Could not apply the profile.', 'bad'); return; }
       await loadSettings(); await loadProfiles();
       const restart = document.createElement('button'); restart.className = 'button small'; restart.type = 'button'; restart.textContent = 'Restart now'; restart.addEventListener('click', () => serverAction('restart'));
-      setNotice('Preset applied and saved. Restart to use it.', 'good', restart);
+      setNotice('Preset applied and saved. Restart the server to use it.', 'good', restart);
     }
     async function deleteProfile(id) { const { response, body } = await json(`/api/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' }); if (!response.ok) { setNotice(body.detail || 'Could not delete the profile.', 'bad'); return; } await loadSettings(); await loadProfiles(); setNotice('Profile deleted.', 'good'); }
     async function saveProfile() { const name = $('profile-name').value.trim(); if (!name) { $('profile-name').focus(); return; } const { response, body } = await json('/api/profiles', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, description: 'Saved from the settings page', settings: state.settings }) }); if (!response.ok) { setNotice(body.detail || 'Could not save the profile.', 'bad'); return; } $('profile-form').hidden = true; $('profile-name').value = ''; state.profiles.push(body); renderProfiles(); setNotice('Profile saved as a start-up file.', 'good'); }
