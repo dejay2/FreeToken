@@ -712,6 +712,15 @@ class OffloadMoELayer(MoELayer):
         touched; ``alphas_for_layer`` is the matching (position == expert id) scale lookup."""
         cache = self.offload_cache
         assert cache is not None
+        if cache.quant_format == "exl3":
+            from freetoken.moe.fused_exl3 import require_exl3_gpu_only
+
+            # Refuse CPU/hybrid before the executor or any bank movement is touched;
+            # EXL3 has no CPU operation in this proof.
+            require_exl3_gpu_only(
+                device=hidden_states.device,
+                decode_target=getattr(cache, "decode_target", "gpu"),
+            )
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
@@ -847,6 +856,15 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if cache.quant_format == "exl3":
+            from freetoken.moe.fused_exl3 import require_exl3_gpu_only
+
+            # EXL3's reconstruct-first prompt path is also card-only, even though it
+            # uses the normal full-layer movement branch.
+            require_exl3_gpu_only(
+                device=hidden_states.device,
+                decode_target=getattr(cache, "decode_target", "gpu"),
+            )
         if cache.is_gpu_owned_layer(self.layer_id):
             # No overlap buffer, no materialize, no release: the layer is already resident.
             # Keep the double-buffer pipeline moving anyway -- the next streaming layer's
@@ -924,6 +942,38 @@ class OffloadMoELayer(MoELayer):
         is_prefill: bool,
     ) -> torch.Tensor:
         fmt = cache.quant_format
+        if fmt == "exl3":
+            # Reconstruct-first EXL3 is a card-only proof path. Graphs stay disabled by
+            # the proof command because it reads the sorted route set on the host and the
+            # ordinary BF16 operation owns temporary activation buffers.
+            from freetoken.moe.fused_exl3 import (
+                fused_experts_exl3,
+                require_exl3_gpu_only,
+            )
+
+            require_exl3_gpu_only(
+                device=hidden_states.device,
+                decode_target=getattr(cache, "decode_target", "gpu"),
+            )
+            scratch = getattr(self, "exl3_scratch", None)
+            if scratch is None:
+                scratch = getattr(cache, "exl3_scratch", None)
+            if scratch is None:
+                raise RuntimeError(
+                    "EXL3 expert scratch is not attached; prepare it after the offload cache"
+                )
+            return fused_experts_exl3(
+                hidden_states,
+                views,
+                topk_weights,
+                topk_ids,
+                is_prefill=is_prefill,
+                activation=self.activation,
+                apply_router_weight_on_input=self.apply_router_weight_on_input,
+                swiglu_limit=getattr(self, "swiglu_limit", None),
+                hidden_act_alpha=getattr(self, "hidden_act_alpha", 1.0),
+                scratch=scratch,
+            )
         if fmt in ("nvfp4_marlin", "nvfp4_b12x"):
             # Borrowed W4A16 fused MoE -- Marlin (vLLM, sm_80-99) or b12x
             # (flashinfer, sm_120) over their pre-tiled banks; one kernel serves
