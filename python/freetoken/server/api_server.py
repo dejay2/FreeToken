@@ -174,6 +174,9 @@ class FrontendManager:
             "hits": 0,
             "misses": 0,
             "last_restore_ms": 0.0,
+            # Per-step cost of the newest restore (views/header/read/hash/copy/sync), so a
+            # live restore can be attributed without a debug-level boot.
+            "last_restore_breakdown_ms": {},
             "disabled": False,
             # Newest parking failure text, so a store that disabled itself says why here and not
             # only in the server log (2026-09-03: ssd parking failed silently for a whole run).
@@ -896,6 +899,7 @@ async def cache_status():
                 "hits": 0,
                 "misses": 0,
                 "last_restore_ms": 0.0,
+                "last_restore_breakdown_ms": {},
                 "disabled": False,
                 "last_error": None,
             },

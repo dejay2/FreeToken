@@ -335,6 +335,7 @@ class CacheManager:
                 "hits": 0,
                 "misses": 0,
                 "last_restore_ms": 0.0,
+                "last_restore_breakdown_ms": {},
                 "disabled": False,
                 "last_error": None,
             }

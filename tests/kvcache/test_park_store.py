@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import freetoken.kvcache.park_store as park_module
 from freetoken.kvcache.linear_state_pool import LinearStatePool
 from freetoken.kvcache.park_store import (
     ParkEntryRejected,
@@ -130,6 +131,7 @@ def _store(
     fingerprint: str = "model-A",
     ram_budget_bytes: int = 1 << 20,
     disk_budget_bytes: int = 1 << 20,
+    pinned_window_bytes: int = 4096,
 ) -> ParkStore:
     return ParkStore(
         mode=mode,
@@ -141,7 +143,7 @@ def _store(
         ram_budget_bytes=ram_budget_bytes,
         ssd_dir=tmp_path,
         disk_budget_bytes=disk_budget_bytes,
-        pinned_window_bytes=4096,
+        pinned_window_bytes=pinned_window_bytes,
     )
 
 
@@ -657,7 +659,65 @@ def test_ssd_round_trip_rebuilds_index_without_manifest(tmp_path: Path):
     )
     header = next(tmp_path.glob("*.park")).read_bytes()[:16]
     assert header.startswith(b"FTKVPARK")
-    assert json.loads((tmp_path / "park.json").read_text(encoding="utf-8"))["version"] == 2
+    assert (
+        json.loads((tmp_path / "park.json").read_text(encoding="utf-8"))["version"]
+        == park_module._VERSION
+    )
+
+
+def test_payload_digest_does_not_depend_on_the_pinned_window_size(tmp_path: Path):
+    # The digest is sliced on a fixed 32 MiB grid rather than on the pinned window, so a
+    # store booted with a different --kv-park-window-mib still verifies an older file.
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    source_pages = torch.tensor([0, 4], dtype=torch.int32)
+    source_slot, target_slot = state_pool.alloc(2)
+    kv_expected, state_expected = _fill_entry(
+        kv_pool, state_pool, source_pages, source_slot
+    )
+    tokens = torch.arange(8, dtype=torch.int32)
+
+    writer = _store("ssd", tmp_path, kv_pool, state_pool, pinned_window_bytes=4096)
+    assert writer.save(tokens, source_pages, source_slot)
+    writer.close()
+
+    reader = _store("ssd", tmp_path, kv_pool, state_pool, pinned_window_bytes=3 * 4096)
+    hit = reader.lookup(tokens)
+    assert hit is not None
+    reader.restore(hit, torch.tensor([8, 12], dtype=torch.int32), target_slot)
+    _assert_entry_equal(
+        kv_pool,
+        state_pool,
+        torch.tensor([8, 12], dtype=torch.int32),
+        target_slot,
+        kv_expected,
+        state_expected,
+    )
+    reader.close()
+
+
+def test_an_older_header_version_is_rejected_and_the_file_removed(tmp_path: Path):
+    # Version 2 wrote a single sequential SHA-256 over the payload; version 3 writes the
+    # chunked digest. An old file must become a miss, not a checksum failure mid-restore.
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    pages = torch.tensor([0, 4], dtype=torch.int32)
+    slot = state_pool.alloc(1)[0]
+    _fill_entry(kv_pool, state_pool, pages, slot)
+    tokens = torch.arange(8, dtype=torch.int32)
+    store = _store("ssd", tmp_path, kv_pool, state_pool)
+    assert store.save(tokens, pages, slot)
+    store.close()
+
+    path = next(tmp_path.glob("*.park"))
+    raw = bytearray(path.read_bytes())
+    raw[len(park_module._MAGIC) : len(park_module._MAGIC) + 4] = (2).to_bytes(4, "little")
+    path.write_bytes(bytes(raw))
+    (tmp_path / "park.json").unlink()
+
+    rebuilt = _store("ssd", tmp_path, kv_pool, state_pool)
+    assert rebuilt.lookup(tokens) is None
+    assert rebuilt.status()["parked_count"] == 0
+    assert not path.exists()
+    rebuilt.close()
 
 
 def test_ssd_reader_honors_unbuffered_gate_and_falls_back(

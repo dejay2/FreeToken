@@ -16,6 +16,7 @@ truth; no full SSD entry remains in RAM.
 
 from __future__ import annotations
 
+import bisect
 import contextlib
 import hashlib
 import json
@@ -23,11 +24,12 @@ import os
 import struct
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Full, Queue
 from threading import Event, Lock, RLock, Thread
-from typing import Iterable, Sequence
+from typing import Iterable
 
 import torch
 
@@ -36,10 +38,72 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 _MAGIC = b"FTKVPARK"
-_VERSION = 2
+# 3: the payload digest became the parallel-friendly chunked scheme in _ChunkedDigest.
+# Version 2 files are rejected by _parse_header and deleted by _load_or_scan, which is the
+# intended upgrade path: parking is off by default and an entry is cheap to rebuild.
+_VERSION = 3
 _HEADER_BYTES = 4096
 _ALIGNMENT = 4096
 _COPY_BYTES = 32 << 20
+# Slice size of the payload digest. Independent of --kv-park-window-mib on purpose, so a
+# store booted with a different window size still verifies files an earlier boot wrote.
+_DIGEST_CHUNK_BYTES = 32 << 20
+# Eight threads was the knee on this 32-thread box: 1 -> 2.40 GiB/s, 4 -> 9.1, 8 -> 18.3,
+# 16 -> 27.4. Eight buys the whole win a restore needs without taking half the machine
+# away from the three other requests that may be decoding at the time.
+_DIGEST_WORKERS = min(8, max(1, os.cpu_count() or 1))
+
+
+def _sha256_digest(raw) -> bytes:
+    return hashlib.sha256(raw).digest()
+
+
+class _ChunkedDigest:
+    """SHA-256 over the concatenated SHA-256 digests of fixed-size payload slices.
+
+    One thread hashes 2.40 GiB/s here (measured 2026-09-04), so the plain sequential
+    ``sha256`` spent 690 ms of the 1,882 ms live SSD restore of a 1.655 GiB entry inside
+    ``update()`` alone -- more than twice the 304 ms unbuffered read it guards. ``hashlib``
+    releases the GIL above 2 KiB, so eight threads over 32 MiB slices reach 18.3 GiB/s and
+    the same guard costs about 90 ms.
+
+    The caller reuses its pinned window the moment ``update()`` returns, so every slice is
+    hashed before then: the pool buys parallelism, not overlap.
+    """
+
+    def __init__(self, pool: ThreadPoolExecutor | None, chunk_bytes: int) -> None:
+        if chunk_bytes < _ALIGNMENT or chunk_bytes % _ALIGNMENT:
+            raise ValueError("park digest chunk must be a positive 4096-byte multiple")
+        self._pool = pool
+        self._chunk = int(chunk_bytes)
+        self._carry = bytearray()
+        self._digests: list[bytes] = []
+
+    def update(self, raw) -> None:
+        view = memoryview(raw).cast("B")
+        if self._carry:
+            take = min(self._chunk - len(self._carry), len(view))
+            self._carry += view[:take]
+            view = view[take:]
+            if len(self._carry) == self._chunk:
+                self._digests.append(_sha256_digest(self._carry))
+                self._carry = bytearray()
+        whole = (len(view) // self._chunk) * self._chunk
+        if whole:
+            slices = [view[o : o + self._chunk] for o in range(0, whole, self._chunk)]
+            if self._pool is None or len(slices) == 1:
+                self._digests.extend(_sha256_digest(part) for part in slices)
+            else:
+                self._digests.extend(self._pool.map(_sha256_digest, slices))
+            view = view[whole:]
+        if view:
+            self._carry += view
+
+    def hexdigest(self) -> str:
+        digests = list(self._digests)
+        if self._carry:
+            digests.append(_sha256_digest(self._carry))
+        return hashlib.sha256(b"".join(digests)).hexdigest()
 
 
 class ParkEntryRejected(RuntimeError):
@@ -89,6 +153,41 @@ def _byte_view(tensor: torch.Tensor) -> torch.Tensor:
     if not tensor.is_contiguous():
         raise ValueError(f"park view must be contiguous, got shape={tuple(tensor.shape)}")
     return tensor.view(torch.uint8).reshape(-1)
+
+
+@dataclass(frozen=True)
+class _ByteSpan:
+    """Flattened uint8 views of one parked snapshot plus their cumulative byte offsets.
+
+    A 65,600-token entry is 1,025 pages x 36 tensors = 36,900 views. Until 2026-09-04 the
+    copy walk restarted at view 0 for every pinned-window chunk and rebuilt a byte view for
+    each view it skipped -- about 166,000 torch calls per seven-chunk restore, and 707 ms of
+    the measured 1,882 ms. Building the byte views and their offsets once, then binary
+    searching the first view of a chunk, removes that walk.
+    """
+
+    views: tuple[torch.Tensor, ...]
+    offsets: tuple[int, ...]
+
+    @classmethod
+    def build(cls, views: Iterable[torch.Tensor]) -> "_ByteSpan":
+        kept: list[torch.Tensor] = []
+        offsets = [0]
+        for view in views:
+            raw = _byte_view(view)
+            if raw.numel() == 0:
+                continue
+            kept.append(raw)
+            offsets.append(offsets[-1] + raw.numel())
+        return cls(tuple(kept), tuple(offsets))
+
+    @property
+    def nbytes(self) -> int:
+        return self.offsets[-1]
+
+    def locate(self, offset: int) -> int:
+        """Index of the view holding byte ``offset``; ``len(views)`` when past the end."""
+        return bisect.bisect_right(self.offsets, offset) - 1
 
 
 def _align_up(value: int, alignment: int = _ALIGNMENT) -> int:
@@ -330,6 +429,7 @@ class ParkStore:
         self._hits = 0
         self._misses = 0
         self._last_restore_ms = 0.0
+        self._last_restore_breakdown: dict[str, float] = {}
         self._disabled = False
         self._last_error: str | None = None
         self._lock = RLock()
@@ -338,6 +438,7 @@ class ParkStore:
         self._windows: tuple[torch.Tensor, torch.Tensor] | None = None
         self._save_queue: Queue[PendingPark | None] | None = None
         self._worker: Thread | None = None
+        self._digest_pool: ThreadPoolExecutor | None = None
         self._reserved_bytes = 0
         self._closed = False
         # Inference mode, the current CUDA device and the current CUDA stream are all THREAD-LOCAL,
@@ -361,6 +462,9 @@ class ParkStore:
             if kv_pool.device.type == "cuda":
                 self._stream = torch.cuda.Stream(device=kv_pool.device)
             if mode == "ssd":
+                self._digest_pool = ThreadPoolExecutor(
+                    max_workers=_DIGEST_WORKERS, thread_name_prefix="kv-park-digest"
+                )
                 self.ssd_dir.mkdir(parents=True, exist_ok=True)
                 self._windows = (
                     self._allocate_window(self.pinned_window_bytes),
@@ -378,6 +482,9 @@ class ParkStore:
             self._disabled = True
             self._stream = None
             self._windows = None
+            if self._digest_pool is not None:
+                self._digest_pool.shutdown(wait=False)
+                self._digest_pool = None
             self._entries.clear()
             self.note_error(f"{mode} store setup failed: {exc!r}")
             logger.warning(
@@ -423,6 +530,9 @@ class ParkStore:
             pinned_window_bytes=int(getattr(config, "kv_park_window_mib", 256)) * (1 << 20),
         )
 
+    def _new_payload_digest(self, chunk_bytes: int) -> _ChunkedDigest:
+        return _ChunkedDigest(self._digest_pool, chunk_bytes)
+
     def payload_bytes(self, token_count: int) -> int:
         if token_count < 0 or token_count % self.page_size:
             raise ValueError("park token_count must be page aligned")
@@ -436,9 +546,7 @@ class ParkStore:
             return payload + token_count * torch.int32.itemsize
         return _align_up(_HEADER_BYTES + token_count * torch.int32.itemsize) + payload
 
-    def _entry_views(
-        self, page_bases: torch.Tensor, state_slot: int
-    ) -> tuple[torch.Tensor, ...]:
+    def _entry_views(self, page_bases: torch.Tensor, state_slot: int) -> _ByteSpan:
         bases = page_bases.detach().to(device="cpu", dtype=torch.int64).tolist()
         views: list[torch.Tensor] = []
         for base in bases:
@@ -446,7 +554,7 @@ class ParkStore:
                 raise ValueError(f"park page base must be aligned, got {base}")
             views.extend(self.kv_pool.page_byte_views(base // self.page_size))
         views.extend(self.state_pool.slot_byte_views(int(state_slot)))
-        return tuple(views)
+        return _ByteSpan.build(views)
 
     def _allocate_window(self, nbytes: int) -> torch.Tensor:
         if self.kv_pool.device.type == "cuda":
@@ -462,8 +570,8 @@ class ParkStore:
         # Keep the parent allocation alive; a tensor slice owns its storage, including the slack.
         return window
 
-    def _copy_to_ram(self, views: Sequence[torch.Tensor]) -> torch.Tensor:
-        payload_bytes = sum(_tensor_nbytes(view) for view in views)
+    def _copy_to_ram(self, span: _ByteSpan) -> torch.Tensor:
+        payload_bytes = span.nbytes
         if self.kv_pool.device.type == "cuda":
             from freetoken.kernel.pinned import alloc_pinned_tensor
 
@@ -471,62 +579,56 @@ class ParkStore:
         else:
             host = torch.empty(payload_bytes, dtype=torch.uint8)
         if self._stream is None:
-            self._copy_span_to_window(views, 0, payload_bytes, host)
+            self._copy_span_to_window(span, 0, payload_bytes, host)
         else:
             current = torch.cuda.current_stream(self.kv_pool.device)
             self._stream.wait_stream(current)
             with torch.cuda.stream(self._stream):
-                self._copy_span_to_window(views, 0, payload_bytes, host)
+                self._copy_span_to_window(span, 0, payload_bytes, host)
             self._stream.synchronize()
         return host
 
     @staticmethod
     def _copy_span_to_window(
-        views: Sequence[torch.Tensor], offset: int, length: int, window: torch.Tensor
+        span: _ByteSpan, offset: int, length: int, window: torch.Tensor
     ) -> None:
-        remaining = length
-        global_offset = offset
+        index = span.locate(offset)
+        views, offsets = span.views, span.offsets
         window_offset = 0
-        for view in views:
-            raw = _byte_view(view)
-            if global_offset >= raw.numel():
-                global_offset -= raw.numel()
-                continue
-            take = min(remaining, raw.numel() - global_offset)
+        while window_offset < length:
+            if index >= len(views):
+                raise RuntimeError(
+                    f"park source ended {length - window_offset} bytes short"
+                )
+            raw = views[index]
+            start = offset + window_offset - offsets[index]
+            take = min(length - window_offset, raw.numel() - start)
             window[window_offset : window_offset + take].copy_(
-                raw[global_offset : global_offset + take], non_blocking=True
+                raw[start : start + take], non_blocking=True
             )
-            remaining -= take
             window_offset += take
-            global_offset = 0
-            if remaining == 0:
-                break
-        if remaining:
-            raise RuntimeError(f"park source ended {remaining} bytes short")
+            index += 1
 
     @staticmethod
     def _copy_window_to_span(
-        window: torch.Tensor, offset: int, length: int, views: Sequence[torch.Tensor]
+        window: torch.Tensor, offset: int, length: int, span: _ByteSpan
     ) -> None:
-        remaining = length
-        global_offset = offset
+        index = span.locate(offset)
+        views, offsets = span.views, span.offsets
         window_offset = 0
-        for view in views:
-            raw = _byte_view(view)
-            if global_offset >= raw.numel():
-                global_offset -= raw.numel()
-                continue
-            take = min(remaining, raw.numel() - global_offset)
-            raw[global_offset : global_offset + take].copy_(
+        while window_offset < length:
+            if index >= len(views):
+                raise RuntimeError(
+                    f"park destination ended {length - window_offset} bytes short"
+                )
+            raw = views[index]
+            start = offset + window_offset - offsets[index]
+            take = min(length - window_offset, raw.numel() - start)
+            raw[start : start + take].copy_(
                 window[window_offset : window_offset + take], non_blocking=True
             )
-            remaining -= take
             window_offset += take
-            global_offset = 0
-            if remaining == 0:
-                break
-        if remaining:
-            raise RuntimeError(f"park destination ended {remaining} bytes short")
+            index += 1
 
     def _header(
         self,
@@ -547,6 +649,7 @@ class ParkStore:
                 "payload_bytes": payload_bytes,
                 "payload_offset": payload_offset,
                 "payload_sha256": payload_sha256,
+                "payload_digest_chunk_bytes": _DIGEST_CHUNK_BYTES,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -588,6 +691,9 @@ class ParkStore:
             raise ParkEntryRejected(f"KV park payload-size mismatch: {path}")
         if payload_offset != _align_up(_HEADER_BYTES + token_count * torch.int32.itemsize):
             raise ParkEntryRejected(f"KV park payload-offset mismatch: {path}")
+        digest_chunk = int(meta.get("payload_digest_chunk_bytes", 0))
+        if digest_chunk < _ALIGNMENT or digest_chunk % _ALIGNMENT:
+            raise ParkEntryRejected(f"invalid KV park digest chunk: {path}")
         if path.stat().st_size != payload_offset + payload_bytes:
             raise ParkEntryRejected(f"KV park file-size mismatch: {path}")
         return meta
@@ -620,7 +726,7 @@ class ParkStore:
         *,
         key: str,
         tokens: torch.Tensor,
-        views: Sequence[torch.Tensor],
+        span: _ByteSpan,
         payload_bytes: int,
         on_source_copied=None,
     ) -> ParkedEntry:
@@ -635,7 +741,7 @@ class ParkStore:
             payload_offset=payload_offset,
             payload_sha256="0" * 64,
         )
-        payload_digest = hashlib.sha256()
+        payload_digest = self._new_payload_digest(_DIGEST_CHUNK_BYTES)
         try:
             with temp.open("w+b", buffering=0) as handle:
                 handle.write(header)
@@ -649,12 +755,12 @@ class ParkStore:
                         window = self._windows[0]
                         length = min(self.pinned_window_bytes, payload_bytes - offset)
                         if self._stream is None:
-                            self._copy_span_to_window(views, offset, length, window)
+                            self._copy_span_to_window(span, offset, length, window)
                         else:
                             current = torch.cuda.current_stream(self.kv_pool.device)
                             self._stream.wait_stream(current)
                             with torch.cuda.stream(self._stream):
-                                self._copy_span_to_window(views, offset, length, window)
+                                self._copy_span_to_window(span, offset, length, window)
                             self._stream.synchronize()
                         if offset + length == payload_bytes and on_source_copied is not None:
                             on_source_copied()
@@ -835,14 +941,14 @@ class ParkStore:
             self._evict_to_fit(needed)
             if self.mode == "ssd" and len(self._entries) != before:
                 self._write_manifest()
-        views = self._entry_views(bases, state_slot)
-        payload = sum(_tensor_nbytes(view) for view in views)
+        span = self._entry_views(bases, state_slot)
+        payload = span.nbytes
         expected = self.payload_bytes(len(tokens))
         if payload != expected:
             raise RuntimeError(f"KV park payload {payload} != expected {expected}")
         try:
             if self.mode == "ram":
-                buffer = self._copy_to_ram(views)
+                buffer = self._copy_to_ram(span)
                 if _on_copied is not None:
                     _on_copied()
                 entry = ParkedEntry(
@@ -858,7 +964,7 @@ class ParkStore:
                 entry = self._write_ssd(
                     key=key,
                     tokens=tokens,
-                    views=views,
+                    span=span,
                     payload_bytes=payload,
                     on_source_copied=_on_copied,
                 )
@@ -921,7 +1027,7 @@ class ParkStore:
         chunk_length: int,
         source_offset: int,
         length: int,
-        views: Sequence[torch.Tensor],
+        span: _ByteSpan,
     ) -> bool:
         restore_start = max(chunk_offset, source_offset)
         restore_stop = min(chunk_offset + chunk_length, source_offset + length)
@@ -933,7 +1039,7 @@ class ParkStore:
             window[window_offset : window_offset + restore_length],
             restore_start - source_offset,
             restore_length,
-            views,
+            span,
         )
         return True
 
@@ -946,14 +1052,16 @@ class ParkStore:
     def _read_payload_cpu(
         self,
         entry: ParkedEntry,
-        views: Sequence[torch.Tensor],
+        span: _ByteSpan,
         payload_offset: int,
         source_offset: int,
         length: int,
+        digest_chunk_bytes: int = _DIGEST_CHUNK_BYTES,
+        timing: dict[str, float] | None = None,
     ) -> None:
         assert entry.path is not None and self._windows is not None
         expected = self._expected_payload_checksum(entry)
-        digest = hashlib.sha256()
+        digest = self._new_payload_digest(digest_chunk_bytes)
         with self._window_lock:
             with entry.path.open("rb", buffering=0) as handle:
                 handle.seek(payload_offset)
@@ -965,34 +1073,45 @@ class ParkStore:
                     )
                     window = self._windows[chunk % len(self._windows)]
                     raw = memoryview(window[:chunk_length].numpy()).cast("B")
+                    mark = time.perf_counter()
                     got = handle.readinto(raw)
+                    if timing is not None:
+                        timing["read_ms"] += (time.perf_counter() - mark) * 1000.0
                     if got != chunk_length:
                         raise ParkEntryRejected(
                             f"short KV park payload read: {entry.path}"
                         )
+                    mark = time.perf_counter()
                     digest.update(raw)
+                    if timing is not None:
+                        timing["hash_ms"] += (time.perf_counter() - mark) * 1000.0
+                    mark = time.perf_counter()
                     self._copy_restored_chunk(
                         window,
                         offset,
                         chunk_length,
                         source_offset,
                         length,
-                        views,
+                        span,
                     )
+                    if timing is not None:
+                        timing["copy_ms"] += (time.perf_counter() - mark) * 1000.0
         if digest.hexdigest() != expected:
             raise ParkEntryRejected(f"KV park payload checksum mismatch: {entry.path}")
 
     def _read_payload_cuda(
         self,
         entry: ParkedEntry,
-        views: Sequence[torch.Tensor],
+        span: _ByteSpan,
         payload_offset: int,
         source_offset: int,
         length: int,
+        digest_chunk_bytes: int = _DIGEST_CHUNK_BYTES,
+        timing: dict[str, float] | None = None,
     ) -> None:
         assert entry.path is not None and self._windows is not None and self._stream is not None
         expected = self._expected_payload_checksum(entry)
-        digest = hashlib.sha256()
+        digest = self._new_payload_digest(digest_chunk_bytes)
         reader = None
         handle = None
         with self._window_lock:
@@ -1010,12 +1129,16 @@ class ParkStore:
                     if event is not None:
                         # Only wait when this tray is about to be reused. Reading into the other
                         # tray meanwhile overlaps disk block N+1 with H2D block N, matching M1.
+                        mark = time.perf_counter()
                         event.synchronize()
+                        if timing is not None:
+                            timing["tray_wait_ms"] += (time.perf_counter() - mark) * 1000.0
                     chunk_length = min(
                         self.pinned_window_bytes, entry.payload_bytes - offset
                     )
                     window = self._windows[index]
                     raw = memoryview(window[:chunk_length].numpy()).cast("B")
+                    mark = time.perf_counter()
                     if reader is not None:
                         got = reader.read_into(
                             raw,
@@ -1024,11 +1147,17 @@ class ParkStore:
                         )
                     else:
                         got = handle.readinto(raw)
+                    if timing is not None:
+                        timing["read_ms"] += (time.perf_counter() - mark) * 1000.0
                     if got != chunk_length:
                         raise ParkEntryRejected(
                             f"short KV park payload read: {entry.path}"
                         )
+                    mark = time.perf_counter()
                     digest.update(raw)
+                    if timing is not None:
+                        timing["hash_ms"] += (time.perf_counter() - mark) * 1000.0
+                    mark = time.perf_counter()
                     with torch.cuda.stream(self._stream):
                         copied = self._copy_restored_chunk(
                             window,
@@ -1036,7 +1165,7 @@ class ParkStore:
                             chunk_length,
                             source_offset,
                             length,
-                            views,
+                            span,
                         )
                         if copied:
                             done = torch.cuda.Event(enable_timing=False)
@@ -1044,7 +1173,12 @@ class ParkStore:
                             events[index] = done
                         else:
                             events[index] = None
+                    if timing is not None:
+                        timing["copy_ms"] += (time.perf_counter() - mark) * 1000.0
+                mark = time.perf_counter()
                 self._stream.synchronize()
+                if timing is not None:
+                    timing["sync_ms"] += (time.perf_counter() - mark) * 1000.0
             finally:
                 if reader is not None:
                     reader.close()
@@ -1063,22 +1197,39 @@ class ParkStore:
     ) -> None:
         """Restore a parked page suffix plus the complete state into newly-owned storage."""
         started = time.perf_counter()
+        # Per-step restore timing. The 2026-09-03 live SSD restore took 1,882 ms against an
+        # 1,883 ms gate while the M1 bench moved the same 1.66 GiB in 317 ms; the breakdown
+        # below is what separates them and is published on /v1/cache/status so a live run can
+        # be attributed without a debug-level boot.
+        timing: dict[str, float] = {
+            "views_ms": 0.0,
+            "header_ms": 0.0,
+            "read_ms": 0.0,
+            "hash_ms": 0.0,
+            "copy_ms": 0.0,
+            "tray_wait_ms": 0.0,
+            "sync_ms": 0.0,
+            "total_ms": 0.0,
+        }
         with self._lock:
             total_pages = entry.token_count // self.page_size
             if page_offset < 0 or page_offset > total_pages:
                 raise ValueError("restore page offset is outside the parked entry")
+            mark = time.perf_counter()
             bases = page_bases.detach().to(device="cpu", dtype=torch.int32).flatten()
             if len(bases) != total_pages - page_offset:
                 raise ValueError("restore target page count does not match parked suffix")
-            views = self._entry_views(bases, state_slot)
+            span = self._entry_views(bases, state_slot)
             per_page_views = self.kv_pool.page_byte_views(0)
             per_page_bytes = sum(_tensor_nbytes(view) for view in per_page_views)
             state_views = self.state_pool.slot_byte_views(self.state_pool.padding_slot)
             state_bytes = sum(_tensor_nbytes(view) for view in state_views)
             source_offset = page_offset * per_page_bytes
             suffix_bytes = (total_pages - page_offset) * per_page_bytes + state_bytes
-            if sum(_tensor_nbytes(view) for view in views) != suffix_bytes:
+            if span.nbytes != suffix_bytes:
                 raise ParkEntryRejected("restore target layout does not match parked suffix")
+            timing["views_ms"] = (time.perf_counter() - mark) * 1000.0
+            timing["views"] = float(len(span.views))
             try:
                 if entry.ram_buffer is not None:
                     if entry.ram_buffer.numel() != entry.payload_bytes:
@@ -1086,27 +1237,36 @@ class ParkStore:
                     source = entry.ram_buffer[
                         source_offset : source_offset + suffix_bytes
                     ]
+                    mark = time.perf_counter()
                     if self._stream is None:
-                        self._copy_window_to_span(source, 0, suffix_bytes, views)
+                        self._copy_window_to_span(source, 0, suffix_bytes, span)
                     else:
                         with torch.cuda.stream(self._stream):
-                            self._copy_window_to_span(source, 0, suffix_bytes, views)
+                            self._copy_window_to_span(source, 0, suffix_bytes, span)
+                        timing["copy_ms"] = (time.perf_counter() - mark) * 1000.0
+                        mark = time.perf_counter()
                         self._stream.synchronize()
+                        timing["sync_ms"] = (time.perf_counter() - mark) * 1000.0
                 else:
                     if entry.path is None:
                         raise ParkEntryRejected("SSD parked entry has no file")
+                    mark = time.perf_counter()
                     meta = self._parse_header(entry.path)
                     disk_tokens = self._read_tokens(entry.path, entry.token_count)
                     if not torch.equal(disk_tokens, entry.token_ids):
                         raise ParkEntryRejected("SSD parked token verification failed")
                     payload_offset = int(meta["payload_offset"])
+                    digest_chunk = int(meta["payload_digest_chunk_bytes"])
+                    timing["header_ms"] = (time.perf_counter() - mark) * 1000.0
                     if self._stream is None:
                         self._read_payload_cpu(
-                            entry, views, payload_offset, source_offset, suffix_bytes
+                            entry, span, payload_offset, source_offset, suffix_bytes,
+                            digest_chunk, timing,
                         )
                     else:
                         self._read_payload_cuda(
-                            entry, views, payload_offset, source_offset, suffix_bytes
+                            entry, span, payload_offset, source_offset, suffix_bytes,
+                            digest_chunk, timing,
                         )
             except Exception:
                 if self._stream is not None:
@@ -1115,6 +1275,9 @@ class ParkStore:
                 raise
             finally:
                 self._last_restore_ms = (time.perf_counter() - started) * 1000.0
+                timing["total_ms"] = self._last_restore_ms
+                self._last_restore_breakdown = timing
+                logger.debug(f"KV park restore breakdown: {timing}")
 
     def _evict_to_fit(self, incoming: int) -> None:
         budget = self.ram_budget_bytes if self.mode == "ram" else self.disk_budget_bytes
@@ -1244,6 +1407,7 @@ class ParkStore:
                 "hits": self._hits,
                 "misses": self._misses,
                 "last_restore_ms": self._last_restore_ms,
+                "last_restore_breakdown_ms": dict(self._last_restore_breakdown),
                 "disabled": self._disabled,
                 "last_error": self._last_error,
             }
@@ -1273,6 +1437,9 @@ class ParkStore:
         with self._lock:
             if self.mode == "ssd":
                 self._write_manifest()
+        if self._digest_pool is not None:
+            self._digest_pool.shutdown(wait=True)
+            self._digest_pool = None
 
 
 __all__ = [
