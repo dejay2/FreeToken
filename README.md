@@ -167,6 +167,16 @@ Vision support is opt-in and disabled by default. Enable it with environment var
 - `-VisionPackagesPath` points to the installed packages (Pillow, TorchVision).
 - Install vision dependencies: `pip install "freetoken[vision]"` (pulls pillow>=11,<13 and torchvision>=0.26,<0.27) or run the helper script `install-qwen38-vision-deps-windows.ps1`.
 
+### Windows settings helper
+
+The fork includes a small local settings page at `http://127.0.0.1:2021`. It edits the startup settings and can start, stop, or restart the main server on port 2020 while remaining available if the server fails to boot. Register it for the current Windows user with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\register-settings-helper.ps1
+```
+
+Remove the startup entry with `scripts\unregister-settings-helper.ps1`. The machine-local `boot-2020.ps1` file is intentionally untracked and is never part of the fork.
+
 ### MTP speculative decoding (feasibility spike)
 
 MTP (Multi-Token Prediction) speculative decoding is a feasibility spike and is off by default. It requires:
