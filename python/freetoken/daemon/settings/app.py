@@ -24,6 +24,7 @@ from .dials import (
     dial_value_for_display,
     validate_settings,
 )
+from .download import DownloadManager, create_download_router
 from .model_info import ModelInfo, read_model
 from .process_manager import LifecycleError, ProcessManager
 from .profiles_manager import ProfileError, ProfileValidationError, ProfilesManager
@@ -59,6 +60,22 @@ def default_paths() -> dict[str, Path]:
         "lock": root / "prompts" / "settings-page" / "gpu.lock",
         "static": Path(__file__).with_name("static") / "index.html",
     }
+
+
+def _models_dir_from_boot(boot: BootFile, supplied: str | os.PathLike[str] | None) -> Path:
+    """Pick the download root beside the saved model, or a safe repository fallback."""
+    if supplied is not None and str(supplied).strip():
+        return Path(supplied)
+    try:
+        settings = boot.load()
+    except Exception:
+        settings = {}
+    model_path = settings.get("ModelPath") if isinstance(settings, dict) else None
+    if isinstance(model_path, str) and model_path.strip() and not model_path.lstrip().startswith(("$", "(")):
+        folder = Path(os.path.expandvars(os.path.expanduser(model_path.strip())))
+        if folder.name:
+            return folder.parent
+    return repository_root() / "models"
 
 
 def _validation_response(errors: list[dict[str, str]]) -> JSONResponse:
@@ -127,6 +144,8 @@ def create_app(
     profiles: ProfilesManager | None = None,
     log_path: str | os.PathLike[str] | None = None,
     static_path: str | os.PathLike[str] | None = None,
+    downloads_dir: str | os.PathLike[str] | None = None,
+    models_dir: str | os.PathLike[str] | None = None,
     version: str = HELPER_VERSION,
     wall_now=time.time,
 ) -> FastAPI:
@@ -152,6 +171,28 @@ def create_app(
         process_manager.boot_file = boot.path
     log = Path(log_path or getattr(process_manager, "log_path", paths["log"]))
     static = Path(static_path or paths["static"])
+    model_root = _models_dir_from_boot(
+        boot,
+        models_dir if models_dir is not None else downloads_dir,
+    )
+    download_root = Path(downloads_dir) if downloads_dir is not None and str(downloads_dir).strip() else model_root
+
+    def card_memory_bytes() -> int:
+        try:
+            status = process_manager.server_status()
+            nested = status.get("gpu") if isinstance(status, dict) else None
+            total_mb = status.get("vramTotalMb", 0) if isinstance(status, dict) else 0
+            if not total_mb and isinstance(nested, dict):
+                total_mb = nested.get("vramTotalMb", 0)
+            return max(0, int(total_mb or 0)) * 1024 * 1024
+        except Exception:
+            return 0
+
+    download_manager = DownloadManager(
+        model_root,
+        download_root,
+        card_memory=card_memory_bytes,
+    )
     started = time.monotonic()
     app = FastAPI(title="FreeToken Settings Helper", version=version)
     app.state.boot_file = boot
@@ -159,7 +200,11 @@ def create_app(
     app.state.process_manager = process_manager
     app.state.profiles = profiles
     app.state.log_path = log
+    app.state.models_dir = model_root
+    app.state.downloads_dir = download_root
+    app.state.download_manager = download_manager
     app.state.started_monotonic = started
+    app.include_router(create_download_router(models_dir=model_root, manager=download_manager))
 
     def set_active_boot(path: str | os.PathLike[str]) -> None:
         nonlocal boot

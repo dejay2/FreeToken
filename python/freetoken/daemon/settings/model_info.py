@@ -179,47 +179,23 @@ def expert_format(config: dict[str, Any]) -> str:
     return ""
 
 
-def read_model(path: str | os.PathLike[str] | None) -> ModelInfo:
-    """Describe the model folder at ``path``. Never raises: an unreadable folder comes back
-    with ``found=False`` and a plain ``error`` so the page can say what is wrong."""
-    text = str(path or "").strip()
-    folder = Path(os.path.expandvars(os.path.expanduser(text))) if text else None
-    info = ModelInfo(path=text, name=folder.name if folder is not None else "")
-    if folder is None:
-        info.error = "No model folder is set."
-        return info
-    if text.startswith("$") or text.startswith("("):
-        info.error = "The model folder is a script expression the page cannot open."
-        return info
-    if not folder.is_dir():
-        info.error = "That folder does not exist."
-        return info
-    config_path = folder / "config.json"
-    if not config_path.is_file():
-        info.error = "No config.json in that folder, so it is not a model folder."
-        return info
-    try:
-        with config_path.open("r", encoding="utf-8") as fh:
-            config = json.load(fh)
-    except (OSError, ValueError) as exc:
-        info.error = f"config.json could not be read: {exc.__class__.__name__}."
-        return info
+def describe_config(
+    config: dict[str, Any],
+    name: str,
+    path: str | os.PathLike[str] | None = None,
+) -> ModelInfo:
+    """Describe an already-read ``config.json`` without opening model weights.
+
+    Previewing a Hub model has the same model-shaping rules as reading a local folder, but it
+    does not have a folder for ``read_model`` to open.  Keeping the config-only part here makes
+    those two paths use one set of formulas.
+    """
+    info = ModelInfo(path=str(path or ""), name=str(name or ""))
     if not isinstance(config, dict):
         info.error = "config.json is not a settings object."
         return info
 
     info.found = True
-    try:
-        for entry in os.scandir(folder):
-            if entry.is_file() and entry.name.endswith(".safetensors"):
-                info.weight_files += 1
-                try:
-                    info.weight_bytes += entry.stat().st_size
-                except OSError:
-                    pass
-    except OSError:
-        pass
-
     architectures = config.get("architectures") or []
     info.architecture = str(architectures[0]) if architectures else ""
     info.supported = info.architecture in SUPPORTED_ARCHITECTURES
@@ -254,13 +230,56 @@ def read_model(path: str | os.PathLike[str] | None) -> ModelInfo:
             info.bytes_per_expert = int(formula(info.hidden_size, info.moe_intermediate_size))
             info.bytes_per_layer = info.bytes_per_expert * info.num_experts
             info.total_expert_bytes = info.bytes_per_layer * info.num_moe_layers
-        ftw = _ftw_bank_bytes(folder)
-        if ftw:
-            # exact bank bytes beat the estimate when the checkpoint is pre-packed (FTW)
-            info.total_expert_bytes = ftw
-            if info.num_moe_layers and info.num_experts:
-                info.bytes_per_layer = ftw // info.num_moe_layers
-                info.bytes_per_expert = info.bytes_per_layer // info.num_experts
+    return info
+
+
+def read_model(path: str | os.PathLike[str] | None) -> ModelInfo:
+    """Describe the model folder at ``path``. Never raises: an unreadable folder comes back
+    with ``found=False`` and a plain ``error`` so the page can say what is wrong."""
+    text = str(path or "").strip()
+    folder = Path(os.path.expandvars(os.path.expanduser(text))) if text else None
+    info = ModelInfo(path=text, name=folder.name if folder is not None else "")
+    if folder is None:
+        info.error = "No model folder is set."
+        return info
+    if text.startswith("$") or text.startswith("("):
+        info.error = "The model folder is a script expression the page cannot open."
+        return info
+    if not folder.is_dir():
+        info.error = "That folder does not exist."
+        return info
+    config_path = folder / "config.json"
+    if not config_path.is_file():
+        info.error = "No config.json in that folder, so it is not a model folder."
+        return info
+    try:
+        with config_path.open("r", encoding="utf-8") as fh:
+            config = json.load(fh)
+    except (OSError, ValueError) as exc:
+        info.error = f"config.json could not be read: {exc.__class__.__name__}."
+        return info
+    info = describe_config(config, folder.name, path=str(folder))
+    if not info.found:
+        return info
+
+    try:
+        for entry in os.scandir(folder):
+            if entry.is_file() and entry.name.endswith(".safetensors"):
+                info.weight_files += 1
+                try:
+                    info.weight_bytes += entry.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+    ftw = _ftw_bank_bytes(folder)
+    if ftw:
+        # exact bank bytes beat the estimate when the checkpoint is pre-packed (FTW)
+        info.total_expert_bytes = ftw
+        if info.num_moe_layers and info.num_experts:
+            info.bytes_per_layer = ftw // info.num_moe_layers
+            info.bytes_per_expert = info.bytes_per_layer // info.num_experts
     return info
 
 
@@ -291,6 +310,7 @@ __all__ = [
     "ModelInfo",
     "REFERENCE_ARCHITECTURE",
     "SUPPORTED_ARCHITECTURES",
+    "describe_config",
     "expert_format",
     "gib",
     "read_model",

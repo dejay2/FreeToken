@@ -141,7 +141,7 @@ def test_page_has_tabs_info_buttons_sliders_and_browse() -> None:
     source = _source()
 
     assert 'role="tablist"' in page
-    for tab in ("settings", "server", "profiles"):
+    for tab in ("settings", "server", "profiles", "models"):
         assert f'data-tab="{tab}"' in page
     # Plain-language help, effect chips, sliders and folder browsing are all driven by the
     # metadata the settings route sends; the page only needs the generic hooks.
@@ -176,3 +176,21 @@ def test_page_reads_the_model_and_reshapes_itself() -> None:
     # Text-stored counts (layers kept on the card) go through the storedAs contract.
     assert "dial.storedAs" in source
     assert "dial.storedZero" in source
+
+
+def test_models_tab_uses_preview_download_progress_and_folder_routes() -> None:
+    page = _page()
+    source = _source()
+
+    assert "<!-- models-tab -->" in page and "<!-- /models-tab -->" in page
+    assert 'id="model-repo"' in page
+    assert 'id="model-preview"' in page
+    for route in ("/api/downloads/preview", "/api/downloads", "/api/models"):
+        assert route in source
+    assert "model-download-cancel" in page
+    assert "setTimeout(pollModelDownload, 2000)" in source
+    assert "Use as model folder" in page
+    assert "dial.browse === 'model'" in source
+    assert "window.confirm" not in source
+    assert "window.alert" not in source
+    assert "window.prompt" not in source
