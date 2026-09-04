@@ -2422,10 +2422,12 @@ def _adjust_config(config: EngineConfig):
                 "EXL3 reconstruct-first expert proof disables CUDA graphs; "
                 "ordinary BF16 expert work is not graph-safe yet"
             )
-        # A non-None explicit batch list wins over max_bs in GraphRunner, so clear both
-        # knobs rather than setting only the maximum to zero.
-        override("cuda_graph_bs", None)
-        override("cuda_graph_max_bs", 0)
+            # A non-None explicit batch list wins over max_bs in GraphRunner, so clear it
+            # whenever present; leave an already-zero maximum untouched.
+            if config.cuda_graph_bs is not None:
+                override("cuda_graph_bs", None)
+            if config.cuda_graph_max_bs != 0:
+                override("cuda_graph_max_bs", 0)
     elif config.cuda_graph_max_bs is None:
         override("cuda_graph_max_bs", config.max_running_req)
 

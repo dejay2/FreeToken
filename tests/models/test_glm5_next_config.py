@@ -8,6 +8,7 @@ exact object cached_load_hf_config falls back to when transformers doesn't know
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -352,11 +353,13 @@ def test_real_trimmed_exl3_metadata_detects_format_and_geometry():
 
 
 def test_trimmed_exl3_records_lock_the_selected_source_headers():
-    # Records were copied byte-for-byte from turboderp/GLM-5.3-Flash-exl3, revision 2.05bpw.
+    # These seven records were copied byte-for-byte from turboderp/GLM-5.3-Flash-exl3,
+    # revision 2.05bpw. The source metadata has no MTP-layer or vision records, so neither
+    # is claimed by this trimmed fixture.
     fixture_path = Path(__file__).parent / "fixtures" / "glm53_exl3_quantization_trimmed.json"
     storage = json.loads(fixture_path.read_text(encoding="utf-8"))["tensor_storage"]
-    assert len(storage) == 9
-    assert sum(len(record["stored_tensors"]) for record in storage.values()) == 37
+    assert len(storage) == 7
+    assert sum(len(record["stored_tensors"]) for record in storage.values()) == 28
     assert all(record["quant_format"] == "exl3" for record in storage.values())
     assert {record["bits_per_weight"] for record in storage.values()} == {2, 3, 4, 5}
 
@@ -378,7 +381,27 @@ def test_trimmed_exl3_records_lock_the_selected_source_headers():
         assert trellis["shape"] == trellis_shape
         assert record["stored_tensors"][f"{base}.mul1"]["shape"] == []
 
-    # The retained trailing MTP and vision samples are metadata-only proof that the
-    # non-language tensors stay outside the text loader's 0..44 loop.
-    assert "model.language_model.layers.45.eh_proj" in storage
-    assert "model.visual.blocks.0.attn.q_proj" in storage
+
+def test_trimmed_exl3_fixture_matches_source_when_requested():
+    # Set this variable to the downloaded revision when running the source-equality proof;
+    # keeping it opt-in leaves the ordinary unit suite independent of a local checkpoint.
+    source_path = os.environ.get("FREETOKEN_GLM53_EXL3_METADATA", "").strip()
+    if not source_path:
+        pytest.skip("set FREETOKEN_GLM53_EXL3_METADATA for source equality")
+    source = Path(source_path)
+    if not source.is_file():
+        pytest.skip(f"metadata source is not a file: {source}")
+
+    fixture_path = Path(__file__).parent / "fixtures" / "glm53_exl3_quantization_trimmed.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    original = json.loads(source.read_text(encoding="utf-8"))
+    fields = (
+        "quant_method", "version", "bits", "head_bits", "out_scales", "codebook",
+        "vision_bits", "mtp_bits",
+    )
+    assert {field: fixture[field] for field in fields} == {
+        field: original[field] for field in fields
+    }
+    original_storage = original["tensor_storage"]
+    for base, record in fixture["tensor_storage"].items():
+        assert original_storage.get(base) == record, base

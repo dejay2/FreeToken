@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
 import torch
 import pytest
 
@@ -154,3 +157,79 @@ def test_dsa_maps_mixed_exl3_projections_and_indexer(monkeypatch):
     assert out["model.layers.3.self_attn.indexer.wq_b.weight"].shape == (128, 128)
     assert out["model.layers.3.self_attn.indexer.index_kpool_compress_ape"].dtype == torch.float32
     assert len(calls) == 5  # four attention projections plus indexer.wq_b
+
+
+def test_iter_weights_routes_dense_shared_and_head_through_exl3_helper(tmp_path, monkeypatch):
+    from freetoken.kernel import exl3
+    from freetoken.models.glm5_next import weight as glm_weight
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": {}}), encoding="utf-8"
+    )
+    bases = (
+        *(f"model.language_model.layers.0.mlp.{proj}" for proj in ("gate_proj", "up_proj", "down_proj")),
+        *(f"model.language_model.layers.1.mlp.shared_experts.{proj}"
+          for proj in ("gate_proj", "up_proj", "down_proj")),
+        "lm_head",
+    )
+
+    class FullReader(_Reader):
+        def __init__(self, folder, weight_map, device):
+            del folder, weight_map, device
+            super().__init__()
+            for base in bases:
+                _put_exl3(self, base)
+
+        def get(self, key: str) -> torch.Tensor:
+            return self.values.get(key, torch.zeros(128, dtype=torch.bfloat16))
+
+        def close(self) -> None:
+            pass
+
+    calls: list[tuple[int, str]] = []
+
+    def fake_reconstruct(trellis, suh, svh, *, k, codebook, out=None, work=None):
+        calls.append((k, codebook))
+        result = torch.zeros(
+            (trellis.shape[1] * 16, trellis.shape[0] * 16), dtype=torch.bfloat16
+        )
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+
+    config = SimpleNamespace(
+        num_layers=2,
+        first_k_dense_replace=1,
+        attn_quant="none",
+        dense_quant="none",
+        lm_head_quant="none",
+        tie_word_embeddings=False,
+        glm5_args=SimpleNamespace(is_kda_layer=lambda layer: False),
+    )
+    monkeypatch.setattr(glm_weight, "_ShardReader", FullReader)
+    monkeypatch.setattr(glm_weight, "cached_load_hf_config", lambda path: object())
+    monkeypatch.setattr(glm_weight, "download_hf_weight", lambda path: str(tmp_path))
+    monkeypatch.setattr(glm_weight, "parse_config", lambda hf: config)
+    monkeypatch.setattr(
+        glm_weight,
+        "get_tp_info",
+        lambda: SimpleNamespace(size=1, is_primary=lambda: False),
+    )
+    monkeypatch.setattr(glm_weight, "_iter_dsa_layer", lambda *args: iter(()))
+    monkeypatch.setattr(exl3, "reconstruct", fake_reconstruct)
+
+    output = dict(
+        glm_weight.iter_weights(
+            "fixture", torch.device("cpu"), include_moe_experts=False, include_non_moe=True
+        )
+    )
+
+    expected_outputs = {
+        *(f"model.layers.0.mlp.{proj}.weight" for proj in ("gate_proj", "up_proj", "down_proj")),
+        *(f"model.layers.1.mlp.shared_experts.{proj}.weight"
+          for proj in ("gate_proj", "up_proj", "down_proj")),
+        "lm_head.weight",
+    }
+    assert expected_outputs <= output.keys()
+    assert calls == [(2, "mul1")] * len(bases)

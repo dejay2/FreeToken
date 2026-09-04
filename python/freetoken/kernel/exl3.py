@@ -291,11 +291,16 @@ def reconstruct(
 ) -> torch.Tensor:
     """Return contiguous BF16 linear weight ``[out_features, in_features]``.
 
-    CUDA tensors use the imported ExLlamaV3 v1.4.6 extension.  Tiny CPU calls use the
-    independent reference above so unit tests can exercise the seam without a card; the
-    expert operation itself remains card-only and calls :func:`require_exl3_gpu_only`.
+    This public seam is card-only and calls the imported ExLlamaV3 v1.4.6 extension.  The
+    independent :func:`reconstruct_reference` is the CPU oracle for tests; keeping it
+    separate prevents a production load from silently expanding a large matrix in host RAM.
     """
     k, in_features, out_features = _validate_inputs(trellis, suh, svh, k=k, codebook=codebook)
+    if trellis.device.type != "cuda":
+        raise ValueError(
+            "EXL3 reconstruction is card-only and requires a CUDA tensor; "
+            "use reconstruct_reference for CPU tests"
+        )
     out, work = _validate_buffers(
         out,
         work,
@@ -303,19 +308,6 @@ def reconstruct(
         in_features=in_features,
         out_features=out_features,
     )
-    if trellis.device.type == "cpu":
-        if trellis.numel() > _CPU_FALLBACK_MAX_TRELLIS_WORDS:
-            raise ValueError(
-                "EXL3 reconstruction requires CUDA for non-tiny matrices; "
-                f"got {trellis.numel()} packed words"
-            )
-        result = reconstruct_reference(trellis, suh, svh, k=k, codebook=codebook)
-        if out is None:
-            return result
-        out.copy_(result)
-        return out
-    if trellis.device.type != "cuda":
-        raise ValueError(f"EXL3 reconstruction requires a CUDA or CPU tensor, got {trellis.device}")
 
     if out is None:
         out = torch.empty(

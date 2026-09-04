@@ -9,6 +9,7 @@ to prove that the main loader leaves it untouched.
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -22,7 +23,7 @@ from freetoken.models.exl3_banks import (
     load_exl3_expert_sources,
 )
 
-_E, _H, _I = 2, 128, 128
+_E, _H, _I = 2, 128, 256
 _FIRST, _NUM_LAYERS = 3, 2
 _CONFIG = SimpleNamespace(
     num_layers=5,
@@ -102,22 +103,22 @@ def test_loader_preserves_the_nine_bank_order_shapes_and_bytes(tmp_path, monkeyp
 
     assert tuple(banks) == EXL3_BANK_NAMES
     assert all(len(per_layer) == _NUM_LAYERS for per_layer in banks.values())
-    assert banks["gate_trellis"][0].shape == (_E, 8, 8, 32)
+    assert banks["gate_trellis"][0].shape == (_E, 8, 16, 32)
     assert banks["gate_suh"][0].shape == (_E, _H)
     assert banks["gate_svh"][0].shape == (_E, _I)
-    assert banks["down_trellis"][0].shape == (_E, 8, 8, 32)
+    assert banks["down_trellis"][0].shape == (_E, 16, 8, 32)
     assert banks["down_suh"][0].shape == (_E, _I)
     assert banks["down_svh"][0].shape == (_E, _H)
     assert banks["gate_trellis"][0].dtype is torch.int16
     assert banks["gate_suh"][0].dtype is torch.float16
     assert banks["gate_trellis"][0].is_contiguous()
 
-    expected_row_bytes = 3 * (8 * 8 * 32 * 2) + 6 * (_H + _I)
+    expected_row_bytes = 3 * ((_H // 16) * (_I // 16) * 32 * 2) + 6 * (_H + _I)
     measured_row_bytes = sum(
         banks[name][0][0].numel() * banks[name][0][0].element_size()
         for name in EXL3_BANK_NAMES
     )
-    assert measured_row_bytes == expected_row_bytes == 13_824
+    assert measured_row_bytes == expected_row_bytes == 26_880
 
     # Check the layer mapping and projection orientation, not only square shapes.
     assert torch.equal(
@@ -154,6 +155,44 @@ def test_loader_reads_every_shard_per_tensor_and_fires_each_layer_once(
     assert calls and all(not whole for _path, whole in calls)
     assert [layer for layer, _banks in seen] == [0, 1]
     assert all(names == EXL3_BANK_NAMES for _layer, names in seen)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only strict EXL3 read policy")
+def test_loader_rejects_windows_buffered_opt_out_before_allocating(tmp_path, monkeypatch):
+    import freetoken.models.exl3_banks as exl3
+
+    allocated = []
+
+    def should_not_allocate(*args, **kwargs):
+        allocated.append((args, kwargs))
+        raise AssertionError("EXL3 allocated banks before rejecting cached reads")
+
+    monkeypatch.setattr(exl3, "_alloc_banks", should_not_allocate)
+    monkeypatch.setenv("FREETOKEN_WIN_UNBUFFERED_IO", "0")
+    with pytest.raises(RuntimeError, match="unbuffered"):
+        _load(tmp_path, monkeypatch, include_mtp=False)
+    assert allocated == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only strict EXL3 read policy")
+def test_loader_rejects_unbuffered_open_failure_before_allocating(tmp_path, monkeypatch):
+    import freetoken.models.exl3_banks as exl3
+    from freetoken.moe import win_io
+
+    allocated = []
+
+    def should_not_allocate(*args, **kwargs):
+        allocated.append((args, kwargs))
+        raise AssertionError("EXL3 allocated banks before rejecting an open failure")
+
+    def fail_open(*args, **kwargs):
+        raise OSError("simulated FILE_FLAG_NO_BUFFERING failure")
+
+    monkeypatch.setattr(exl3, "_alloc_banks", should_not_allocate)
+    monkeypatch.setattr(win_io, "UnbufferedReader", fail_open)
+    with pytest.raises(RuntimeError, match="unbuffered"):
+        _load(tmp_path, monkeypatch, include_mtp=False)
+    assert allocated == []
 
 
 def test_layer_45_mtp_experts_are_excluded(tmp_path, monkeypatch):

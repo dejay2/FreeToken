@@ -129,6 +129,9 @@ class DirectShard:
     * ``whole=False`` -- read only the bytes of each requested tensor. For a pass that
       touches a handful of tiny tensors per shard (the nvfp4 ``weight_scale_2`` globals),
       where slurping the shard would be 700x read amplification.
+    * ``unbuffered_only=True`` -- fail instead of falling back to cached reads when the
+      Windows direct handle cannot be opened. The EXL3 proof uses this to protect its
+      pinned-bank memory budget; other formats retain the fallback above.
 
     Tensors are views over buffers this object owns, so they must be consumed (copied
     into the banks) before :meth:`close`.
@@ -137,7 +140,7 @@ class DirectShard:
     __slots__ = ("path", "_hdr", "_base", "_buf", "_mv", "_reader", "_alive")
 
     def __init__(self, path: str, *, whole: bool = True, workers: int = 8,
-                 chunk: int = 8 << 20) -> None:
+                 chunk: int = 8 << 20, unbuffered_only: bool = False) -> None:
         self.path = path
         self._buf = None
         self._mv = None
@@ -153,7 +156,13 @@ class DirectShard:
                 try:
                     self._reader = win_io.UnbufferedReader(path)
                 except OSError:
+                    if unbuffered_only:
+                        raise
                     self._reader = None
+            elif unbuffered_only:
+                raise OSError(
+                    "unbuffered DirectShard requested but the Windows reader is disabled"
+                )
             n = struct.unpack("<Q", self._read(0, 8))[0]
             self._hdr = json.loads(self._read(8, n))
         self._base = 8 + n

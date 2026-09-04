@@ -342,16 +342,53 @@ def _validate_headers(
 
 
 def _open_shard(path: str, *, whole: bool = False):
-    """Open a shard for per-tensor reads, using the shared Windows direct reader."""
+    """Open a shard for per-tensor reads, using the shared Windows direct reader.
+
+    Unlike the other model loaders, EXL3 cannot accept a cached-read fallback: its pinned
+    banks already consume roughly 71.29 GiB, so a second Windows file-cache copy can exhaust
+    host memory before the model is ready. ``DirectShard`` therefore receives its strict
+    mode here, while the generic reader keeps its existing fallback for other formats.
+    """
     if whole:
         raise ValueError("the EXL3 proof loader only supports per-tensor shard reads")
     from freetoken.moe import win_io
 
+    if os.name == "nt":
+        if not win_io.enabled():
+            raise RuntimeError(
+                "EXL3 Windows loading requires unbuffered shard reads; "
+                "unset FREETOKEN_WIN_UNBUFFERED_IO=0 or set it to 1"
+            )
+        from freetoken.models.weight import DirectShard
+
+        return DirectShard(path, whole=False, unbuffered_only=True)
     if win_io.enabled():
         from freetoken.models.weight import DirectShard
 
-        return DirectShard(path, whole=False)
+        return DirectShard(path, whole=False, unbuffered_only=True)
     return safetensors.safe_open(path, framework="pt", device="cpu")
+
+
+def _preflight_windows_reads(folder: str, by_shard: dict[str, list[Exl3ExpertRecord]]) -> None:
+    """Prove every EXL3 shard opens unbuffered before allocating the large host banks."""
+    if os.name != "nt":
+        return
+    from freetoken.moe import win_io
+
+    if not win_io.enabled():
+        raise RuntimeError(
+            "EXL3 Windows loading requires unbuffered shard reads; "
+            "FREETOKEN_WIN_UNBUFFERED_IO=0 is not allowed for this format"
+        )
+    for shard in sorted(by_shard):
+        path = os.path.join(folder, shard)
+        try:
+            with _open_shard(path, whole=False):
+                pass
+        except Exception as exc:
+            raise RuntimeError(
+                f"EXL3 shard {path!r} could not be opened with Windows unbuffered reads"
+            ) from exc
 
 
 # --------------------------------------------------------------------------------------
@@ -491,6 +528,9 @@ def load_exl3_expert_source_banks(
     weight_map = _weight_map(folder)
     records, geometry = _collect_records(weight_map, config)
     by_shard = _validate_headers(folder, records, geometry)
+    # A direct-open failure must stop before the ~71.29 GiB bank allocation; otherwise the
+    # generic DirectShard fallback could leave a cached second copy on the Windows standby list.
+    _preflight_windows_reads(folder, by_shard)
     num_layers, experts, hidden, intermediate, _first = geometry
     banks = _alloc_banks(num_layers, experts, hidden, intermediate)
 

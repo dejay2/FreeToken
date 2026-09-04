@@ -176,15 +176,17 @@ def test_reconstruct_first_decode_chunks_unique_experts_and_clears_routes(monkey
 
 def test_reconstruct_first_prompt_restores_original_input_and_clamped_activation(monkeypatch):
     fused_exl3 = _install_mocks(monkeypatch)
-    banks, matrices = _matrices(4)
+    # Ten unique experts force a second eight-expert prompt chunk, where restoring the
+    # caller's input is required before the BF16 operation overwrites its working copy.
+    banks, matrices = _matrices(10)
     hidden = torch.tensor(
         [[-12.0, -10.0, -2.0, 0.0] + [2.0] * (H - 4)], dtype=torch.bfloat16
-    ).repeat(3, 1)
-    ids = torch.tensor([[3], [3], [3]], dtype=torch.int32)
-    weights = torch.ones((3, 1), dtype=torch.float32)
+    ).repeat(10, 1)
+    ids = torch.arange(10, dtype=torch.int32).view(10, 1)
+    weights = torch.ones((10, 1), dtype=torch.float32)
     original = hidden.clone()
     scratch = fused_exl3.prepare_exl3_scratch(
-        device="cpu", hidden_size=H, intermediate_size=I, max_tokens=8, chunk_experts=8
+        device="cpu", hidden_size=H, intermediate_size=I, max_tokens=16, chunk_experts=8
     )
 
     got = fused_exl3.fused_experts_exl3(

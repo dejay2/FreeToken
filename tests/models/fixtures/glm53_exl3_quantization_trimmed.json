@@ -9,252 +9,249 @@
   "mtp_bits": 2,
   "tensor_storage": {
     "model.language_model.layers.3.mlp.experts.0.gate_proj": {
-      "bits_per_weight": 2,
-      "mul1_multiplier": 2212286765,
-      "quant_format": "exl3",
       "stored_tensors": {
-        "model.language_model.layers.3.mlp.experts.0.gate_proj.mul1": {
-          "dtype": "torch.int32",
-          "n_bytes": 4,
-          "shape": []
-        },
         "model.language_model.layers.3.mlp.experts.0.gate_proj.suh": {
-          "dtype": "torch.float16",
+          "shape": [
+            4096
+          ],
           "n_bytes": 8192,
-          "shape": [4096]
+          "dtype": "torch.float16"
         },
         "model.language_model.layers.3.mlp.experts.0.gate_proj.svh": {
-          "dtype": "torch.float16",
+          "shape": [
+            2048
+          ],
           "n_bytes": 4096,
-          "shape": [2048]
+          "dtype": "torch.float16"
+        },
+        "model.language_model.layers.3.mlp.experts.0.gate_proj.mul1": {
+          "shape": [],
+          "n_bytes": 4,
+          "dtype": "torch.int32"
         },
         "model.language_model.layers.3.mlp.experts.0.gate_proj.trellis": {
-          "dtype": "torch.int16",
+          "shape": [
+            256,
+            128,
+            32
+          ],
           "n_bytes": 2097152,
-          "shape": [256, 128, 32]
+          "dtype": "torch.int16"
         }
-      }
+      },
+      "quant_format": "exl3",
+      "bits_per_weight": 2,
+      "mul1_multiplier": 2212286765
     },
     "model.language_model.layers.3.mlp.experts.0.up_proj": {
-      "bits_per_weight": 2,
-      "mul1_multiplier": 2212286765,
-      "quant_format": "exl3",
       "stored_tensors": {
-        "model.language_model.layers.3.mlp.experts.0.up_proj.mul1": {
-          "dtype": "torch.int32",
-          "n_bytes": 4,
-          "shape": []
-        },
         "model.language_model.layers.3.mlp.experts.0.up_proj.suh": {
-          "dtype": "torch.float16",
+          "shape": [
+            4096
+          ],
           "n_bytes": 8192,
-          "shape": [4096]
+          "dtype": "torch.float16"
         },
         "model.language_model.layers.3.mlp.experts.0.up_proj.svh": {
-          "dtype": "torch.float16",
+          "shape": [
+            2048
+          ],
           "n_bytes": 4096,
-          "shape": [2048]
+          "dtype": "torch.float16"
+        },
+        "model.language_model.layers.3.mlp.experts.0.up_proj.mul1": {
+          "shape": [],
+          "n_bytes": 4,
+          "dtype": "torch.int32"
         },
         "model.language_model.layers.3.mlp.experts.0.up_proj.trellis": {
-          "dtype": "torch.int16",
+          "shape": [
+            256,
+            128,
+            32
+          ],
           "n_bytes": 2097152,
-          "shape": [256, 128, 32]
+          "dtype": "torch.int16"
         }
-      }
+      },
+      "quant_format": "exl3",
+      "bits_per_weight": 2,
+      "mul1_multiplier": 2212286765
     },
     "model.language_model.layers.3.mlp.experts.0.down_proj": {
-      "bits_per_weight": 2,
-      "mul1_multiplier": 2212286765,
-      "quant_format": "exl3",
       "stored_tensors": {
-        "model.language_model.layers.3.mlp.experts.0.down_proj.mul1": {
-          "dtype": "torch.int32",
-          "n_bytes": 4,
-          "shape": []
-        },
         "model.language_model.layers.3.mlp.experts.0.down_proj.suh": {
-          "dtype": "torch.float16",
+          "shape": [
+            2048
+          ],
           "n_bytes": 4096,
-          "shape": [2048]
+          "dtype": "torch.float16"
         },
         "model.language_model.layers.3.mlp.experts.0.down_proj.svh": {
-          "dtype": "torch.float16",
+          "shape": [
+            4096
+          ],
           "n_bytes": 8192,
-          "shape": [4096]
+          "dtype": "torch.float16"
+        },
+        "model.language_model.layers.3.mlp.experts.0.down_proj.mul1": {
+          "shape": [],
+          "n_bytes": 4,
+          "dtype": "torch.int32"
         },
         "model.language_model.layers.3.mlp.experts.0.down_proj.trellis": {
-          "dtype": "torch.int16",
+          "shape": [
+            128,
+            256,
+            32
+          ],
           "n_bytes": 2097152,
-          "shape": [128, 256, 32]
+          "dtype": "torch.int16"
         }
-      }
+      },
+      "quant_format": "exl3",
+      "bits_per_weight": 2,
+      "mul1_multiplier": 2212286765
     },
     "model.language_model.layers.0.mlp.down_proj": {
-      "bits_per_weight": 3,
-      "mul1_multiplier": 2212286765,
-      "quant_format": "exl3",
       "stored_tensors": {
-        "model.language_model.layers.0.mlp.down_proj.mul1": {
-          "dtype": "torch.int32",
-          "n_bytes": 4,
-          "shape": []
-        },
         "model.language_model.layers.0.mlp.down_proj.suh": {
-          "dtype": "torch.float16",
+          "shape": [
+            12288
+          ],
           "n_bytes": 24576,
-          "shape": [12288]
+          "dtype": "torch.float16"
         },
         "model.language_model.layers.0.mlp.down_proj.svh": {
-          "dtype": "torch.float16",
+          "shape": [
+            4096
+          ],
           "n_bytes": 8192,
-          "shape": [4096]
+          "dtype": "torch.float16"
+        },
+        "model.language_model.layers.0.mlp.down_proj.mul1": {
+          "shape": [],
+          "n_bytes": 4,
+          "dtype": "torch.int32"
         },
         "model.language_model.layers.0.mlp.down_proj.trellis": {
-          "dtype": "torch.int16",
+          "shape": [
+            768,
+            256,
+            48
+          ],
           "n_bytes": 18874368,
-          "shape": [768, 256, 48]
+          "dtype": "torch.int16"
         }
-      }
+      },
+      "quant_format": "exl3",
+      "bits_per_weight": 3,
+      "mul1_multiplier": 2212286765
     },
     "model.language_model.layers.0.self_attn.qkv_proj": {
-      "bits_per_weight": 4,
-      "mul1_multiplier": 2212286765,
-      "quant_format": "exl3",
       "stored_tensors": {
-        "model.language_model.layers.0.self_attn.qkv_proj.mul1": {
-          "dtype": "torch.int32",
-          "n_bytes": 4,
-          "shape": []
-        },
         "model.language_model.layers.0.self_attn.qkv_proj.suh": {
-          "dtype": "torch.float16",
+          "shape": [
+            4096
+          ],
           "n_bytes": 8192,
-          "shape": [4096]
+          "dtype": "torch.float16"
         },
         "model.language_model.layers.0.self_attn.qkv_proj.svh": {
-          "dtype": "torch.float16",
+          "shape": [
+            24576
+          ],
           "n_bytes": 49152,
-          "shape": [24576]
+          "dtype": "torch.float16"
+        },
+        "model.language_model.layers.0.self_attn.qkv_proj.mul1": {
+          "shape": [],
+          "n_bytes": 4,
+          "dtype": "torch.int32"
         },
         "model.language_model.layers.0.self_attn.qkv_proj.trellis": {
-          "dtype": "torch.int16",
+          "shape": [
+            256,
+            1536,
+            64
+          ],
           "n_bytes": 50331648,
-          "shape": [256, 1536, 64]
+          "dtype": "torch.int16"
         }
-      }
+      },
+      "quant_format": "exl3",
+      "bits_per_weight": 4,
+      "mul1_multiplier": 2212286765
     },
     "model.language_model.layers.3.mlp.shared_experts.gate_proj": {
-      "bits_per_weight": 4,
-      "mul1_multiplier": 2212286765,
-      "quant_format": "exl3",
       "stored_tensors": {
-        "model.language_model.layers.3.mlp.shared_experts.gate_proj.mul1": {
-          "dtype": "torch.int32",
-          "n_bytes": 4,
-          "shape": []
-        },
         "model.language_model.layers.3.mlp.shared_experts.gate_proj.suh": {
-          "dtype": "torch.float16",
+          "shape": [
+            4096
+          ],
           "n_bytes": 8192,
-          "shape": [4096]
+          "dtype": "torch.float16"
         },
         "model.language_model.layers.3.mlp.shared_experts.gate_proj.svh": {
-          "dtype": "torch.float16",
+          "shape": [
+            2048
+          ],
           "n_bytes": 4096,
-          "shape": [2048]
+          "dtype": "torch.float16"
+        },
+        "model.language_model.layers.3.mlp.shared_experts.gate_proj.mul1": {
+          "shape": [],
+          "n_bytes": 4,
+          "dtype": "torch.int32"
         },
         "model.language_model.layers.3.mlp.shared_experts.gate_proj.trellis": {
-          "dtype": "torch.int16",
+          "shape": [
+            256,
+            128,
+            64
+          ],
           "n_bytes": 4194304,
-          "shape": [256, 128, 64]
+          "dtype": "torch.int16"
         }
-      }
+      },
+      "quant_format": "exl3",
+      "bits_per_weight": 4,
+      "mul1_multiplier": 2212286765
     },
     "lm_head": {
-      "bits_per_weight": 5,
-      "mul1_multiplier": 2212286765,
-      "quant_format": "exl3",
       "stored_tensors": {
-        "lm_head.mul1": {
-          "dtype": "torch.int32",
-          "n_bytes": 4,
-          "shape": []
-        },
         "lm_head.suh": {
-          "dtype": "torch.float16",
+          "shape": [
+            4096
+          ],
           "n_bytes": 8192,
-          "shape": [4096]
+          "dtype": "torch.float16"
         },
         "lm_head.svh": {
-          "dtype": "torch.float16",
+          "shape": [
+            154880
+          ],
           "n_bytes": 309760,
-          "shape": [154880]
+          "dtype": "torch.float16"
+        },
+        "lm_head.mul1": {
+          "shape": [],
+          "n_bytes": 4,
+          "dtype": "torch.int32"
         },
         "lm_head.trellis": {
-          "dtype": "torch.int16",
+          "shape": [
+            256,
+            9680,
+            80
+          ],
           "n_bytes": 396492800,
-          "shape": [256, 9680, 80]
+          "dtype": "torch.int16"
         }
-      }
-    },
-    "model.language_model.layers.45.eh_proj": {
-      "bits_per_weight": 2,
-      "mul1_multiplier": 2212286765,
+      },
       "quant_format": "exl3",
-      "stored_tensors": {
-        "model.language_model.layers.45.eh_proj.suh": {
-          "dtype": "torch.float16",
-          "n_bytes": 16384,
-          "shape": [8192]
-        },
-        "model.language_model.layers.45.eh_proj.svh": {
-          "dtype": "torch.float16",
-          "n_bytes": 8192,
-          "shape": [4096]
-        },
-        "model.language_model.layers.45.eh_proj.mul1": {
-          "dtype": "torch.int32",
-          "n_bytes": 4,
-          "shape": []
-        },
-        "model.language_model.layers.45.eh_proj.trellis": {
-          "dtype": "torch.int16",
-          "n_bytes": 8388608,
-          "shape": [512, 256, 32]
-        }
-      }
-    },
-    "model.visual.blocks.0.attn.q_proj": {
       "bits_per_weight": 5,
-      "mul1_multiplier": 2212286765,
-      "quant_format": "exl3",
-      "stored_tensors": {
-        "model.visual.blocks.0.attn.q_proj.suh": {
-          "dtype": "torch.float16",
-          "n_bytes": 2048,
-          "shape": [1024]
-        },
-        "model.visual.blocks.0.attn.q_proj.svh": {
-          "dtype": "torch.float16",
-          "n_bytes": 2048,
-          "shape": [1024]
-        },
-        "model.visual.blocks.0.attn.q_proj.bias": {
-          "dtype": "torch.float16",
-          "n_bytes": 2048,
-          "shape": [1024]
-        },
-        "model.visual.blocks.0.attn.q_proj.mul1": {
-          "dtype": "torch.int32",
-          "n_bytes": 4,
-          "shape": []
-        },
-        "model.visual.blocks.0.attn.q_proj.trellis": {
-          "dtype": "torch.int16",
-          "n_bytes": 655360,
-          "shape": [64, 64, 80]
-        }
-      }
+      "mul1_multiplier": 2212286765
     }
   }
 }

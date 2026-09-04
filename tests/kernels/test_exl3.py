@@ -48,7 +48,8 @@ def test_reference_zero_trellis_has_known_mul1_value_and_expected_shape():
 
     trellis, suh, svh = _matrix_parts(128, 128)
     out = reconstruct_reference(trellis, suh, svh, k=2, codebook="mul1")
-    direct = reconstruct(trellis, suh, svh, k=2, codebook="mul1")
+    with pytest.raises(ValueError, match="card-only|CUDA"):
+        reconstruct(trellis, suh, svh, k=2, codebook="mul1")
 
     k_inv = torch.tensor([0x1EEE], dtype=torch.uint16).view(torch.float16)
     k_bias = torch.tensor([0xC931], dtype=torch.uint16).view(torch.float16)
@@ -57,7 +58,6 @@ def test_reference_zero_trellis_has_known_mul1_value_and_expected_shape():
 
     assert out.shape == (128, 128)
     assert out.dtype == torch.bfloat16 and out.is_contiguous()
-    torch.testing.assert_close(out, direct)
     torch.testing.assert_close(out[0, 0].float(), expected_corner, rtol=1e-3, atol=1e-3)
 
 
@@ -104,7 +104,7 @@ def test_reconstruction_rejects_bad_k_codebook_and_factor_shapes(mutator, match)
 
 
 def test_reconstruction_rejects_non_128_divisible_dimensions_and_bad_buffers():
-    from freetoken.kernel.exl3 import reconstruct_reference, reconstruct
+    from freetoken.kernel.exl3 import _validate_buffers, reconstruct, reconstruct_reference
 
     trellis = torch.zeros((1, 8, 32), dtype=torch.int16)
     suh = torch.ones(16, dtype=torch.float16)
@@ -112,25 +112,26 @@ def test_reconstruction_rejects_non_128_divisible_dimensions_and_bad_buffers():
     with pytest.raises(ValueError, match="divisible by 128"):
         reconstruct_reference(trellis, suh, svh, k=2, codebook="mul1")
 
-    trellis, suh, svh = _matrix_parts(128, 128)
     with pytest.raises(ValueError, match="out shape"):
-        reconstruct(
-            trellis,
-            suh,
-            svh,
-            k=2,
-            codebook="mul1",
-            out=torch.empty((128, 64), dtype=torch.bfloat16),
+        _validate_buffers(
+            torch.empty((128, 64), dtype=torch.bfloat16),
+            None,
+            device=torch.device("cpu"),
+            in_features=128,
+            out_features=128,
         )
     with pytest.raises(ValueError, match="work"):
-        reconstruct(
-            trellis,
-            suh,
-            svh,
-            k=2,
-            codebook="mul1",
-            work=torch.empty((128, 128), dtype=torch.float32),
+        _validate_buffers(
+            None,
+            torch.empty((128, 128), dtype=torch.float32),
+            device=torch.device("cpu"),
+            in_features=128,
+            out_features=128,
         )
+
+    trellis, suh, svh = _matrix_parts(128, 128)
+    with pytest.raises(ValueError, match="card-only|CUDA"):
+        reconstruct(trellis, suh, svh, k=2, codebook="mul1")
 
 
 @cuda
