@@ -469,9 +469,11 @@ class BootFile:
         if result_args:
             for index, (name, raw, indent) in enumerate(result_args):
                 value_part = "" if raw is None else f" {raw}"
-                continuation = "`" if index < len(result_args) - 1 else ""
-                ending = final_end if index == len(result_args) - 1 else (start_end or document.newline)
-                block.append(f"{indent}-{name}{value_part} {continuation}{ending}")
+                is_final = index == len(result_args) - 1
+                continuation = "`" if not is_final else ""
+                separator = "" if is_final else " "
+                ending = final_end if is_final else (start_end or document.newline)
+                block.append(f"{indent}-{name}{value_part}{separator}{continuation}{ending}")
         else:
             # Retain a syntactically valid call even if every switch was turned off.
             block[0] = _without_eol(start_line).rstrip("`").rstrip() + (start_end or document.newline)

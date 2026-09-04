@@ -19,6 +19,16 @@ def copy_boot(tmp_path: Path) -> Path:
 
 def test_real_boot_round_trips_and_preserves_comments_and_expressions(tmp_path):
     path = copy_boot(tmp_path)
+    raw = path.read_bytes()
+    raw = raw.replace(
+        b"    -CollectRoutingStats " + bytes((13, 10)),
+        b"    -CollectRoutingStats" + bytes((13, 10)),
+    )
+    raw = raw.replace(
+        b"    -CollectRoutingStats " + bytes((10,)),
+        b"    -CollectRoutingStats" + bytes((10,)),
+    )
+    path.write_bytes(raw)
     original = path.read_text(encoding="utf-8")
     boot = BootFile(path)
 
@@ -38,6 +48,7 @@ def test_real_boot_round_trips_and_preserves_comments_and_expressions(tmp_path):
     assert "Optional FP8 candidate" in updated
     assert "-KVDtype fp8" in updated
     assert "(Join-Path $env:LOCALAPPDATA 'FreeToken\\venv\\Scripts\\python.exe')" in updated
+    assert all(not line.rstrip(chr(13) + chr(10)).endswith(" ") for line in updated.splitlines(keepends=True))
     assert (tmp_path / "boot-2020.ps1.bak").read_text(encoding="utf-8") == original
     assert BootFile(path).load()["CudaGraphMaxBS"] == 3
 
