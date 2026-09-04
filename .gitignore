@@ -230,3 +230,6 @@ benchmarks/cross_framework
 
 # Local picture packages, fixtures, logs, and acceptance evidence
 /.local/
+
+# Machine-local settings profile start-up files
+/boot-profiles/

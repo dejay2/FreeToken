@@ -26,7 +26,7 @@ from .dials import (
 )
 from .model_info import ModelInfo, read_model
 from .process_manager import LifecycleError, ProcessManager
-from .profiles_manager import ProfileValidationError, ProfilesManager
+from .profiles_manager import ProfileError, ProfileValidationError, ProfilesManager
 
 HELPER_VERSION = "1.2.0"
 
@@ -92,7 +92,9 @@ def _model_for(settings: dict[str, Any], override: str | None = None) -> ModelIn
     return read_model(path if isinstance(path, str) else "")
 
 
-def _settings_payload(boot: BootFile, model_path: str | None = None) -> dict[str, Any]:
+def _settings_payload(
+    boot: BootFile, model_path: str | None = None, active_profile: str | None = None
+) -> dict[str, Any]:
     settings = boot.load()
     model = _model_for(settings, model_path)
     primary = {
@@ -110,7 +112,7 @@ def _settings_payload(boot: BootFile, model_path: str | None = None) -> dict[str
     ]
     return {
         "bootFilePath": str(boot.path),
-        "activeProfile": _active_profile(settings),
+        "activeProfile": _active_profile(settings) if active_profile is None else active_profile,
         "settings": primary,
         "dials": dials,
         "groups": groups,
@@ -130,7 +132,13 @@ def create_app(
 ) -> FastAPI:
     """Build an app with injectable file/process pieces so routes are testable without a GPU."""
     paths = default_paths()
-    boot = BootFile(boot_file or paths["boot"])
+    default_boot = Path(boot_file or paths["boot"])
+    if profiles is None:
+        profiles = ProfilesManager(paths["profiles"], boot_file=default_boot)
+    else:
+        profiles.configure_boot_file(default_boot)
+    active_boot = profiles.boot_file or default_boot
+    boot = BootFile(active_boot)
     if process_manager is None:
         process_manager = ProcessManager(
             boot_file=boot.path,
@@ -139,19 +147,26 @@ def create_app(
             lock_path=paths["lock"],
             port=2020,
         )
-    if profiles is None:
-        profiles = ProfilesManager(profiles_path := paths["profiles"], boot_file=boot.path)
-    elif profiles.boot_file is None:
-        profiles.boot_file = boot.path
+    else:
+        # The helper, the process controller and the profile store must all name the same file.
+        process_manager.boot_file = boot.path
     log = Path(log_path or getattr(process_manager, "log_path", paths["log"]))
     static = Path(static_path or paths["static"])
     started = time.monotonic()
     app = FastAPI(title="FreeToken Settings Helper", version=version)
     app.state.boot_file = boot
+    app.state.default_boot_file = default_boot
     app.state.process_manager = process_manager
     app.state.profiles = profiles
     app.state.log_path = log
     app.state.started_monotonic = started
+
+    def set_active_boot(path: str | os.PathLike[str]) -> None:
+        nonlocal boot
+        boot = BootFile(path)
+        profiles.boot_file = boot.path
+        process_manager.boot_file = boot.path
+        app.state.boot_file = boot
 
     @app.get("/")
     async def root():
@@ -164,7 +179,7 @@ def create_app(
         """``?model=<folder>`` shapes the dials for a folder the page is previewing but has
         not saved yet; without it the saved ModelPath is used."""
         try:
-            return _settings_payload(boot, model)
+            return _settings_payload(boot, model, profiles.active_profile_id)
         except BootParseError as exc:
             raise _boot_http_error(exc) from exc
 
@@ -198,6 +213,7 @@ def create_app(
                 changes[name] = canonical_value(dial, value, adapt_dial(dial, model).get("storedAs"))
         try:
             saved = boot.save(changes)
+            profiles.sync_active(saved)
         except BootValidationError as exc:
             return _validation_response(exc.errors)
         except BootParseError as exc:
@@ -225,9 +241,42 @@ def create_app(
         except ProfileValidationError as exc:
             return _validation_response(exc.errors)
 
+    @app.put("/api/profiles/{profile_id}")
+    async def put_profile(profile_id: str, body: ProfileBody):
+        try:
+            return profiles.update(
+                profile_id,
+                name=body.name,
+                description=body.description,
+                settings=body.settings,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"profile {profile_id} not found")
+        except ProfileValidationError as exc:
+            return _validation_response(exc.errors)
+        except ProfileError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.delete("/api/profiles/{profile_id}")
     async def delete_profile(profile_id: str):
-        return profiles.delete(profile_id)
+        try:
+            result = profiles.delete(profile_id)
+        except ProfileError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if result.get("bootFilePath") and result.get("activeProfileId"):
+            set_active_boot(result["bootFilePath"])
+        return result
+
+    @app.post("/api/profiles/{profile_id}/activate")
+    async def activate_profile(profile_id: str):
+        try:
+            result = profiles.activate(profile_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"profile {profile_id} not found")
+        except ProfileError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        set_active_boot(result["bootFilePath"])
+        return result
 
     @app.post("/api/profiles/{profile_id}/apply")
     async def apply_profile(profile_id: str):
@@ -244,13 +293,20 @@ def create_app(
             if errors:
                 return _validation_response(errors)
         try:
-            return profiles.apply(profile_id, boot.path)
+            result = profiles.apply(profile_id)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"profile {profile_id} not found")
+        except ProfileError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except BootValidationError as exc:
             return _validation_response(exc.errors)
         except BootParseError as exc:
             raise _boot_http_error(exc) from exc
+        if result.get("activated") and result.get("bootFilePath"):
+            set_active_boot(result["bootFilePath"])
+        else:
+            profiles.sync_active(result.get("settings") or {})
+        return result
 
     @app.get("/api/status")
     async def status():

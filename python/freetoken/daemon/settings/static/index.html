@@ -250,7 +250,7 @@
 
     <section class="tab" id="tab-profiles" role="tabpanel" hidden>
       <div class="panel">
-        <div class="panel-head"><div><h2>Saved profiles</h2><p class="small">A profile is a snapshot of every setting. Applying one rewrites the start-up file; restart to use it.</p></div><button class="button" id="new-profile" type="button">Save current settings as a profile</button></div>
+        <div class="panel-head"><div><h2>Saved profiles</h2><p class="small">Each saved profile is its own start-up file. Use one to switch the file Start and Restart will run; presets still copy their values into the active file.</p></div><button class="button" id="new-profile" type="button">Save current settings as a profile</button></div>
         <div id="profile-form" hidden>
           <label class="small" for="profile-name">Profile name</label>
           <div class="inline-form"><input id="profile-name" type="text" maxlength="100" placeholder="For example: Quiet evening mode"><button class="button primary" id="profile-save" type="button">Save profile</button><button class="button" id="profile-cancel" type="button">Cancel</button></div>
@@ -528,7 +528,8 @@
       state.activeProfile = body.activeProfile || '';
       state.dials.forEach((dial) => { if (!(dial.name in state.settings) && dial.value !== undefined) state.settings[dial.name] = dial.value; });
       state.saved = JSON.parse(JSON.stringify(state.settings));
-      $('active-profile').textContent = state.activeProfile && state.activeProfile !== 'custom' ? `Saved file matches profile ${state.activeProfile}` : (body.bootFilePath ? `Saved file: ${body.bootFilePath}` : '');
+      renderActiveProfile();
+      if (!state.profiles.length && body.bootFilePath) $('active-profile').textContent = `Saved file: ${body.bootFilePath}`;
       renderModelCard();
       renderSettings();
     }
@@ -633,28 +634,52 @@
     function startLogRefresh() { clearTimeout(state.logTimer); if ($('auto-follow').checked) state.logTimer = setTimeout(async () => { await loadLogs(); startLogRefresh(); }, 3000); }
 
     /* ---------- profiles ---------- */
+    const fileName = (path) => { const parts = String(path || '').split(/[\\/]/); return parts[parts.length - 1] || '—'; };
+    function renderActiveProfile() {
+      const profile = state.profiles.find((item) => item.id === state.activeProfile || item.active);
+      $('active-profile').textContent = profile ? `Active profile: ${profile.name}` : (state.activeProfile ? `Active profile: ${state.activeProfile}` : '');
+    }
     function renderProfiles() {
+      const active = state.profiles.find((item) => item.active);
+      if (active) state.activeProfile = active.id;
       $('profiles').innerHTML = state.profiles.length ? state.profiles.map((profile) => {
         const values = Object.entries(profile.settings || {}).map(([key, value]) => { const dial = dialByName(key); return `<span><b>${escapeHtml(dial ? dial.plain : labelFor(key))}:</b> ${escapeHtml(value === '' ? 'off' : value)}</span>`; }).join('');
-        const active = state.activeProfile && profile.id === `profile-${String(state.activeProfile).toLowerCase()}`;
-        return `<article class="profile"><div class="profile-head"><div><h3>${escapeHtml(profile.name)}${active ? '<span class="tag">In the saved file</span>' : ''}${profile.isPreset ? '<span class="small">built in</span>' : ''}</h3><p class="small">${escapeHtml(profile.description || '')}</p></div><div class="actions"><button class="button small" type="button" data-apply="${escapeHtml(profile.id)}">Apply</button>${profile.isPreset ? '' : `<button class="button small danger" type="button" data-delete="${escapeHtml(profile.id)}">Delete</button>`}</div></div><div class="values">${values}</div><div class="confirm" data-confirm="${escapeHtml(profile.id)}" hidden>Delete this profile? <button type="button" data-confirm-delete="${escapeHtml(profile.id)}">Yes, delete</button> <button type="button" data-cancel-delete="${escapeHtml(profile.id)}">Keep it</button></div></article>`;
+        const isActive = profile.id === state.activeProfile || profile.active;
+        const kind = profile.isDefault ? '<span class="small">default</span>' : (profile.label === 'preset' || profile.isPreset ? '<span class="small">preset</span>' : '');
+        const file = profile.bootFile ? fileName(profile.bootFile) : 'active file';
+        const model = profile.modelFolder || 'model folder not set';
+        const use = profile.isPreset
+          ? `<button class="button small" type="button" data-apply="${escapeHtml(profile.id)}">Apply preset</button>`
+          : `<button class="button small${isActive ? ' primary' : ''}" type="button" data-activate="${escapeHtml(profile.id)}" ${isActive ? 'disabled' : ''}>Use this profile</button>`;
+        return `<article class="profile"><div class="profile-head"><div><h3>${escapeHtml(profile.name)}${isActive ? '<span class="tag">Active</span>' : ''}${kind}</h3><p class="small">${escapeHtml(profile.description || '')}</p></div><div class="actions">${use}${profile.isDefault || profile.isPreset ? '' : `<button class="button small danger" type="button" data-delete="${escapeHtml(profile.id)}">Delete</button>`}</div></div><div class="values"><span><b>Model:</b> ${escapeHtml(model)}</span><span><b>File:</b> ${escapeHtml(file)}</span>${values}</div><div class="confirm" data-confirm="${escapeHtml(profile.id)}" hidden>Delete this profile? <button type="button" data-confirm-delete="${escapeHtml(profile.id)}">Yes, delete</button> <button type="button" data-cancel-delete="${escapeHtml(profile.id)}">Keep it</button></div></article>`;
       }).join('') : '<p class="empty">No saved profiles yet.</p>';
       $('profiles-tab-count').hidden = !state.profiles.length; $('profiles-tab-count').textContent = String(state.profiles.length);
+      renderActiveProfile();
+      document.querySelectorAll('[data-activate]').forEach((button) => button.addEventListener('click', () => activateProfile(button.dataset.activate)));
       document.querySelectorAll('[data-apply]').forEach((button) => button.addEventListener('click', () => applyProfile(button.dataset.apply)));
       document.querySelectorAll('[data-delete]').forEach((button) => button.addEventListener('click', () => { const confirm = document.querySelector(`[data-confirm="${CSS.escape(button.dataset.delete)}"]`); if (confirm) confirm.hidden = false; }));
       document.querySelectorAll('[data-confirm-delete]').forEach((button) => button.addEventListener('click', () => deleteProfile(button.dataset.confirmDelete)));
       document.querySelectorAll('[data-cancel-delete]').forEach((button) => button.addEventListener('click', () => { const confirm = document.querySelector(`[data-confirm="${CSS.escape(button.dataset.cancelDelete)}"]`); if (confirm) confirm.hidden = true; }));
     }
     async function loadProfiles() { const { response, body } = await json('/api/profiles'); if (response.ok) { state.profiles = body.profiles || []; renderProfiles(); } }
+    async function activateProfile(id) {
+      if (changedNames().length) { setNotice('Save or discard the changes before switching profiles.', 'warn'); return; }
+      const { response, body } = await json(`/api/profiles/${encodeURIComponent(id)}/activate`, { method: 'POST' });
+      if (!response.ok) { setNotice(body.detail || 'Could not use the profile.', 'bad'); return; }
+      await loadSettings(); await loadProfiles();
+      setNotice('This profile is now active. Restart the server to use it.', 'good');
+    }
     async function applyProfile(id) {
+      const profile = state.profiles.find((item) => item.id === id);
+      if (profile && !profile.isPreset) { await activateProfile(id); return; }
       const { response, body } = await json(`/api/profiles/${encodeURIComponent(id)}/apply`, { method: 'POST' });
       if (!response.ok) { setNotice(body.detail || 'Could not apply the profile.', 'bad'); return; }
       await loadSettings(); await loadProfiles();
       const restart = document.createElement('button'); restart.className = 'button small'; restart.type = 'button'; restart.textContent = 'Restart now'; restart.addEventListener('click', () => serverAction('restart'));
-      setNotice('Profile applied and saved. Restart the server to use it.', 'good', restart);
+      setNotice('Preset applied and saved. Restart to use it.', 'good', restart);
     }
-    async function deleteProfile(id) { const { response, body } = await json(`/api/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' }); if (!response.ok) { setNotice(body.detail || 'Could not delete the profile.', 'bad'); return; } setNotice('Profile deleted.', 'good'); loadProfiles(); }
-    async function saveProfile() { const name = $('profile-name').value.trim(); if (!name) { $('profile-name').focus(); return; } const { response, body } = await json('/api/profiles', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, description: 'Saved from the settings page', settings: state.settings }) }); if (!response.ok) { setNotice(body.detail || 'Could not save the profile.', 'bad'); return; } $('profile-form').hidden = true; $('profile-name').value = ''; state.profiles.push(body); renderProfiles(); setNotice('Profile saved.', 'good'); }
+    async function deleteProfile(id) { const { response, body } = await json(`/api/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' }); if (!response.ok) { setNotice(body.detail || 'Could not delete the profile.', 'bad'); return; } await loadSettings(); await loadProfiles(); setNotice('Profile deleted.', 'good'); }
+    async function saveProfile() { const name = $('profile-name').value.trim(); if (!name) { $('profile-name').focus(); return; } const { response, body } = await json('/api/profiles', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, description: 'Saved from the settings page', settings: state.settings }) }); if (!response.ok) { setNotice(body.detail || 'Could not save the profile.', 'bad'); return; } $('profile-form').hidden = true; $('profile-name').value = ''; state.profiles.push(body); renderProfiles(); setNotice('Profile saved as a start-up file.', 'good'); }
 
     /* ---------- folder browser ---------- */
     async function openBrowser(name, kind) {

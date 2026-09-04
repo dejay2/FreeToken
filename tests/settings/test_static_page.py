@@ -121,8 +121,11 @@ def test_lifecycle_profiles_status_and_logs_use_the_route_contract() -> None:
         "/api/logs",
         "/api/profiles",
         "/api/profiles/",
+        "/api/profiles/${encodeURIComponent(id)}/activate",
     ):
         assert route in source
+    assert "profile.isDefault" in source
+    assert "profile.bootFile" in source
     for action in ("start", "stop", "restart"):
         assert f"serverAction('{action}')" in page
     assert "auto-follow" in page

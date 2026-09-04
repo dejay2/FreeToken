@@ -169,12 +169,20 @@ def _value_from_raw(raw: str | None) -> Any:
             return int(value)
         except ValueError:
             pass
+    if re.fullmatch(r"-?(?:\d+\.\d*|\.\d+)", value):
+        try:
+            return float(value)
+        except ValueError:
+            pass
     return value
 
 
 def _quote_literal(value: str) -> str:
     if value.startswith("(") or value.startswith("$"):
         return value
+    # A decimal-looking string must stay a string (not become a float on the next load).
+    if re.fullmatch(r"-?(?:\d+\.\d*|\.\d+)", value):
+        return "'" + value.replace("'", "''") + "'"
     if re.fullmatch(r"[A-Za-z0-9_.:+-]+", value):
         return value
     return "'" + value.replace("'", "''") + "'"
