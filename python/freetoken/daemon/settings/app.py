@@ -12,11 +12,12 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from .boot_parser import BootFile, BootParseError, BootValidationError
-from .dials import DIALS, EXTENSION_DIALS, ENV_DIALS, dial_value_for_display, validate_settings
+from .browse import BROWSE_KINDS, list_directory
+from .dials import DIALS, EXTENSION_DIALS, ENV_DIALS, GROUP_INFO, dial_value_for_display, validate_settings
 from .process_manager import LifecycleError, ProcessManager
 from .profiles_manager import ProfileValidationError, ProfilesManager
 
-HELPER_VERSION = "1.0.0"
+HELPER_VERSION = "1.1.0"
 
 
 class SettingsBody(BaseModel):
@@ -84,11 +85,16 @@ def _settings_payload(boot: BootFile) -> dict[str, Any]:
     for dial in DIALS:
         value = settings.get(dial.name, dial.default)
         dials.append(dial.as_dict(dial_value_for_display(dial, value)))
+    groups = [
+        {"name": name, "plain": info.get("plain", name), "info": info.get("info", "")}
+        for name, info in GROUP_INFO.items()
+    ]
     return {
         "bootFilePath": str(boot.path),
         "activeProfile": _active_profile(settings),
         "settings": primary,
         "dials": dials,
+        "groups": groups,
     }
 
 
@@ -156,6 +162,12 @@ def create_app(
             "backupPath": str(boot.backup_path),
             "settings": saved,
         }
+
+    @app.get("/api/browse")
+    async def browse(path: str = Query(default=""), kind: str = Query(default="folder")):
+        if kind not in BROWSE_KINDS:
+            raise HTTPException(status_code=422, detail=f"kind must be one of {', '.join(BROWSE_KINDS)}")
+        return list_directory(path, kind)
 
     @app.get("/api/profiles")
     async def get_profiles():

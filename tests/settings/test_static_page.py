@@ -131,3 +131,27 @@ def test_lifecycle_profiles_status_and_logs_use_the_route_contract() -> None:
     assert "window.prompt" not in source
     assert "window.confirm" not in source
     assert "window.alert" not in source
+
+
+def test_page_has_tabs_info_buttons_sliders_and_browse() -> None:
+    page = _page()
+    source = _source()
+
+    assert 'role="tablist"' in page
+    for tab in ("settings", "server", "profiles"):
+        assert f'data-tab="{tab}"' in page
+    # Plain-language help, effect chips, sliders and folder browsing are all driven by the
+    # metadata the settings route sends; the page only needs the generic hooks.
+    assert 'data-info="${name}"' in source
+    assert "dial.effects" in source
+    assert 'type="range" data-slider=' in source
+    assert "dial.slider" in source
+    assert 'data-browse="${name}"' in source
+    assert "/api/browse" in source
+    assert "dial.autoValue" in source
+    assert "dial.displayFactor" in source
+    assert "show-advanced" in page
+    assert 'id="search"' in page
+    # Restarting with unsaved changes asks in-page, never through a browser dialog.
+    assert "restart-dialog" in page
+    assert "changedNames()" in source

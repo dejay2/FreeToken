@@ -169,7 +169,7 @@ Vision support is opt-in and disabled by default. Enable it with environment var
 
 ### Windows settings helper
 
-The fork includes a small local settings page at `http://127.0.0.1:2031`. It edits the startup settings and can start, stop, or restart the main server on port 2020 while remaining available if the server fails to boot. Register it for the current Windows user with:
+The fork includes a small local settings page at `http://127.0.0.1:2031`. It edits the startup settings and can start, stop, or restart the main server on port 2020 while remaining available if the server fails to boot. Every setting has a plain-language explanation with the numbers measured in `docs/research/` and chips for what it costs or buys (speed, accuracy, card memory, PC memory, drive space, start-up time); amounts get sliders, paths get a folder browser that marks model folders, and rarely-touched settings sit behind a "Show expert settings" switch. Register it for the current Windows user with:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\register-settings-helper.ps1
