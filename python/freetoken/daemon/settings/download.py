@@ -21,11 +21,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from .model_info import GIB, ModelInfo, describe_config, read_model
+from .model_info import (
+    GIB,
+    ModelInfo,
+    describe_config,
+    ple_bytes_from_header,
+    read_model,
+    safetensors_ple_bytes,
+)
 
 
 _REPO_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
@@ -293,6 +301,59 @@ def _default_config_fetcher(repo: str, downloads_dir: Path) -> dict[str, Any]:
             return json.load(fh)
 
 
+_MAX_SAFETENSORS_HEADER_BYTES = 256 * 1024 * 1024
+
+
+def _remote_range(url: str, start: int, end: int, token: str | None) -> bytes:
+    """Read one bounded byte range without ever buffering a full weight shard."""
+    expected = end - start + 1
+    request = Request(url, headers={"Range": f"bytes={start}-{end}"})
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urlopen(request, timeout=30) as response:
+            status = getattr(response, "status", None) or response.getcode()
+            content_range = response.headers.get("Content-Range")
+            data = response.read(expected + 1)
+    except (OSError, ValueError):
+        return b""
+    # A server that ignores Range would otherwise hand us the entire weight file. Reject it
+    # after reading only one extra byte, and require a partial response for non-empty ranges.
+    if len(data) != expected or (status == 200 and not content_range):
+        return b""
+    return data
+
+
+def _default_safetensors_header_fetcher(repo: str, filename: str) -> bytes:
+    """Fetch only a remote safetensors header, never its tensor payload."""
+    from huggingface_hub import hf_hub_url
+
+    url = hf_hub_url(repo_id=repo, filename=filename)
+    token = os.environ.get("HF_TOKEN")
+    prefix = _remote_range(url, 0, 7, token)
+    if len(prefix) != 8:
+        return b""
+    header_length = int.from_bytes(prefix, "little", signed=False)
+    if not 0 < header_length <= _MAX_SAFETENSORS_HEADER_BYTES:
+        return b""
+    return _remote_range(url, 8, 7 + header_length, token)
+
+
+def _header_ple_bytes(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return ple_bytes_from_header(value)
+    if isinstance(value, (str, os.PathLike)):
+        return safetensors_ple_bytes(value)
+    return 0
+
+
 def _decode_config(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -355,7 +416,12 @@ def _fit(
     expert_bytes = max(0, int(model.total_expert_bytes or 0))
     download_bytes = max(0, int(download_bytes))
     if model.is_moe:
-        dense_bytes = max(0, download_bytes - expert_bytes) if download_bytes else 0
+        # Fit is about resident model tensors, not tokenizer/config files or the demand-paged
+        # PLE table. Prefer the known top-level weight total; Hub metadata includes both kinds.
+        weight_bytes = max(0, int(model.weight_bytes or 0))
+        source_bytes = weight_bytes or download_bytes
+        ple_bytes = max(0, int(model.ple_bytes or 0))
+        dense_bytes = max(0, source_bytes - expert_bytes - ple_bytes)
         needs_bytes = expert_bytes + dense_bytes
         budget_bytes = max(0, pc_bytes - 8 * GIB) + min(int(card_bytes * 0.75), 24 * GIB)
     else:
@@ -406,6 +472,7 @@ class DownloadManager:
         api_factory: Callable[[], Any] | Any | None = None,
         config_fetcher: Callable[..., Any] | None = None,
         snapshot_downloader: Callable[..., Any] | None = None,
+        header_fetcher: Callable[..., Any] | None = None,
         pc_memory: int | Callable[[], int] | None = None,
         card_memory: int | Callable[[], int] | None = None,
         disk_free: Callable[[str | os.PathLike[str]], int] | None = None,
@@ -415,6 +482,13 @@ class DownloadManager:
         self._api_factory = api_factory
         self._config_fetcher = config_fetcher
         self._snapshot_downloader = snapshot_downloader or _default_snapshot_download
+        # Test doubles do not have to make network calls for header metadata. The live helper,
+        # which uses the default Hub API, gets a bounded Range reader unless a seam is supplied.
+        self._header_fetcher = (
+            header_fetcher
+            if header_fetcher is not None
+            else (_default_safetensors_header_fetcher if api_factory is None else None)
+        )
         self._pc_memory = pc_memory if pc_memory is not None else physical_memory_bytes
         self._card_memory = card_memory
         self._disk_free = disk_free or disk_free_bytes
@@ -456,6 +530,22 @@ class DownloadManager:
             # Keep the seam friendly to a fetcher that also wants the configured scratch directory.
             return _decode_config(fetcher(repo, self.downloads_dir))
 
+    def _ple_bytes(self, repo: str, files: list[RemoteFile]) -> int:
+        fetcher = self._header_fetcher
+        if fetcher is None:
+            return 0
+        total = 0
+        for item in files:
+            try:
+                try:
+                    header = fetcher(repo, item.name)
+                except TypeError:
+                    header = fetcher(repo=repo, filename=item.name)
+                total += _header_ple_bytes(header)
+            except Exception:  # noqa: BLE001 - an optional metadata probe cannot block preview
+                continue
+        return total
+
     def _measure_card(self) -> int:
         # An unknown card is represented by zero; unlike an estimate, that cannot falsely clear a
         # model for download.  The app supplies a callback backed by ProcessManager.server_status.
@@ -472,6 +562,8 @@ class DownloadManager:
         download_bytes = sum(item.size or 0 for item in files)
         model.weight_files = len(weight_files)
         model.weight_bytes = sum(item.size or 0 for item in weight_files)
+        if model.has_ple:
+            model.ple_bytes = self._ple_bytes(repo, weight_files)
         pc_bytes = _as_bytes(self._pc_memory)
         card_bytes = self._measure_card()
         fit = _fit(model, download_bytes, pc_bytes=pc_bytes, card_bytes=card_bytes)
@@ -690,6 +782,7 @@ def create_router(
     api_factory: Callable[[], Any] | Any | None = None,
     config_fetcher: Callable[..., Any] | None = None,
     snapshot_downloader: Callable[..., Any] | None = None,
+    header_fetcher: Callable[..., Any] | None = None,
     pc_memory: int | Callable[[], int] | None = None,
     card_memory: int | Callable[[], int] | None = None,
     disk_free: Callable[[str | os.PathLike[str]], int] | None = None,
@@ -709,6 +802,7 @@ def create_router(
             api_factory=api_factory,
             config_fetcher=config_fetcher,
             snapshot_downloader=snapshot_downloader,
+            header_fetcher=header_fetcher,
             pc_memory=pc_memory,
             card_memory=card_memory,
             disk_free=disk_free,

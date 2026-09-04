@@ -2,9 +2,9 @@
 
 The page sizes its sliders, limits and explanations from what the chosen model actually is:
 longest chat (``max_position_embeddings``), how many layers hold routed experts, how many
-experts each layer has, and how many bytes one expert occupies in the offload banks. Only
-``config.json`` (and, when present, the FTW ``freetoken_weight.json`` metadata) is read; the
-weight files are never opened.
+experts each layer has, and how many bytes one expert occupies in the offload banks. It reads
+``config.json`` (and, when present, FTW metadata) plus the small safetensors headers needed to
+identify demand-paged PLE/n-gram tensors; weight payloads are never opened.
 
 The per-expert byte formulas are copied from ``freetoken.moe.offload_cache._BANK_BYTES_PER_EXPERT``
 (which cannot be imported here: it pulls in torch). Keep the two in step. Checked against the
@@ -57,6 +57,56 @@ REFERENCE_MOE_LAYERS = 48
 REFERENCE_EXPERTS = 512
 
 GIB = 1024 ** 3
+
+# Safetensors stores an 8-byte little-endian JSON-header length before the tensor
+# metadata. Only that prefix and header are read; the weight payload is never touched.
+_MAX_SAFETENSORS_HEADER_BYTES = 256 * 1024 * 1024
+_PLE_TENSOR_MARKERS = ("ple", "ngram", "embed_ngram")
+
+
+def ple_bytes_from_header(header: bytes | bytearray | memoryview) -> int:
+    """Sum data ranges for PLE/n-gram tensors in a safetensors JSON header."""
+    try:
+        document = json.loads(bytes(header).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, TypeError):
+        return 0
+    if not isinstance(document, dict):
+        return 0
+
+    total = 0
+    for name, tensor in document.items():
+        if not isinstance(name, str) or not any(marker in name.lower() for marker in _PLE_TENSOR_MARKERS):
+            continue
+        if not isinstance(tensor, dict):
+            continue
+        offsets = tensor.get("data_offsets")
+        if not isinstance(offsets, (list, tuple)) or len(offsets) != 2:
+            continue
+        try:
+            start, end = int(offsets[0]), int(offsets[1])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if 0 <= start <= end:
+            total += end - start
+    return total
+
+
+def safetensors_ple_bytes(path: str | os.PathLike[str]) -> int:
+    """Read one safetensors header and return the PLE/n-gram payload bytes."""
+    try:
+        with Path(path).open("rb") as fh:
+            raw_length = fh.read(8)
+            if len(raw_length) != 8:
+                return 0
+            header_length = int.from_bytes(raw_length, "little", signed=False)
+            if not 0 < header_length <= _MAX_SAFETENSORS_HEADER_BYTES:
+                return 0
+            header = fh.read(header_length)
+            if len(header) != header_length:
+                return 0
+    except (OSError, ValueError, OverflowError):
+        return 0
+    return ple_bytes_from_header(header)
 
 
 def _fp8_block_scale_pad(rows: int, cols: int) -> int:
@@ -112,6 +162,7 @@ class ModelInfo:
     has_vision: bool = False
     has_ple: bool = False
     has_mtp: bool = False
+    ple_bytes: int = 0
     weight_files: int = 0
     weight_bytes: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
@@ -270,6 +321,7 @@ def read_model(path: str | os.PathLike[str] | None) -> ModelInfo:
                     info.weight_bytes += entry.stat().st_size
                 except OSError:
                     pass
+                info.ple_bytes += safetensors_ple_bytes(entry.path)
     except OSError:
         pass
 
@@ -313,5 +365,7 @@ __all__ = [
     "describe_config",
     "expert_format",
     "gib",
+    "ple_bytes_from_header",
     "read_model",
+    "safetensors_ple_bytes",
 ]

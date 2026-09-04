@@ -60,7 +60,9 @@ def test_profile_lifecycle_routes(tmp_path):
 
 def test_status_logs_and_lifecycle_job_routes(tmp_path):
     client, _ = make_client(tmp_path)
-    assert client.get("/api/status").status_code == 200
+    status = client.get("/api/status")
+    assert status.status_code == 200
+    assert status.json()["helper"]["version"] == "1.3.0"
     assert client.get("/api/logs?limit=10").json()["lines"] == []
     response = client.post("/api/server/start", json={})
     assert response.status_code == 202
@@ -86,3 +88,42 @@ def test_unknown_job_and_action_are_rejected(tmp_path):
 def test_root_is_plain_not_found_until_frontend_arrives(tmp_path):
     client, _ = make_client(tmp_path)
     assert client.get("/").status_code == 404
+
+
+def test_model_catalog_follows_the_active_profile_model_path(tmp_path):
+    current = tmp_path / "current-model"
+    alternate_root = tmp_path / "alternate-library"
+    alternate = alternate_root / "alternate-model"
+    current.mkdir()
+    alternate.mkdir(parents=True)
+    boot = tmp_path / "boot-2020.ps1"
+    boot.write_text(
+        f"& $launcher `\n    -ModelPath '{current}' `\n    -Port 2020\n",
+        encoding="utf-8",
+    )
+    store = tmp_path / "boot-profiles.json"
+    profiles = ProfilesManager(store, boot_file=boot)
+    proc = ProcessManager(
+        boot_file=boot,
+        stop_script=tmp_path / "stop.ps1",
+        log_path=tmp_path / "server.log",
+        lock_path=tmp_path / "gpu.lock",
+        runner=lambda *a, **k: None,
+        readiness=lambda: {"state": "serving"},
+        sleep=lambda _: None,
+        poll_interval=0,
+    )
+    app = create_app(boot_file=boot, process_manager=proc, profiles=profiles, static_path=tmp_path / "missing.html")
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/profiles",
+            json={"name": "Alternate", "description": "", "settings": {"ModelPath": str(alternate)}},
+        )
+        assert created.status_code == 201, created.text
+        activated = client.post(f"/api/profiles/{created.json()['id']}/activate")
+        assert activated.status_code == 200, activated.text
+        assert app.state.models_dir == alternate_root
+        assert app.state.download_manager.models_dir == alternate_root
+        listed = client.get("/api/models").json()["models"]
+        assert [item["path"] for item in listed] == [str(alternate)]

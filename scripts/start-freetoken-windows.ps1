@@ -139,6 +139,13 @@ if ($null -eq $mtpLayers) { $mtpLayers = Get-Field $config 'num_nextn_predict_la
 $hasMtp = ($null -ne $mtpLayers) -and ([int]$mtpLayers -gt 0)
 $maxContext = Get-Field $text 'max_position_embeddings'
 if ($null -eq $maxContext) { $maxContext = Get-Field $config 'max_position_embeddings' }
+$numLayers = Get-Field $text 'num_hidden_layers'
+if ($null -eq $numLayers) { $numLayers = Get-Field $text 'n_layer' }
+if ($null -eq $numLayers) { $numLayers = Get-Field $config 'num_hidden_layers' }
+if ($null -eq $numLayers) { $numLayers = Get-Field $config 'n_layer' }
+$firstDense = Get-Field $text 'first_k_dense_replace'
+if ($null -eq $firstDense) { $firstDense = Get-Field $config 'first_k_dense_replace' }
+$moeLayerCount = if ($null -ne $numLayers) { [math]::Max(0, [int]$numLayers - [int]($firstDense -as [int])) } else { 0 }
 $experts = Get-Field $text 'num_experts'
 if ($null -eq $experts) { $experts = Get-Field $text 'n_routed_experts' }
 if ($null -eq $experts) { $experts = Get-Field $text 'num_local_experts' }
@@ -146,6 +153,7 @@ if ($null -eq $experts) { $experts = Get-Field $config 'num_experts' }
 if ($null -eq $experts) { $experts = Get-Field $config 'n_routed_experts' }
 if ($null -eq $experts) { $experts = Get-Field $config 'num_local_experts' }
 $isMoe = ($null -ne $experts) -and ([int]$experts -gt 0)
+$modelExpertCount = if ($isMoe -and $moeLayerCount -gt 0) { $moeLayerCount * [int]$experts } else { 0 }
 # KV parking is implemented for the QSA + GDN hybrid cache only (kvcache/park_store.py).
 $parkingSupported = ($modelType -eq 'qwen4_exp_text') -or ($modelType -eq 'qwen4_exp')
 
@@ -176,6 +184,10 @@ if (-not $isMoe -and ($MoECacheSize -gt 0 -or $GpuOwnedLayers)) {
     $notes += 'Expert-slot settings ignored: this model has no routed experts'
     $MoECacheSize = 0
     $GpuOwnedLayers = ''
+}
+if ($isMoe -and $modelExpertCount -gt 0 -and $MoECacheSize -gt $modelExpertCount) {
+    $notes += "MoE cache slots clamped from $MoECacheSize to ${modelExpertCount}: this model has only $modelExpertCount expert pieces"
+    $MoECacheSize = $modelExpertCount
 }
 if (-not $hasMtp) {
     # The MTP head is a Qwen3.8 private file; keep every entry switch off for other models.
@@ -303,9 +315,9 @@ if ($parkingSupported) {
 }
 if ($EnableCacheReport) { $serveArgs += '--enable-cache-report' }
 if ($CollectRoutingStats -and $isMoe) { $serveArgs += '--moe-collect-decode-freq' }
-if ($GpuOwnedLayers) { $serveArgs += @('--moe-gpu-owned-layers', $GpuOwnedLayers) }
-if ($MoEVramReserveBytes -ge 0) { $serveArgs += @('--moe-vram-reserve-bytes', "$MoEVramReserveBytes") }
-if ($MoECacheHeadroomBytes -ge 0) { $serveArgs += @('--moe-cache-headroom-bytes', "$MoECacheHeadroomBytes") }
+if ($isMoe -and $GpuOwnedLayers) { $serveArgs += @('--moe-gpu-owned-layers', $GpuOwnedLayers) }
+if ($isMoe -and $MoEVramReserveBytes -ge 0) { $serveArgs += @('--moe-vram-reserve-bytes', "$MoEVramReserveBytes") }
+if ($isMoe -and $MoECacheHeadroomBytes -ge 0) { $serveArgs += @('--moe-cache-headroom-bytes', "$MoECacheHeadroomBytes") }
 if ($CudaGraphMaxBS -ge 0) { $serveArgs += @('--cuda-graph-max-bs', "$CudaGraphMaxBS") }
 if ($KVCacheTokens -gt 0) { $serveArgs += @('--num-tokens', "$KVCacheTokens") }
 

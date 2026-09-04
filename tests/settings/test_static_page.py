@@ -176,6 +176,9 @@ def test_page_reads_the_model_and_reshapes_itself() -> None:
     # Text-stored counts (layers kept on the card) go through the storedAs contract.
     assert "dial.storedAs" in source
     assert "dial.storedZero" in source
+    assert "const respelled = []" in source
+    assert "toStored(dial, count)" in source
+    assert "respelled.forEach((name) => markChanged(name))" in source
 
 
 def test_models_tab_uses_preview_download_progress_and_folder_routes() -> None:

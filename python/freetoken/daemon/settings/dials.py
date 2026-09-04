@@ -616,7 +616,12 @@ def adapt_dial(dial: Dial, model: ModelInfo | None) -> dict[str, Any]:
         top = total
         if per:
             top = min(total, max(64, (SLOT_SLIDER_BUDGET_BYTES // per) // 64 * 64))
-        over["slider"] = (min(1024, top), top, 64 if top >= 2048 else 1)
+        over["max"] = total
+        over["limitNote"] = f" ({label} has {total:,} expert pieces)"
+        slider_low = min(1024, top)
+        if slider_low >= top:
+            slider_low = 0
+        over["slider"] = (slider_low, top, 64 if top >= 2048 else 1)
         text = (
             f"{label} is made of {total:,} expert pieces"
             + (f" ({gib(model.total_expert_bytes)})" if model.total_expert_bytes else "")

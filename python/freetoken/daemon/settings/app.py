@@ -29,7 +29,7 @@ from .model_info import ModelInfo, read_model
 from .process_manager import LifecycleError, ProcessManager
 from .profiles_manager import ProfileError, ProfileValidationError, ProfilesManager
 
-HELPER_VERSION = "1.2.0"
+HELPER_VERSION = "1.3.0"
 
 
 class SettingsBody(BaseModel):
@@ -171,6 +171,9 @@ def create_app(
         process_manager.boot_file = boot.path
     log = Path(log_path or getattr(process_manager, "log_path", paths["log"]))
     static = Path(static_path or paths["static"])
+    # Explicit roots are test/integration overrides. With neither supplied, both roots follow the
+    # active boot file's ModelPath whenever a profile is activated or the model is saved.
+    dynamic_model_root = models_dir is None and downloads_dir is None
     model_root = _models_dir_from_boot(
         boot,
         models_dir if models_dir is not None else downloads_dir,
@@ -206,12 +209,27 @@ def create_app(
     app.state.started_monotonic = started
     app.include_router(create_download_router(models_dir=model_root, manager=download_manager))
 
+    def refresh_model_roots() -> None:
+        nonlocal model_root, download_root
+        if not dynamic_model_root:
+            return
+        next_root = _models_dir_from_boot(boot, None)
+        if next_root == model_root:
+            return
+        model_root = next_root
+        download_root = next_root
+        download_manager.models_dir = next_root
+        download_manager.downloads_dir = next_root
+        app.state.models_dir = next_root
+        app.state.downloads_dir = next_root
+
     def set_active_boot(path: str | os.PathLike[str]) -> None:
         nonlocal boot
         boot = BootFile(path)
         profiles.boot_file = boot.path
         process_manager.boot_file = boot.path
         app.state.boot_file = boot
+        refresh_model_roots()
 
     @app.get("/")
     async def root():
@@ -259,6 +277,7 @@ def create_app(
         try:
             saved = boot.save(changes)
             profiles.sync_active(saved)
+            refresh_model_roots()
         except BootValidationError as exc:
             return _validation_response(exc.errors)
         except BootParseError as exc:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import struct
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -88,6 +89,25 @@ def test_reference_model_sizes_match_the_measured_numbers(tmp_path):
     assert doc["isReference"] is True and doc["bytesPerExpert"] == 2_772_480 and doc["isMoe"] is True
 
 
+def test_read_model_counts_ple_payload_from_safetensors_header(tmp_path):
+    folder = _qwen_like(tmp_path / "Qwen-With-PLE")
+    header = json.dumps(
+        {
+            "model.layers.2.ple_table": {"dtype": "U8", "shape": [13], "data_offsets": [0, 13]},
+            "model.embed_ngram.weight": {"dtype": "U8", "shape": [14], "data_offsets": [13, 27]},
+            "model.layers.2.mlp.gate_proj": {"dtype": "U8", "shape": [5], "data_offsets": [27, 32]},
+            "__metadata__": {"format": "pt"},
+        }
+    ).encode("utf-8")
+    payload = struct.pack("<Q", len(header)) + header + (b"\\0" * 32)
+    (folder / "model-00001-of-00002.safetensors").write_bytes(payload)
+
+    info = read_model(folder)
+
+    assert info.ple_bytes == 27
+    assert info.as_dict()["pleBytes"] == 27
+
+
 def test_other_model_gets_its_own_layers_context_and_format(tmp_path):
     info = read_model(_small_fp8(tmp_path / "Small-FP8"))
     assert info.found and info.supported and not info.is_reference
@@ -145,6 +165,8 @@ def test_adapted_dials_follow_the_model(tmp_path):
     slots = DIAL_BY_NAME["MoECacheSize"]
     assert adapt_dial(slots, ref)["slider"][1] <= 48 * 512
     assert adapt_dial(slots, small)["slider"][1] <= 24 * 64
+    assert adapt_dial(slots, small)["max"] == 24 * 64
+    assert "expert pieces" in adapt_dial(slots, small)["limitNote"]
     assert "2.58 GiB" in adapt_dial(slots, ref)["info"]
     assert "not been measured" in adapt_dial(slots, small)["info"]
 
@@ -249,7 +271,24 @@ def test_routes_shape_dials_for_the_saved_and_previewed_model(tmp_path):
     # until the chat length is lowered in the same save.
     switch = client.put("/api/settings", json={"settings": {"ModelPath": str(small)}})
     assert switch.status_code == 422 and switch.json()["detail"][0]["field"] == "ContextTokens"
-    both = client.put("/api/settings", json={"settings": {"ModelPath": str(small), "ContextTokens": 32768, "GpuOwnedLayers": 2}})
+    slot_switch = client.put(
+        "/api/settings",
+        json={"settings": {"ModelPath": str(small), "ContextTokens": 32768}},
+    )
+    assert slot_switch.status_code == 422
+    assert slot_switch.json()["detail"][0]["field"] == "MoECacheSize"
+    assert "1,536 expert pieces" in slot_switch.json()["detail"][0]["message"]
+    both = client.put(
+        "/api/settings",
+        json={
+            "settings": {
+                "ModelPath": str(small),
+                "ContextTokens": 32768,
+                "MoECacheSize": 1536,
+                "GpuOwnedLayers": 2,
+            }
+        },
+    )
     assert both.status_code == 200, both.text
     text = (tmp_path / "boot-2020.ps1").read_text(encoding="utf-8")
     assert "-ContextTokens 32768" in text

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import threading
 import time
 from pathlib import Path
@@ -159,6 +160,75 @@ def test_preview_reports_glm_shortfall_and_gpt_oss_fit(tmp_path: Path) -> None:
     assert linked.status_code == 200
     assert linked.json()["downloadBytes"] == gpt_body["downloadBytes"]
     assert all(repo == "openai/gpt-oss-20b" and metadata for repo, metadata in api.calls[-2:])
+
+
+def test_preview_excludes_remote_ple_header_bytes(tmp_path: Path) -> None:
+    config = {
+        "architectures": ["Qwen3MoeForConditionalGeneration"],
+        "model_type": "tiny_moe",
+        "num_hidden_layers": 1,
+        "num_experts": 1,
+        "num_experts_per_tok": 1,
+        "hidden_size": 2,
+        "moe_intermediate_size": 2,
+        "ple_layer_ids": [0],
+    }
+    files = [
+        SimpleNamespace(rfilename="config.json", size=20),
+        SimpleNamespace(rfilename="model.safetensors", size=1_000),
+    ]
+    api = _FakeApi({"owner/tiny": files})
+    header = json.dumps(
+        {
+            "model.layers.0.ple_table": {"data_offsets": [0, 600]},
+            "model.layers.0.mlp.gate_proj": {"data_offsets": [600, 1_000]},
+        }
+    ).encode("utf-8")
+    client = _app(
+        tmp_path,
+        api=api,
+        config_fetcher=lambda _: config,
+        header_fetcher=lambda repo, filename: header,
+    )
+
+    response = client.get("/api/downloads/preview", params={"repo": "owner/tiny"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["pleBytes"] == 600
+    assert body["fit"]["denseBytes"] == max(0, body["weightBytes"] - body["fit"]["expertBytes"] - 600)
+    assert body["fit"]["needsBytes"] == body["fit"]["expertBytes"] + body["fit"]["denseBytes"]
+
+
+def test_local_models_fit_excludes_ple_header_tensor_bytes(tmp_path: Path) -> None:
+    models = tmp_path / "models" / "tiny"
+    models.mkdir(parents=True)
+    config = {
+        "architectures": ["Qwen3MoeForConditionalGeneration"],
+        "model_type": "tiny_moe",
+        "num_hidden_layers": 1,
+        "num_experts": 1,
+        "num_experts_per_tok": 1,
+        "hidden_size": 2,
+        "moe_intermediate_size": 2,
+        "ple_layer_ids": [0],
+    }
+    (models / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    header = json.dumps(
+        {
+            "model.layers.0.ple_table": {"data_offsets": [0, 600]},
+            "model.layers.0.mlp.gate_proj": {"data_offsets": [600, 1_000]},
+        }
+    ).encode("utf-8")
+    (models / "model.safetensors").write_bytes(struct.pack("<Q", len(header)) + header + (b"x" * 1_000))
+    client = _app(tmp_path, api=_FakeApi({}), config_fetcher=lambda _: config)
+
+    response = client.get("/api/models")
+
+    assert response.status_code == 200, response.text
+    body = response.json()["models"][0]
+    assert body["pleBytes"] == 600
+    assert body["fit"]["denseBytes"] == max(0, body["weightBytes"] - body["fit"]["expertBytes"] - 600)
 
 
 def test_start_refuses_existing_folder(tmp_path: Path) -> None:

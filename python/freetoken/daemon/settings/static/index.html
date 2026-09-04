@@ -30,6 +30,7 @@
       :root { color-scheme: dark; --paper: #0f141f; --panel: #171d2b; --panel-2: #1d2434; --ink: #eaf0ff; --muted: #a9b4ca; --line: #2d3750; --accent: #9db7ff; --accent-ink: #0f1a3a; --accent-soft: #243459; --good: #79d9a8; --good-soft: #17352a; --warn: #f2b45f; --warn-soft: #3b2d14; --bad: #ff8d98; --bad-soft: #3d1e24; --neutral-soft: #242c3d; --shadow: 0 8px 28px #0007; }
     }
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     html { scroll-behavior: smooth; }
     body { margin: 0; background: var(--paper); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     button, input, select { font: inherit; color: inherit; }
@@ -653,8 +654,21 @@
       state.model = body.model || null;
       state.dials = Array.isArray(body.dials) ? body.dials : state.dials;
       state.groups = Array.isArray(body.groups) ? body.groups : state.groups;
+      // Launcher text uses a model-specific spelling for layer counts: Qwen's "auto:3" means
+      // three busiest layers, while another model's "3" means three evenly spread layers.
+      const respelled = [];
+      state.dials.forEach((dial) => {
+        if (!dial.storedAs || !(dial.name in state.settings)) return;
+        const count = storedCount(state.settings[dial.name]);
+        const next = toStored(dial, count);
+        if (next !== state.settings[dial.name]) {
+          state.settings[dial.name] = next;
+          respelled.push(dial.name);
+        }
+      });
       renderModelCard();
       renderSettings();
+      respelled.forEach((name) => markChanged(name));
       // Values the new model cannot take are flagged straight away, before Save.
       const errors = [];
       state.dials.forEach((dial) => { if (dial.max == null) return; const shown = toShown(dial, state.settings[dial.name]); if (shown !== '' && !isAuto(dial, state.settings[dial.name]) && Number(shown) * (dial.displayFactor || 1) > Number(dial.max)) errors.push({ field: dial.name, message: `Above what this model allows (${fmt(toShown(dial, dial.max))}${dial.displayUnit || dial.unit ? ` ${dial.displayUnit || dial.unit}` : ''}).` }); });
