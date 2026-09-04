@@ -46,6 +46,56 @@ from .config import parse_config
 _CKPT = "model.language_model"
 _MODEL = "model"
 
+
+class _Exl3DirectShardReader:
+    """Read EXL3 resident tensors by range from strict Windows unbuffered shards.
+
+    The generic GLM reader keeps ``safe_open`` mappings for every shard until the final
+    yielded tensor.  That is fine for ordinary checkpoints, but on Windows its touched
+    pages join the file cache beside the 71.29 GiB of EXL3 banks.  The proof's resident
+    matrices therefore use the same per-tensor ``DirectShard`` path as the expert loader;
+    each small anonymous range buffer is released immediately after its CUDA copy.
+    """
+
+    def __init__(self, folder: str, weight_map: dict, device: torch.device):
+        self._folder = folder
+        self._weight_map = weight_map
+        self._device = device
+        self._handles: dict[str, object] = {}
+
+    def has(self, name: str) -> bool:
+        return name in self._weight_map
+
+    def get(self, name: str) -> torch.Tensor:
+        from freetoken.models.weight import DirectShard
+
+        shard = self._weight_map[name]
+        handle = self._handles.get(shard)
+        if handle is None:
+            handle = DirectShard(
+                os.path.join(self._folder, shard), whole=False, unbuffered_only=True
+            )
+            self._handles[shard] = handle
+        tensor = handle.get_tensor(name)
+        try:
+            return tensor.to(device=self._device)
+        finally:
+            # DirectShard owns one anonymous range mmap per requested tensor.  The CUDA
+            # copy above is final; do not let those ranges accumulate across the layer loop.
+            del tensor
+            alive = getattr(handle, "_alive", None)
+            if alive is not None:
+                alive.clear()
+
+    def close(self) -> None:
+        for handle in self._handles.values():
+            try:
+                handle.close()
+            except Exception:  # pragma: no cover - best effort
+                pass
+        self._handles.clear()
+
+
 # MTP-layer experts (layer == num_layers under the full checkpoint) map to None
 # alongside the dense prefix; the bank loader skips them.
 def _layer_to_bank(layer, config):
@@ -284,7 +334,15 @@ def iter_weights(
     folder = download_hf_weight(model_path)
     with open(os.path.join(folder, "model.safetensors.index.json")) as f:
         weight_map = json.load(f)["weight_map"]
-    reader = _ShardReader(folder, weight_map, device)
+    # The EXL3 proof cannot keep resident-weight safe_open mappings in Windows' file
+    # cache while the pinned expert banks are being filled.  Range-read those resident
+    # tensors too; Linux and older GLM exports retain the established reader.
+    reader_type = (
+        _Exl3DirectShardReader
+        if os.name == "nt" and getattr(config, "expert_quant", None) == "exl3"
+        else _ShardReader
+    )
+    reader = reader_type(folder, weight_map, device)
     primary = get_tp_info().is_primary()
     attn_fp8 = config.attn_quant == "fp8_pertensor"
     mlp_fp8 = config.dense_quant == "fp8_pertensor"
@@ -292,6 +350,10 @@ def iter_weights(
     if primary:
         from freetoken.utils import init_logger
 
+        if reader_type is _Exl3DirectShardReader:
+            init_logger(__name__).info(
+                "GLM-5.3 EXL3 resident weights: Windows unbuffered range reads"
+            )
         init_logger(__name__).info(
             f"GLM-5.3 resident quant: attn={config.attn_quant} dense={config.dense_quant} "
             f"lm_head={config.lm_head_quant} (FREETOKEN_GLM5_ATTN_FP8/FREETOKEN_GLM5_MLP_FP8; "
