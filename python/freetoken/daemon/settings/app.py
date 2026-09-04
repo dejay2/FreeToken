@@ -14,10 +14,11 @@ from pydantic import BaseModel, Field
 from .boot_parser import BootFile, BootParseError, BootValidationError
 from .browse import BROWSE_KINDS, list_directory
 from .dials import DIALS, EXTENSION_DIALS, ENV_DIALS, GROUP_INFO, dial_value_for_display, validate_settings
+from .model_info import ModelInfo, read_model
 from .process_manager import LifecycleError, ProcessManager
 from .profiles_manager import ProfileValidationError, ProfilesManager
 
-HELPER_VERSION = "1.1.0"
+HELPER_VERSION = "1.2.0"
 
 
 class SettingsBody(BaseModel):
@@ -74,8 +75,16 @@ def _active_profile(settings: dict[str, Any]) -> str:
     return "custom"
 
 
-def _settings_payload(boot: BootFile) -> dict[str, Any]:
+def _model_for(settings: dict[str, Any], override: str | None = None) -> ModelInfo:
+    """The model the dials are shaped for: an explicit folder (the page previewing a folder
+    it has not saved yet) or the saved ModelPath."""
+    path = override if override is not None and override.strip() else settings.get("ModelPath", "")
+    return read_model(path if isinstance(path, str) else "")
+
+
+def _settings_payload(boot: BootFile, model_path: str | None = None) -> dict[str, Any]:
     settings = boot.load()
+    model = _model_for(settings, model_path)
     primary = {
         dial.name: settings.get(dial.name, dial.default)
         for dial in DIALS
@@ -84,7 +93,7 @@ def _settings_payload(boot: BootFile) -> dict[str, Any]:
     dials = []
     for dial in DIALS:
         value = settings.get(dial.name, dial.default)
-        dials.append(dial.as_dict(dial_value_for_display(dial, value)))
+        dials.append(dial.as_dict(dial_value_for_display(dial, value), model))
     groups = [
         {"name": name, "plain": info.get("plain", name), "info": info.get("info", "")}
         for name, info in GROUP_INFO.items()
@@ -95,6 +104,7 @@ def _settings_payload(boot: BootFile) -> dict[str, Any]:
         "settings": primary,
         "dials": dials,
         "groups": groups,
+        "model": model.as_dict(),
     }
 
 
@@ -140,15 +150,27 @@ def create_app(
         return PlainTextResponse("Settings page is not available yet\n", status_code=404)
 
     @app.get("/api/settings")
-    async def get_settings():
+    async def get_settings(model: str | None = Query(default=None)):
+        """``?model=<folder>`` shapes the dials for a folder the page is previewing but has
+        not saved yet; without it the saved ModelPath is used."""
         try:
-            return _settings_payload(boot)
+            return _settings_payload(boot, model)
         except BootParseError as exc:
             raise _boot_http_error(exc) from exc
 
+    @app.get("/api/model")
+    async def get_model(path: str = Query(default="")):
+        """Describe a model folder from its config.json alone (no weight files are opened)."""
+        return read_model(path).as_dict()
+
     @app.put("/api/settings")
     async def put_settings(body: SettingsBody):
-        errors = validate_settings(body.settings)
+        try:
+            saved_settings = boot.load()
+        except BootParseError as exc:
+            raise _boot_http_error(exc) from exc
+        model_path = body.settings.get("ModelPath")
+        errors = validate_settings(body.settings, _model_for(saved_settings, model_path if isinstance(model_path, str) else None))
         if errors:
             return _validation_response(errors)
         try:

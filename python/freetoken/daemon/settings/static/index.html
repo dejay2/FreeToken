@@ -183,6 +183,16 @@
     .hint { font-size: .84rem; color: var(--muted); }
     .hint.warn { color: var(--warn); }
 
+    /* Model card: what the chosen folder holds and what the page sized itself for */
+    .model-card { border: 1px solid var(--line); border-left: 4px solid var(--good); border-radius: 12px; background: var(--panel); padding: 12px 16px; margin-bottom: 14px; display: flex; flex-direction: column; gap: 8px; }
+    .model-card.warn { border-left-color: var(--warn); }
+    .model-card.bad { border-left-color: var(--bad); }
+    .model-card .model-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+    .model-card h2 { font-size: 1.02rem; }
+    .model-card .facts { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: .86rem; color: var(--muted); }
+    .model-card .facts b { color: var(--text); font-weight: 600; }
+    .model-card .badge-line { display: flex; gap: 6px; flex-wrap: wrap; }
+
     @media (max-width: 900px) { .settings-layout { grid-template-columns: 1fr; } .group-nav { display: none; } .top-right { align-items: flex-start; } }
     @media (max-width: 600px) { .dial { grid-template-columns: 1fr; } .amount { grid-template-columns: 1fr; } .amount .number-wrap { justify-content: flex-end; } }
   </style>
@@ -218,6 +228,7 @@
         <label class="switch"><input id="show-advanced" type="checkbox"> <span>Show expert settings</span></label>
         <span class="small" id="active-profile"></span>
       </div>
+      <div class="model-card" id="model-card" aria-live="polite"><p class="empty">Reading the model folder…</p></div>
       <div class="settings-layout">
         <nav class="group-nav" id="group-nav" aria-label="Setting groups"></nav>
         <div id="settings" aria-live="polite"><p class="empty">Loading settings…</p></div>
@@ -273,7 +284,7 @@
 
   <script>
     'use strict';
-    const state = { settings: {}, saved: {}, dials: [], groups: [], profiles: [], activeProfile: '', busy: false, jobId: null, jobTimer: null, logTimer: null, tab: 'settings', showAdvanced: false, query: '', browser: null, lastNonAuto: {} };
+    const state = { settings: {}, saved: {}, dials: [], groups: [], model: null, modelTimer: null, modelPath: null, profiles: [], activeProfile: '', busy: false, jobId: null, jobTimer: null, logTimer: null, tab: 'settings', showAdvanced: false, query: '', browser: null, lastNonAuto: {} };
     const axisLabels = { speed: 'Speed', accuracy: 'Accuracy', vram: 'Card memory', ram: 'PC memory', ssd: 'Drive space', boot: 'Start-up time' };
     const costAxes = new Set(['vram', 'ram', 'ssd', 'boot']);
     const $ = (id) => document.getElementById(id);
@@ -320,8 +331,11 @@
 
     function isAuto(dial, value) { return dial.autoValue !== null && dial.autoValue !== undefined && Number(value) === Number(dial.autoValue); }
     const isFractional = (dial) => (dial.displayFactor && dial.displayFactor !== 1) || [dial.min, dial.max, dial.value, ...(dial.slider || [])].some((item) => item != null && Number(item) % 1 !== 0);
-    const toShown = (dial, stored) => (stored === '' || stored == null) ? '' : Number(stored) / (dial.displayFactor || 1);
+    // Text-stored counts ("auto:3", "3", "auto" = 6, "" = 0, an id list counts its entries).
+    const storedCount = (text) => { const value = String(text ?? '').trim(); if (value === '' ) return 0; if (value === 'auto') return 6; if (value.includes(',')) return value.split(',').filter((part) => part.trim()).length; const match = value.match(/(\d+)\s*$/); return match ? Number(match[1]) : 0; };
+    const toShown = (dial, stored) => dial.storedAs ? (typeof stored === 'number' ? stored : storedCount(stored)) : ((stored === '' || stored == null) ? '' : Number(stored) / (dial.displayFactor || 1));
     function toStored(dial, shown) {
+      if (dial.storedAs) { const count = Math.max(0, Math.round(Number(shown) || 0)); return count === 0 ? (dial.storedZero || '') : dial.storedAs.replace('{n}', String(count)); }
       if (shown === '' || shown == null || Number.isNaN(Number(shown))) return '';
       const raw = Number(shown) * (dial.displayFactor || 1);
       return isFractional(dial) && (!dial.displayFactor || dial.displayFactor === 1) ? raw : Math.round(raw);
@@ -402,6 +416,7 @@
       state.settings[control.dataset.dial] = value;
       if (control.type === 'checkbox') control.nextElementSibling.textContent = control.checked ? 'On' : 'Off';
       if (control.type === 'number' && dial && dial.slider) { const slider = document.querySelector(`[data-slider="${CSS.escape(dial.name)}"]`); if (slider) slider.value = control.value; }
+      if (dial && dial.browse === 'model') scheduleModelRefresh(value);
       markChanged(control.dataset.dial);
     }
 
@@ -452,16 +467,69 @@
       if (first) { const row = first.closest('.dial'); if (row) { row.hidden = false; row.closest('.group').hidden = false; showTab('settings'); row.scrollIntoView({ block: 'center' }); } }
     }
 
+    /* ---------- the chosen model ---------- */
+    const fmtGib = (bytes) => bytes ? `${(Number(bytes) / 1024 ** 3).toFixed(bytes >= 10 * 1024 ** 3 ? 0 : 2)} GiB` : '—';
+    function renderModelCard() {
+      const model = state.model;
+      const card = $('model-card');
+      if (!model) { card.className = 'model-card'; card.innerHTML = '<p class="empty">Reading the model folder…</p>'; return; }
+      if (!model.found) {
+        card.className = 'model-card bad';
+        card.innerHTML = `<div class="model-head"><h2>No model read</h2><span class="small">${escapeHtml(model.path || '')}</span></div><p class="hint warn">${escapeHtml(model.error || 'The model folder could not be read.')} The limits below are the page's built-in ones, not this folder's.</p>`;
+        return;
+      }
+      const tone = model.supported ? '' : 'warn';
+      card.className = `model-card ${tone}`;
+      const facts = [];
+      if (model.maxContextTokens) facts.push(`<span><b>${fmt(model.maxContextTokens)}</b> tokens longest chat</span>`);
+      if (model.numLayers) facts.push(`<span><b>${fmt(model.numLayers)}</b> layers${model.isMoe ? `, <b>${fmt(model.numMoeLayers)}</b> with experts` : ''}</span>`);
+      if (model.isMoe) facts.push(`<span><b>${fmt(model.numExperts)}</b> experts per layer${model.expertsPerToken ? `, <b>${fmt(model.expertsPerToken)}</b> used per word` : ''}</span>`);
+      if (model.bytesPerExpert) facts.push(`<span><b>${(model.bytesPerExpert / 1e6).toFixed(2)} MB</b> per expert, <b>${escapeHtml(fmtGib(model.bytesPerLayer))}</b> per layer, <b>${escapeHtml(fmtGib(model.totalExpertBytes))}</b> all experts</span>`);
+      if (model.expertFormatLabel) facts.push(`<span>experts stored <b>${escapeHtml(model.expertFormatLabel)}</b></span>`);
+      if (model.weightFiles) facts.push(`<span><b>${fmt(model.weightFiles)}</b> weight files, <b>${escapeHtml(fmtGib(model.weightBytes))}</b> on the drive</span>`);
+      const badges = [
+        model.supported ? '<span class="chip good">✓ Known to this engine</span>' : '<span class="chip bad">✕ Not a model type this engine lists</span>',
+        model.isReference ? '<span class="chip good">Speeds on this page were measured on it</span>' : '<span class="chip">Sizes computed for it; speeds not measured</span>',
+        model.hasVision ? '<span class="chip">Pictures</span>' : '',
+        model.hasPle ? '<span class="chip">Lookup table</span>' : '',
+        model.hasMtp ? '<span class="chip">Guess-ahead head</span>' : '',
+      ].filter(Boolean).join('');
+      card.innerHTML = `<div class="model-head"><h2>${escapeHtml(model.name || 'Model')}</h2><span class="small">${escapeHtml(model.architecture || model.modelType || '')}</span></div><div class="badge-line">${badges}</div><div class="facts">${facts.join('')}</div><p class="small">The limits, slider tops and memory numbers on this page are sized for this model. Change the model folder and they follow it.</p>`;
+    }
+
+    // The page re-shapes itself for the folder typed or browsed into the model dial before it is
+    // saved, so the limits and explanations already match the model that will be started.
+    async function refreshModel(path) {
+      const target = String(path ?? '');
+      if (target === state.modelPath) return;
+      state.modelPath = target;
+      const { response, body } = await json(`/api/settings?model=${encodeURIComponent(target)}`);
+      if (!response.ok || state.modelPath !== target) return;
+      state.model = body.model || null;
+      state.dials = Array.isArray(body.dials) ? body.dials : state.dials;
+      state.groups = Array.isArray(body.groups) ? body.groups : state.groups;
+      renderModelCard();
+      renderSettings();
+      // Values the new model cannot take are flagged straight away, before Save.
+      const errors = [];
+      state.dials.forEach((dial) => { if (dial.max == null) return; const shown = toShown(dial, state.settings[dial.name]); if (shown !== '' && !isAuto(dial, state.settings[dial.name]) && Number(shown) * (dial.displayFactor || 1) > Number(dial.max)) errors.push({ field: dial.name, message: `Above what this model allows (${fmt(toShown(dial, dial.max))}${dial.displayUnit || dial.unit ? ` ${dial.displayUnit || dial.unit}` : ''}).` }); });
+      showFieldErrors(errors);
+    }
+    function scheduleModelRefresh(path) { clearTimeout(state.modelTimer); state.modelTimer = setTimeout(() => refreshModel(path), 500); }
+
     async function loadSettings() {
       const { response, body } = await json('/api/settings');
       if (!response.ok) throw new Error(body.detail || 'Could not load settings.');
       state.settings = { ...(body.settings || {}) };
       state.dials = Array.isArray(body.dials) ? body.dials : [];
       state.groups = Array.isArray(body.groups) ? body.groups : [];
+      state.model = body.model || null;
+      state.modelPath = state.model ? String(state.model.path ?? '') : null;
       state.activeProfile = body.activeProfile || '';
       state.dials.forEach((dial) => { if (!(dial.name in state.settings) && dial.value !== undefined) state.settings[dial.name] = dial.value; });
       state.saved = JSON.parse(JSON.stringify(state.settings));
       $('active-profile').textContent = state.activeProfile && state.activeProfile !== 'custom' ? `Saved file matches profile ${state.activeProfile}` : (body.bootFilePath ? `Saved file: ${body.bootFilePath}` : '');
+      renderModelCard();
       renderSettings();
     }
 
@@ -622,6 +690,7 @@
       const { name } = state.browser;
       const input = document.querySelector(`[data-dial="${CSS.escape(name)}"]`);
       input.value = path; state.settings[name] = path; markChanged(name);
+      const dial = dialByName(name); if (dial && dial.browse === 'model') refreshModel(path);
       closeBrowser();
     }
     $('browser-close').addEventListener('click', closeBrowser);

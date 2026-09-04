@@ -375,7 +375,7 @@ class BootFile:
     def save(self, changes: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(changes, dict):
             raise BootValidationError([{"field": "settings", "message": "must be an object"}])
-        errors = validate_settings(changes)
+        errors = validate_settings(changes, ceilings_only=True)  # the app already applied the model limits
         if errors:
             raise BootValidationError(errors)
         document = self.read_document()  # parse before backup: a broken source is never rewritten

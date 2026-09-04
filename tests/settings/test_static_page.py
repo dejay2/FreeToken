@@ -155,3 +155,21 @@ def test_page_has_tabs_info_buttons_sliders_and_browse() -> None:
     # Restarting with unsaved changes asks in-page, never through a browser dialog.
     assert "restart-dialog" in page
     assert "changedNames()" in source
+
+
+def test_page_reads_the_model_and_reshapes_itself() -> None:
+    page = _page()
+    source = _source()
+
+    # A model card above the settings, filled from the settings payload's model block.
+    assert 'id="model-card"' in page
+    assert "body.model" in source
+    assert "renderModelCard()" in source
+    # Typing or browsing a new model folder previews it before Save through the settings
+    # route's model query, and the dials are re-rendered from that response.
+    assert "/api/settings?model=" in source
+    assert "refreshModel(" in source
+    assert "dial.browse === 'model'" in source
+    # Text-stored counts (layers kept on the card) go through the storedAs contract.
+    assert "dial.storedAs" in source
+    assert "dial.storedZero" in source

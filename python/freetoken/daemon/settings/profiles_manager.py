@@ -65,7 +65,7 @@ class ProfilesManager:
             raise ProfileValidationError([{"field": "description", "message": "Description must be text"}])
         if not isinstance(settings, dict):
             raise ProfileValidationError([{"field": "settings", "message": "must be an object"}])
-        errors = validate_settings(settings)
+        errors = validate_settings(settings, ceilings_only=True)  # a profile may belong to another model
         if errors:
             raise ProfileValidationError(errors)
         profiles = self._custom()

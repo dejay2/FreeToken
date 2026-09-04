@@ -14,8 +14,11 @@ step with those documents when the measurements change.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from typing import Any
+
+from .model_info import GIB as _GIB, ModelInfo, gib
 
 EFFECT_AXES = ("speed", "accuracy", "vram", "ram", "ssd", "boot")
 EFFECT_DIRECTIONS = ("up", "down", "mixed")
@@ -56,8 +59,17 @@ class Dial:
     # Expert settings are hidden behind the page's "Show expert settings" switch.
     advanced: bool = False
     option_labels: tuple[str, ...] | None = None
+    # A number the launcher stores as text: the page shows the count, the file keeps
+    # ``stored_as.format(n=count)`` (``stored_zero`` when the count is 0). Used by the
+    # layers-on-card dial, whose launcher value is "auto:3" (measured ranking) or "3".
+    stored_as: str = ""
+    stored_zero: str = ""
 
-    def as_dict(self, value: Any) -> dict[str, Any]:
+    def as_dict(self, value: Any, model: Any = None) -> dict[str, Any]:
+        """The page contract. ``model`` (a ModelInfo) reshapes the limits, slider and
+        explanation of the model-dependent dials; without it the catalogue's defaults
+        (sized for Qwen3.8-Flash-Next) are sent unchanged."""
+        over = adapt_dial(self, model) if model is not None else {}
         return {
             "name": self.name,
             "group": self.group,
@@ -67,15 +79,15 @@ class Dial:
             "help": self.help,
             "options": list(self.options) if self.options is not None else None,
             "optionLabels": list(self.option_labels) if self.option_labels is not None else None,
-            "min": self.minimum,
-            "max": self.maximum,
+            "min": over.get("min", self.minimum),
+            "max": over.get("max", self.maximum),
             "plain": self.plain or self.name,
-            "info": self.info,
+            "info": over.get("info", self.info),
             "effects": [
                 {"axis": axis, "direction": direction}
                 for axis, direction in (item.split(":", 1) for item in self.effects)
             ],
-            "slider": list(self.slider) if self.slider is not None else None,
+            "slider": list(over["slider"]) if "slider" in over else (list(self.slider) if self.slider is not None else None),
             "displayUnit": self.display_unit,
             "displayFactor": self.display_factor,
             "autoValue": self.auto_value,
@@ -83,6 +95,9 @@ class Dial:
             "browse": self.browse,
             "advanced": self.advanced,
             "engine": self.engine_mapping,
+            "storedAs": over.get("storedAs", self.stored_as),
+            "storedZero": self.stored_zero,
+            "modelAware": bool(over) or self.name in MODEL_AWARE_DIALS,
         }
 
 
@@ -136,8 +151,10 @@ DIALS: tuple[Dial, ...] = (
         ),
     ),
     Dial(
+        # maximum is a technical ceiling; the real limit is the chosen model's longest chat
+        # (config.json max_position_embeddings), applied by adapt_dial / validate_settings.
         "ContextTokens", "number", 262144, "tokens", "Maximum sequence length per request reserved in the KV cache.",
-        "Model and context", minimum=64, maximum=262144, engine_mapping="--kv-reserve-tokens <N>",
+        "Model and context", minimum=64, maximum=4194304, engine_mapping="--kv-reserve-tokens <N>",
         plain="Longest single chat", slider=(1024, 262144, 1024), effects=("vram:up",),
         info=(
             "How long one conversation may grow, in tokens. A token is about three quarters of a "
@@ -273,16 +290,20 @@ DIALS: tuple[Dial, ...] = (
         ),
     ),
     Dial(
-        "GpuOwnedLayers", "choice", "auto", "layers", "MoE layers that remain permanently resident in GPU VRAM instead of streaming from host RAM.",
-        "Expert slots and card memory", options=("", "auto", "auto:1", "auto:2", "auto:3", "auto:4", "auto:5", "auto:6"), engine_mapping="--moe-gpu-owned-layers <val>",
-        plain="Layers kept whole on the card",
-        option_labels=("Off", "Automatic (six busiest)", "Busiest 1", "Busiest 2", "Busiest 3", "Busiest 4", "Busiest 5", "Busiest 6"),
-        effects=("ram:down", "speed:mixed"),
+        # Stored as launcher text: "auto:N" = the N busiest layers of the ranking measured for
+        # Qwen3.8 (engine GPU_OWNED_LAYER_RANK), "N" = N layers spread evenly through the model,
+        # "" = off. The engine accepts any N up to the model's MoE layer count; the slider top and
+        # the storage form come from the chosen model (adapt_dial). Static maximum is a ceiling.
+        "GpuOwnedLayers", "number", "auto", "layers", "MoE layers that remain permanently resident in GPU VRAM instead of streaming from host RAM.",
+        "Expert slots and card memory", minimum=0, maximum=4096, engine_mapping="--moe-gpu-owned-layers <val>",
+        plain="Layers kept whole on the card", slider=(0, 48, 1), stored_as="auto:{n}", stored_zero="",
+        effects=("ram:down", "vram:up", "speed:mixed"),
         info=(
             "Keeps every expert of the chosen layers on the card so those layers never need PC memory. "
             "Each layer hands back 1.32 GiB of PC memory and takes 1.32 GiB of card memory, which is "
-            "charged against the expert slots above (about 512 slots per layer). Automatic picks the "
-            "six busiest layers measured on this PC and needs at least 4,096 expert slots."
+            "charged against the expert slots above (about 512 slots per layer). The layers are taken "
+            "from a busiest-first ranking measured on this PC; six was the measured sweet spot with "
+            "4,188 slots, and every extra layer removes about 512 streaming slots. 0 turns this off."
         ),
     ),
     Dial(
@@ -476,6 +497,180 @@ DIALS: tuple[Dial, ...] = (
     ),
 )
 
+# ---------------------------------------------------------------------------------------
+# Model-aware reshaping. The catalogue above is sized for Qwen3.8-Flash-Next; adapt_dial
+# re-derives the limits, slider tops, storage form and explanation of these dials from the
+# chosen model folder's config.json (model_info.read_model) so another model gets its own
+# longest chat, layer count and expert sizes instead of Qwen's.
+# ---------------------------------------------------------------------------------------
+
+MODEL_AWARE_DIALS = frozenset({
+    "ModelPath",
+    "ContextTokens",
+    "KVCacheTokens",
+    "MoECacheSize",
+    "GpuOwnedLayers",
+    "EnableVision",
+    "FREETOKEN_MTP_SPECULATE",
+})
+
+# What the catalogue was measured with; applied when the model folder cannot be read.
+REFERENCE_LIMITS: dict[str, dict[str, Any]] = {
+    "ContextTokens": {"max": 262144, "slider": (1024, 262144, 1024), "limitNote": " (the built-in limit; the model folder could not be read)"},
+    "GpuOwnedLayers": {"max": 48, "slider": (0, 48, 1), "limitNote": " (the built-in limit; the model folder could not be read)"},
+}
+
+# Slider top for expert slots on a model we have no sweep for: the slots that fit in this
+# much card memory. 24 GiB is what a 32 GB card has left after the always-on weights, the
+# chat memory reserve and the headroom on the measured build (memory audit, 2026-09-02).
+SLOT_SLIDER_BUDGET_BYTES = 24 * _GIB
+
+
+def _words(tokens: int) -> str:
+    return f"{int(tokens * 0.75):,}"
+
+
+def _token_step(top: int) -> int:
+    if top >= 65536:
+        return 1024
+    if top >= 8192:
+        return 256
+    return 64
+
+
+def adapt_dial(dial: Dial, model: ModelInfo | None) -> dict[str, Any]:
+    """Overrides for one dial given a model: keys ``min``, ``max``, ``slider``, ``info``,
+    ``storedAs`` and ``limitNote`` (appended to an out-of-range error). Empty when the
+    dial does not depend on the model or the folder could not be read."""
+    if dial.name not in MODEL_AWARE_DIALS:
+        return {}
+    if model is None or not model.found:
+        # Unknown folder: hold the limits the catalogue was measured with, so a typo in the
+        # model path cannot let a 4-million-token chat through to the launcher.
+        return dict(REFERENCE_LIMITS.get(dial.name, {}))
+    over: dict[str, Any] = {}
+    ref = model.is_reference
+    name = dial.name
+    label = model.name or "this model"
+
+    if name == "ModelPath":
+        parts = [f"The folder now holds {label}"]
+        parts.append(
+            f"({model.architecture}), a model type this engine knows." if model.supported
+            else f"({model.architecture or 'unknown type'}), which this engine does not list, so it may not start."
+        )
+        if model.is_moe:
+            parts.append(
+                f"It has {model.num_moe_layers} expert layers of {model.num_experts:,} experts each"
+                + (f", {model.experts_per_token} used per word" if model.experts_per_token else "")
+                + (f", stored {model.expert_format_label}" if model.expert_format_label else "")
+                + "."
+            )
+        else:
+            parts.append("It has no routed experts, so the expert-slot settings do not apply.")
+        if model.max_context_tokens:
+            parts.append(f"Its longest chat is {model.max_context_tokens:,} tokens (roughly {_words(model.max_context_tokens)} words).")
+        parts.append(
+            "The speeds quoted on this page were measured on this model." if ref
+            else "Speeds quoted on this page were measured on Qwen3.8-Flash-Next and do not carry over; the sizes and limits below are computed for this model."
+        )
+        over["info"] = " ".join(parts)
+
+    elif name == "ContextTokens" and model.max_context_tokens:
+        top = model.max_context_tokens
+        step = _token_step(top)
+        over["max"] = top
+        over["slider"] = (min(1024, top), top, step)
+        over["limitNote"] = f" ({label} cannot read a longer chat)"
+        text = (
+            f"How long one conversation may grow, in tokens. A token is about three quarters of a "
+            f"word, so {label}'s limit of {top:,} tokens is roughly {_words(top)} words. The server "
+            f"sets this much room aside for a single chat. "
+        )
+        if ref:
+            text += (
+                "At 25,344 bytes per token the full 262,144 costs about 6.2 GiB of card memory at "
+                "the normal precision, half that at the compact precision."
+            )
+        else:
+            text += "Card memory per token has not been measured for this model; longer costs more."
+        over["info"] = text
+
+    elif name == "KVCacheTokens" and model.max_context_tokens:
+        top = min(4194304, max(8192, 2 * model.max_context_tokens))
+        over["slider"] = (0, top, _token_step(top))
+        text = (
+            "The total chat memory the card keeps for all chats together. Bigger means more chats "
+            "can run at once with long histories before the server has to re-read them. "
+        )
+        if ref:
+            text += "Each 65,536 tokens costs about 1.55 GiB of card memory (measured 2026-09-02). "
+        else:
+            text += f"The slider runs to twice {label}'s longest chat; the cost per token is not measured for this model. "
+        text += "Automatic lets the engine fit it to whatever card memory is left after the expert slots."
+        over["info"] = text
+
+    elif name == "MoECacheSize" and model.is_moe:
+        total = model.num_moe_layers * model.num_experts
+        per = model.bytes_per_expert
+        top = total
+        if per:
+            top = min(total, max(64, (SLOT_SLIDER_BUDGET_BYTES // per) // 64 * 64))
+        over["slider"] = (min(1024, top), top, 64 if top >= 2048 else 1)
+        text = (
+            f"{label} is made of {total:,} expert pieces"
+            + (f" ({gib(model.total_expert_bytes)})" if model.total_expert_bytes else "")
+            + " that live in PC memory; the card keeps this many of them ready"
+            + (f" ({per / 1e6:.2f} MB each). Every 1,000 slots costs {gib(per * 1000)} of card memory." if per else ".")
+        )
+        if ref:
+            text += (
+                " This is the main speed dial. Measured 2026-09-02 on this PC: every 1,000 slots is "
+                "worth about 5.8 words per second on an 8,000-token chat (73 words per second at "
+                "6,750 slots); below about 4,750 the slowdown gets steep."
+            )
+        else:
+            text += " More slots means fewer experts fetched from PC memory per word; the speed per slot has not been measured for this model."
+        text += " Slots and chat memory share the same card memory. Automatic lets the engine pick the largest count that fits."
+        over["info"] = text
+
+    elif name == "GpuOwnedLayers" and model.is_moe:
+        layers = model.num_moe_layers
+        over["max"] = layers
+        over["slider"] = (0, layers, 1)
+        over["storedAs"] = "auto:{n}" if ref else "{n}"
+        over["limitNote"] = f" ({label} has {layers} expert layers)"
+        text = "Keeps every expert of the chosen layers on the card so those layers never need PC memory. "
+        if model.bytes_per_layer:
+            text += (
+                f"On {label} each layer hands back {gib(model.bytes_per_layer)} of PC memory and takes "
+                f"{gib(model.bytes_per_layer)} of card memory, charged against the expert slots above "
+                f"({model.num_experts:,} slots per layer). All {layers} layers would need "
+                f"{gib(model.bytes_per_layer * layers)}. "
+            )
+        else:
+            text += f"{label} has {layers} expert layers of {model.num_experts:,} experts; each kept layer takes that many expert slots. "
+        if ref:
+            text += (
+                "The layers are taken from a busiest-first ranking measured on this PC; six was the "
+                "measured sweet spot with 4,188 slots. 0 turns this off."
+            )
+        else:
+            text += (
+                "The busiest-first ranking was measured for Qwen3.8 only, so on this model the chosen "
+                "number of layers is spread evenly through the model. 0 turns this off."
+            )
+        over["info"] = text
+
+    elif name == "EnableVision" and not model.has_vision:
+        over["info"] = f"{label} has no picture part, so this switch does nothing for it. Leave it off. " + dial.info
+
+    elif name == "FREETOKEN_MTP_SPECULATE" and not model.has_mtp:
+        over["info"] = f"{label} ships no guess-ahead head, so this cannot work for it. Leave it off. " + dial.info
+
+    return over
+
+
 DIAL_BY_NAME = {dial.name: dial for dial in DIALS}
 DIAL_CATALOG = DIALS
 PRIMARY_DIALS = tuple(dial for dial in DIALS if dial.name not in {
@@ -515,10 +710,59 @@ def _toggle_value(value: Any, *, allow_text: bool = False) -> bool:
     raise ValueError("must be a boolean")
 
 
-def canonical_value(dial: Dial, value: Any) -> Any:
+_STORED_COUNT_RE = re.compile(r"^(?:(?P<prefix>[A-Za-z]+):)?(?P<n>\d+)$")
+
+
+def stored_count(dial: Dial, value: Any) -> int:
+    """The count behind a text-stored number ("auto:3" -> 3, "auto" -> 6, "" -> 0, 4 -> 4).
+
+    A bare "auto" is the launcher's old spelling of the six-layer default. An explicit id
+    list ("3,7,11") counts its entries so the slider still shows how many layers it means.
+    """
+    if isinstance(value, bool):
+        raise ValueError("must be a number")
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and value != int(value):
+            raise ValueError("must be a whole number")
+        return int(value)
+    if not isinstance(value, str):
+        raise ValueError("must be a number or text")
+    text = value.strip()
+    if text == dial.stored_zero or text == "":
+        return 0
+    if text == "auto":
+        return 6
+    if "," in text:
+        return len([part for part in text.split(",") if part.strip()])
+    if "." in text:
+        raise ValueError("fractions are not accepted here")
+    match = _STORED_COUNT_RE.match(text)
+    if match is None:
+        raise ValueError("must be a count like 3 or auto:3")
+    return int(match.group("n"))
+
+
+def stored_text(dial: Dial, count: int, stored_as: str | None = None) -> str:
+    """Format a count back into launcher text (0 -> stored_zero)."""
+    if count <= 0:
+        return dial.stored_zero
+    return (stored_as if stored_as is not None else dial.stored_as).format(n=count)
+
+
+def canonical_value(dial: Dial, value: Any, stored_as: str | None = None) -> Any:
     if dial.control == "toggle":
         enabled = _toggle_value(value, allow_text=dial.source == "env")
         return ("1" if enabled else "0") if dial.source == "env" else enabled
+    if dial.stored_as:
+        if isinstance(value, str) and "," in value:
+            # an explicit id list typed by hand stays as typed
+            return value.strip()
+        count = stored_count(dial, value)
+        keep = stored_as
+        if keep is None and isinstance(value, str) and value.strip():
+            # a text value keeps its own spelling ("3" stays "3", "auto:3" stays "auto:3")
+            keep = "{n}" if _STORED_COUNT_RE.fullmatch(value.strip()) and ":" not in value else None
+        return stored_text(dial, count, keep)
     if dial.control == "number":
         if isinstance(value, bool):
             raise ValueError("must be a number")
@@ -538,8 +782,19 @@ def canonical_value(dial: Dial, value: Any) -> Any:
     return value
 
 
-def validate_settings(settings: dict[str, Any]) -> list[dict[str, str]]:
-    """Return the contract's field/message list without importing any engine package."""
+def validate_settings(
+    settings: dict[str, Any],
+    model: ModelInfo | None = None,
+    *,
+    ceilings_only: bool = False,
+) -> list[dict[str, str]]:
+    """Return the contract's field/message list without importing any engine package.
+
+    ``model`` (a ModelInfo) applies that model's limits: longest chat, expert-layer count.
+    Without one, or with a folder that could not be read, the limits the catalogue was
+    measured with apply (REFERENCE_LIMITS). ``ceilings_only`` checks just the technical
+    ceilings: the boot-file writer and the profile store use it, since the app has already
+    applied the model limits and a stored profile may belong to a different model."""
     errors: list[dict[str, str]] = []
     for name, value in settings.items():
         dial = DIAL_BY_NAME.get(name)
@@ -551,13 +806,18 @@ def validate_settings(settings: dict[str, Any]) -> list[dict[str, str]]:
         except (TypeError, ValueError, OverflowError):
             errors.append({"field": name, "message": f"Value {value!r} for {name} {dial.control} is invalid"})
             continue
+        over = {} if ceilings_only else adapt_dial(dial, model)
+        minimum = over.get("min", dial.minimum)
+        maximum = over.get("max", dial.maximum)
+        limit_note = over.get("limitNote", "")
+        compared = stored_count(dial, parsed) if dial.stored_as else parsed
         if dial.options is not None and parsed not in dial.options:
             choices = ", ".join(repr(item) for item in dial.options)
             errors.append({"field": name, "message": f"Value {parsed!r} for {name} must be one of {choices}"})
-        if dial.minimum is not None and parsed < dial.minimum:
-            errors.append({"field": name, "message": f"Value {parsed} below minimum {dial.minimum}"})
-        if dial.maximum is not None and parsed > dial.maximum:
-            errors.append({"field": name, "message": f"Value {parsed} exceeds maximum {dial.maximum}"})
+        if minimum is not None and compared < minimum:
+            errors.append({"field": name, "message": f"Value {compared} below minimum {minimum}"})
+        if maximum is not None and compared > maximum:
+            errors.append({"field": name, "message": f"Value {compared} exceeds maximum {maximum}{limit_note}"})
         if dial.control == "path" and "\x00" in parsed:
             errors.append({"field": name, "message": f"Value for {name} contains a NUL character"})
     return errors
@@ -588,8 +848,12 @@ __all__ = [
     "PRIMARY_DIALS",
     "ENV_DIALS",
     "EXTENSION_DIALS",
+    "MODEL_AWARE_DIALS",
     "Dial",
+    "adapt_dial",
     "canonical_value",
+    "stored_count",
+    "stored_text",
     "dial_value_for_display",
     "normalise_settings",
     "normalize_settings",
