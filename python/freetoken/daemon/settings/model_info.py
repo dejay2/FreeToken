@@ -45,6 +45,8 @@ SUPPORTED_ARCHITECTURES: tuple[str, ...] = (
     "Qwen2ForCausalLM",
     "Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
     "Qwen4ExpForConditionalGeneration",
 )
 

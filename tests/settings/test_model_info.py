@@ -120,8 +120,10 @@ def test_expert_format_detection():
 
 def test_supported_architectures_mirror_the_engine_registry():
     source = (REPO / "python" / "freetoken" / "models" / "register.py").read_text(encoding="utf-8")
-    registered = set(re.findall(r'^\s{4}"([A-Za-z0-9]+)":\s*ModelSpec\(', source, flags=re.M))
+    # underscore included: Qwen3_5* keys were invisible to the first version of this pattern
+    registered = set(re.findall(r'^\s{4}"([A-Za-z0-9_]+)":\s*ModelSpec\(', source, flags=re.M))
     assert registered, "could not find the registry keys in register.py"
+    assert "Qwen3_5MoeForConditionalGeneration" in registered, "the pattern must see underscored keys"
     assert registered == set(SUPPORTED_ARCHITECTURES)
 
 
@@ -241,3 +243,33 @@ def test_routes_shape_dials_for_the_saved_and_previewed_model(tmp_path):
     text = (tmp_path / "boot-2020.ps1").read_text(encoding="utf-8")
     assert "-ContextTokens 65536" in text and "-GpuOwnedLayers auto:3" in text
     assert client.get("/api/settings").json()["settings"]["GpuOwnedLayers"] == "auto:3"
+
+    # Switching the saved model re-checks what the file already holds (R1 finding F2): the
+    # 65,536-token chat saved above does not fit the 32k model, so the switch is refused
+    # until the chat length is lowered in the same save.
+    switch = client.put("/api/settings", json={"settings": {"ModelPath": str(small)}})
+    assert switch.status_code == 422 and switch.json()["detail"][0]["field"] == "ContextTokens"
+    both = client.put("/api/settings", json={"settings": {"ModelPath": str(small), "ContextTokens": 32768, "GpuOwnedLayers": 2}})
+    assert both.status_code == 200, both.text
+    text = (tmp_path / "boot-2020.ps1").read_text(encoding="utf-8")
+    assert "-ContextTokens 32768" in text
+    assert re.search(r"-GpuOwnedLayers 2\b", text), "a non-reference model stores a plain count"
+
+
+def test_profile_apply_is_checked_against_the_model(tmp_path):
+    small = _small_fp8(tmp_path / "Small-FP8")
+    client = _client(tmp_path, small)
+    created = client.post("/api/profiles", json={"name": "Big chat", "description": "", "settings": {"ContextTokens": 262144}})
+    assert created.status_code == 201, created.text
+    profile_id = created.json()["id"]
+    refused = client.post(f"/api/profiles/{profile_id}/apply")
+    assert refused.status_code == 422 and "Small-FP8" in refused.json()["detail"][0]["message"]
+    assert "-ContextTokens 262144" in (tmp_path / "boot-2020.ps1").read_text(encoding="utf-8"), "the file was left alone"
+
+
+def test_hand_typed_fraction_is_kept_as_typed():
+    layers = DIAL_BY_NAME["GpuOwnedLayers"]
+    assert stored_count(layers, "0.125") == 0
+    assert canonical_value(layers, "0.125") == "0.125"
+    assert validate_settings({"GpuOwnedLayers": "0.125"}) == []
+    assert validate_settings({"GpuOwnedLayers": "1.5"}), "fractions above 1 are refused"

@@ -13,7 +13,17 @@ from pydantic import BaseModel, Field
 
 from .boot_parser import BootFile, BootParseError, BootValidationError
 from .browse import BROWSE_KINDS, list_directory
-from .dials import DIALS, EXTENSION_DIALS, ENV_DIALS, GROUP_INFO, dial_value_for_display, validate_settings
+from .dials import (
+    DIAL_BY_NAME,
+    DIALS,
+    EXTENSION_DIALS,
+    ENV_DIALS,
+    GROUP_INFO,
+    adapt_dial,
+    canonical_value,
+    dial_value_for_display,
+    validate_settings,
+)
 from .model_info import ModelInfo, read_model
 from .process_manager import LifecycleError, ProcessManager
 from .profiles_manager import ProfileValidationError, ProfilesManager
@@ -170,11 +180,24 @@ def create_app(
         except BootParseError as exc:
             raise _boot_http_error(exc) from exc
         model_path = body.settings.get("ModelPath")
-        errors = validate_settings(body.settings, _model_for(saved_settings, model_path if isinstance(model_path, str) else None))
+        model = _model_for(saved_settings, model_path if isinstance(model_path, str) else None)
+        errors = validate_settings(body.settings, model)
+        if not errors and isinstance(model_path, str) and model_path != saved_settings.get("ModelPath", ""):
+            # A new model must also fit what the file already holds: a 32k model saved next to
+            # a 262,144-token chat would reserve memory for a length it cannot produce.
+            merged = {**saved_settings, **body.settings}
+            errors = validate_settings(merged, model)
         if errors:
             return _validation_response(errors)
+        # Text-stored counts take the model's spelling ("auto:3" on the measured model, "3"
+        # elsewhere) whether the caller sent a number or text.
+        changes = dict(body.settings)
+        for name, value in body.settings.items():
+            dial = DIAL_BY_NAME.get(name)
+            if dial is not None and dial.stored_as:
+                changes[name] = canonical_value(dial, value, adapt_dial(dial, model).get("storedAs"))
         try:
-            saved = boot.save(body.settings)
+            saved = boot.save(changes)
         except BootValidationError as exc:
             return _validation_response(exc.errors)
         except BootParseError as exc:
@@ -208,6 +231,18 @@ def create_app(
 
     @app.post("/api/profiles/{profile_id}/apply")
     async def apply_profile(profile_id: str):
+        # A profile is checked against the model it will run with (the profile's own
+        # ModelPath if it names one, else the saved one) before the file is rewritten.
+        profile = next((item for item in profiles.list() if item.get("id") == profile_id), None)
+        if profile is not None:
+            try:
+                saved_settings = boot.load()
+            except BootParseError as exc:
+                raise _boot_http_error(exc) from exc
+            merged = {**saved_settings, **(profile.get("settings") or {})}
+            errors = validate_settings(merged, _model_for(merged))
+            if errors:
+                return _validation_response(errors)
         try:
             return profiles.apply(profile_id, boot.path)
         except KeyError:

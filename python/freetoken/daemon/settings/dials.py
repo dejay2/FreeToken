@@ -735,7 +735,12 @@ def stored_count(dial: Dial, value: Any) -> int:
     if "," in text:
         return len([part for part in text.split(",") if part.strip()])
     if "." in text:
-        raise ValueError("fractions are not accepted here")
+        # the engine's fraction form ("0.125" of the layers): kept as typed, and counted as 0
+        # here because the layer total is not known at this point
+        frac = float(text)
+        if not 0.0 <= frac <= 1.0:
+            raise ValueError("a fraction must be between 0 and 1")
+        return 0
     match = _STORED_COUNT_RE.match(text)
     if match is None:
         raise ValueError("must be a count like 3 or auto:3")
@@ -754,8 +759,9 @@ def canonical_value(dial: Dial, value: Any, stored_as: str | None = None) -> Any
         enabled = _toggle_value(value, allow_text=dial.source == "env")
         return ("1" if enabled else "0") if dial.source == "env" else enabled
     if dial.stored_as:
-        if isinstance(value, str) and "," in value:
-            # an explicit id list typed by hand stays as typed
+        if isinstance(value, str) and ("," in value or "." in value.strip()):
+            # an explicit id list or fraction typed by hand stays as typed (checked above)
+            stored_count(dial, value)
             return value.strip()
         count = stored_count(dial, value)
         keep = stored_as

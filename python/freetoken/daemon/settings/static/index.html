@@ -332,7 +332,7 @@
     function isAuto(dial, value) { return dial.autoValue !== null && dial.autoValue !== undefined && Number(value) === Number(dial.autoValue); }
     const isFractional = (dial) => (dial.displayFactor && dial.displayFactor !== 1) || [dial.min, dial.max, dial.value, ...(dial.slider || [])].some((item) => item != null && Number(item) % 1 !== 0);
     // Text-stored counts ("auto:3", "3", "auto" = 6, "" = 0, an id list counts its entries).
-    const storedCount = (text) => { const value = String(text ?? '').trim(); if (value === '' ) return 0; if (value === 'auto') return 6; if (value.includes(',')) return value.split(',').filter((part) => part.trim()).length; const match = value.match(/(\d+)\s*$/); return match ? Number(match[1]) : 0; };
+    const storedCount = (text) => { const value = String(text ?? '').trim(); if (value === '' ) return 0; if (value === 'auto') return 6; if (value.includes(',')) return value.split(',').filter((part) => part.trim()).length; const match = value.match(/^(?:[a-z]+:)?(\d+)$/i); return match ? Number(match[1]) : 0; };
     const toShown = (dial, stored) => dial.storedAs ? (typeof stored === 'number' ? stored : storedCount(stored)) : ((stored === '' || stored == null) ? '' : Number(stored) / (dial.displayFactor || 1));
     function toStored(dial, shown) {
       if (dial.storedAs) { const count = Math.max(0, Math.round(Number(shown) || 0)); return count === 0 ? (dial.storedZero || '') : dial.storedAs.replace('{n}', String(count)); }
@@ -481,7 +481,7 @@
       const tone = model.supported ? '' : 'warn';
       card.className = `model-card ${tone}`;
       const facts = [];
-      if (model.maxContextTokens) facts.push(`<span><b>${fmt(model.maxContextTokens)}</b> tokens longest chat</span>`);
+      if (model.maxContextTokens) facts.push(`<span>Longest chat <b>${fmt(model.maxContextTokens)}</b> tokens (about ${fmt(Math.round(model.maxContextTokens * 0.75))} words)</span>`);
       if (model.numLayers) facts.push(`<span><b>${fmt(model.numLayers)}</b> layers${model.isMoe ? `, <b>${fmt(model.numMoeLayers)}</b> with experts` : ''}</span>`);
       if (model.isMoe) facts.push(`<span><b>${fmt(model.numExperts)}</b> experts per layer${model.expertsPerToken ? `, <b>${fmt(model.expertsPerToken)}</b> used per word` : ''}</span>`);
       if (model.bytesPerExpert) facts.push(`<span><b>${(model.bytesPerExpert / 1e6).toFixed(2)} MB</b> per expert, <b>${escapeHtml(fmtGib(model.bytesPerLayer))}</b> per layer, <b>${escapeHtml(fmtGib(model.totalExpertBytes))}</b> all experts</span>`);
