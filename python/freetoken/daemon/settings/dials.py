@@ -191,7 +191,7 @@ DIALS: tuple[Dial, ...] = (
             "When a chat goes quiet, its memory is moved off the card so other chats can use the space, "
             "and copied back when the chat continues. Without it a long chat must be re-read: a "
             "65,000-token chat takes about 37 seconds to re-read. Measured 2026-09-04: bringing it back "
-            "from PC memory takes 0.68 seconds, from the SSD 1.08 seconds, and the answer is identical. "
+            "from PC memory takes 0.68 seconds, from the SSD 1.11 seconds, and the answer is identical. "
             "PC memory uses 1.65 GiB per 65,000-token chat and holds it until the chat is dropped; "
             "the SSD option uses drive space instead."
         ),
