@@ -220,6 +220,72 @@ copies. Coalescing those copies would need the parked payload laid out layer-maj
 page-major, which only helps when the destination pages are contiguous — they come from a
 free list and generally are not. Not pursued.
 
+## Addendum 2026-09-04: the FP8 gate redefined, and the flaky FP8 kernel test
+
+Same box and model, commit `a38ea16` on `mtp-upstream-merge` plus the two changes described
+here. This settles follow-ups 3 and 6 above.
+
+### The gate now ends where the answer ends
+
+The 2026-09-03 gate compared the first 48 temperature-0 tokens with `ignore_eos` forcing
+generation past the end of the turn. The answer is about 20 tokens long, so more than half of
+that window was padding that is unstable even BF16 against BF16, and the gate failed on the
+one part of the output that carries no information.
+
+`scripts/bench/kv_long_chat_live.py` now defaults to `--gate-mode eot`: it drops `ignore_eos`,
+lets the server end its own turn, and compares every token up to and including the first
+end-of-turn token. Without `ignore_eos` the server ends the turn itself and leaves `<|im_end|>`
+out of `content`, so `finish_reason == "stop"` is that boundary in practice; the explicit
+`<|im_end|>` cut still applies in `--gate-mode forced-48`, which keeps the 2026-09-03
+comparison available for reference. The gate reports tokens compared, the first divergence
+index, and both texts per prompt. It also covers four prompt lengths now, not one: `short`
+2,070, `medium` 16,408, `long` 65,549 and `primary` 250,018 prompt tokens, each with a distinct
+code at both ends.
+
+| prompt | prompt tokens | completion tokens | tokens compared | BF16 reference | FP8 candidate | verdict |
+|---|---:|---:|---:|---|---|---|
+| short | 2,070 | 17 | 16 | `topaz-1204\|saffron-8815` | identical | **PASS** |
+| medium | 16,408 | 16 | 15 | `jasper-3370\|crimson-6402` | identical | **PASS** |
+| long | 65,549 | 16 | 15 | `onyx-5581\|willow-2937` | identical | **PASS** |
+| primary | 250,018 | 16 | 15 | `maple-7319\|cobalt-4826` | identical | **PASS** |
+| **gate overall** | | | | | | **PASS** |
+
+`usage` reports one completion token more than the gate compares, the same off-by-one the
+2026-09-03 run saw at 48: the emitted end-of-turn token is counted in `usage` but is not in
+`content`.
+
+Three boots, all through the machine-local helper, in this order: profile A (BF16, ready in
+74.1 s) recorded the reference; profile C (FP8, `-MoECacheSize 5332`, ready in 77.6 s,
+`kv_per_token` 13,248, `moe_cache_size` 2,260) verified **PASS** on all four prompts with no
+divergence; a second profile A boot (ready in 76.6 s) re-verified the same reference and also
+passed, which is the BF16-against-BF16 control the old gate never had — the redefined gate is
+stable across boots, so a failure would mean a real change in the answer.
+
+**FP8 KV therefore passes the gate as redefined.** It stays off by default: the gate is a
+correctness floor, not a reason to switch, and the measured speed gain is still the +2.9% of
+the 2026-09-03 four-request run.
+
+### The FP8 kernel test's bound
+
+`tests/models/qwen4_exp/test_qsa_fp8_kernels.py::test_fp8_sparse_attention_dequantizes_scales_with_masking_and_split_k`
+seeded a generator for `k` and `q` but drew `v` through `torch.randn_like` and its selected
+columns through `torch.randperm`, both of which use the global CUDA RNG, so the test drew fresh
+values on every run and its 4% aggregate ceiling sat inside the natural spread. Both draws now
+come from the seeded generator.
+
+A 20-seed sweep of that exact shape measures aggregate relative-L2 **3.412-4.028%**
+(mean 3.660%) and worst token/head **3.899-5.647%** (mean 4.408%); the test's fixed seed 73
+lands at 3.769% and 4.702%. The aggregate ceiling is now **5%**, clearing the sweep maximum by
+24%, and the per-token/head ceiling stays at 8%, a 1.4x margin over 5.647%. The 1% floor is
+unchanged and still catches a raw-copy path. 20 consecutive GPU runs: **20 passed, 0 failed**,
+using about 866 MiB of VRAM alongside the live port-2020 server. CPU-only
+(`CUDA_VISIBLE_DEVICES=-1`) the four GPU tests in that file skip cleanly and the rest of the
+FP8 suite passes: 17 passed, 4 skipped.
+
+Note for later, not fixed here: `test_fp8_store_quantizes_each_token_head_and_scatters_its_scale`
+also picks `out_loc` with an unseeded `torch.randperm`, but its error is per-token quantization
+and does not depend on where the rows land, so it is not flaky.
+
 ## Follow-ups
 
 1. **Fixed by `2ce6403`** — the parking save worker now re-enters its caller's inference
