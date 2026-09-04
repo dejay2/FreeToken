@@ -292,6 +292,43 @@ def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     )
 
 
+def _exl3_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    """Load the fixed K=2/mul1 EXL3 routed banks for graphics-card execution only.
+
+    The proof loader is deliberately serial: its Windows path reads each safetensors
+    tensor through ``DirectShard`` without retaining a second cached shard copy. A
+    forced parallel request raises here so ``load_expert_banks`` can use its established
+    serial fallback rather than silently switching to buffered reads.
+    """
+    if decode_target != "gpu":
+        raise ValueError(
+            "EXL3 expert banks are card-only; decode_target must be 'gpu', "
+            f"got {decode_target!r}"
+        )
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for exl3: the proof loader is serial-only "
+            "so Windows always uses DirectShard per-tensor reads"
+        )
+    from freetoken.models.exl3_banks import (
+        dummy_exl3_expert_sources,
+        load_exl3_expert_sources,
+    )
+
+    if dummy:
+        sources = dummy_exl3_expert_sources(model_config)
+        streamed = False
+    else:
+        sources = load_exl3_expert_sources(
+            model_path, model_config, primary=True, layer_sink=layer_sink
+        )
+        streamed = layer_sink is not None
+    return ExpertBanks(
+        "exl3", {name: sources[name] for name in _BANK_SCHEMAS["exl3"]},
+        streamed=streamed,
+    )
+
+
 def _model_setup_override(model_config):
     architectures = getattr(model_config, "architectures", None)
     if not architectures:
@@ -313,6 +350,7 @@ def _model_setup_override(model_config):
 _PROVIDERS = {
     "none": _bf16_banks,
     "nvfp4": _nvfp4_banks,
+    "exl3": _exl3_banks,
     "ds_fp4": _dsfp4_banks,
     "q4_0": _q4_0_banks,
 }

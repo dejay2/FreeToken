@@ -108,6 +108,21 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
             banks["gate_up_global"] = 2 * I * 2
             banks["down_global"] = H * 2
         return banks
+    if fmt == "exl3":
+        # models/exl3_banks.py: fixed K=2 trellis tiles plus FP16 suh/svh
+        # factors. Keep this map in the exact registration order used by the
+        # cache; at GLM H=4096/I=2048 it totals 6,328,320 bytes per expert.
+        return {
+            "gate_trellis": (H // 16) * (I // 16) * 32 * 2,
+            "gate_suh": H * 2,
+            "gate_svh": I * 2,
+            "up_trellis": (H // 16) * (I // 16) * 32 * 2,
+            "up_suh": H * 2,
+            "up_svh": I * 2,
+            "down_trellis": (I // 16) * (H // 16) * 32 * 2,
+            "down_suh": I * 2,
+            "down_svh": H * 2,
+        }
     if fmt == "mxfp4_triton":
         # gpt_oss/weight.py _empty_mxfp4_triton_banks: transposed split-K blocks/scales + bf16 bias
         return {
@@ -285,7 +300,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         kv_groups=(),
         top_k=8,
         moe_intermediate_size=2048,
-        expert_formats=_NVFP4_FORMATS,
+        expert_formats=(*_NVFP4_FORMATS, "exl3"),
         aliases=("zai-org/GLM-5.3-Flash", "LibertAIDAI/GLM-5.3-Flash-NVFP4"),
     ),
     AotModel(

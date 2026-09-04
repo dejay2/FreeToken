@@ -82,9 +82,9 @@ def detect_expert_quant(hf_config: Any) -> str:
     a ModelOpt FP4 build (``quant_algo: NVFP4``) OR an llm-compressor NVFP4 export
     (``quant_method: compressed-tensors`` + ``format: nvfp4-pack-quantized``, or
     ``format: mixed-precision`` with an nvfp4 config group, e.g.
-    RedHatAI/GLM-5.3-Flash-NVFP4), else the lowercased algo string (``"none"`` when
-    unquantized). Models with mixed-precision configs (e.g. qwen3_5_moe) need their
-    own detector."""
+    RedHatAI/GLM-5.3-Flash-NVFP4), else the lowercased algo string (``"exl3"`` for the
+    turboderp GLM-5.3-Flash EXL3 checkpoint, ``"none"`` when unquantized). Models with
+    mixed-precision configs (e.g. qwen3_5_moe) need their own detector."""
     quant = getattr(hf_config, "quantization_config", None)
     if quant is None:
         return "none"

@@ -61,6 +61,20 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # (set_alphas), so they are not banks
     "nvfp4_marlin": ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale"),
     "nvfp4_b12x": ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale"),
+    # turboderp EXL3 K=2 routed experts: trellis [in/16, out/16, 32] plus
+    # independent input/output FP16 factors for gate, up and down. The marker is
+    # validated while loading but does not need a bank because this proof fixes mul1.
+    "exl3": (
+        "gate_trellis",
+        "gate_suh",
+        "gate_svh",
+        "up_trellis",
+        "up_suh",
+        "up_svh",
+        "down_trellis",
+        "down_suh",
+        "down_svh",
+    ),
     # gpt-oss mxfp4, transposed split-K layout (N innermost): per-expert blocks_t
     # [K//2, N] (uint8), scales_t [K//32, N] (uint8 e8m0), bias [N]. No folded alphas
     # (scales are a bank); split-K GEMV decode + transposed _t grouped prefill.
@@ -91,6 +105,16 @@ _BANK_BYTES_PER_EXPERT = {
     ) * 2,
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
+    # GLM-5.3-Flash EXL3 proof: K=2, mul1, three independent projections.
+    # At H=4096/I=2048 this is 6,328,320 bytes per expert row; the three
+    # trellises account for 6,291,456 bytes and the six factor vectors 36,864.
+    # The leading 2 counts gate/up; the final trellis uses the transposed shape.
+    "exl3": lambda H, I: (
+        2 * (H // 16) * (I // 16) * 32 * 2  # gate + up trellises
+        + 2 * H * 2 + 2 * I * 2  # gate + up suh/svh
+        + (I // 16) * (H // 16) * 32 * 2  # down trellis
+        + I * 2 + H * 2  # down suh/svh
+    ),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
 }
