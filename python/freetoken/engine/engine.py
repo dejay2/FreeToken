@@ -383,6 +383,11 @@ class Engine:
 
         self.device = bind_assigned_gpu(config.tp_info.rank)
         _adjust_config(config)
+        if getattr(config.model_config, "expert_quant", "none") == "exl3":
+            # Fail before model weights or the roughly 71 GiB host expert banks are read.
+            from freetoken.moe.fused_exl3 import require_exl3_gpu_only
+
+            require_exl3_gpu_only(device=self.device, decode_target="gpu")
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -1035,6 +1040,22 @@ class Engine:
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
+        if cache.quant_format == "exl3":
+            # One reconstruct-first arena is shared by every routed layer. Allocate it after
+            # compressed banks/cache setup, but before GraphRunner so all fixed buffers exist at
+            # the only proof path that reaches the EXL3 operation.
+            from freetoken.moe.fused_exl3 import prepare_exl3_scratch
+
+            scratch = prepare_exl3_scratch(
+                device=self.device,
+                hidden_size=config.model_config.hidden_size,
+                intermediate_size=config.model_config.moe_intermediate_size,
+                max_tokens=8192,
+                chunk_experts=8,
+            )
+            cache.exl3_scratch = scratch
+            for layer in layers:
+                layer.exl3_scratch = scratch
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
@@ -2336,6 +2357,31 @@ def _adjust_config(config: EngineConfig):
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
 
+    if is_moe and expert_quant == "exl3":
+        # The proof operation reconstructs compressed rows into GPU scratch and has no
+        # CPU or resident-expert implementation. Reject these choices before the loader
+        # allocates the large host banks, rather than failing after a long boot.
+        if config.moe_backend in ("cpu", "hybrid"):
+            raise ValueError(
+                "EXL3 routed experts are card-only; --moe-backend "
+                f"{config.moe_backend!r} is unsupported. Use --moe-backend offload."
+            )
+        if config.moe_backend == "fused":
+            raise ValueError(
+                "EXL3 routed experts require --moe-backend offload; "
+                "the resident fused backend is unsupported"
+            )
+        if getattr(config, "moe_cpu_layers", None):
+            raise ValueError(
+                "EXL3 routed experts are card-only; --moe-cpu-layers is unsupported. "
+                "Use plain --moe-backend offload."
+            )
+        if getattr(config, "moe_gpu_owned_layers", None):
+            raise ValueError(
+                "EXL3 routed experts do not support GPU-owned layers; "
+                "drop --moe-gpu-owned-layers and use plain --moe-backend offload."
+            )
+
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
         # is worse than inert -- engine init would build an expert cache for a model that has
@@ -2370,7 +2416,17 @@ def _adjust_config(config: EngineConfig):
             override("cuda_graph_max_bs", 1)
 
     _validate_ple_backend(config, model_config)
-    if config.cuda_graph_max_bs is None:
+    if is_moe and expert_quant == "exl3":
+        if config.cuda_graph_max_bs != 0 or config.cuda_graph_bs is not None:
+            logger.info_rank0(
+                "EXL3 reconstruct-first expert proof disables CUDA graphs; "
+                "ordinary BF16 expert work is not graph-safe yet"
+            )
+        # A non-None explicit batch list wins over max_bs in GraphRunner, so clear both
+        # knobs rather than setting only the maximum to zero.
+        override("cuda_graph_bs", None)
+        override("cuda_graph_max_bs", 0)
+    elif config.cuda_graph_max_bs is None:
         override("cuda_graph_max_bs", config.max_running_req)
 
     if is_dsv4:
@@ -2486,43 +2542,52 @@ def _adjust_config(config: EngineConfig):
         # -- auto never picks it, because nothing here knows whether the experts would fit in
         # HBM and a wrong guess is a weight-load OOM rather than a slower-but-working run.
         default_backend = "offload"
-        # Hardware-adaptive config: a cached `ft bench bw` profile can upgrade
-        # the offload default to hybrid when this machine's CPU MoE bandwidth clears its PCIe
-        # gather bandwidth by the bench threshold (default 2x). hybrid is VRAM-equivalent to
-        # offload -- same auto-sized GPU slot cache (_resolve_auto_moe_cache_size), plus a
-        # host-RAM CPU executor -- so this never raises the OOM risk; with no profile (or one
-        # from different hardware) it stays offload. offload remains the always-safe fallback.
-        # Key the lookup on the real expert format: mxfp4/q4_0 live in moe_weight_format when
-        # expert_quant is "none", and "none" with no weight format means plain bf16 experts.
-        moe_wfmt = getattr(model_config, "moe_weight_format", None)
-        bench_fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
-        from freetoken.moe.bench_profile import load_backend_recommendation
+        if expert_quant == "exl3":
+            # EXL3 reconstructs selected rows into GPU scratch and has no CPU or resident
+            # operation. Keep the proof on plain offload even when a bench profile prefers
+            # hybrid; the explicit policy above already rejected those modes.
+            logger.info_rank0(
+                "Auto-selected MoE backend: offload (EXL3 is card-only; "
+                "skipping benchmark-driven hybrid selection)"
+            )
+        else:
+            # Hardware-adaptive config: a cached `ft bench bw` profile can upgrade
+            # the offload default to hybrid when this machine's CPU MoE bandwidth clears its PCIe
+            # gather bandwidth by the bench threshold (default 2x). hybrid is VRAM-equivalent to
+            # offload -- same auto-sized GPU slot cache (_resolve_auto_moe_cache_size), plus a
+            # host-RAM CPU executor -- so this never raises the OOM risk; with no profile (or one
+            # from different hardware) it stays offload. offload remains the always-safe fallback.
+            # Key the lookup on the real expert format: mxfp4/q4_0 live in moe_weight_format when
+            # expert_quant is "none", and "none" with no weight format means plain bf16 experts.
+            moe_wfmt = getattr(model_config, "moe_weight_format", None)
+            bench_fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
+            from freetoken.moe.bench_profile import load_backend_recommendation
 
-        gpu_name, gpu_uuid = _profile_gpu()
-        if load_backend_recommendation(bench_fmt, gpu_name=gpu_name, gpu_uuid=gpu_uuid) == "hybrid":
-            from freetoken.moe.cpu_executor import compiled_extension_supports
+            gpu_name, gpu_uuid = _profile_gpu()
+            if load_backend_recommendation(bench_fmt, gpu_name=gpu_name, gpu_uuid=gpu_uuid) == "hybrid":
+                from freetoken.moe.cpu_executor import compiled_extension_supports
 
-            _act = getattr(model_config, "hidden_act", "silu")
-            if not _cpu_moe_act_ok:
-                logger.info_rank0(
-                    f"benchbw profile recommends hybrid, but the CPU MoE executor does not "
-                    f"support this model's expert activation "
-                    f"{getattr(model_config, 'hidden_act', None)!r}; staying on offload"
-                )
-            elif moe_wfmt != "mxfp4" and not compiled_extension_supports(_act):
-                # Stale prebuilt _cpu_moe.so: an explicit cpu/hybrid pick still
-                # hard-fails in the executor, but a default must not turn into a
-                # post-load crash -- degrade to offload.
-                logger.info_rank0(
-                    f"benchbw profile recommends hybrid, but the compiled _cpu_moe "
-                    f"extension predates activation {_act!r} (rebuild with "
-                    f"`python setup.py build_ext --inplace`); staying on offload"
-                )
-            else:
-                default_backend = "hybrid"
-                logger.info_rank0(
-                    f"benchbw profile recommends hybrid for {bench_fmt!r} experts on this GPU"
-                )
+                _act = getattr(model_config, "hidden_act", "silu")
+                if not _cpu_moe_act_ok:
+                    logger.info_rank0(
+                        f"benchbw profile recommends hybrid, but the CPU MoE executor does not "
+                        f"support this model's expert activation "
+                        f"{getattr(model_config, 'hidden_act', None)!r}; staying on offload"
+                    )
+                elif moe_wfmt != "mxfp4" and not compiled_extension_supports(_act):
+                    # Stale prebuilt _cpu_moe.so: an explicit cpu/hybrid pick still
+                    # hard-fails in the executor, but a default must not turn into a
+                    # post-load crash -- degrade to offload.
+                    logger.info_rank0(
+                        f"benchbw profile recommends hybrid, but the compiled _cpu_moe "
+                        f"extension predates activation {_act!r} (rebuild with "
+                        f"`python setup.py build_ext --inplace`); staying on offload"
+                    )
+                else:
+                    default_backend = "hybrid"
+                    logger.info_rank0(
+                        f"benchbw profile recommends hybrid for {bench_fmt!r} experts on this GPU"
+                    )
         override("moe_backend", default_backend)
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
 

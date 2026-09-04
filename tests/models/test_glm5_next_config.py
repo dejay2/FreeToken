@@ -7,6 +7,9 @@ exact object cached_load_hf_config falls back to when transformers doesn't know
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from freetoken.attention.base import AttnType
@@ -328,3 +331,54 @@ def test_ingest_global_reciprocal():
     g = torch.tensor(4.0)
     assert _ingest_global(_NVFP4_CT_SOURCE_SPEC, g).item() == 0.25
     assert _ingest_global(_NVFP4_SOURCE_SPEC, g).item() == 4.0
+
+
+def test_real_trimmed_exl3_metadata_detects_format_and_geometry():
+    fixture_path = Path(__file__).parent / "fixtures" / "glm53_exl3_quantization_trimmed.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    cfg = parse_config(_hf_config(fixture))
+
+    assert cfg.expert_quant == "exl3"
+    assert cfg.num_layers == 45
+    assert cfg.first_k_dense_replace == 3
+    assert cfg.num_moe_layers == 42
+    assert cfg.num_experts == 288
+    assert cfg.num_experts_per_tok == 8
+    assert fixture["codebook"] == "mul1"
+    assert fixture["bits"] == pytest.approx(2.05)
+    assert fixture["head_bits"] == 5
+    assert fixture["mtp_bits"] == 2
+    assert fixture["vision_bits"] == 5
+
+
+def test_trimmed_exl3_records_lock_the_selected_source_headers():
+    # Records were copied byte-for-byte from turboderp/GLM-5.3-Flash-exl3, revision 2.05bpw.
+    fixture_path = Path(__file__).parent / "fixtures" / "glm53_exl3_quantization_trimmed.json"
+    storage = json.loads(fixture_path.read_text(encoding="utf-8"))["tensor_storage"]
+    assert len(storage) == 9
+    assert sum(len(record["stored_tensors"]) for record in storage.values()) == 37
+    assert all(record["quant_format"] == "exl3" for record in storage.values())
+    assert {record["bits_per_weight"] for record in storage.values()} == {2, 3, 4, 5}
+
+    expected = {
+        "model.language_model.layers.3.mlp.experts.0.gate_proj": (2, [256, 128, 32]),
+        "model.language_model.layers.3.mlp.experts.0.up_proj": (2, [256, 128, 32]),
+        "model.language_model.layers.3.mlp.experts.0.down_proj": (2, [128, 256, 32]),
+        "model.language_model.layers.0.mlp.down_proj": (3, [768, 256, 48]),
+        "model.language_model.layers.0.self_attn.qkv_proj": (4, [256, 1536, 64]),
+        "model.language_model.layers.3.mlp.shared_experts.gate_proj": (4, [256, 128, 64]),
+        "lm_head": (5, [256, 9680, 80]),
+    }
+    for base, (bits, trellis_shape) in expected.items():
+        record = storage[base]
+        assert record["bits_per_weight"] == bits
+        assert record["mul1_multiplier"] == 2212286765
+        trellis = record["stored_tensors"][f"{base}.trellis"]
+        assert trellis["dtype"] == "torch.int16"
+        assert trellis["shape"] == trellis_shape
+        assert record["stored_tensors"][f"{base}.mul1"]["shape"] == []
+
+    # The retained trailing MTP and vision samples are metadata-only proof that the
+    # non-language tensors stay outside the text loader's 0..44 loop.
+    assert "model.language_model.layers.45.eh_proj" in storage
+    assert "model.visual.blocks.0.attn.q_proj" in storage

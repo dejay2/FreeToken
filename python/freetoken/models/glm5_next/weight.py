@@ -2,10 +2,11 @@
 
 Supported checkpoints: NVFP4 exports of GLM-5.3-Flash in the multimodal-wrapper
 layout (``model.language_model.*``) -- ModelOpt tensor kinds (LibertAIDAI) or
-compressed-tensors kinds (RedHatAI), selected by ``quantization_config``. Not
-supported: bf16-expert originals (zai-org), text-only key layouts, TP > 1.
+compressed-tensors kinds (RedHatAI) -- and the EXL3 export in the same layout,
+selected by ``quantization_config``. Not supported: bf16-expert originals
+(zai-org), text-only key layouts, TP > 1.
 
-Routed experts go to the offload cache via ``load_nvfp4_expert_sources``;
+Routed experts go to the offload cache via the format-selected provider;
 everything else loads bf16 with keys renamed ``model.language_model.X`` ->
 ``model.X``. ``model.visual.*`` and the trailing MTP layer are never read.
 
@@ -91,6 +92,60 @@ def _select_expert_source_spec(model_path: str) -> Nvfp4ExpertSourceSpec:
     method = str(get("quant_method") or "").lower()
     return _NVFP4_CT_SOURCE_SPEC if method == "compressed-tensors" else _NVFP4_SOURCE_SPEC
 
+
+def _read_linear(reader: _ShardReader, base: str) -> torch.Tensor:
+    """Read one resident GLM linear in its checkpoint form.
+
+    EXL3 stores a linear as three tensors plus a scalar codebook marker instead of
+    ``<base>.weight``. Reconstructing here keeps the rest of the model loader and its
+    optional W8A16 conversion unchanged; only one non-routed matrix is live at a time.
+    The plain path remains for the older GLM-5.3 NVFP4 export and for non-quantized state.
+    """
+    weight_key = f"{base}.weight"
+    if reader.has(weight_key):
+        return reader.get(weight_key)
+
+    marker_key = f"{base}.mul1"
+    mcg_key = f"{base}.mcg"
+    if reader.has(mcg_key):
+        raise ValueError(f"{base}: EXL3 mcg codebooks are unsupported; expected mul1")
+    required = tuple(f"{base}.{part}" for part in ("trellis", "suh", "svh", "mul1"))
+    missing = [key.rsplit(".", 1)[1] for key in required if not reader.has(key)]
+    if missing:
+        raise KeyError(
+            f"{base}: missing EXL3 tensor(s) {', '.join(missing)}; expected "
+            ".trellis/.suh/.svh/.mul1 or .weight"
+        )
+
+    trellis = reader.get(f"{base}.trellis")
+    suh = reader.get(f"{base}.suh")
+    svh = reader.get(f"{base}.svh")
+    marker = reader.get(marker_key)
+    if trellis.dtype != torch.int16:
+        raise ValueError(f"{base}.trellis must be int16, got {trellis.dtype}")
+    if trellis.ndim != 3 or trellis.shape[-1] % 16:
+        raise ValueError(
+            f"{base}.trellis must have shape [in/16, out/16, 16*K], got "
+            f"{tuple(trellis.shape)}"
+        )
+    if suh.dtype != torch.float16 or svh.dtype != torch.float16:
+        raise ValueError(
+            f"{base}: EXL3 suh/svh must be float16, got {suh.dtype}/{svh.dtype}"
+        )
+    if marker.dtype != torch.int32 or marker.ndim != 0:
+        raise ValueError(
+            f"{marker_key} must be a scalar int32 marker, got {marker.dtype} "
+            f"{tuple(marker.shape)}"
+        )
+    k = trellis.shape[-1] // 16
+    # B2 owns the EXL3 arithmetic and the card-only implementation. Keeping this
+    # import local lets config/weight tests use a tiny seam stub without loading the
+    # optional extension, while production always calls the shared implementation.
+    from freetoken.kernel.exl3 import reconstruct
+
+    return reconstruct(trellis, suh, svh, k=k, codebook="mul1")
+
+
 # KDA in_proj fusion order; MUST match Glm5NextKDA._in_proj_split.
 _KDA_IN_PROJ = ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")
 
@@ -118,7 +173,24 @@ def _maybe_fp8(key: str, w: torch.Tensor, fp8: bool):
 def _iter_kda_layer(reader, layer: int, attn_fp8: bool) -> Iterator[tuple[str, torch.Tensor]]:
     src = f"{_CKPT}.layers.{layer}.self_attn"
     dst = f"{_MODEL}.layers.{layer}.self_attn"
-    if attn_fp8:
+
+    # EXL3 already stores q|k|v as one qkv_proj matrix. The KDA module still
+    # needs the six-way in_proj layout, so append the plain b|f_a|g_a slices.
+    # Older GLM-5.3 exports carry separate q/k/v weights; retain that path.
+    if reader.has(f"{src}.qkv_proj.weight") or reader.has(f"{src}.qkv_proj.trellis"):
+        qkv = _read_linear(reader, f"{src}.qkv_proj").to(torch.bfloat16)
+        bfg = torch.cat(
+            [reader.get(f"{src}.{p}.weight").to(torch.bfloat16) for p in ("b_proj", "f_a_proj", "g_a_proj")],
+            dim=0,
+        )
+        if attn_fp8:
+            q, scale = _quant_fp8_per_row(qkv)
+            yield f"{dst}.in_proj_qkv.weight", q
+            yield f"{dst}.in_proj_qkv.weight_scale", scale
+            yield f"{dst}.in_proj_bfg.weight", bfg
+        else:
+            yield f"{dst}.in_proj.weight", torch.cat((qkv, bfg), dim=0)
+    elif attn_fp8:
         # fp8 resident: q|k|v (the 201 MB/layer read) as one W8A16 GEMM with
         # per-row scales; the small gate projections b|f_a|g_a stay bf16.
         qkv = torch.cat(
@@ -139,15 +211,20 @@ def _iter_kda_layer(reader, layer: int, attn_fp8: bool) -> Iterator[tuple[str, t
             [reader.get(f"{src}.{p}.weight").to(torch.bfloat16) for p in _KDA_IN_PROJ], dim=0
         )
         yield f"{dst}.in_proj.weight", fused
-    # One merged depthwise conv over the q|k|v stream (channel-axis concat).
-    conv = torch.cat(
-        [reader.get(f"{src}.{p}_conv1d.weight").to(torch.bfloat16) for p in ("q", "k", "v")],
-        dim=0,
-    )
+
+    # The EXL3 checkpoint carries the already merged q|k|v depthwise convolution;
+    # the older layout has three per-stream tensors and is concatenated here.
+    if reader.has(f"{src}.conv1d.weight"):
+        conv = reader.get(f"{src}.conv1d.weight").to(torch.bfloat16)
+    else:
+        conv = torch.cat(
+            [reader.get(f"{src}.{p}_conv1d.weight").to(torch.bfloat16) for p in ("q", "k", "v")],
+            dim=0,
+        )
     yield f"{dst}.conv1d.weight", conv
     for p in ("f_b_proj", "g_b_proj"):
         yield f"{dst}.{p}.weight", reader.get(f"{src}.{p}.weight").to(torch.bfloat16)
-    yield from _maybe_fp8(f"{dst}.o_proj", reader.get(f"{src}.o_proj.weight"), attn_fp8)
+    yield from _maybe_fp8(f"{dst}.o_proj", _read_linear(reader, f"{src}.o_proj"), attn_fp8)
     # Gate params stay fp32 (the recurrent kernels read them as fp32).
     yield f"{dst}.A_log", reader.get(f"{src}.A_log").to(torch.float32)
     yield f"{dst}.dt_bias", reader.get(f"{src}.dt_bias").to(torch.float32)
@@ -159,12 +236,20 @@ def _iter_dsa_layer(reader, layer: int, attn_fp8: bool) -> Iterator[tuple[str, t
     dst = f"{_MODEL}.layers.{layer}.self_attn"
     fp8_projs = ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "o_proj") if attn_fp8 else ()
     for proj in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"):
-        w = reader.get(f"{src}.{proj}.weight")
+        w = (
+            reader.get(f"{src}.{proj}.weight")
+            if proj == "kv_b_proj"
+            else _read_linear(reader, f"{src}.{proj}")
+        )
         yield from _maybe_fp8(f"{dst}.{proj}", w, proj in fp8_projs)
     for norm in ("q_a_layernorm", "kv_a_layernorm"):
         yield f"{dst}.{norm}.weight", reader.get(f"{src}.{norm}.weight").to(torch.bfloat16)
-    # kpool indexer (every DSA layer owns one). Kept bf16; the APE is fp32.
-    for proj in ("wq_b", "wk", "weights_proj"):
+    # kpool indexer (every DSA layer owns one). wq_b may be EXL3; wk and
+    # weights_proj remain plain tensors. Kept bf16; the APE is fp32.
+    yield f"{dst}.indexer.wq_b.weight", _read_linear(reader, f"{src}.indexer.wq_b").to(
+        torch.bfloat16
+    )
+    for proj in ("wk", "weights_proj"):
         yield f"{dst}.indexer.{proj}.weight", reader.get(
             f"{src}.indexer.{proj}.weight"
         ).to(torch.bfloat16)
@@ -238,7 +323,7 @@ def iter_weights(
             if layer < config.first_k_dense_replace:
                 for proj in ("gate_proj", "up_proj", "down_proj"):
                     yield from _maybe_fp8(
-                        f"{dst}.mlp.{proj}", reader.get(f"{src}.mlp.{proj}.weight"), mlp_fp8
+                        f"{dst}.mlp.{proj}", _read_linear(reader, f"{src}.mlp.{proj}"), mlp_fp8
                     )
             else:
                 yield f"{dst}.mlp.gate.weight", reader.get(f"{src}.mlp.gate.weight").to(
@@ -253,7 +338,7 @@ def iter_weights(
                 for proj in ("gate_proj", "up_proj", "down_proj"):
                     yield from _maybe_fp8(
                         f"{dst}.mlp.shared_experts.{proj}",
-                        reader.get(f"{src}.mlp.shared_experts.{proj}.weight"),
+                        _read_linear(reader, f"{src}.mlp.shared_experts.{proj}"),
                         mlp_fp8,
                     )
 
@@ -261,7 +346,7 @@ def iter_weights(
             f"{_CKPT}.embed_tokens.weight"
         ).to(torch.bfloat16)
         yield f"{_MODEL}.norm.weight", reader.get(f"{_CKPT}.norm.weight").to(torch.bfloat16)
-        head = reader.get("lm_head.weight")
+        head = _read_linear(reader, "lm_head")
         if head_fp8 and not config.tie_word_embeddings:
             q, scale = _quant_fp8_per_row(head)
             yield "lm_head.weight", q
