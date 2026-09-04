@@ -91,18 +91,36 @@ def test_exl3_rejects_non_offload_backend_before_weight_loading(backend):
         _adjust_config(config)
 
 
-@pytest.mark.parametrize(
-    "overrides, message",
-    [
-        ({"moe_backend": "offload", "moe_cpu_layers": "0"}, "moe-cpu-layers"),
-        ({"moe_backend": "offload", "moe_gpu_owned_layers": "0"}, "GPU-owned"),
-    ],
-)
-def test_exl3_rejects_layer_split_modes(overrides, message):
+def test_exl3_rejects_cpu_layer_split_mode():
     from freetoken.engine.engine import _adjust_config
 
-    with pytest.raises(ValueError, match=message):
-        _adjust_config(_config(**overrides))
+    with pytest.raises(ValueError, match="moe-cpu-layers"):
+        _adjust_config(_config(moe_backend="offload", moe_cpu_layers="0"))
+
+
+def test_exl3_allows_reviewed_gpu_owned_layers():
+    from freetoken.engine.engine import _adjust_config
+
+    config = _config(
+        moe_backend="offload",
+        moe_gpu_owned_layers="auto:1",
+        cuda_graph_max_bs=0,
+        cuda_graph_bs=None,
+    )
+    _adjust_config(config)
+
+    assert config.moe_gpu_owned_layers == "auto:1"
+    assert config.moe_backend == "offload"
+
+
+def test_exl3_rejects_a_gpu_owned_cpu_layer_overlap():
+    from freetoken.engine.engine import _validate_gpu_owned_layers
+
+    config = _config(
+        moe_backend="offload", moe_gpu_owned_layers="0,1", moe_cpu_layers="0,1"
+    )
+    with pytest.raises(ValueError, match="both GPU-owned and CPU layers"):
+        _validate_gpu_owned_layers(config, 42)
 
 
 def test_exl3_provider_is_registered_and_layer_dispatches_to_b2_operation(monkeypatch):

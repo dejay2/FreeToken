@@ -278,3 +278,50 @@ def test_key_pattern_keeps_the_glm_style_components_explicit():
         "proj": "down_proj",
         "kind": "svh",
     }
+
+
+def test_gpu_owned_layers_use_device_banks_and_skip_host_settling(tmp_path, monkeypatch):
+    import freetoken.moe.host_banks as host_banks
+    import freetoken.models.exl3_banks as exl3
+
+    allocated = {}
+    original_alloc = exl3._alloc_banks
+
+    def capture_alloc(*args, **kwargs):
+        result = original_alloc(*args, **kwargs)
+        allocated.update(result)
+        return result
+
+    settled = []
+    monkeypatch.setattr(exl3, "_alloc_banks", capture_alloc)
+    monkeypatch.setattr(
+        host_banks.PinPipeline,
+        "submit",
+        lambda self, *args, **kwargs: settled.append(args),
+    )
+    monkeypatch.setenv("FREETOKEN_SKIP_BANK_PIN", "1")
+
+    labels = [
+        host_banks.HostResidency.GPU_OWNED.value,
+        host_banks.HostResidency.PINNED.value,
+    ]
+    with host_banks.requested_residency(
+        labels, device=torch.device("cpu"), expert_quant="exl3"
+    ):
+        banks = load_exl3_expert_sources(
+            _write_checkpoint(tmp_path),
+            _CONFIG,
+            drop_page_cache=lambda path: None,
+            primary=False,
+        )
+
+    for name in EXL3_BANK_NAMES:
+        assert isinstance(allocated[name][0], host_banks.GpuOwnedBank)
+        assert allocated[name][0].tensor.device == torch.device("cpu")
+        assert isinstance(allocated[name][1], host_banks.HostBank)
+
+    assert len(set(item[3] for item in settled)) == 1
+    assert {item[3] for item in settled} == {1}
+    assert len(set(item[0] for item in settled)) == len(EXL3_BANK_NAMES)
+    assert banks["gate_suh"][0][0, 0].item() == pytest.approx(30.0, abs=0.1)
+    assert banks["gate_suh"][1][0, 0].item() == pytest.approx(40.0, abs=0.1)

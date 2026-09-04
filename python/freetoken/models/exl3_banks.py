@@ -1,10 +1,13 @@
 """Serial safetensors loader for the fixed K=2/mul1 GLM EXL3 expert banks.
 
-The proof keeps the routed experts compressed in pinned host memory.  Each selected
-expert is reconstructed by the card-side operation later; this module only validates
-and places the nine stored bank components.  The loader deliberately reads one
-safetensors tensor at a time on Windows through ``DirectShard`` so the operating-system
-file cache does not retain a second copy beside the roughly 71.29 GiB of banks.
+The proof keeps the routed experts compressed in per-layer host banks for streaming
+layers.  A layer marked GPU_OWNED by the ambient residency plan instead receives the
+same nine compressed banks as device tensors, so its experts never consume host-bank
+memory.  Each selected expert is reconstructed by the card-side operation later; this
+module only validates and places the nine stored bank components.  The loader deliberately
+reads one safetensors tensor at a time on Windows through ``DirectShard`` so the
+operating-system file cache does not retain a second copy beside the roughly 71.29 GiB
+of streaming banks.
 """
 
 from __future__ import annotations
@@ -418,6 +421,9 @@ def _alloc_banks(
 ) -> dict[str, list]:
     from freetoken.moe.host_banks import alloc_layer_banks
 
+    # alloc_layer_banks reads the engine's ambient residency plan: streaming layers get
+    # HostBank storage, while GPU_OWNED layers get GpuOwnedBank device tensors and are filled
+    # synchronously by this placement loop (the inference-mode thread rule matters here).
     return alloc_layer_banks(_bank_specs(experts, hidden, intermediate), num_layers)
 
 
@@ -516,13 +522,15 @@ def load_exl3_expert_source_banks(
     primary: bool = True,
     layer_sink=None,
 ) -> dict[str, list[torch.Tensor]]:
-    """Load routed GLM EXL3 experts into nine per-layer pinned source banks.
+    """Load routed GLM EXL3 experts into nine per-layer source banks.
 
-    Validation is split from placement: all names, component sets, dimensions, K values,
-    dtypes and exact counts are checked from safetensors headers before the first bank is
-    allocated.  Main sparse layers only are mapped to bank layers; trailing MTP layer 45
-    and all unrelated tensors are ignored.  ``layer_sink`` receives completed layers as
-    ``{bank_name: HostBank}``, matching the NVFP4 loader's converter seam.
+    Streaming layers use pinned host banks; GPU_OWNED layers use resident device banks from
+    the ambient residency plan and are filled on this placement thread. Validation is split
+    from placement: all names, component sets, dimensions, K values, dtypes and exact counts
+    are checked from safetensors headers before the first bank is allocated. Main sparse
+    layers only are mapped to bank layers; trailing MTP layer 45 and all unrelated tensors
+    are ignored. ``layer_sink`` receives completed layers as ``{bank_name: HostBank}``,
+    matching the NVFP4 loader's converter seam.
     """
     folder = download_hf_weight(model_path)
     weight_map = _weight_map(folder)

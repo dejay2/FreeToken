@@ -318,10 +318,10 @@ class _ResidencyPlan:
             i for i, r in enumerate(labels) if r == HostResidency.GPU_OWNED.value
         )
         self.device = device
-        # The checkpoint's expert quant format, when the caller declared one. Only the NVFP4
-        # providers fill an owned layer's device banks correctly; every other provider writes
-        # straight through .fill/.tensor since 8a63977 removed the staging indirection, so a
-        # wrong-geometry load no longer trips an assert -- it may silently appear to work.
+        # The checkpoint's expert quant format, when the caller declared one. Only providers
+        # reviewed for the owned-layer device-fill contract may write these tensors; every other
+        # provider writes straight through .fill/.tensor since 8a63977 removed the staging
+        # indirection, so a wrong-geometry load may silently appear to work.
         # ``None`` = undeclared (hand-built plans in tests and the shadow tooling), unchecked.
         self.expert_quant = expert_quant
 
@@ -341,7 +341,7 @@ _requested_residency: _ResidencyPlan | None = None
 #: Expert quant formats whose providers are known to fill a GPU-owned layer's DEVICE banks
 #: correctly. Everything else is refused before a device tensor exists -- see
 #: :attr:`_ResidencyPlan.expert_quant`.
-GPU_OWNED_EXPERT_QUANTS = frozenset({"nvfp4"})
+GPU_OWNED_EXPERT_QUANTS = frozenset({"nvfp4", "exl3"})
 
 
 @contextlib.contextmanager
@@ -369,11 +369,11 @@ def plan_gpu_owned() -> "tuple[frozenset[int], torch.device | None]":
     "this loader ignored the request" failure on that), but only when there is an owned set
     to honor -- a LOCKED-only plan is still only applied by a settle point.
 
-    This is the narrowest gate every provider's owned-bank allocation passes through, so it
-    is where a non-NVFP4 expert format is refused: since 8a63977 an owned bank IS its device
-    tensor, so an unreviewed provider writing through ``.fill``/``.tensor`` no longer trips an
-    assert and may silently appear to work on a row geometry the owned path was never checked
-    against (status doc, residual risk 6).
+    This is the narrowest gate every provider's owned-bank allocation passes through, so an
+    unreviewed expert format is refused: since 8a63977 an owned bank IS its device tensor, so
+    a provider writing through ``.fill``/``.tensor`` without a reviewed geometry may silently
+    appear to work on a row layout the owned path was never checked against (status doc,
+    residual risk 6).
     """
     plan = _requested_residency
     if plan is None:
@@ -381,10 +381,10 @@ def plan_gpu_owned() -> "tuple[frozenset[int], torch.device | None]":
     if plan.gpu_owned:
         if plan.expert_quant is not None and plan.expert_quant not in GPU_OWNED_EXPERT_QUANTS:
             raise ValueError(
-                f"--moe-gpu-owned-layers needs NVFP4 expert banks; this checkpoint's expert "
-                f"quant format is {plan.expert_quant!r}. Only the NVFP4 providers are "
-                f"reviewed for filling an owned layer's device banks in place "
-                f"(supported: {sorted(GPU_OWNED_EXPERT_QUANTS)}); drop the flag for this model"
+                f"--moe-gpu-owned-layers needs a reviewed expert-bank format; this checkpoint's "
+                f"expert quant format is {plan.expert_quant!r}. Only reviewed providers fill "
+                f"owned-layer device banks in place (supported: {sorted(GPU_OWNED_EXPERT_QUANTS)}); "
+                f"drop the flag for this model"
             )
         plan.applied = True
     return plan.gpu_owned, plan.device

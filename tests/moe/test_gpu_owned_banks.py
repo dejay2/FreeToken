@@ -377,10 +377,10 @@ def test_cpu_moe_executor_refuses_cuda_bank_sources():
 
 
 # ------------------------------------------------------ the expert quant-format guard
-# Only the NVFP4 providers fill an owned layer's device banks correctly. Since 8a63977
-# removed the staging indirection, any other provider writes straight THROUGH .fill /
-# .tensor into the device tensor, so a wrong-geometry load no longer trips an assert -- it
-# may silently appear to work. Refuse the format instead of relying on that accident.
+# Only reviewed providers (currently NVFP4 and EXL3) fill an owned layer's device banks
+# correctly. Since 8a63977 removed the staging indirection, any other provider writes straight
+# THROUGH .fill / .tensor into the device tensor, so a wrong-geometry load no longer trips an
+# assert -- it may silently appear to work. Refuse the format instead of relying on that accident.
 
 
 def test_the_config_validator_refuses_a_non_nvfp4_expert_quant():

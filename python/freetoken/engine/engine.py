@@ -2103,13 +2103,13 @@ def _validate_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> fro
         )
     expert_quant = getattr(config.model_config, "expert_quant", None)
     if expert_quant is not None and expert_quant not in GPU_OWNED_EXPERT_QUANTS:
-        # Boot-time twin of the loader guard in host_banks.plan_gpu_owned: only the NVFP4
-        # providers are reviewed for filling an owned layer's device banks in place, and
-        # since 8a63977 an unreviewed one writes the device tensor without tripping an
-        # assert (status doc, residual risk 6). Refuse before the load, not after 40 s of it.
+        # Boot-time twin of the loader guard in host_banks.plan_gpu_owned: only reviewed
+        # providers fill an owned layer's device banks in place, and since 8a63977 an
+        # unreviewed one writes the device tensor without tripping an assert (status doc,
+        # residual risk 6). Refuse before the load, not after 40 s of it.
         raise ValueError(
-            f"--moe-gpu-owned-layers needs NVFP4 expert banks; this checkpoint's expert "
-            f"quant format is {expert_quant!r} (supported: "
+            f"--moe-gpu-owned-layers needs a reviewed expert-bank format; this checkpoint's "
+            f"expert quant format is {expert_quant!r} (supported: "
             f"{sorted(GPU_OWNED_EXPERT_QUANTS)}). Drop the flag for this model"
         )
     if config.model_path and is_ftw_checkpoint(config.model_path):
@@ -2358,9 +2358,10 @@ def _adjust_config(config: EngineConfig):
     expert_quant = getattr(model_config, "expert_quant", "none")
 
     if is_moe and expert_quant == "exl3":
-        # The proof operation reconstructs compressed rows into GPU scratch and has no
-        # CPU or resident-expert implementation. Reject these choices before the loader
-        # allocates the large host banks, rather than failing after a long boot.
+        # The reconstruct-first operation remains card-only, while the reviewed EXL3
+        # provider may keep selected complete layers in device banks. Reject CPU/hybrid/fused
+        # choices before the loader allocates the large host banks; the later owned-layer
+        # validator handles the provider whitelist and any CPU-layer overlap.
         if config.moe_backend in ("cpu", "hybrid"):
             raise ValueError(
                 "EXL3 routed experts are card-only; --moe-backend "
@@ -2375,11 +2376,6 @@ def _adjust_config(config: EngineConfig):
             raise ValueError(
                 "EXL3 routed experts are card-only; --moe-cpu-layers is unsupported. "
                 "Use plain --moe-backend offload."
-            )
-        if getattr(config, "moe_gpu_owned_layers", None):
-            raise ValueError(
-                "EXL3 routed experts do not support GPU-owned layers; "
-                "drop --moe-gpu-owned-layers and use plain --moe-backend offload."
             )
 
     if not is_moe:
