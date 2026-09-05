@@ -626,33 +626,55 @@ def _run_mgemm_prefill(
         raise ValueError("EXL3 packed prompt workspace must have positive row capacity")
 
     out.zero_()
-    for expert in _unique_routed_slots(topk_ids, tables.slot_count):
-        mask = topk_ids == expert
-        token_indices, _route_indices = torch.where(mask)
-        route_weights = topk_weights[mask]
-        for start in range(0, token_indices.numel(), tile_rows):
-            stop = min(start + tile_rows, token_indices.numel())
-            indices = token_indices[start:stop]
-            weights = route_weights[start:stop]
+    # Group the routes by expert with one sort instead of one boolean mask per expert. The
+    # per-expert `topk_ids == expert` / `torch.where` form cost one host sync per routed
+    # expert (R4c N13: ~24,200 syncs per 42-layer prompt chunk on GLM-5.3-Flash); this form
+    # syncs three times per layer (the id range check and the per-expert counts) and keeps the
+    # grouped-by-expert packed call, which reads each expert's trellis once per tile rather than
+    # once per route.
+    top_k = int(topk_ids.shape[1])
+    flat_ids = topk_ids.reshape(-1)
+    flat_weights = topk_weights.reshape(-1)
+    order = torch.argsort(flat_ids, stable=True)
+    sorted_ids = flat_ids[order]
+    max_id, invalid = (
+        int(v) for v in torch.stack((sorted_ids[-1], (sorted_ids < 0).sum())).tolist()
+    )
+    if max_id >= tables.slot_count:
+        raise ValueError(
+            f"EXL3 route id {max_id} is outside the available bank slots [0, {tables.slot_count})"
+        )
+    counts = torch.bincount(sorted_ids[invalid:], minlength=tables.slot_count).tolist()
+    group_id = packed_scratch.group_id_i64 if packed_scratch is not None else None
+    start = invalid
+    for expert, count in enumerate(counts):
+        if count == 0:
+            continue
+        routes = order[start : start + count]
+        start += count
+        if group_id is not None:
+            group_id.fill_(expert)
+        else:
+            group_id_tensor = torch.tensor(
+                [expert], dtype=torch.int64, device=hidden_states.device
+            )
+        for tile in range(0, count, tile_rows):
+            tile_routes = routes[tile : tile + tile_rows]
+            indices = torch.div(tile_routes, top_k, rounding_mode="floor")
+            weights = flat_weights[tile_routes]
             group_hidden = hidden_states.index_select(0, indices)
-            if packed_scratch is not None and packed_scratch.group_id_i64 is not None:
-                group_id = packed_scratch.group_id_i64
-                group_id.fill_(expert)
-            else:
-                group_id = torch.tensor(
-                    [expert], dtype=torch.int64, device=hidden_states.device
-                )
+            expert_ids = group_id if group_id is not None else group_id_tensor
             gate = exl3_mgemm_projection(
                 group_hidden,
                 tables,
-                group_id,
+                expert_ids,
                 projection="gate",
                 scratch=packed_scratch,
             )
             up = exl3_mgemm_projection(
                 group_hidden,
                 tables,
-                group_id,
+                expert_ids,
                 projection="up",
                 scratch=packed_scratch,
             )
@@ -677,7 +699,7 @@ def _run_mgemm_prefill(
             down = exl3_mgemm_projection(
                 activated,
                 tables,
-                group_id,
+                expert_ids,
                 projection="down",
                 scratch=packed_scratch,
             )

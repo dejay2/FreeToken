@@ -300,6 +300,136 @@ def test_reconstruct_first_prompt_restores_original_input_and_clamped_activation
     assert torch.equal(hidden, original), "prompt input must remain available to the shared expert"
 
 
+class _FakeTables:
+    """Stands in for Exl3MgemmBanks: only slot_count and a per-expert matrix set."""
+
+    def __init__(self, gate, up, down):
+        self.gate, self.up, self.down = gate, up, down
+        self.slot_count = int(gate.shape[0])
+
+
+class _FakePackedScratch:
+    def __init__(self, max_rows: int):
+        self.max_rows = max_rows
+        self.group_id_i64 = torch.zeros(1, dtype=torch.int64)
+
+
+def _fake_projection(inputs, tables, expert_ids, *, projection, scratch=None, weights=None):
+    assert expert_ids.numel() == 1, "the grouped prompt path must broadcast one expert per call"
+    matrix = getattr(tables, projection)[int(expert_ids)]
+    return (inputs.float() @ matrix.float().t()).to(inputs.dtype)
+
+
+def _grouped_prompt_reference(hidden, weights, ids, tables, *, alpha=1.0, limit=10.0):
+    result = torch.zeros_like(hidden, dtype=torch.float32)
+    for token in range(hidden.shape[0]):
+        for route in range(ids.shape[1]):
+            expert = int(ids[token, route])
+            if expert < 0:
+                continue
+            h = hidden[token].float()
+            gate_up = torch.cat((tables.gate[expert].float() @ h, tables.up[expert].float() @ h))
+            activated = _activation(gate_up, "swiglu_clamp", alpha=alpha, limit=limit)
+            result[token] += float(weights[token, route]) * (tables.down[expert].float() @ activated)
+    return result.to(hidden.dtype)
+
+
+@pytest.mark.parametrize("tile_rows", [4, 128])
+def test_packed_prompt_groups_routes_by_expert_with_a_bounded_number_of_host_syncs(
+    monkeypatch, tile_rows
+):
+    """The grouped prompt path sorts routes once; it must not sync per routed expert."""
+    from freetoken import layers
+    from freetoken.kernel import exl3_mgemm
+    from freetoken.moe import fused_exl3
+
+    monkeypatch.setattr(exl3_mgemm, "exl3_mgemm_projection", _fake_projection)
+    # The card activation kernel is CUDA-only; the test's reference activation stands in.
+    monkeypatch.setattr(
+        layers,
+        "swiglu_clamp_and_mul",
+        lambda gate_up, *, alpha, limit: _activation(
+            gate_up, "swiglu_clamp", alpha=alpha, limit=limit
+        ).to(gate_up.dtype),
+    )
+    torch.manual_seed(7)
+    experts, rows, top_k = 12, 20, 3
+    # Unit-variance activations keep the bf16 intermediates inside the tolerance below.
+    scale = H ** -0.5
+    tables = _FakeTables(
+        (torch.randn(experts, I, H) * scale).to(torch.bfloat16),
+        (torch.randn(experts, I, H) * scale).to(torch.bfloat16),
+        (torch.randn(experts, H, I) * scale).to(torch.bfloat16),
+    )
+    hidden = torch.randn(rows, H, dtype=torch.bfloat16)
+    ids = torch.randint(0, experts, (rows, top_k), dtype=torch.int32)
+    ids[0, 0] = -1  # a masked route: skipped, never counted as an expert
+    weights = torch.rand(rows, top_k, dtype=torch.float32)
+    scratch = fused_exl3.prepare_exl3_scratch(
+        device="cpu", hidden_size=H, intermediate_size=I, max_tokens=rows, chunk_experts=8
+    )
+    scratch.mgemm_prefill_scratch = _FakePackedScratch(max_rows=tile_rows)
+    out = torch.empty(rows, H, dtype=torch.bfloat16)
+
+    syncs = 0
+    real_tolist = torch.Tensor.tolist
+
+    def counting_tolist(self):
+        nonlocal syncs
+        syncs += 1
+        return real_tolist(self)
+
+    monkeypatch.setattr(torch.Tensor, "tolist", counting_tolist)
+    got = fused_exl3._run_mgemm_prefill(
+        hidden,
+        tables,
+        weights,
+        ids,
+        activation="swiglu_clamp",
+        apply_router_weight_on_input=False,
+        hidden_act_alpha=1.0,
+        swiglu_limit=10.0,
+        scratch=scratch,
+        out=out,
+    )
+    monkeypatch.setattr(torch.Tensor, "tolist", real_tolist)
+
+    expected = _grouped_prompt_reference(hidden, weights, ids, tables)
+    torch.testing.assert_close(got.float(), expected.float(), rtol=3e-2, atol=3e-2)
+    assert got.data_ptr() == out.data_ptr()
+    # Two host reads per layer (id range + per-expert counts), whatever the expert count. The
+    # previous per-expert mask form read the host once per routed expert (12 here, 288 on GLM).
+    assert syncs == 2, syncs
+
+
+def test_packed_prompt_rejects_a_route_outside_the_bank_slots(monkeypatch):
+    from freetoken.kernel import exl3_mgemm
+    from freetoken.moe import fused_exl3
+
+    monkeypatch.setattr(exl3_mgemm, "exl3_mgemm_projection", _fake_projection)
+    tables = _FakeTables(
+        torch.zeros(4, I, H, dtype=torch.bfloat16),
+        torch.zeros(4, I, H, dtype=torch.bfloat16),
+        torch.zeros(4, H, I, dtype=torch.bfloat16),
+    )
+    scratch = fused_exl3.prepare_exl3_scratch(
+        device="cpu", hidden_size=H, intermediate_size=I, max_tokens=2, chunk_experts=8
+    )
+    with pytest.raises(ValueError, match=r"route id 4 is outside the available bank slots \[0, 4\)"):
+        fused_exl3._run_mgemm_prefill(
+            torch.zeros(2, H, dtype=torch.bfloat16),
+            tables,
+            torch.ones(2, 1),
+            torch.tensor([[1], [4]], dtype=torch.int32),
+            activation="silu",
+            apply_router_weight_on_input=False,
+            hidden_act_alpha=1.0,
+            swiglu_limit=None,
+            scratch=scratch,
+            out=torch.empty(2, H, dtype=torch.bfloat16),
+        )
+
+
 def test_exl3_operation_refuses_cpu_without_a_mocked_card_seam():
     from freetoken.moe.fused_exl3 import fused_experts_exl3, prepare_exl3_scratch
 
@@ -536,6 +666,25 @@ def test_real_checkpoint_packed_full_operation_agrees_for_decode_and_grouped_pro
     torch.testing.assert_close(
         prompt_got.float(), prompt_expected.float(), rtol=5e-2, atol=0.5
     )
+
+    # Mixed routing: 40 rows x 8 routes over the eight loaded experts, so every expert takes
+    # several rows and the grouped path's sort/count bookkeeping is exercised end to end.
+    torch.manual_seed(11)
+    mixed_rows = 40
+    mixed_hidden = torch.randn((mixed_rows, hidden_size), dtype=torch.bfloat16, device=device)
+    mixed_ids = torch.stack(
+        [torch.randperm(8, device=device) for _ in range(mixed_rows)]
+    ).to(torch.int32)
+    mixed_weights = torch.softmax(
+        torch.randn((mixed_rows, 8), device=device), dim=-1
+    ).to(torch.float32)
+    mixed_expected = run(
+        mixed_hidden, mixed_weights, mixed_ids, is_prefill=True, expert_op="reconstruct"
+    ).clone()
+    mixed_got = run(
+        mixed_hidden, mixed_weights, mixed_ids, is_prefill=True, expert_op="mgemm"
+    ).clone()
+    torch.testing.assert_close(mixed_got.float(), mixed_expected.float(), rtol=5e-2, atol=0.5)
 
     # Pointer tables and every full-operation tensor are now warm. These guards catch a regression
     # that moves the old torch.cat/torch.empty/host-routing work back into graph replay.
