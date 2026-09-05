@@ -28,6 +28,11 @@ FAILURE_SIGNATURES = (
 )
 
 
+# The helper boots servers through PowerShell on Windows and through linux_launch elsewhere
+# (WSL included). Tests pin the branch with ProcessManager(platform_windows=...).
+IS_WINDOWS = os.name == "nt"
+
+
 class LifecycleError(RuntimeError):
     """A lifecycle operation could not be completed."""
 
@@ -76,6 +81,8 @@ class ProcessManager:
         wall_now: Callable[[], float] = time.time,
         poll_interval: float = 1.5,
         readiness_timeout: float = 600.0,
+        platform_windows: bool | None = None,
+        linux_stop: Callable[..., Any] | None = None,
         lock_poll_interval: float = 60.0,
         lock_timeout: float = 900.0,
         failure_scan_interval: float = 2.0,
@@ -89,6 +96,8 @@ class ProcessManager:
         self.port = int(port)
         self._runner = runner or subprocess.run
         self._popen = popen or subprocess.Popen
+        self.platform_windows = IS_WINDOWS if platform_windows is None else bool(platform_windows)
+        self._linux_stop = linux_stop
         self._readiness = readiness or self._default_readiness
         self._stats = stats or self._default_stats
         self._gpu_probe = gpu_probe or self._default_gpu_probe
@@ -168,6 +177,8 @@ class ProcessManager:
         self.run_stop()
 
     def run_stop(self) -> Any:
+        if not self.platform_windows:
+            return self._run_stop_linux()
         command = [
             "powershell.exe",
             "-NoProfile",
@@ -196,11 +207,51 @@ class ProcessManager:
             raise LifecycleError(f"stop script exited with code {result.returncode}")
         return result
 
+    def _run_stop_linux(self) -> Any:
+        """Stop through /proc instead of the PowerShell stop script (WSL and native Linux)."""
+        from .linux_launch import stop_servers
+
+        stop = self._linux_stop or stop_servers
+        report = stop(self.port, timeout=120.0)
+        text = json.dumps(report, sort_keys=True)
+        self._append_process_output(type("Result", (), {"stdout": f"linux stop: {text}\n", "stderr": ""})())
+        if not report.get("ok", False):
+            raise LifecycleError(f"server on port {self.port} did not stop cleanly: {text}")
+        return report
+
+    def _run_start_linux(self, log: Any) -> Any:
+        """Map the boot file onto ``ft serve`` (linux_launch) and start it detached."""
+        from .boot_parser import BootFile
+        from .linux_launch import build_launch
+
+        plan = build_launch(BootFile(self.boot_file).load())
+        for note in plan.notes:
+            log.write(f"  Note: {note}\n".encode())
+        log.write(f"  {plan.command_line()}\n".encode())
+        kwargs: dict[str, Any] = {
+            "stdout": log,
+            "stderr": subprocess.STDOUT,
+            "stdin": subprocess.DEVNULL,
+            "env": plan.env,
+            "start_new_session": True,  # the helper may restart; the server must outlive it
+        }
+        try:
+            return self._popen(plan.argv, **kwargs)
+        except TypeError:
+            kwargs.pop("start_new_session", None)
+            kwargs.pop("env", None)
+            return self._popen(plan.argv, **kwargs)
+
     def run_start(self) -> Any:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("ab", buffering=0) as log:
             separator = f"\n===== settings helper start {_datetime.datetime.now().isoformat()} =====\n".encode()
             log.write(separator)
+            if not self.platform_windows:
+                process = self._run_start_linux(log)
+                with self._lock:
+                    self._process = process
+                return process
             command = [
                 "powershell.exe",
                 "-NoProfile",

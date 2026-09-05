@@ -83,11 +83,49 @@ def test_stop_command_contains_timeout(tmp_path):
         lock_path=tmp_path / "gpu.lock",
         runner=lambda *args, **kwargs: commands.append(args),
         sleep=lambda _: None,
+        platform_windows=True,
     )
     manager.run_stop()
     command = commands[0][0]
     assert "-TimeoutSeconds" in command
     assert "-Port" in command
+
+
+def test_linux_branch_stops_through_proc_and_starts_the_mapped_command(tmp_path, monkeypatch):
+    """On Linux the helper never calls PowerShell: stop walks /proc, start execs ft serve."""
+    from freetoken.daemon.settings import linux_launch
+
+    boot = tmp_path / "boot.ps1"
+    boot.write_text(
+        "$env:FREETOKEN_MTP_SPECULATE = '0'\n$launcher = Join-Path $PSScriptRoot 'x.ps1'\n& $launcher `\n"
+        "    -ModelPath '/models/demo' `\n    -Port 2020 `\n    -ContextTokens 4096 `\n    -MoECacheSize 100\n",
+        encoding="utf-8",
+    )
+    facts = linux_launch.ModelFacts(is_moe=True, expert_count=1000, max_context=8192, has_ple=False)
+    monkeypatch.setattr(linux_launch, "read_model_facts", lambda path: facts)
+    started = []
+    stops = []
+    manager = ProcessManager(
+        boot_file=boot,
+        stop_script=tmp_path / "stop.ps1",
+        log_path=tmp_path / "server.log",
+        lock_path=tmp_path / "gpu.lock",
+        runner=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("PowerShell must not run on Linux")),
+        popen=lambda argv, **kwargs: started.append((argv, kwargs)) or FakeProcess(),
+        linux_stop=lambda port, timeout: stops.append(port) or {"ok": True, "killed": [], "port": port},
+        sleep=lambda _: None,
+        platform_windows=False,
+    )
+    manager.run_stop()
+    assert stops == [2020]
+    manager.run_start()
+    argv, kwargs = started[0]
+    assert argv[1:5] == ["-m", "freetoken.cli", "serve", "--model"]
+    assert "--moe-cache-size" in argv and argv[argv.index("--moe-cache-size") + 1] == "100"
+    assert kwargs["env"]["FREETOKEN_MTP_SPECULATE"] == "0"
+    assert kwargs.get("start_new_session") is True
+    log = (tmp_path / "server.log").read_text(encoding="utf-8")
+    assert "linux stop" in log and "freetoken.cli serve" in log
 
 
 def test_failure_signatures_are_detected():
