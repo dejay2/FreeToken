@@ -345,6 +345,7 @@ def fused_experts_decode_impl(
     *,
     hidden_act_alpha: float = 1.0,
     swiglu_limit: float | None = None,
+    workspace=None,
 ) -> torch.Tensor:
     from freetoken.kernel import fused_moe_decode_kernel_triton, moe_sum_reduce_triton
     from freetoken.layers import (
@@ -381,11 +382,63 @@ def fused_experts_decode_impl(
         "num_warps": 8,
     }
 
-    intermediate_cache1 = torch.empty(
-        (M, top_k, gate_up_dim),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
+    if workspace is None:
+        intermediate_cache1 = torch.empty(
+            (M, top_k, gate_up_dim),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        intermediate_cache2 = torch.empty(
+            (M * top_k, intermediate_size),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        intermediate_cache3 = torch.empty(
+            (M, top_k, w2.shape[1]),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        out_hidden_states = torch.empty_like(hidden_states)
+    else:
+        # EXL3 decode supplies these tensors from its graph-owned arena.  The arena is
+        # deliberately sized for one fixed top-k and batch width; a different shape falls
+        # back to the historical allocating path at the caller rather than silently using a
+        # strided view that the Triton kernel cannot consume.
+        try:
+            workspace_top_k = int(workspace.decode_top_k)
+            workspace_max_tokens = int(workspace.decode_max_tokens)
+            intermediate_cache1 = workspace.decode_intermediate_cache1
+            intermediate_cache2 = workspace.decode_intermediate_cache2
+            intermediate_cache3 = workspace.decode_intermediate_cache3
+            out_hidden_states = workspace.decode_output
+        except AttributeError as exc:
+            raise ValueError(
+                "decode workspace must expose the EXL3 fixed activation buffers"
+            ) from exc
+        if top_k != workspace_top_k or M > workspace_max_tokens:
+            raise ValueError(
+                "decode workspace shape does not cover the requested batch: "
+                f"M={M}, top_k={top_k}, workspace M={workspace_max_tokens}, "
+                f"top_k={workspace_top_k}"
+            )
+        intermediate_cache1 = intermediate_cache1[:M]
+        intermediate_cache2 = intermediate_cache2[: M * top_k]
+        intermediate_cache3 = intermediate_cache3[:M]
+        out_hidden_states = out_hidden_states[:M]
+        tensors = (
+            intermediate_cache1,
+            intermediate_cache2,
+            intermediate_cache3,
+            out_hidden_states,
+        )
+        if any(
+            tensor.device != hidden_states.device
+            or tensor.dtype != hidden_states.dtype
+            or not tensor.is_contiguous()
+            for tensor in tensors
+        ):
+            raise ValueError("decode workspace tensors must be contiguous and match hidden states")
+
     fused_moe_decode_kernel_triton(
         hidden_states,
         w1,
@@ -397,24 +450,12 @@ def fused_experts_decode_impl(
         config,
         compute_type=hidden_states.dtype,
     )
-
-    intermediate_cache2 = torch.empty(
-        (M * top_k, intermediate_size),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
     _run_activation(
         activation,
         intermediate_cache1.view(-1, gate_up_dim),
         intermediate_cache2,
         hidden_act_alpha=hidden_act_alpha,
         swiglu_limit=swiglu_limit,
-    )
-
-    intermediate_cache3 = torch.empty(
-        (M, top_k, w2.shape[1]),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
     )
     fused_moe_decode_kernel_triton(
         intermediate_cache2,
@@ -428,7 +469,6 @@ def fused_experts_decode_impl(
         compute_type=hidden_states.dtype,
     )
 
-    out_hidden_states = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(intermediate_cache3, out_hidden_states)
     return out_hidden_states
 

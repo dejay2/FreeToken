@@ -238,3 +238,80 @@ def test_exl3_operation_refuses_cpu_without_a_mocked_card_seam():
             hidden_act_alpha=1.0,
             scratch=scratch,
         )
+
+
+def test_graph_decode_compacts_routes_on_device_and_matches_reference(monkeypatch):
+    fused_exl3 = _install_mocks(monkeypatch)
+    banks, matrices = _matrices(8)
+    hidden = torch.randn(1, H, dtype=torch.bfloat16) / 8
+    ids = torch.arange(8, dtype=torch.int32).view(1, 8)
+    weights = torch.tensor(
+        [[0.03, 0.07, 0.11, 0.15, 0.18, 0.19, 0.17, 0.10]], dtype=torch.float32
+    )
+    scratch = fused_exl3.prepare_exl3_scratch(
+        device="cpu", hidden_size=H, intermediate_size=I, max_tokens=8, chunk_experts=8
+    )
+
+    got = fused_exl3.fused_experts_exl3(
+        hidden,
+        banks,
+        weights,
+        ids,
+        is_prefill=False,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        swiglu_limit=None,
+        hidden_act_alpha=1.0,
+        scratch=scratch,
+    )
+    expected = _reference(hidden, weights, ids, matrices)
+
+    torch.testing.assert_close(got, expected, rtol=2e-2, atol=2e-2)
+    assert torch.equal(scratch.slot_list, torch.arange(8, dtype=torch.int32))
+    assert scratch.slot_count.item() == 8
+
+
+def test_graph_decode_reuses_fixed_workspace_without_host_reads_or_allocations(monkeypatch):
+    fused_exl3 = _install_mocks(monkeypatch)
+    banks, _ = _matrices(8)
+    hidden = torch.randn(1, H, dtype=torch.bfloat16) / 8
+    ids = torch.arange(8, dtype=torch.int32).view(1, 8)
+    weights = torch.full((1, 8), 1 / 8, dtype=torch.float32)
+    scratch = fused_exl3.prepare_exl3_scratch(
+        device="cpu", hidden_size=H, intermediate_size=I, max_tokens=8, chunk_experts=8
+    )
+
+    first = fused_exl3.fused_experts_exl3(
+        hidden,
+        banks,
+        weights,
+        ids,
+        is_prefill=False,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        swiglu_limit=None,
+        hidden_act_alpha=1.0,
+        scratch=scratch,
+    )
+
+    def fail(*args, **kwargs):
+        raise AssertionError("graph-safe decode read host data or allocated a tensor")
+
+    monkeypatch.setattr(torch.Tensor, "cpu", fail)
+    monkeypatch.setattr(torch.Tensor, "tolist", fail)
+    monkeypatch.setattr(torch, "empty", fail)
+    second = fused_exl3.fused_experts_exl3(
+        hidden,
+        banks,
+        weights,
+        ids,
+        is_prefill=False,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        swiglu_limit=None,
+        hidden_act_alpha=1.0,
+        scratch=scratch,
+    )
+
+    torch.testing.assert_close(second, first)
+    assert second.data_ptr() == scratch.output_accumulator.data_ptr()

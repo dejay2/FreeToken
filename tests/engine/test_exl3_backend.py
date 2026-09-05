@@ -31,6 +31,7 @@ def _config(**overrides):
             num_layers=45,
             num_moe_layers=42,
             num_experts=288,
+            num_experts_per_tok=8,
             expert_quant="exl3",
             hidden_act="silu",
             moe_weight_format=None,
@@ -170,3 +171,47 @@ def test_exl3_provider_is_registered_and_layer_dispatches_to_b2_operation(monkey
     assert called["require"] == {"device": hidden.device, "decode_target": "gpu"}
     assert called["operation"][1] is views
     assert called["operation"][4]["scratch"] is scratch
+
+
+def test_exl3_allows_the_single_safe_cuda_graph(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    config = _config(
+        moe_backend="offload",
+        max_running_req=1,
+        cuda_graph_bs=[1],
+        cuda_graph_max_bs=1,
+    )
+    _adjust_config(config)
+
+    assert config.max_running_req == 1
+    assert config.cuda_graph_bs == [1]
+    assert config.cuda_graph_max_bs == 1
+
+
+def test_exl3_safe_decode_defaults_to_a_one_row_graph():
+    from freetoken.engine.engine import _adjust_config
+
+    config = _config(
+        moe_backend="offload",
+        max_running_req=1,
+        cuda_graph_bs=None,
+        cuda_graph_max_bs=None,
+    )
+    _adjust_config(config)
+
+    assert config.cuda_graph_bs is None
+    assert config.cuda_graph_max_bs == 1
+
+
+def test_exl3_rejects_a_graph_wider_than_the_fixed_decode_arena():
+    from freetoken.engine.engine import _adjust_config
+
+    config = _config(
+        moe_backend="offload",
+        max_running_req=1,
+        cuda_graph_bs=[1, 2],
+        cuda_graph_max_bs=2,
+    )
+    with pytest.raises(ValueError, match=r"pass --cuda-graph-max-bs 0"):
+        _adjust_config(config)

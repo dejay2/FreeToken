@@ -31,6 +31,8 @@ class Exl3Scratch:
     max_tokens: int
     chunk_experts: int
     max_top_k: int
+    decode_max_tokens: int
+    decode_top_k: int
     gate_up: torch.Tensor
     down: torch.Tensor
     reconstruct_work: torch.Tensor
@@ -38,6 +40,20 @@ class Exl3Scratch:
     output_accumulator: torch.Tensor
     route_ids: torch.Tensor
     route_weights: torch.Tensor
+    slot_list: torch.Tensor
+    slot_count: torch.Tensor
+    slot_sort_ids: torch.Tensor
+    slot_sort_indices: torch.Tensor
+    slot_candidates: torch.Tensor
+    slot_unique: torch.Tensor
+    slot_valid: torch.Tensor
+    slot_mask: torch.Tensor
+    reconstruct_slots: torch.Tensor
+    reconstruct_banks: tuple[torch.Tensor, ...]
+    decode_intermediate_cache1: torch.Tensor
+    decode_intermediate_cache2: torch.Tensor
+    decode_intermediate_cache3: torch.Tensor
+    decode_output: torch.Tensor
 
 
 def prepare_exl3_scratch(
@@ -47,6 +63,7 @@ def prepare_exl3_scratch(
     intermediate_size,
     max_tokens=8192,
     chunk_experts=_MAX_RECONSTRUCT_EXPERTS,
+    decode_max_tokens=1,
 ) -> Exl3Scratch:
     """Allocate the one reusable reconstruct-first workspace.
 
@@ -55,10 +72,13 @@ def prepare_exl3_scratch(
     view without allocating a new tensor when the request width changes.
     """
     device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
     hidden_size = int(hidden_size)
     intermediate_size = int(intermediate_size)
     max_tokens = int(max_tokens)
     chunk_experts = int(chunk_experts)
+    decode_max_tokens = int(decode_max_tokens)
     if hidden_size <= 0 or intermediate_size <= 0:
         raise ValueError("EXL3 scratch dimensions must be positive")
     if hidden_size % 128 or intermediate_size % 128:
@@ -68,12 +88,30 @@ def prepare_exl3_scratch(
         )
     if max_tokens <= 0:
         raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+    if decode_max_tokens <= 0:
+        raise ValueError(f"decode_max_tokens must be positive, got {decode_max_tokens}")
     if not 1 <= chunk_experts <= _MAX_RECONSTRUCT_EXPERTS:
         raise ValueError(
             "chunk_experts must be in 1.."
             f"{_MAX_RECONSTRUCT_EXPERTS}, got {chunk_experts}"
         )
 
+    trellis_shapes = (
+        (chunk_experts, hidden_size // 16, intermediate_size // 16, 16 * _EXL3_K),
+        (chunk_experts, hidden_size // 16, intermediate_size // 16, 16 * _EXL3_K),
+        (chunk_experts, intermediate_size // 16, hidden_size // 16, 16 * _EXL3_K),
+    )
+    reconstruct_banks = (
+        torch.empty(trellis_shapes[0], dtype=torch.int16, device=device),
+        torch.empty((chunk_experts, hidden_size), dtype=torch.float16, device=device),
+        torch.empty((chunk_experts, intermediate_size), dtype=torch.float16, device=device),
+        torch.empty(trellis_shapes[1], dtype=torch.int16, device=device),
+        torch.empty((chunk_experts, hidden_size), dtype=torch.float16, device=device),
+        torch.empty((chunk_experts, intermediate_size), dtype=torch.float16, device=device),
+        torch.empty(trellis_shapes[2], dtype=torch.int16, device=device),
+        torch.empty((chunk_experts, intermediate_size), dtype=torch.float16, device=device),
+        torch.empty((chunk_experts, hidden_size), dtype=torch.float16, device=device),
+    )
     return Exl3Scratch(
         device=device,
         hidden_size=hidden_size,
@@ -81,6 +119,8 @@ def prepare_exl3_scratch(
         max_tokens=max_tokens,
         chunk_experts=chunk_experts,
         max_top_k=_MAX_TOP_K,
+        decode_max_tokens=decode_max_tokens,
+        decode_top_k=chunk_experts,
         gate_up=torch.empty(
             (chunk_experts, 2 * intermediate_size, hidden_size),
             dtype=torch.bfloat16,
@@ -106,6 +146,37 @@ def prepare_exl3_scratch(
         ),
         route_weights=torch.empty(
             max_tokens * _MAX_TOP_K, dtype=torch.float32, device=device
+        ),
+        # Decode routing stays at fixed shape: sorting and compaction use sentinels rather
+        # than a variable-length unique result, so graph replay never asks the allocator for
+        # a new route tensor.
+        slot_list=torch.empty(chunk_experts, dtype=torch.int32, device=device),
+        slot_count=torch.empty(1, dtype=torch.int32, device=device),
+        slot_sort_ids=torch.empty(chunk_experts, dtype=torch.int32, device=device),
+        slot_sort_indices=torch.empty(chunk_experts, dtype=torch.int64, device=device),
+        slot_candidates=torch.empty(chunk_experts, dtype=torch.int32, device=device),
+        slot_unique=torch.empty(chunk_experts, dtype=torch.bool, device=device),
+        slot_valid=torch.empty(chunk_experts, dtype=torch.bool, device=device),
+        slot_mask=torch.empty(chunk_experts, dtype=torch.bool, device=device),
+        reconstruct_slots=torch.empty(chunk_experts, dtype=torch.int32, device=device),
+        reconstruct_banks=reconstruct_banks,
+        decode_intermediate_cache1=torch.empty(
+            (decode_max_tokens, chunk_experts, 2 * intermediate_size),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        decode_intermediate_cache2=torch.empty(
+            (decode_max_tokens * chunk_experts, intermediate_size),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        decode_intermediate_cache3=torch.empty(
+            (decode_max_tokens, chunk_experts, hidden_size),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        decode_output=torch.empty(
+            (decode_max_tokens, hidden_size), dtype=torch.bfloat16, device=device
         ),
     )
 
@@ -231,7 +302,7 @@ def _route_views(
 
 
 def _unique_routed_slots(topk_ids: torch.Tensor, slot_count: int) -> list[int]:
-    """Return sorted valid route ids; this host read is safe because proof graphs are off."""
+    """Return sorted valid route ids for the eager, multi-chunk prompt path."""
     unique = torch.unique(topk_ids)
     values = [int(value) for value in unique[unique >= 0].detach().cpu().tolist()]
     invalid = [value for value in values if value >= slot_count]
@@ -240,6 +311,141 @@ def _unique_routed_slots(topk_ids: torch.Tensor, slot_count: int) -> list[int]:
             f"EXL3 route id {invalid[0]} is outside the available bank slots [0, {slot_count})"
         )
     return values
+
+
+def _unique_routed_slots_device(
+    topk_ids: torch.Tensor,
+    scratch: Exl3Scratch,
+    slot_capacity: int,
+) -> None:
+    """Fill the fixed decode slot list without reading routing data on the host.
+
+    The decode contract is at most ``chunk_experts`` routes.  Sorting into a fixed-size
+    candidate array, replacing duplicate/invalid entries with a sentinel, and sorting once
+    more compacts the unique ids while keeping every tensor shape stable for graph capture.
+    """
+    route_count = topk_ids.numel()
+    if not 1 <= route_count <= scratch.chunk_experts:
+        raise ValueError(
+            "EXL3 graph-safe decode needs rows * top_k in 1.."
+            f"{scratch.chunk_experts}, got {route_count}"
+        )
+    flat_ids = topk_ids.reshape(-1)
+    sorted_ids = scratch.slot_sort_ids[:route_count]
+    sort_indices = scratch.slot_sort_indices[:route_count]
+    torch.sort(flat_ids, dim=0, out=(sorted_ids, sort_indices))
+
+    valid = scratch.slot_valid[:route_count]
+    torch.ge(sorted_ids, 0, out=valid)
+    capacity_mask = scratch.slot_mask[:route_count]
+    torch.lt(sorted_ids, slot_capacity, out=capacity_mask)
+    valid.logical_and_(capacity_mask)
+
+    unique = scratch.slot_unique[:route_count]
+    unique.zero_()
+    unique[0].copy_(valid[0])
+    if route_count > 1:
+        torch.ne(sorted_ids[1:], sorted_ids[:-1], out=unique[1:])
+        unique.logical_and_(valid)
+
+    candidates = scratch.slot_candidates
+    candidates.fill_(slot_capacity)
+    candidates[:route_count].copy_(sorted_ids)
+    capacity_mask.copy_(unique)
+    capacity_mask.logical_not_()
+    candidates[:route_count].masked_fill_(capacity_mask, slot_capacity)
+    torch.sort(candidates, dim=0, out=(scratch.slot_list, scratch.slot_sort_indices))
+    torch.sum(unique, 0, keepdim=True, dtype=torch.int32, out=scratch.slot_count)
+
+
+def _route_views_device(
+    scratch: Exl3Scratch,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    rows: int,
+    slot_capacity: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map raw cache slots to compact reconstructed rows using fixed device buffers."""
+    route_weights, route_ids = _route_views(scratch, topk_weights, topk_ids, rows=rows)
+    route_count = rows * topk_ids.shape[1]
+    valid = scratch.slot_valid[:route_count].view(rows, topk_ids.shape[1])
+    torch.ge(topk_ids, 0, out=valid)
+    route_mask = scratch.slot_mask[:route_count].view(rows, topk_ids.shape[1])
+    torch.lt(topk_ids, slot_capacity, out=route_mask)
+    valid.logical_and_(route_mask)
+
+    route_weights.copy_(topk_weights)
+    torch.logical_not(valid, out=route_mask)
+    route_weights.masked_fill_(route_mask, 0.0)
+    torch.searchsorted(
+        scratch.slot_list,
+        topk_ids,
+        out_int32=True,
+        out=route_ids,
+    )
+    route_ids.clamp_min_(0)
+    route_ids.clamp_max_(scratch.chunk_experts - 1)
+    return route_weights, route_ids
+
+
+def _reconstruct_decode(
+    banks: tuple[torch.Tensor, ...],
+    scratch: Exl3Scratch,
+) -> None:
+    """Gather all fixed decode rows, then reconstruct them with stable tensor addresses."""
+    slot_capacity = banks[0].shape[0]
+    if slot_capacity <= 0:
+        raise ValueError("EXL3 decode banks must contain at least one slot")
+    torch.clamp(
+        scratch.slot_list,
+        max=slot_capacity - 1,
+        out=scratch.reconstruct_slots,
+    )
+    for bank, staging in zip(banks, scratch.reconstruct_banks):
+        torch.index_select(bank, 0, scratch.reconstruct_slots, out=staging)
+
+    (
+        gate_trellis,
+        gate_suh,
+        gate_svh,
+        up_trellis,
+        up_suh,
+        up_svh,
+        down_trellis,
+        down_suh,
+        down_svh,
+    ) = scratch.reconstruct_banks
+    work_gate_up = scratch.reconstruct_work
+    work_down = scratch.reconstruct_work.view(scratch.intermediate_size, scratch.hidden_size)
+    for local in range(scratch.chunk_experts):
+        _exl3_kernel.reconstruct(
+            gate_trellis[local],
+            gate_suh[local],
+            gate_svh[local],
+            k=_EXL3_K,
+            codebook=_EXL3_CODEBOOK,
+            out=scratch.gate_up[local, : scratch.intermediate_size, :],
+            work=work_gate_up,
+        )
+        _exl3_kernel.reconstruct(
+            up_trellis[local],
+            up_suh[local],
+            up_svh[local],
+            k=_EXL3_K,
+            codebook=_EXL3_CODEBOOK,
+            out=scratch.gate_up[local, scratch.intermediate_size :, :],
+            work=work_gate_up,
+        )
+        _exl3_kernel.reconstruct(
+            down_trellis[local],
+            down_suh[local],
+            down_svh[local],
+            k=_EXL3_K,
+            codebook=_EXL3_CODEBOOK,
+            out=scratch.down[local],
+            work=work_down,
+        )
 
 
 def _reconstruct_chunk(
@@ -305,6 +511,7 @@ def _run_bf16_experts(
     apply_router_weight_on_input: bool,
     hidden_act_alpha: float,
     swiglu_limit: float | None,
+    workspace=None,
 ) -> torch.Tensor:
     fn = fused_experts_impl if is_prefill else fused_experts_decode_impl
     kwargs = {
@@ -314,6 +521,8 @@ def _run_bf16_experts(
     if activation == "swiglu_clamp":
         kwargs["hidden_act_alpha"] = hidden_act_alpha
         kwargs["swiglu_limit"] = 10.0 if swiglu_limit is None else float(swiglu_limit)
+    if not is_prefill and workspace is not None:
+        kwargs["workspace"] = workspace
     return fn(hidden_states, gate_up, down, topk_weights, topk_ids, **kwargs)
 
 
@@ -330,11 +539,11 @@ def fused_experts_exl3(
     hidden_act_alpha: float,
     scratch: Exl3Scratch,
 ) -> torch.Tensor:
-    """Reconstruct routed EXL3 experts in chunks, then run the BF16 grouped path.
+    """Reconstruct routed EXL3 experts, then run the BF16 grouped path.
 
-    CUDA graphs are deliberately disabled for this proof. The sorted expert list is read on
-    the host and the ordinary BF16 operations still own their temporary activation buffers;
-    the large EXL3 buffers themselves stay at fixed addresses and are reused layer to layer.
+    Decode uses one fixed-size route chunk, device-side routing compaction, stable bank staging,
+    and a caller-owned BF16 activation workspace.  Prefill keeps the eager multi-chunk path:
+    its variable prompt width is not part of CUDA graph capture.
     """
     if not isinstance(scratch, Exl3Scratch):
         raise ValueError("fused_experts_exl3 requires an Exl3Scratch workspace")
@@ -386,14 +595,49 @@ def fused_experts_exl3(
         intermediate_size=scratch.intermediate_size,
         device=hidden_states.device,
     )
-    slots = _unique_routed_slots(topk_ids, banks[0].shape[0])
-
     input_buffer = scratch.input_buffer[:rows]
     output = scratch.output_accumulator[:rows]
     output.zero_()
     # The BF16 prompt path overwrites its input. Copying once for decode too gives both
     # phases a contiguous fixed-address input and keeps the caller's tensor untouched.
     input_buffer.copy_(hidden_states)
+
+    if not is_prefill and rows * top_k <= scratch.chunk_experts:
+        _unique_routed_slots_device(
+            topk_ids,
+            scratch,
+            banks[0].shape[0],
+        )
+        _reconstruct_decode(banks, scratch)
+        route_weights, route_ids = _route_views_device(
+            scratch,
+            topk_weights,
+            topk_ids,
+            rows=rows,
+            slot_capacity=banks[0].shape[0],
+        )
+        workspace = (
+            scratch
+            if top_k == scratch.decode_top_k and rows <= scratch.decode_max_tokens
+            else None
+        )
+        chunk_out = _run_bf16_experts(
+            input_buffer,
+            scratch.gate_up,
+            scratch.down,
+            route_weights,
+            route_ids,
+            is_prefill=False,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            hidden_act_alpha=hidden_act_alpha,
+            swiglu_limit=swiglu_limit,
+            workspace=workspace,
+        )
+        output.copy_(chunk_out)
+        return output
+
+    slots = _unique_routed_slots(topk_ids, banks[0].shape[0])
     route_weights, route_ids = _route_views(
         scratch, topk_weights, topk_ids, rows=rows
     )
@@ -426,14 +670,48 @@ def fused_experts_exl3(
             apply_router_weight_on_input=apply_router_weight_on_input,
             hidden_act_alpha=hidden_act_alpha,
             swiglu_limit=swiglu_limit,
+            workspace=(
+                scratch
+                if not is_prefill
+                and top_k == scratch.decode_top_k
+                and rows <= scratch.decode_max_tokens
+                else None
+            ),
         )
         output.add_(chunk_out)
 
     return output
 
 
+def decode_is_graph_safe(config) -> bool:
+    """Whether the configured EXL3 decode can use the single fixed capture shape."""
+    if getattr(config, "max_running_req", None) != 1:
+        return False
+    model_config = getattr(config, "model_config", None)
+    top_k = getattr(model_config, "num_experts_per_tok", None)
+    if top_k is None:
+        top_k = getattr(model_config, "num_experts_per_token", None)
+    if top_k is None:
+        return False
+    try:
+        top_k = int(top_k)
+    except (TypeError, ValueError):
+        return False
+    if not 1 <= top_k <= _MAX_RECONSTRUCT_EXPERTS:
+        return False
+
+    # This item captures only the one-row graph.  A wider requested graph would exceed the
+    # fixed eight-expert reconstruction arena even though the eager prompt path is wider.
+    graph_bs = getattr(config, "cuda_graph_bs", None)
+    if graph_bs is not None and list(graph_bs) != [1]:
+        return False
+    graph_max_bs = getattr(config, "cuda_graph_max_bs", None)
+    return graph_max_bs in (None, 0, 1)
+
+
 __all__ = [
     "Exl3Scratch",
+    "decode_is_graph_safe",
     "fused_experts_exl3",
     "prepare_exl3_scratch",
     "require_exl3_gpu_only",

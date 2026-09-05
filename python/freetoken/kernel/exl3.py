@@ -33,6 +33,15 @@ from typing import Tuple
 import torch
 
 
+# Import the optional extension before CUDA graph capture.  CPU-only imports keep the
+# reference path available when the proof wheel is not installed; the card path reports a
+# focused error from ``reconstruct`` instead of entering an import during graph replay.
+try:
+    import exllamav3_ext as _exllamav3_ext
+except (ImportError, OSError):  # pragma: no cover - depends on the optional proof wheel
+    _exllamav3_ext = None
+
+
 # The proof fixes the codebook to EXL3's ``mul1`` (cb2) path.  The extension supports
 # K=1..8, but the first checkpoint and its routed banks use K=2 throughout.
 _MUL1_MULTIPLIER = 0x83DCD12D
@@ -318,17 +327,12 @@ def reconstruct(
             (in_features, out_features), dtype=torch.float16, device=trellis.device
         )
 
-    # Torch must be imported before the extension on Windows so its CUDA DLL folders are
-    # active when the wheel is loaded.  ``torch`` is imported at module load above; keep the
-    # direct extension import here so CPU-only tests never need the optional wheel.
-    try:
-        import exllamav3_ext
-    except ImportError as exc:  # pragma: no cover - depends on the optional proof wheel
+    if _exllamav3_ext is None:
         raise RuntimeError(
             "EXL3 CUDA reconstruction needs the ExLlamaV3 v1.4.6 exllamav3_ext wheel"
-        ) from exc
+        )
 
-    exllamav3_ext.reconstruct_had_slice(
+    _exllamav3_ext.reconstruct_had_slice(
         work,
         trellis,
         suh,

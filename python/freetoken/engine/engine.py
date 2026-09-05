@@ -1052,6 +1052,13 @@ class Engine:
                 intermediate_size=config.model_config.moe_intermediate_size,
                 max_tokens=8192,
                 chunk_experts=8,
+                # The graph-safe EXL3 branch is deliberately one-row only.  Keep its
+                # activation arena tiny; the larger input buffer above still serves prompts.
+                decode_max_tokens=max(
+                    1,
+                    int(config.max_running_req),
+                    int(config.cuda_graph_max_bs or 0),
+                ),
             )
             cache.exl3_scratch = scratch
             for layer in layers:
@@ -2413,11 +2420,22 @@ def _adjust_config(config: EngineConfig):
 
     _validate_ple_backend(config, model_config)
     if is_moe and expert_quant == "exl3":
-        if config.cuda_graph_max_bs != 0 or config.cuda_graph_bs is not None:
+        from freetoken.moe.fused_exl3 import decode_is_graph_safe
+
+        graph_safe = decode_is_graph_safe(config)
+        graph_settings_requested = (
+            config.cuda_graph_bs is not None or config.cuda_graph_max_bs != 0
+        )
+        if graph_settings_requested and (
+            not graph_safe
+            or (config.cuda_graph_max_bs == 0 and config.cuda_graph_bs is not None)
+        ):
             raise ValueError(
                 "EXL3 reconstruct-first expert proof requires CUDA graphs to be disabled; "
                 "pass --cuda-graph-max-bs 0."
             )
+        if graph_safe and config.cuda_graph_max_bs is None:
+            override("cuda_graph_max_bs", config.max_running_req)
     elif config.cuda_graph_max_bs is None:
         override("cuda_graph_max_bs", config.max_running_req)
 
