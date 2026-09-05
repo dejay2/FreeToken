@@ -430,6 +430,83 @@ def test_packed_prompt_rejects_a_route_outside_the_bank_slots(monkeypatch):
         )
 
 
+def test_a_missing_packed_wheel_falls_back_to_reconstruct_first_once_and_sticks(
+    monkeypatch, caplog
+):
+    """The default op is mgemm; without the ExLlamaV3 wheel the fallback must be silent-safe."""
+    fused_exl3 = _install_mocks(monkeypatch)
+    attempts = []
+
+    def missing_wheel(scratch, banks):
+        attempts.append(1)
+        raise RuntimeError("EXL3 mgemm needs the ExLlamaV3 v1.4.6 exllamav3_ext wheel")
+
+    monkeypatch.setattr(fused_exl3, "_mgemm_tables_for_views", missing_wheel)
+    fused_exl3._MGEMM_FALLBACKS.clear()
+    banks, matrices = _matrices(4)
+    hidden = torch.randn((3, H), dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 1], [2, 3], [1, 2]], dtype=torch.int32)
+    weights = torch.full((3, 2), 0.5, dtype=torch.float32)
+    scratch = fused_exl3.prepare_exl3_scratch(
+        device="cpu", hidden_size=H, intermediate_size=I, max_tokens=8, chunk_experts=8
+    )
+
+    def run():
+        return fused_exl3.fused_experts_exl3(
+            hidden.clone(),
+            banks,
+            weights,
+            ids,
+            is_prefill=True,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            swiglu_limit=None,
+            hidden_act_alpha=1.0,
+            scratch=scratch,
+            expert_op="mgemm",
+            layer_id=5,
+        ).clone()
+
+    with caplog.at_level("WARNING", logger="freetoken.moe.fused_exl3"):
+        first = run()
+        second = run()
+    expected = _reference(hidden, weights, ids, matrices, activation="silu")
+    torch.testing.assert_close(first, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(second, expected, rtol=2e-2, atol=2e-2)
+    assert scratch.mgemm_disabled is True
+    assert len(attempts) == 1, "the fallback is sticky: the packed branch is not retried"
+    fallbacks = [r for r in caplog.records if "falling back to reconstruct-first" in r.getMessage()]
+    assert len(fallbacks) == 1 and "layer 5" in fallbacks[0].getMessage()
+
+
+def test_an_unrelated_runtime_error_in_the_packed_branch_still_stops_the_call(monkeypatch):
+    fused_exl3 = _install_mocks(monkeypatch)
+
+    def broken(scratch, banks):
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    monkeypatch.setattr(fused_exl3, "_mgemm_tables_for_views", broken)
+    banks, _ = _matrices(2)
+    scratch = fused_exl3.prepare_exl3_scratch(
+        device="cpu", hidden_size=H, intermediate_size=I, max_tokens=2, chunk_experts=8
+    )
+    with pytest.raises(RuntimeError, match="illegal memory access"):
+        fused_exl3.fused_experts_exl3(
+            torch.zeros((1, H), dtype=torch.bfloat16),
+            banks,
+            torch.ones((1, 1)),
+            torch.zeros((1, 1), dtype=torch.int32),
+            is_prefill=True,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            swiglu_limit=None,
+            hidden_act_alpha=1.0,
+            scratch=scratch,
+            expert_op="mgemm",
+        )
+    assert scratch.mgemm_disabled is False
+
+
 def test_exl3_operation_refuses_cpu_without_a_mocked_card_seam():
     from freetoken.moe.fused_exl3 import fused_experts_exl3, prepare_exl3_scratch
 

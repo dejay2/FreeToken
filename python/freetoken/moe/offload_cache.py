@@ -25,6 +25,7 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
+from freetoken.moe.exl3_ops import DEFAULT_EXL3_EXPERT_OP, EXL3_EXPERT_OPS
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -148,7 +149,7 @@ class OffloadMoeCache:
     # EXL3 routed-expert operation. The packed mgemm path is the accepted default: R4e measured
     # decode 136.26 -> 35.43 ms/token and cold prefill 112.72 -> 238.83 prompt tok/s
     # (2026-09-05); reconstruct remains the fallback.
-    exl3_expert_op: str = "mgemm"
+    exl3_expert_op: str = DEFAULT_EXL3_EXPERT_OP
     # Decode mode + bank layout; per-layer CPU routing is cpu_layer_ids. "gpu":
     # GPU-tiled banks, all decode on GPU (stream misses over PCIe into the slot
     # cache, GEMM on GPU). "cpu": native (CPU-readable) banks + a CPU executor;
@@ -175,7 +176,7 @@ class OffloadMoeCache:
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
         assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
-        assert self.exl3_expert_op in ("reconstruct", "mgemm"), self.exl3_expert_op
+        assert self.exl3_expert_op in EXL3_EXPERT_OPS, self.exl3_expert_op
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None

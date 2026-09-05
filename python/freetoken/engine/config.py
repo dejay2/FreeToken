@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, List, Mapping
 import torch
 from freetoken.distributed import DistributedInfo
 from freetoken.models.register import _load_attr, get_model_spec
+from freetoken.moe.exl3_ops import DEFAULT_EXL3_EXPERT_OP
 from freetoken.utils import cached_load_hf_config
 
 if TYPE_CHECKING:
@@ -327,8 +328,9 @@ class EngineConfig:
     nvfp4_backend: str = "triton"
     # EXL3 routed-expert operation. The packed mgemm path is the accepted default: R4e measured
     # decode 136.26 -> 35.43 ms/token and cold prefill 112.72 -> 238.83 prompt tok/s
-    # (2026-09-05); reconstruct remains the fallback (--exl3-expert-op).
-    exl3_expert_op: str = "mgemm"
+    # (2026-09-05); reconstruct remains the fallback (--exl3-expert-op). The literal lives in
+    # moe/exl3_ops.py so every site that reads the field by getattr shares one default.
+    exl3_expert_op: str = DEFAULT_EXL3_EXPERT_OP
     # PLE table backend: "disk" reads rows from the checkpoint files per fill via the Linux
     # io_uring row store (Linux-only); "mmap" demand-pages the safetensors table (the Windows
     # option); "pinned" preloads the whole table into page-locked host RAM.

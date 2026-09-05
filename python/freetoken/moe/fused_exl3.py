@@ -14,6 +14,7 @@ import torch
 
 from freetoken.kernel import exl3 as _exl3_kernel
 from freetoken.kernel.exl3_mgemm import EXL3_MGEMM_MAX_INDICES
+from freetoken.moe.exl3_ops import EXL3_EXPERT_OPS
 from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl
 from freetoken.utils import init_logger
 
@@ -781,7 +782,7 @@ def fused_experts_exl3(
         intermediate_size=scratch.intermediate_size,
         device=hidden_states.device,
     )
-    if expert_op not in {"reconstruct", "mgemm"}:
+    if expert_op not in EXL3_EXPERT_OPS:
         raise ValueError(
             f"unsupported EXL3 expert operation {expert_op!r}; use 'reconstruct' or 'mgemm'"
         )

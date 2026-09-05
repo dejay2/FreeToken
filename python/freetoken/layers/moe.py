@@ -7,6 +7,7 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_backend
+from freetoken.moe.exl3_ops import DEFAULT_EXL3_EXPERT_OP
 from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl, fused_topk
 from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -972,7 +973,7 @@ class OffloadMoELayer(MoELayer):
                 swiglu_limit=getattr(self, "swiglu_limit", None),
                 hidden_act_alpha=getattr(self, "hidden_act_alpha", 1.0),
                 scratch=scratch,
-                expert_op=getattr(cache, "exl3_expert_op", "reconstruct"),
+                expert_op=getattr(cache, "exl3_expert_op", DEFAULT_EXL3_EXPERT_OP),
                 layer_id=getattr(self, "layer_id", None),
             )
         if fmt in ("nvfp4_marlin", "nvfp4_b12x"):

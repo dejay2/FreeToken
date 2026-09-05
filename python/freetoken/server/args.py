@@ -7,6 +7,7 @@ from typing import List, Tuple
 
 import torch
 from freetoken.distributed import DistributedInfo
+from freetoken.moe.exl3_ops import EXL3_EXPERT_OPS
 from freetoken.scheduler import SchedulerConfig
 from freetoken.scheduler.config import pin_kv_park_model_path_value
 from freetoken.utils import init_logger
@@ -574,7 +575,7 @@ def parse_args(
     parser.add_argument(
         "--exl3-expert-op",
         default=os.getenv("FREETOKEN_EXL3_EXPERT_OP", ServerArgs.exl3_expert_op),
-        choices=["reconstruct", "mgemm"],
+        choices=list(EXL3_EXPERT_OPS),
         help=(
             "EXL3 routed-expert operation: mgemm (default, uses the packed ExLlamaV3 kernel) "
             "or reconstruct (fallback, rebuilds BF16 rows)."

@@ -16,6 +16,7 @@ from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
+from freetoken.moe.exl3_ops import DEFAULT_EXL3_EXPERT_OP, EXL3_EXPERT_OPS
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
@@ -1044,7 +1045,7 @@ class Engine:
             # One EXL3 arena is shared by every routed layer. Allocate it after compressed
             # banks/cache setup, but before GraphRunner so all fixed buffers exist at the only
             # proof path that reaches the selected EXL3 operation.
-            cache.exl3_expert_op = getattr(config, "exl3_expert_op", "reconstruct")
+            cache.exl3_expert_op = getattr(config, "exl3_expert_op", DEFAULT_EXL3_EXPERT_OP)
             from freetoken.moe.fused_exl3 import prepare_exl3_scratch
 
             scratch = prepare_exl3_scratch(
@@ -1065,6 +1066,14 @@ class Engine:
             cache.exl3_scratch = scratch
             for layer in layers:
                 layer.exl3_scratch = scratch
+            # The positive twin of fused_exl3's "falling back to reconstruct-first" warning, so a
+            # boot log says which EXL3 operation is live without having to infer it from silence.
+            logger.info_rank0(
+                "EXL3 routed experts: %s path selected for %d layers (--exl3-expert-op; "
+                "a per-layer fallback to reconstruct-first is logged as a warning)",
+                "packed mgemm" if cache.exl3_expert_op == "mgemm" else "reconstruct-first",
+                len(layers),
+            )
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
@@ -2373,8 +2382,8 @@ def _adjust_config(config: EngineConfig):
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
-    exl3_expert_op = getattr(config, "exl3_expert_op", "reconstruct")
-    if exl3_expert_op not in ("reconstruct", "mgemm"):
+    exl3_expert_op = getattr(config, "exl3_expert_op", DEFAULT_EXL3_EXPERT_OP)
+    if exl3_expert_op not in EXL3_EXPERT_OPS:
         raise ValueError(
             "--exl3-expert-op must be 'reconstruct' or 'mgemm', "
             f"got {exl3_expert_op!r}"
