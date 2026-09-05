@@ -335,8 +335,9 @@ def _grouped_prompt_reference(hidden, weights, ids, tables, *, alpha=1.0, limit=
 
 
 @pytest.mark.parametrize("tile_rows", [4, 128])
-def test_packed_prompt_groups_routes_by_expert_with_a_bounded_number_of_host_syncs(
-    monkeypatch, tile_rows
+@pytest.mark.parametrize("weight_on_input", [False, True])
+def test_packed_prompt_groups_routes_by_expert_with_a_bounded_number_of_host_reads(
+    monkeypatch, tile_rows, weight_on_input
 ):
     """The grouped prompt path sorts routes once; it must not sync per routed expert."""
     from freetoken import layers
@@ -386,7 +387,7 @@ def test_packed_prompt_groups_routes_by_expert_with_a_bounded_number_of_host_syn
         weights,
         ids,
         activation="swiglu_clamp",
-        apply_router_weight_on_input=False,
+        apply_router_weight_on_input=weight_on_input,
         hidden_act_alpha=1.0,
         swiglu_limit=10.0,
         scratch=scratch,
@@ -397,9 +398,40 @@ def test_packed_prompt_groups_routes_by_expert_with_a_bounded_number_of_host_syn
     expected = _grouped_prompt_reference(hidden, weights, ids, tables)
     torch.testing.assert_close(got.float(), expected.float(), rtol=3e-2, atol=3e-2)
     assert got.data_ptr() == out.data_ptr()
-    # Two host reads per layer (id range + per-expert counts), whatever the expert count. The
-    # previous per-expert mask form read the host once per routed expert (12 here, 288 on GLM).
+    # Two explicit host reads per layer (id range + per-expert counts), whatever the expert
+    # count; the old per-expert mask form read once per routed expert (12 here, 288 on GLM).
+    # On CPU .tolist() is not a stream sync; on the card R1 measured four syncs per layer in
+    # total, since torch.bincount reads its own max() twice to size the histogram.
     assert syncs == 2, syncs
+
+
+def test_packed_prompt_with_no_routes_returns_the_zeroed_output(monkeypatch):
+    from freetoken.kernel import exl3_mgemm
+    from freetoken.moe import fused_exl3
+
+    monkeypatch.setattr(exl3_mgemm, "exl3_mgemm_projection", _fake_projection)
+    tables = _FakeTables(
+        torch.zeros(2, I, H, dtype=torch.bfloat16),
+        torch.zeros(2, I, H, dtype=torch.bfloat16),
+        torch.zeros(2, H, I, dtype=torch.bfloat16),
+    )
+    scratch = fused_exl3.prepare_exl3_scratch(
+        device="cpu", hidden_size=H, intermediate_size=I, max_tokens=2, chunk_experts=8
+    )
+    out = torch.ones(0, H, dtype=torch.bfloat16)
+    got = fused_exl3._run_mgemm_prefill(
+        torch.zeros(0, H, dtype=torch.bfloat16),
+        tables,
+        torch.ones(0, 1),
+        torch.zeros((0, 1), dtype=torch.int32),
+        activation="silu",
+        apply_router_weight_on_input=False,
+        hidden_act_alpha=1.0,
+        swiglu_limit=None,
+        scratch=scratch,
+        out=out,
+    )
+    assert got.shape == (0, H)
 
 
 def test_packed_prompt_rejects_a_route_outside_the_bank_slots(monkeypatch):

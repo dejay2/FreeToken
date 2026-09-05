@@ -630,11 +630,14 @@ def _run_mgemm_prefill(
     # Group the routes by expert with one sort instead of one boolean mask per expert. The
     # per-expert `topk_ids == expert` / `torch.where` form cost one host sync per routed
     # expert (R4c N13: ~24,200 syncs per 42-layer prompt chunk on GLM-5.3-Flash); this form
-    # syncs three times per layer (the id range check and the per-expert counts) and keeps the
-    # grouped-by-expert packed call, which reads each expert's trellis once per tile rather than
-    # once per route.
+    # syncs four times per layer whatever the expert count (R1 measured it with
+    # torch.cuda.set_sync_debug_mode: the id-range read, bincount's own max() read to size its
+    # histogram, and the counts read) and keeps the grouped-by-expert packed call, which reads
+    # each expert's trellis once per tile rather than once per route.
     top_k = int(topk_ids.shape[1])
     flat_ids = topk_ids.reshape(-1)
+    if flat_ids.numel() == 0:
+        return out
     flat_weights = topk_weights.reshape(-1)
     order = torch.argsort(flat_ids, stable=True)
     sorted_ids = flat_ids[order]
