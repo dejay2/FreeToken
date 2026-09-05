@@ -86,6 +86,8 @@ class Exl3MgemmScratch:
     The buffers are flat on purpose.  A route call views them as ``[routes, 1, width]``;
     a grouped one-expert call views them as ``[1, tokens, width]``.  Slicing a flat prefix
     keeps every tensor contiguous even when hidden and intermediate widths differ.
+    Gate and up have separate output storage because a float16 cast is a no-op: sharing one
+    output buffer would let the up launch overwrite gate before the activation reads it.
     """
 
     device: torch.device
@@ -94,6 +96,8 @@ class Exl3MgemmScratch:
     input_fp16: torch.Tensor
     a_had: torch.Tensor
     output_fp16: torch.Tensor
+    gate_output_fp16: torch.Tensor
+    up_output_fp16: torch.Tensor
 
 
 def prepare_exl3_mgemm_scratch(*, device, max_rows: int, max_features: int) -> Exl3MgemmScratch:
@@ -117,6 +121,8 @@ def prepare_exl3_mgemm_scratch(*, device, max_rows: int, max_features: int) -> E
         input_fp16=torch.empty(size, dtype=torch.float16, device=device),
         a_had=torch.empty(size, dtype=torch.float16, device=device),
         output_fp16=torch.empty(size, dtype=torch.float16, device=device),
+        gate_output_fp16=torch.empty(size, dtype=torch.float16, device=device),
+        up_output_fp16=torch.empty(size, dtype=torch.float16, device=device),
     )
 
 
@@ -296,6 +302,7 @@ def _workspace_view(
     input_features: int,
     output_features: int,
     device: torch.device,
+    output_storage: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if scratch is None:
         return (
@@ -313,7 +320,9 @@ def _workspace_view(
         )
     input_buf = scratch.input_fp16[: rows * input_features].view(rows, input_features)
     had_buf = scratch.a_had[: rows * input_features].view(rows, input_features)
-    output_buf = scratch.output_fp16[: rows * output_features].view(rows, output_features)
+    if output_storage is None:
+        output_storage = scratch.output_fp16
+    output_buf = output_storage[: rows * output_features].view(rows, output_features)
     return input_buf, had_buf, output_buf
 
 
@@ -365,12 +374,19 @@ def _raw_mgemm(
             )
 
     total_rows = batch * rows_per_batch
+    output_storage = None
+    if scratch is not None:
+        if projection == "gate":
+            output_storage = scratch.gate_output_fp16
+        elif projection == "up":
+            output_storage = scratch.up_output_fp16
     input_buf, had_buf, output_buf = _workspace_view(
         scratch,
         rows=total_rows,
         input_features=input_features,
         output_features=output_features,
         device=tables.device,
+        output_storage=output_storage,
     )
     input_buf.copy_(inputs.to(dtype=torch.float16))
     a = input_buf.view(batch, rows_per_batch, input_features)
@@ -459,7 +475,7 @@ def exl3_mgemm_projection(
             num_tokens=1,
             broadcast_input=True,
             scratch=scratch,
-        ).to(dtype=inputs.dtype)
+        ).to(dtype=inputs.dtype).clone()
     result = _raw_mgemm(
         inputs,
         tables,
@@ -474,7 +490,7 @@ def exl3_mgemm_projection(
         if not isinstance(weights, torch.Tensor) or weights.dim() != 1 or weights.numel() != inputs.shape[0]:
             raise ValueError("route EXL3 mgemm weights need one value per input row")
         result = result * weights.to(dtype=result.dtype).reshape(-1, 1)
-    return result.to(dtype=inputs.dtype)
+    return result.to(dtype=inputs.dtype).clone()
 
 
 def _route_mgemm(
@@ -613,7 +629,7 @@ def fused_experts_exl3_mgemm(
             num_tokens=1,
             scratch=scratch,
         )
-        return down.view(rows, top_k, -1).sum(dim=1).to(dtype=hidden_states.dtype)
+        return down.view(rows, top_k, -1).sum(dim=1).to(dtype=hidden_states.dtype).clone()
 
     down = _route_mgemm(
         activated.reshape(route_count, -1).contiguous(),
@@ -624,7 +640,7 @@ def fused_experts_exl3_mgemm(
         num_tokens=rows,
         scratch=scratch,
     )
-    return down.to(dtype=hidden_states.dtype)
+    return down.to(dtype=hidden_states.dtype).clone()
 
 
 __all__ = [

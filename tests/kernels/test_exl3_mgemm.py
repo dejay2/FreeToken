@@ -91,11 +91,65 @@ def test_grouped_projection_accepts_more_than_the_route_index_capacity():
 
 
 @cuda
-def test_route_reduction_matches_reconstruct_first_for_glm_activation():
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
+def test_gate_and_up_projection_results_match_reconstruct_first(dtype):
+    device = torch.device("cuda")
+    banks = Exl3MgemmBanks.from_banks(_synthetic_banks(device))
+    scratch = prepare_exl3_mgemm_scratch(device=device, max_rows=2, max_features=_I)
+    hidden = torch.randn((2, _H), dtype=dtype, device=device)
+    expert_ids = torch.tensor([0, 1], dtype=torch.int32, device=device)
+
+    from freetoken.kernel.exl3 import reconstruct
+
+    reference = {}
+    for projection, bank_indices in {"gate": (0, 1, 2), "up": (3, 4, 5)}.items():
+        trellis_i, suh_i, svh_i = bank_indices
+        matrices = [
+            reconstruct(
+                banks.banks[trellis_i][expert],
+                banks.banks[suh_i][expert],
+                banks.banks[svh_i][expert],
+                k=2,
+                codebook="mul1",
+            ).to(dtype)
+            for expert in range(2)
+        ]
+        reference[projection] = torch.stack(
+            [
+                torch.matmul(hidden[row], matrices[int(expert_ids[row].item())].transpose(0, 1))
+                for row in range(hidden.shape[0])
+            ],
+            dim=0,
+        )
+
+    # The second call must not overwrite the first result when inputs are float16: the
+    # pre-fix public return was a view of the shared scratch output.
+    got_gate = exl3_mgemm_projection(
+        hidden,
+        banks,
+        expert_ids,
+        projection="gate",
+        scratch=scratch,
+    )
+    got_up = exl3_mgemm_projection(
+        hidden,
+        banks,
+        expert_ids,
+        projection="up",
+        scratch=scratch,
+    )
+
+    torch.testing.assert_close(got_gate.float(), reference["gate"].float(), rtol=5e-2, atol=0.5)
+    torch.testing.assert_close(got_up.float(), reference["up"].float(), rtol=5e-2, atol=0.5)
+
+
+@cuda
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
+def test_route_reduction_matches_reconstruct_first_for_glm_activation(dtype):
     device = torch.device("cuda")
     banks = Exl3MgemmBanks.from_banks(_synthetic_banks(device))
     scratch = prepare_exl3_mgemm_scratch(device=device, max_rows=8, max_features=_I)
-    hidden = torch.randn((2, _H), dtype=torch.bfloat16, device=device)
+    hidden = torch.randn((2, _H), dtype=dtype, device=device)
     ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32, device=device)
     weights = torch.tensor([[0.25, 0.75], [0.6, 0.4]], dtype=torch.float32, device=device)
 
@@ -124,21 +178,21 @@ def test_route_reduction_matches_reconstruct_first_for_glm_activation():
                 banks.banks[2][expert],
                 k=2,
                 codebook="mul1",
-            )
+            ).to(dtype)
             up = reconstruct(
                 banks.banks[3][expert],
                 banks.banks[4][expert],
                 banks.banks[5][expert],
                 k=2,
                 codebook="mul1",
-            )
+            ).to(dtype)
             down = reconstruct(
                 banks.banks[6][expert],
                 banks.banks[7][expert],
                 banks.banks[8][expert],
                 k=2,
                 codebook="mul1",
-            )
+            ).to(dtype)
             gate_up = torch.cat(
                 (
                     torch.matmul(hidden[token], gate.transpose(0, 1)),
@@ -149,8 +203,8 @@ def test_route_reduction_matches_reconstruct_first_for_glm_activation():
             activated = swiglu_clamp_and_mul(gate_up.unsqueeze(0), alpha=1.0, limit=10.0)[0]
             routed.append(float(weights[token, route]) * torch.matmul(activated, down.transpose(0, 1)))
         expected.append(torch.stack(routed).sum(dim=0))
-    expected = torch.stack(expected).to(torch.bfloat16)
-    torch.testing.assert_close(got.float(), expected.float(), rtol=8e-2, atol=0.5)
+    expected = torch.stack(expected).to(dtype)
+    torch.testing.assert_close(got.float(), expected.float(), rtol=5e-2, atol=0.5)
 
 
 def _load_real_banks(model_path: Path, *, experts: int = _E):
