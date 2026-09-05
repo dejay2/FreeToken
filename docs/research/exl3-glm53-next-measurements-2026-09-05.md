@@ -53,6 +53,29 @@ The learned layer choice itself made no measurable difference on these three pro
 out-ranks layer 6 on breadth 211 vs 188 of 288). Cold prefill varies 282-322 across boots on
 the same code, so single-boot cold numbers carry about +-10 %.
 
+## Qwen3.8-Flash-Next on the same branch (live check, same day)
+
+The accepted Qwen profile (262,144-token pool, four chats, 4,188 slots, `--moe-gpu-owned-layers
+auto`, dense int8, vision layer-stream over mmap, MTP off) was booted four times: twice from
+this branch, once from the pre-batch main branch as the control, and once more from the branch
+by the reviewer. The classic Qwen bench (greedy 512-token numbers / essay / code, 8k-chat):
+
+| boot | owned layers | numbers | essay | code | 8k-chat tok/s | cold-7k TTFT s |
+|---|---|---:|---:|---:|---:|---:|
+| main branch (control) | `[0, 1, 2, 6, 7, 22]` fixed | 44.3 | 51.5 | 50.0 | 47.3 | 1.62 |
+| this branch, first boot (cold file cache) | `[0, 1, 2, 6, 7, 22]` fixed | 44.1 | 50.0 | 49.9 | 46.8 | 1.91 |
+| this branch, learned | `[0, 2, 6, 7, 18, 29]` | 45.0 | 51.2 | 50.3 | 47.1 | 1.60 |
+| this branch, learned (reviewer) | `[0, 2, 7, 18, 22, 29]` | 44.5 | 50.3 | 49.6 | 46.5 | 1.61 |
+
+The branch runs Qwen unchanged (the first boot's slower prompt and cold TTFT were the day's
+cold file cache; a warm boot on the same commit reproduces the control to 0.3 %). **The learned
+set was neutral on Qwen, not a speed win:** end-to-end within 2 % of the fixed order. By the
+realized streaming miss rate on the identical bench, the two layers learning dropped (1 and 6,
+0.662 and 0.598) were slightly hungrier than the two it added (18 and 29, 0.598 and 0.522), the
+documented limit of a breadth proxy that cannot re-rank the layers it already owns; the breadth
+scores at ranks 2-11 are within 5 % of each other. Any future A/B on Qwen must pin the layers
+explicitly or pass `--disable-moe-learn-routing`, since `auto` now follows the learned file.
+
 ## Ranking metric versus the measured Qwen order
 
 On the pooled histogram of the four `routing-skew-2026-09-02` captures, "experts for 90 % of
