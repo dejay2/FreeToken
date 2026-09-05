@@ -1037,12 +1037,16 @@ class Engine:
         learn_routing = (
             bool(getattr(config, "moe_learn_routing", False)) and decode_target != "cpu"
         )
-        collect_decode_freq = (
-            config.moe_collect_decode_freq
-            or _env_flag("FREETOKEN_MOE_COLLECT_DECODE_FREQ")
-            or learn_routing
+        collect_decode_freq_flag = config.moe_collect_decode_freq or _env_flag(
+            "FREETOKEN_MOE_COLLECT_DECODE_FREQ"
         )
-        cache.collect_stats = config.moe_collect_stats or collect_decode_freq
+        collect_decode_freq = collect_decode_freq_flag or learn_routing
+        # Learning arms the histogram only. The explicit flags also arm collect_stats (LRU
+        # miss counters, prefetch scoring, copy-row counters: several captured device ops per
+        # layer per step), which learning does not read. Measured on GLM-5.3-Flash 2.05bpw
+        # (2026-09-05, prompts/exl3-glm53-next bench): with collect_stats armed by learning,
+        # long-context decode fell 11.22 -> 10.57 tok/s; short and 300-word decode within 2 %.
+        cache.collect_stats = config.moe_collect_stats or collect_decode_freq_flag
         # The routing histogram is a per-layer scatter_add_ over device tensors, so a
         # captured decode graph replays it like any other decode op -- but only if it is
         # armed here, before capture. Arming it later leaves the graph without the scatter.

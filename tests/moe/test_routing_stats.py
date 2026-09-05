@@ -210,6 +210,34 @@ def test_routing_route_forwards_the_reset_flag():
     assert state.sent[0].reset is True
 
 
+def test_the_scheduler_serves_the_histogram_when_only_learning_armed_it():
+    """Routing learning arms collect_decode_freq without collect_stats; the backend reply
+    must still carry the histogram instead of the counters-are-off error."""
+    from types import SimpleNamespace
+
+    from freetoken.message import RoutingStatsBackendMsg
+    from freetoken.scheduler.scheduler import Scheduler
+
+    cache = _cpu_cache()
+    cache.collect_decode_freq = True
+    cache.collect_stats = False
+    cache.decode_freq[0, 1] = 7
+    sent = []
+    fake = SimpleNamespace(
+        engine=SimpleNamespace(moe_offload_cache=cache),
+        send_result=lambda msgs: sent.extend(msgs),
+    )
+    Scheduler._reply_routing_stats(fake, RoutingStatsBackendMsg(request_id="r", reset=False))
+    (reply,) = sent
+    assert reply.error is None
+    assert reply.stats["decode_freq"][0][1] == 7
+
+    cache.collect_decode_freq = False
+    sent.clear()
+    Scheduler._reply_routing_stats(fake, RoutingStatsBackendMsg(request_id="r", reset=False))
+    assert "decode counters are off" in sent[0].error
+
+
 def test_routing_route_409s_when_the_counters_were_never_armed():
     state = _RoutingState(error="decode counters are off; boot with --moe-collect-decode-freq")
     client, restore = _routing_client(state)

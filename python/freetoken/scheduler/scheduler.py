@@ -927,7 +927,11 @@ class Scheduler(SchedulerIOMixin):
         error: str | None = None
         if cache is None:
             error = "this model has no MoE offload cache"
-        elif not getattr(cache, "collect_stats", False):
+        elif not (
+            getattr(cache, "collect_stats", False) or getattr(cache, "collect_decode_freq", False)
+        ):
+            # Routing learning arms the histogram without the miss counters; the route still
+            # serves it (the per_layer miss columns then read as zeros).
             error = (
                 "decode counters are off; boot with --moe-collect-decode-freq "
                 "(or FREETOKEN_MOE_COLLECT_DECODE_FREQ=1)"
