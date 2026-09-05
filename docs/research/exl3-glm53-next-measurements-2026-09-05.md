@@ -68,8 +68,10 @@ by the reviewer. The classic Qwen bench (greedy 512-token numbers / essay / code
 | this branch, learned (reviewer) | `[0, 2, 7, 18, 22, 29]` | 44.5 | 50.3 | 49.6 | 46.5 | 1.61 |
 
 The branch runs Qwen unchanged (the first boot's slower prompt and cold TTFT were the day's
-cold file cache; a warm boot on the same commit reproduces the control to 0.3 %). **The learned
-set was neutral on Qwen, not a speed win:** end-to-end within 2 % of the fixed order. By the
+cold file cache; a warm boot on the same commit reproduces the control to 0.3 % on the
+long-context prompt and decode rates and 0.6 % on cold TTFT). **The learned set was neutral on
+Qwen, not a speed win:** each learned boot within 2.4 % of the control end-to-end (2.7 %
+counting warm-turn TTFT), one above it and one below. By the
 realized streaming miss rate on the identical bench, the two layers learning dropped (1 and 6,
 0.662 and 0.598) were slightly hungrier than the two it added (18 and 29, 0.598 and 0.522), the
 documented limit of a breadth proxy that cannot re-rank the layers it already owns; the breadth
