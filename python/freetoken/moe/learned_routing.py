@@ -42,7 +42,9 @@ SCHEMA_VERSION = 1
 MIN_LEARNED_ROUTES = 4_000
 # Fraction the stored prior keeps at each boot.
 PRIOR_DECAY = 0.5
-# The scheduler flushes at most this often; a killed process loses at most this much.
+# The scheduler flushes at most this often, checked once per loop iteration; the loops block
+# while idle, so a killed process loses what was routed since the last flush (at most one
+# minute of an active session, but everything since the last active minute of an idle one).
 FLUSH_INTERVAL_S = 60.0
 
 
@@ -170,19 +172,24 @@ class RoutingStatsRecorder:
         self.num_layers = num_layers
         self.num_experts = num_experts
         self.top_k = top_k
+        self.decay = decay
         if prior is None:
             self.total = RoutingStats.empty(num_layers, num_experts, top_k=top_k)
         else:
             self.total = RoutingStats(
                 num_layers,
                 num_experts,
-                [[int(c * decay) for c in row] for row in prior.freq],
+                [list(row) for row in prior.freq],
                 boots=prior.boots,
                 top_k=top_k if top_k is not None else prior.top_k,
             )
-        self.total.boots += 1
+        # The prior is decayed and the boot counted at the FIRST merge that brings new routes,
+        # not at construction: a boot that serves nothing (a restart for a test, a crashed
+        # boot) must leave the file exactly as it was. R2 measured three idle restarts taking a
+        # 20,000-route file to 2,500 and `auto` silently reverting to the fixed order.
+        self._started = False
         self._snapshot: list[list[int]] = [[0] * num_experts for _ in range(num_layers)]
-        self.dirty = True  # the boot count changed
+        self.dirty = False
         self.saves = 0
         self.last_error: str | None = None
 
@@ -197,18 +204,27 @@ class RoutingStatsRecorder:
             for row_cur, row_old in zip(histogram, self._snapshot)
             for cur, old in zip(row_cur, row_old)
         )
+        deltas: list[list[int]] = []
         merged = 0
         for layer, row in enumerate(histogram):
             snap = self._snapshot[layer]
-            tot = self.total.freq[layer]
-            for expert, cur in enumerate(row):
-                delta = cur if reset else cur - snap[expert]
+            delta_row = [cur if reset else cur - snap[expert] for expert, cur in enumerate(row)]
+            merged += sum(delta_row)
+            deltas.append(delta_row)
+            self._snapshot[layer] = list(row)
+        if merged <= 0:
+            return 0
+        if not self._started:
+            self._started = True
+            self.total.boots += 1
+            for row in self.total.freq:
+                for expert, count in enumerate(row):
+                    row[expert] = int(count * self.decay)
+        for tot, delta_row in zip(self.total.freq, deltas):
+            for expert, delta in enumerate(delta_row):
                 if delta:
                     tot[expert] += delta
-                    merged += delta
-            self._snapshot[layer] = list(row)
-        if merged:
-            self.dirty = True
+        self.dirty = True
         return merged
 
     def save(self) -> bool:

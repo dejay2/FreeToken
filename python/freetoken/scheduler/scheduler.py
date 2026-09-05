@@ -920,6 +920,21 @@ class Scheduler(SchedulerIOMixin):
             ]
         )
 
+    @staticmethod
+    def _routing_per_layer_rows(cache) -> list:
+        """Per-layer decode rows; without collect_stats the step-derived columns are null.
+
+        A streaming layer reported as ``steps: 0, miss_rate: 0.0`` would read as perfectly
+        cacheable (the sentinel offload_cache's docstring forbids), so the columns follow the
+        owned-layer convention and go null when the counters were never armed (R2 N1)."""
+        rows = cache.decode_miss_stats_per_layer()["per_layer"]
+        if cache.collect_stats:
+            return rows
+        for row in rows:
+            for key in ("active_per_step", "missing_per_step", "miss_rate", "fetched_per_step"):
+                row[key] = None
+        return rows
+
     def _reply_routing_stats(self, msg: RoutingStatsBackendMsg) -> None:
         """Answer GET /v1/cache/routing from the live offload cache's decode counters."""
         cache = getattr(self.engine, "moe_offload_cache", None)
@@ -948,7 +963,10 @@ class Scheduler(SchedulerIOMixin):
                     # streaming-cache summary.
                     "gpu_owned_layers": sorted(getattr(cache, "gpu_owned_layer_ids", ()) or ()),
                     "summary": cache.decode_routing_stats(),
-                    "per_layer": cache.decode_miss_stats_per_layer()["per_layer"],
+                    "per_layer": Scheduler._routing_per_layer_rows(cache),
+                    # False when only routing learning armed the histogram: the miss columns
+                    # above are then null, not zero.
+                    "counters": bool(cache.collect_stats),
                     # raw [layers, experts] histogram: the input every offline skew study
                     # (static hot set sizing, overlap across workloads) actually needs.
                     "decode_freq": (

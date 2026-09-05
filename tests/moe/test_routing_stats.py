@@ -231,11 +231,57 @@ def test_the_scheduler_serves_the_histogram_when_only_learning_armed_it():
     (reply,) = sent
     assert reply.error is None
     assert reply.stats["decode_freq"][0][1] == 7
+    # Without the miss counters the per-layer miss columns are null, never a false 0.0 that
+    # would read as a perfectly cacheable streaming layer (R2 N1).
+    assert reply.stats["counters"] is False
+    assert all(row["miss_rate"] is None and row["missing_per_step"] is None for row in reply.stats["per_layer"])
+    cache.collect_stats = True
+    sent.clear()
+    Scheduler._reply_routing_stats(fake, RoutingStatsBackendMsg(request_id="r", reset=False))
+    assert sent[0].stats["counters"] is True
+    assert sent[0].stats["per_layer"][0]["miss_rate"] == 0.0
+    cache.collect_stats = False
 
     cache.collect_decode_freq = False
     sent.clear()
     Scheduler._reply_routing_stats(fake, RoutingStatsBackendMsg(request_id="r", reset=False))
     assert "decode counters are off" in sent[0].error
+
+
+def test_the_engine_flush_and_the_scheduler_timer_reach_the_file(tmp_path, monkeypatch):
+    """R2 N9: the wiring itself. Engine.flush_routing_stats merges the live histogram into the
+    recorder and writes; Scheduler._maybe_flush_routing_stats calls it once per interval."""
+    from types import SimpleNamespace
+
+    from freetoken.engine.engine import Engine
+    from freetoken.moe import learned_routing as lr
+    from freetoken.scheduler import scheduler as sched
+
+    cache = _cpu_cache()
+    cache.collect_decode_freq = True
+    cache.decode_freq[1, 2] = 9
+    engine = SimpleNamespace(
+        routing_recorder=lr.RoutingStatsRecorder(tmp_path, num_layers=2, num_experts=4),
+        moe_offload_cache=cache,
+        device=torch.device("cpu"),
+    )
+    assert Engine.flush_routing_stats(engine) is True
+    saved = lr.load_routing_stats(tmp_path, num_layers=2, num_experts=4)
+    assert saved.freq[1][2] == 9 and saved.boots == 1
+    assert Engine.flush_routing_stats(engine) is False, "nothing new: no rewrite"
+
+    calls = []
+    engine.flush_routing_stats = lambda **kw: calls.append(kw)
+    fake = SimpleNamespace(engine=engine, _routing_flush_at=0.0)
+    clock = iter([100.0, 100.0 + sched.FLUSH_INTERVAL_S - 1, 100.0 + sched.FLUSH_INTERVAL_S + 1])
+    monkeypatch.setattr(sched.time, "monotonic", lambda: next(clock))
+    sched.Scheduler._maybe_flush_routing_stats(fake)  # first tick: interval elapsed since 0
+    sched.Scheduler._maybe_flush_routing_stats(fake)  # 59 s later: too soon
+    sched.Scheduler._maybe_flush_routing_stats(fake)  # 61 s later: flush
+    assert len(calls) == 2
+    engine.routing_recorder = None
+    sched.Scheduler._maybe_flush_routing_stats(fake)
+    assert len(calls) == 2, "no recorder: the timer is inert"
 
 
 def test_routing_route_409s_when_the_counters_were_never_armed():

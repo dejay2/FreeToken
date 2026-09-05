@@ -85,8 +85,8 @@ def test_load_returns_none_without_a_file(tmp_path):
 
 def test_recorder_round_trips_through_the_file(tmp_path):
     rec = lr.RoutingStatsRecorder(tmp_path, num_layers=2, num_experts=3, top_k=2)
-    assert rec.total.boots == 1
     assert rec.note([[1, 2, 0], [0, 0, 5]]) == 8
+    assert rec.total.boots == 1
     assert rec.save() is True
     assert rec.save() is False, "nothing new: no rewrite"
     loaded = lr.load_routing_stats(tmp_path, num_layers=2, num_experts=3)
@@ -110,16 +110,34 @@ def test_recorder_merges_only_new_counts_and_detects_a_reset(tmp_path):
     assert rec.total.freq == [[7, 1]]
 
 
-def test_a_new_boot_halves_the_prior_and_counts_the_boot(tmp_path):
+def test_a_boot_that_learns_halves_the_prior_and_counts_the_boot(tmp_path):
     first = lr.RoutingStatsRecorder(tmp_path, num_layers=1, num_experts=2)
     first.note([[10, 3]])
     assert first.save()
     prior = lr.load_routing_stats(tmp_path, num_layers=1, num_experts=2)
     second = lr.RoutingStatsRecorder(tmp_path, num_layers=1, num_experts=2, prior=prior)
-    assert second.total.boots == 2
-    assert second.total.freq == [[5, 1]]
+    # Nothing happens until routes arrive: the prior is intact and no write is pending.
+    assert second.total.boots == 1 and second.total.freq == [[10, 3]]
+    assert second.save() is False
     second.note([[2, 2]])
+    assert second.total.boots == 2
     assert second.total.freq == [[7, 3]]
+
+
+def test_an_idle_restart_leaves_the_file_untouched(tmp_path):
+    """R2 N2: three idle restarts must not decay a 20,000-route file toward the fixed list."""
+    rec = lr.RoutingStatsRecorder(tmp_path, num_layers=1, num_experts=2)
+    rec.note([[20_000, 0]])
+    rec.save()
+    stamp = lr.routing_stats_path(tmp_path).read_bytes()
+    for _ in range(3):
+        prior = lr.load_routing_stats(tmp_path, num_layers=1, num_experts=2)
+        idle = lr.RoutingStatsRecorder(tmp_path, num_layers=1, num_experts=2, prior=prior)
+        idle.note([[0, 0]])
+        assert idle.save() is False
+    assert lr.routing_stats_path(tmp_path).read_bytes() == stamp
+    loaded = lr.load_routing_stats(tmp_path, num_layers=1, num_experts=2)
+    assert loaded.routes == 20_000 and loaded.boots == 1
 
 
 @pytest.mark.parametrize(

@@ -1939,7 +1939,8 @@ class Engine:
         if recorder is None or cache is None:
             return False
         try:
-            torch.cuda.synchronize(self.device)
+            if cache.decode_freq.is_cuda:
+                torch.cuda.synchronize(self.device)
             recorder.note(cache.decode_freq.tolist())
             saved = recorder.save()
         except Exception as exc:  # noqa: BLE001 -- learning must never take the server down
@@ -2189,6 +2190,9 @@ def _learned_owned_layer_rank(
     return learned_layer_rank(model_path, num_layers=num_moe_layers, num_experts=int(num_experts))
 
 
+_OWNED_LAYERS_LOGGED: set = set()
+
+
 def _validate_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int]:
     """Resolve and fully validate the owned set, or raise. Returns the empty set when off."""
     from freetoken.checkpoint.ftw import is_ftw_checkpoint
@@ -2205,7 +2209,11 @@ def _validate_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> fro
         )
     ranked, reason = _learned_owned_layer_rank(config, num_moe_layers)
     owned = _parse_gpu_owned_layers_spec(spec, num_moe_layers, ranked)
-    if spec.strip().startswith("auto"):
+    # Validation runs at _adjust_config and again in the engine constructor; the log line
+    # is worth one copy per resolved set, not two (R2 N3).
+    log_key = (spec.strip(), tuple(sorted(owned)), ranked is not None)
+    if spec.strip().startswith("auto") and log_key not in _OWNED_LAYERS_LOGGED:
+        _OWNED_LAYERS_LOGGED.add(log_key)
         logger.info_rank0(
             "--moe-gpu-owned-layers %s -> %s from %s (%s)",
             spec,
