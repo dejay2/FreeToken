@@ -84,6 +84,65 @@ def test_resolve_needs_an_offload_backend_and_a_spec():
     assert resolve(_cfg(moe_backend="cpu", moe_gpu_owned_layers="auto"), L) == frozenset()
 
 
+# ------------------------------------------------------------ the learned order
+
+
+def _learned_model(tmp_path, *, routes_per_expert, num_experts=512, ranked_first=(40, 41, 42)):
+    """A checkpoint dir with a stats file whose broadest layers are ``ranked_first``."""
+    from freetoken.moe.learned_routing import RoutingStatsRecorder
+
+    freq = [[0] * num_experts for _ in range(L)]
+    for layer in range(L):
+        freq[layer][0] = routes_per_expert * 8  # narrow: one expert
+    for layer in ranked_first:
+        freq[layer] = [routes_per_expert] * num_experts  # broad: every expert
+    rec = RoutingStatsRecorder(tmp_path, num_layers=L, num_experts=num_experts)
+    rec.note(freq)
+    assert rec.save()
+    return _cfg(
+        model_path=str(tmp_path),
+        model_config=SimpleNamespace(num_experts=num_experts),
+        moe_learn_routing=True,
+    )
+
+
+def test_auto_uses_the_learned_order_when_the_checkpoint_has_enough_routes(tmp_path):
+    cfg = _learned_model(tmp_path, routes_per_expert=100)
+    cfg.moe_gpu_owned_layers = "auto:3"
+    assert resolve(cfg, L) == frozenset({40, 41, 42})
+    cfg.moe_gpu_owned_layers = "auto"
+    learned_six = resolve(cfg, L)
+    assert {40, 41, 42} <= learned_six and len(learned_six) == 6
+
+
+def test_auto_keeps_the_fixed_order_with_too_few_routes(tmp_path):
+    cfg = _learned_model(tmp_path, routes_per_expert=1)
+    cfg.moe_gpu_owned_layers = "auto:3"
+    assert resolve(cfg, L) == frozenset({1, 6, 0})
+
+
+def test_auto_keeps_the_fixed_order_when_learning_is_off_or_the_geometry_differs(tmp_path):
+    cfg = _learned_model(tmp_path, routes_per_expert=100)
+    cfg.moe_gpu_owned_layers = "auto:3"
+    cfg.moe_learn_routing = False
+    assert resolve(cfg, L) == frozenset({1, 6, 0})
+    cfg.moe_learn_routing = True
+    cfg.model_config = SimpleNamespace(num_experts=288)  # another model's file shape
+    assert resolve(cfg, L) == frozenset({1, 6, 0})
+
+
+def test_an_explicit_layer_list_ignores_the_stats_file(tmp_path):
+    cfg = _learned_model(tmp_path, routes_per_expert=100)
+    cfg.moe_gpu_owned_layers = "3,7"
+    assert resolve(cfg, L) == frozenset({3, 7})
+
+
+def test_configs_without_a_model_config_still_resolve_auto():
+    # SimpleNamespace configs elsewhere in this file carry no model_config; the learned path
+    # must step aside instead of raising.
+    assert resolve(_cfg(moe_gpu_owned_layers="auto:2", moe_learn_routing=True), L) == frozenset({1, 6})
+
+
 # ------------------------------------------------------------ the _adjust_config gate
 
 

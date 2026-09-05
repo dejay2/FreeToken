@@ -766,6 +766,21 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--disable-moe-learn-routing",
+        action="store_false",
+        dest="moe_learn_routing",
+        default=os.getenv("FREETOKEN_MOE_LEARN_ROUTING", "1").strip().lower()
+        not in ("0", "false", "no", "off"),
+        help=(
+            "Do not learn the MoE layer ranking from use. By default the offload backend keeps "
+            "the decode routing histogram, saves it to freetoken-routing-stats.json beside the "
+            "checkpoint (every minute and at shutdown), and --moe-gpu-owned-layers auto[:N] "
+            "ranks layers from that file on the next boot; without a file it uses the fixed "
+            "measured list. Also settable with FREETOKEN_MOE_LEARN_ROUTING=0."
+        ),
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",

@@ -43,6 +43,14 @@ def test_collect_decode_freq_flag_reaches_the_config():
     assert _parse("--moe-collect-decode-freq").moe_collect_decode_freq is True
 
 
+def test_routing_learning_is_on_by_default_and_the_flag_and_env_turn_it_off(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_MOE_LEARN_ROUTING", raising=False)
+    assert _parse().moe_learn_routing is True
+    assert _parse("--disable-moe-learn-routing").moe_learn_routing is False
+    monkeypatch.setenv("FREETOKEN_MOE_LEARN_ROUTING", "0")
+    assert _parse().moe_learn_routing is False
+
+
 @pytest.mark.parametrize("value,expected", [("1", True), ("true", True), ("on", True),
                                             ("0", False), ("", False), ("no", False)])
 def test_env_flag_spelling(monkeypatch, value, expected):
@@ -74,6 +82,7 @@ def test_the_dense_override_table_clears_the_flag():
     from freetoken.engine.engine import _DENSE_MOE_SETTINGS
 
     assert _DENSE_MOE_SETTINGS["moe_collect_decode_freq"] is False
+    assert _DENSE_MOE_SETTINGS["moe_learn_routing"] is False
 
 
 # ---------------------------------------------------------------- the histogram

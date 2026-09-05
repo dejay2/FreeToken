@@ -19,6 +19,7 @@ from freetoken.attention.linear import build_fla_metadata
 from freetoken.core import Batch, Req, SpecInflight
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
+from freetoken.moe.learned_routing import FLUSH_INTERVAL_S
 from freetoken.message import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -80,6 +81,7 @@ class Scheduler(SchedulerIOMixin):
 
         config = pin_kv_park_model_path(config)
         self.engine = Engine(config)
+        self._routing_flush_at = time.monotonic()
 
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
@@ -413,12 +415,25 @@ class Scheduler(SchedulerIOMixin):
                 while True:
                     self.normal_loop()
                     diag.profile_step()
+                    self._maybe_flush_routing_stats()
         else:
             assert torch.cuda.current_stream() == self.stream
             data = None
             while True:
                 data = self.overlap_loop(data)
                 diag.profile_step()
+                self._maybe_flush_routing_stats()
+
+    def _maybe_flush_routing_stats(self) -> None:
+        """Once per FLUSH_INTERVAL_S, merge the routing histogram into the stats file. A
+        monotonic-clock compare per iteration; the flush itself syncs the device once."""
+        if self.engine.routing_recorder is None:
+            return
+        now = time.monotonic()
+        if now - self._routing_flush_at < FLUSH_INTERVAL_S:
+            return
+        self._routing_flush_at = now
+        self.engine.flush_routing_stats()
 
     def shutdown(self) -> None:
         self.cache_manager.close()

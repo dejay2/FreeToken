@@ -87,7 +87,8 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-cache-headroom-bytes` | 1.5 GiB | Free VRAM the cache must leave after every reservation; an explicit `--moe-cache-size` that leaves less refuses to boot, naming the largest slot count that fits |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
-| `--moe-gpu-owned-layers` | off | With `offload`, NVFP4 experts only: MoE layers whose experts stay permanently resident in VRAM with no host bank (`0,1,2`, a count, a fraction, `auto` = the six measured hungriest, or `auto:N`); each is CHARGED `num_experts` slots of `--moe-cache-size` (so total VRAM is unchanged) and returns one layer of host RAM. `--moe-cache-size` must leave the streaming layers their overlap floor: `512 * owned + 1024` on this checkpoint, so `auto` needs >= 4096. `/v1/cache/routing` reports owned layers as `resident: true, miss_rate: null` |
+| `--moe-gpu-owned-layers` | off | With `offload`, NVFP4 experts only: MoE layers whose experts stay permanently resident in VRAM with no host bank (`0,1,2`, a count, a fraction, `auto` = the six hungriest, or `auto:N`; `auto` ranks layers from the checkpoint's learned `freetoken-routing-stats.json` when it holds enough routes, else from the fixed measured Qwen3.8 order); each is CHARGED `num_experts` slots of `--moe-cache-size` (so total VRAM is unchanged) and returns one layer of host RAM. `--moe-cache-size` must leave the streaming layers their overlap floor: `512 * owned + 1024` on this checkpoint, so `auto` needs >= 4096. `/v1/cache/routing` reports owned layers as `resident: true, miss_rate: null` |
+| `--disable-moe-learn-routing` | learning on | With `offload`/`hybrid`: stop learning the MoE layer ranking from use. By default the decode routing histogram is kept and saved to `freetoken-routing-stats.json` beside the checkpoint every minute and at shutdown (stored counts are halved at each boot), and `--moe-gpu-owned-layers auto[:N]` ranks layers from it on the next boot. Also `FREETOKEN_MOE_LEARN_ROUTING=0` |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
@@ -125,7 +126,7 @@ ft ctl [--base-url http://127.0.0.1:1919] [--timeout 10] [--json] <subcommand>
 | `cache` | `GET /v1/cache/status` | Cache pool table |
 | `cache --moe N \| --kv N \| --mamba N \| --swa N [--wait 300]` | `POST /v1/cache/rebuild` | Live pool resizing without a restart (`k`/`m` suffixes; `--kv`/`--swa` in tokens) |
 | `requests [--since N] [--limit N]` | `GET /v1/requests` | Recent request ring |
-| — | `GET /v1/cache/routing` | MoE decode routing histogram (needs `--moe-collect-decode-freq` at boot) |
+| — | `GET /v1/cache/routing` | MoE decode routing histogram (armed by routing learning, the default, or by `--moe-collect-decode-freq` at boot) |
 
 `GET /health` is a liveness probe, not a readiness one: it answers 200 as soon
 as the port is bound and reports the load in its body (`status` is `loading`

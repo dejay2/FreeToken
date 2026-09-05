@@ -357,6 +357,12 @@ class EngineConfig:
     # so this is boot-time only (--moe-collect-decode-freq /
     # FREETOKEN_MOE_COLLECT_DECODE_FREQ=1), never a runtime toggle.
     moe_collect_decode_freq: bool = False
+    # Learn the MoE layer ranking from use (--disable-moe-learn-routing /
+    # FREETOKEN_MOE_LEARN_ROUTING=0): arms the same decode routing histogram, flushes it to
+    # freetoken-routing-stats.json beside the checkpoint every minute and at shutdown, and
+    # lets --moe-gpu-owned-layers auto[:N] rank layers from that file on the next boot. With no
+    # file (or too few routes) the boot is exactly the fixed-list boot. See moe/learned_routing.py.
+    moe_learn_routing: bool = True
     # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0

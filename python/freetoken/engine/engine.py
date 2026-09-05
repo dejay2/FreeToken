@@ -17,6 +17,12 @@ from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.exl3_ops import DEFAULT_EXL3_EXPERT_OP, EXL3_EXPERT_OPS
+from freetoken.moe.learned_routing import (
+    RoutingStatsRecorder,
+    learned_layer_rank,
+    load_routing_stats,
+    rank_layers_by_breadth,
+)
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
@@ -421,6 +427,8 @@ class Engine:
         # graphs, or other processes. Cross-rank MIN, deterministic across ranks.
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
+        # Set by the offload cache build when routing learning is on (rank 0 only).
+        self.routing_recorder: RoutingStatsRecorder | None = None
         # MoE layer ids resolved from --moe-gpu-owned-layers; read by the budget helpers
         # below and by the cache build. Empty until _init_offload_moe_cache resolves it.
         self._gpu_owned_layer_ids: frozenset = frozenset()
@@ -1024,8 +1032,15 @@ class Engine:
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
-        collect_decode_freq = config.moe_collect_decode_freq or _env_flag(
-            "FREETOKEN_MOE_COLLECT_DECODE_FREQ"
+        # Routing learning needs the same histogram, so it arms it too (offload/hybrid only:
+        # the CPU executor never calls ensure_experts, so there is nothing to count there).
+        learn_routing = (
+            bool(getattr(config, "moe_learn_routing", False)) and decode_target != "cpu"
+        )
+        collect_decode_freq = (
+            config.moe_collect_decode_freq
+            or _env_flag("FREETOKEN_MOE_COLLECT_DECODE_FREQ")
+            or learn_routing
         )
         cache.collect_stats = config.moe_collect_stats or collect_decode_freq
         # The routing histogram is a per-layer scatter_add_ over device tensors, so a
@@ -1041,6 +1056,23 @@ class Engine:
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
+        if learn_routing and config.tp_info.rank == 0:
+            # Rank 0 owns the file; every rank sees the same routing, so one copy is enough.
+            self.routing_recorder = RoutingStatsRecorder(
+                config.model_path,
+                num_layers=cache.num_layers,
+                num_experts=cache.num_experts,
+                top_k=getattr(config.model_config, "num_experts_per_tok", None),
+                prior=load_routing_stats(
+                    config.model_path, num_layers=cache.num_layers, num_experts=cache.num_experts
+                ),
+            )
+            logger.info_rank0(
+                "MoE routing learning on: the decode routing histogram is saved to %s "
+                "(boot %d of this file)",
+                self.routing_recorder.path,
+                self.routing_recorder.total.boots,
+            )
         if cache.quant_format == "exl3":
             # One EXL3 arena is shared by every routed layer. Allocate it after compressed
             # banks/cache setup, but before GraphRunner so all fixed buffers exist at the only
@@ -1892,7 +1924,34 @@ class Engine:
             f"in {started.elapsed_time(ended) / 1000.0:.3f} s"
         )
 
+    def flush_routing_stats(self, *, final: bool = False) -> bool:
+        """Merge the live decode routing histogram into freetoken-routing-stats.json.
+
+        Called by the scheduler every FLUSH_INTERVAL_S and at shutdown. Captured decode
+        graphs write the histogram on the engine stream, so it is read after one device
+        sync: one stall per minute, never per step. Returns whether a file was written."""
+        recorder = self.routing_recorder
+        cache = self.moe_offload_cache
+        if recorder is None or cache is None:
+            return False
+        try:
+            torch.cuda.synchronize(self.device)
+            recorder.note(cache.decode_freq.tolist())
+            saved = recorder.save()
+        except Exception as exc:  # noqa: BLE001 -- learning must never take the server down
+            logger.warning_rank0("routing stats flush failed: %r", exc)
+            return False
+        if saved and (final or recorder.saves == 1):
+            logger.info_rank0(
+                "routing stats saved to %s: %d routes per layer, learned layer order %s ...",
+                recorder.path,
+                recorder.total.routes,
+                rank_layers_by_breadth(recorder.total.freq)[:8],
+            )
+        return saved
+
     def shutdown(self) -> None:
+        self.flush_routing_stats(final=True)
         if self.mtp_shadow_observer is not None:
             self.mtp_shadow_observer.close()
             self.mtp_shadow_observer = None
@@ -2054,10 +2113,14 @@ GPU_OWNED_LAYER_RANK = (
 )
 
 
-def _parse_gpu_owned_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
+def _parse_gpu_owned_layers_spec(
+    spec: str, num_moe_layers: int, ranked_layers: "list[int] | None" = None
+) -> frozenset[int]:
     """Parse ``--moe-gpu-owned-layers``: the ``--moe-cpu-layers`` grammar (explicit id list
     ``"0,1,2"``, count ``"6"``, fraction ``"0.125"``) plus ``"auto"`` (the six hungriest
-    layers of :data:`GPU_OWNED_LAYER_RANK`) and ``"auto:N"`` (its first N)."""
+    layers) and ``"auto:N"`` (its first N). Hungriest-first is ``ranked_layers`` when given
+    (the learned order from this checkpoint's routing stats), else the measured
+    :data:`GPU_OWNED_LAYER_RANK`."""
     s = spec.strip()
     if s == "auto":
         s = "auto:6"
@@ -2070,7 +2133,8 @@ def _parse_gpu_owned_layers_spec(spec: str, num_moe_layers: int) -> frozenset[in
             raise ValueError(
                 f"--moe-gpu-owned-layers auto:{n} must be in [0, {num_moe_layers}]"
             )
-        ranked = [i for i in GPU_OWNED_LAYER_RANK if i < num_moe_layers]
+        source = GPU_OWNED_LAYER_RANK if ranked_layers is None else tuple(ranked_layers)
+        ranked = [i for i in source if i < num_moe_layers]
         if n > len(ranked):
             # A model deeper than the measured ranking: taking ranked[:n] would silently own
             # len(ranked) layers instead of the n that were asked for.
@@ -2098,7 +2162,27 @@ def _resolve_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> froz
     spec = config.moe_gpu_owned_layers
     if not spec or config.moe_backend != "offload":
         return frozenset()
-    return _parse_gpu_owned_layers_spec(spec, num_moe_layers)
+    ranked, _reason = _learned_owned_layer_rank(config, num_moe_layers)
+    return _parse_gpu_owned_layers_spec(spec, num_moe_layers, ranked)
+
+
+def _learned_owned_layer_rank(
+    config: EngineConfig, num_moe_layers: int
+) -> "tuple[list[int] | None, str]":
+    """The learned hungriest-first layer order for an ``auto[:N]`` spec, or (None, why not).
+
+    Only an ``auto`` spec with routing learning on consults the stats file, which must match
+    this model's MoE geometry and hold enough routes (see moe/learned_routing.py)."""
+    spec = (config.moe_gpu_owned_layers or "").strip()
+    if not spec.startswith("auto"):
+        return None, "explicit layer spec"
+    if not getattr(config, "moe_learn_routing", False):
+        return None, "routing learning is off"
+    model_path = getattr(config, "model_path", None)
+    num_experts = getattr(getattr(config, "model_config", None), "num_experts", None)
+    if not model_path or not num_experts:
+        return None, "model path or expert count unknown"
+    return learned_layer_rank(model_path, num_layers=num_moe_layers, num_experts=int(num_experts))
 
 
 def _validate_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int]:
@@ -2115,7 +2199,16 @@ def _validate_gpu_owned_layers(config: EngineConfig, num_moe_layers: int) -> fro
             f"{config.moe_backend!r}): a VRAM-resident layer has no host bank for the CPU "
             "executor to read, and 'fused' keeps every expert resident already"
         )
-    owned = _parse_gpu_owned_layers_spec(spec, num_moe_layers)
+    ranked, reason = _learned_owned_layer_rank(config, num_moe_layers)
+    owned = _parse_gpu_owned_layers_spec(spec, num_moe_layers, ranked)
+    if spec.strip().startswith("auto"):
+        logger.info_rank0(
+            "--moe-gpu-owned-layers %s -> %s from %s (%s)",
+            spec,
+            sorted(owned),
+            "the learned order" if ranked is not None else "the fixed measured order",
+            reason,
+        )
     if not owned:
         return owned
     cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers)
@@ -2336,6 +2429,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "moe_collect_decode_freq": False,
+    "moe_learn_routing": False,
     "expert_load": "auto",
 }
 
