@@ -1073,7 +1073,7 @@ class Engine:
             )
             logger.info_rank0(
                 "MoE routing learning on: the decode routing histogram is saved to %s "
-                "(boot %d of this file)",
+                "(%d earlier boots recorded in this file)",
                 self.routing_recorder.path,
                 self.routing_recorder.total.boots,
             )

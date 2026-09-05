@@ -18,8 +18,9 @@ score per workload instead gives the measured top six exactly. Entropy, working-
 "oracle miss at the slot budget" score no better, and this one needs no slot budget.
 
 The file is plain JSON, one per checkpoint directory, torch-free to read. Counts stored from
-earlier sessions are halved at every boot (``PRIOR_DECAY``) so the ranking follows recent use
-instead of the first week's workload forever.
+earlier sessions are halved on each boot that records new routes (``PRIOR_DECAY``; an idle boot
+leaves the file alone) so the ranking follows recent use instead of the first week's workload
+forever.
 """
 
 from __future__ import annotations
@@ -211,9 +212,10 @@ class RoutingStatsRecorder:
             delta_row = [cur if reset else cur - snap[expert] for expert, cur in enumerate(row)]
             merged += sum(delta_row)
             deltas.append(delta_row)
-            self._snapshot[layer] = list(row)
         if merged <= 0:
+            # Nothing to merge: leave the snapshot where it is so no delta is ever dropped.
             return 0
+        self._snapshot = [list(row) for row in histogram]
         if not self._started:
             self._started = True
             self.total.boots += 1
