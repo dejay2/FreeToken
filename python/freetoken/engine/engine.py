@@ -1041,9 +1041,10 @@ class Engine:
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
         if cache.quant_format == "exl3":
-            # One reconstruct-first arena is shared by every routed layer. Allocate it after
-            # compressed banks/cache setup, but before GraphRunner so all fixed buffers exist at
-            # the only proof path that reaches the EXL3 operation.
+            # One EXL3 arena is shared by every routed layer. Allocate it after compressed
+            # banks/cache setup, but before GraphRunner so all fixed buffers exist at the only
+            # proof path that reaches the selected EXL3 operation.
+            cache.exl3_expert_op = getattr(config, "exl3_expert_op", "reconstruct")
             from freetoken.moe.fused_exl3 import prepare_exl3_scratch
 
             scratch = prepare_exl3_scratch(
@@ -1052,13 +1053,14 @@ class Engine:
                 intermediate_size=config.model_config.moe_intermediate_size,
                 max_tokens=8192,
                 chunk_experts=8,
-                # The graph-safe EXL3 branch is deliberately one-row only.  Keep its
-                # activation arena tiny; the larger input buffer above still serves prompts.
+                # The graph-safe EXL3 branch is deliberately one-row only. Keep its activation
+                # arena tiny; the larger input buffer above still serves prompts.
                 decode_max_tokens=max(
                     1,
                     int(config.max_running_req),
                     int(config.cuda_graph_max_bs or 0),
                 ),
+                enable_mgemm=cache.exl3_expert_op == "mgemm",
             )
             cache.exl3_scratch = scratch
             for layer in layers:
@@ -1315,6 +1317,14 @@ class Engine:
             object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
         if moe_cache_size is not None:
             assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
+            if self.moe_offload_cache.quant_format == "exl3":
+                # Packed pointer tables retain references to the old slot tensors. Drop them
+                # before rebuild so resizing can actually release that allocation; the next
+                # eager call rebuilds tables for the new bank addresses before graph capture.
+                scratch = getattr(self.moe_offload_cache, "exl3_scratch", None)
+                tables = getattr(scratch, "mgemm_tables", None)
+                if tables is not None:
+                    tables.clear()
             self.moe_offload_cache.rebuild(moe_cache_size)
         if num_pages is not None:
             # sets self.num_pages (rebuilds KV + window)
@@ -2363,10 +2373,16 @@ def _adjust_config(config: EngineConfig):
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
+    exl3_expert_op = getattr(config, "exl3_expert_op", "reconstruct")
+    if exl3_expert_op not in ("reconstruct", "mgemm"):
+        raise ValueError(
+            "--exl3-expert-op must be 'reconstruct' or 'mgemm', "
+            f"got {exl3_expert_op!r}"
+        )
 
     if is_moe and expert_quant == "exl3":
-        # The reconstruct-first operation remains card-only, while the reviewed EXL3
-        # provider may keep selected complete layers in device banks. Reject CPU/hybrid/fused
+        # Both EXL3 operations remain card-only, while the reviewed EXL3 provider may keep
+        # selected complete layers in device banks. Reject CPU/hybrid/fused
         # choices before the loader allocates the large host banks; the later owned-layer
         # validator handles the provider whitelist and any CPU-layer overlap.
         if config.moe_backend in ("cpu", "hybrid"):
@@ -2431,7 +2447,7 @@ def _adjust_config(config: EngineConfig):
             or (config.cuda_graph_max_bs == 0 and config.cuda_graph_bs is not None)
         ):
             raise ValueError(
-                "EXL3 reconstruct-first expert proof requires CUDA graphs to be disabled; "
+                "EXL3 expert operation requires CUDA graphs to be disabled for this configuration; "
                 "pass --cuda-graph-max-bs 0."
             )
         if graph_safe and config.cuda_graph_max_bs is None:

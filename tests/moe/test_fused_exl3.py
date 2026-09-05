@@ -1,12 +1,21 @@
-"""CPU-safe reconstruct-first EXL3 operation tests with mocked card seams."""
+"""EXL3 operation tests with mocked CPU seams and optional card agreement checks."""
 
 from __future__ import annotations
+
+import json
+import os
+from collections import defaultdict
+from pathlib import Path
 
 import pytest
 import torch
 
 
 H = I = 128
+cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+REAL_MODEL_PATH = Path(
+    os.environ.get("FREETOKEN_GLM53_EXL3_MODEL", r"D:\Models\GLM-5.3-Flash-exl3-2.05bpw")
+)
 
 
 def _banks(num_experts: int = 10):
@@ -31,6 +40,37 @@ def _banks(num_experts: int = 10):
         down_trellis,
         factors(I, 401),
         factors(H, 501),
+    )
+
+
+def _mgemm_banks(num_experts: int = 8):
+    torch.manual_seed(19)
+    gate_up_trellis = torch.randint(
+        -32768,
+        32767,
+        (num_experts, H // 16, I // 16, 32),
+        dtype=torch.int16,
+    ).contiguous()
+    down_trellis = torch.randint(
+        -32768,
+        32767,
+        (num_experts, I // 16, H // 16, 32),
+        dtype=torch.int16,
+    ).contiguous()
+
+    def factor(width: int):
+        return torch.rand((num_experts, width), dtype=torch.float16).contiguous()
+
+    return (
+        gate_up_trellis,
+        factor(H),
+        factor(I),
+        gate_up_trellis.clone(),
+        factor(H),
+        factor(I),
+        down_trellis,
+        factor(I),
+        factor(H),
     )
 
 
@@ -119,6 +159,51 @@ def _matrices(num_experts: int):
         down = torch.eye(H) * float(401 + expert)
         matrices.append((torch.cat((gate, up), dim=0), down))
     return banks, matrices
+
+
+def _load_real_banks(model_path: Path, *, experts: int = 8):
+    from safetensors import safe_open
+
+    with (model_path / "model.safetensors.index.json").open(encoding="utf-8") as fh:
+        weight_map = json.load(fh)["weight_map"]
+
+    names = {
+        projection: {
+            kind: [
+                f"model.language_model.layers.3.mlp.experts.{expert}."
+                f"{projection}_proj.{kind}"
+                for expert in range(experts)
+            ]
+            for kind in ("trellis", "suh", "svh")
+        }
+        for projection in ("gate", "up", "down")
+    }
+    by_shard: dict[str, list[str]] = defaultdict(list)
+    for projection in names.values():
+        for records in projection.values():
+            for name in records:
+                by_shard[weight_map[name]].append(name)
+
+    loaded: dict[str, torch.Tensor] = {}
+    for shard, shard_names in by_shard.items():
+        with safe_open(str(model_path / shard), framework="pt", device="cpu") as reader:
+            for name in shard_names:
+                loaded[name] = reader.get_tensor(name).contiguous()
+
+    return tuple(
+        torch.stack(
+            [
+                loaded[
+                    f"model.language_model.layers.3.mlp.experts.{expert}."
+                    f"{projection}_proj.{kind}"
+                ]
+                for expert in range(experts)
+            ],
+            dim=0,
+        )
+        for projection in ("gate", "up", "down")
+        for kind in ("trellis", "suh", "svh")
+    )
 
 
 def test_prepare_scratch_uses_fixed_contiguous_buffers():
@@ -315,3 +400,236 @@ def test_graph_decode_reuses_fixed_workspace_without_host_reads_or_allocations(m
 
     torch.testing.assert_close(second, first)
     assert second.data_ptr() == scratch.output_accumulator.data_ptr()
+
+
+@cuda
+def test_packed_wrapper_matches_reconstruct_first_on_synthetic_banks():
+    """The fused module must preserve the complete GLM operation, not only one projection."""
+    pytest.importorskip("exllamav3_ext")
+    from freetoken.moe.fused_exl3 import fused_experts_exl3, prepare_exl3_scratch
+
+    device = torch.device("cuda")
+    banks = tuple(bank.to(device=device) for bank in _mgemm_banks(8))
+    hidden = torch.randn((2, H), dtype=torch.bfloat16, device=device)
+    ids = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32, device=device)
+    weights = torch.tensor(
+        [[0.10, 0.20, 0.30, 0.40], [0.40, 0.30, 0.20, 0.10]],
+        dtype=torch.float32,
+        device=device,
+    )
+    scratch = prepare_exl3_scratch(
+        device=device,
+        hidden_size=H,
+        intermediate_size=I,
+        max_tokens=8,
+        chunk_experts=8,
+        decode_max_tokens=2,
+        enable_mgemm=True,
+    )
+    kwargs = dict(
+        is_prefill=False,
+        activation="swiglu_clamp",
+        apply_router_weight_on_input=False,
+        swiglu_limit=10.0,
+        hidden_act_alpha=1.0,
+        scratch=scratch,
+        layer_id=0,
+    )
+    expected = fused_experts_exl3(
+        hidden, banks, weights, ids, expert_op="reconstruct", **kwargs
+    ).clone()
+    got = fused_experts_exl3(hidden, banks, weights, ids, expert_op="mgemm", **kwargs)
+    torch.testing.assert_close(got.float(), expected.float(), rtol=5e-2, atol=0.5)
+
+
+@pytest.mark.needs_weights
+@pytest.mark.slow
+@cuda
+def test_real_checkpoint_packed_full_operation_agrees_for_decode_and_grouped_prompt(
+    monkeypatch,
+):
+    """Compare the complete packed operation with reconstruct-first on real GLM rows."""
+    pytest.importorskip("exllamav3_ext")
+    if not REAL_MODEL_PATH.is_dir():
+        pytest.skip(f"checkpoint is not present: {REAL_MODEL_PATH}")
+
+    from freetoken.moe.fused_exl3 import fused_experts_exl3, prepare_exl3_scratch
+
+    device = torch.device("cuda")
+    cpu_banks = _load_real_banks(REAL_MODEL_PATH)
+    banks = tuple(bank.to(device=device) for bank in cpu_banks)
+    hidden_size = int(banks[0].shape[1] * 16)
+    intermediate_size = int(banks[0].shape[2] * 16)
+    scratch = prepare_exl3_scratch(
+        device=device,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        max_tokens=256,
+        chunk_experts=8,
+        decode_max_tokens=1,
+        enable_mgemm=True,
+    )
+
+    def run(hidden, weights, ids, *, is_prefill, expert_op):
+        return fused_experts_exl3(
+            hidden,
+            banks,
+            weights,
+            ids,
+            is_prefill=is_prefill,
+            activation="swiglu_clamp",
+            apply_router_weight_on_input=False,
+            swiglu_limit=10.0,
+            hidden_act_alpha=1.0,
+            scratch=scratch,
+            expert_op=expert_op,
+            layer_id=3,
+        )
+
+    decode_hidden = torch.randn((1, hidden_size), dtype=torch.bfloat16, device=device)
+    decode_ids = torch.arange(8, dtype=torch.int32, device=device).view(1, 8)
+    decode_weights = torch.tensor(
+        [[0.03, 0.07, 0.11, 0.15, 0.18, 0.19, 0.17, 0.10]],
+        dtype=torch.float32,
+        device=device,
+    )
+    decode_expected = run(
+        decode_hidden,
+        decode_weights,
+        decode_ids,
+        is_prefill=False,
+        expert_op="reconstruct",
+    ).clone()
+    decode_got = run(
+        decode_hidden,
+        decode_weights,
+        decode_ids,
+        is_prefill=False,
+        expert_op="mgemm",
+    ).clone()
+    torch.testing.assert_close(
+        decode_got.float(), decode_expected.float(), rtol=5e-2, atol=0.5
+    )
+
+    # One expert is deliberately repeated for 129 rows. Grouping keeps each packed call at one
+    # expert index while the wrapper tiles the group to 128 rows, proving this is not a row cap.
+    prompt_rows = 129
+    prompt_hidden = torch.randn(
+        (prompt_rows, hidden_size), dtype=torch.bfloat16, device=device
+    )
+    prompt_ids = torch.zeros((prompt_rows, 1), dtype=torch.int32, device=device)
+    prompt_weights = torch.ones((prompt_rows, 1), dtype=torch.float32, device=device)
+    prompt_expected = run(
+        prompt_hidden,
+        prompt_weights,
+        prompt_ids,
+        is_prefill=True,
+        expert_op="reconstruct",
+    ).clone()
+    prompt_got = run(
+        prompt_hidden,
+        prompt_weights,
+        prompt_ids,
+        is_prefill=True,
+        expert_op="mgemm",
+    ).clone()
+    torch.testing.assert_close(
+        prompt_got.float(), prompt_expected.float(), rtol=5e-2, atol=0.5
+    )
+
+    # Pointer tables and every full-operation tensor are now warm. These guards catch a regression
+    # that moves the old torch.cat/torch.empty/host-routing work back into graph replay.
+    warm_decode = run(
+        decode_hidden,
+        decode_weights,
+        decode_ids,
+        is_prefill=False,
+        expert_op="mgemm",
+    ).clone()
+
+    def fail(*args, **kwargs):
+        raise AssertionError("packed decode allocated or read routing data on the host")
+
+    monkeypatch.setattr(torch.Tensor, "cpu", fail)
+    monkeypatch.setattr(torch.Tensor, "tolist", fail)
+    monkeypatch.setattr(torch, "empty", fail)
+    monkeypatch.setattr(torch, "tensor", fail)
+    monkeypatch.setattr(torch, "cat", fail)
+    replay = run(
+        decode_hidden,
+        decode_weights,
+        decode_ids,
+        is_prefill=False,
+        expert_op="mgemm",
+    )
+    assert torch.equal(replay, warm_decode)
+    assert replay.data_ptr() == scratch.output_accumulator.data_ptr()
+
+
+def test_packed_decode_falls_back_once_at_the_route_index_limit(monkeypatch):
+    """The real wrapper limit must choose reconstruct-first and emit one warning per shape."""
+    fused_exl3 = _install_mocks(monkeypatch)
+    from freetoken.kernel.exl3_mgemm import Exl3MgemmBanks
+
+    banks, _ = _matrices(10)
+    # Construct only the table shell: fused_experts_exl3_mgemm checks the route limit before it
+    # needs CUDA or an extension, so this remains a CPU-side fallback test.
+    tables = Exl3MgemmBanks(
+        tuple(banks),
+        tuple(torch.empty(10, dtype=torch.int64) for _ in range(9)),
+        k=2,
+    )
+    monkeypatch.setattr(
+        fused_exl3,
+        "_mgemm_tables_for_views",
+        lambda scratch, views: tables,
+    )
+    fused_exl3._MGEMM_FALLBACKS.clear()
+    warnings = []
+    monkeypatch.setattr(
+        fused_exl3.logger,
+        "warning_rank0",
+        lambda *args, **kwargs: warnings.append((args, kwargs)),
+    )
+
+    rows = 129  # top_k=1 => 129 route indices, one past the wheel's 128-entry limit.
+    hidden = torch.randn((rows, H), dtype=torch.bfloat16)
+    weights = torch.ones((rows, 1), dtype=torch.float32)
+    ids = torch.zeros((rows, 1), dtype=torch.int32)
+    scratch = fused_exl3.prepare_exl3_scratch(
+        device="cpu", hidden_size=H, intermediate_size=I, max_tokens=rows, chunk_experts=8
+    )
+
+    first = fused_exl3.fused_experts_exl3(
+        hidden,
+        banks,
+        weights,
+        ids,
+        is_prefill=False,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        swiglu_limit=None,
+        hidden_act_alpha=1.0,
+        scratch=scratch,
+        expert_op="mgemm",
+        layer_id=991,
+    ).clone()
+    second = fused_exl3.fused_experts_exl3(
+        hidden,
+        banks,
+        weights,
+        ids,
+        is_prefill=False,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        swiglu_limit=None,
+        hidden_act_alpha=1.0,
+        scratch=scratch,
+        expert_op="mgemm",
+        layer_id=991,
+    )
+
+    assert torch.equal(second, first)
+    assert torch.count_nonzero(first) > 0
+    assert len(warnings) == 1
+    assert "falling back" in warnings[0][0][0]

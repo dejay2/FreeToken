@@ -1,19 +1,24 @@
-"""Reconstruct-first EXL3 routed-expert operation.
+"""EXL3 routed-expert operations.
 
-This proof keeps the compressed EXL3 rows in the slot cache, rebuilds at most eight
-selected experts into BF16 scratch banks, and reuses FreeToken's ordinary BF16 grouped
-MoE operations. It is intentionally a correctness path, not the later fused EXL3 kernel.
+The default reconstruct-first path keeps the compressed rows in the slot cache, rebuilds at most
+8 selected experts into BF16 scratch banks, and reuses FreeToken's ordinary BF16 grouped
+MoE operations.  The opt-in packed path calls ExLlamaV3's ``exl3_mgemm`` three times and falls
+back to reconstruction when its compiled shape or route limits do not cover a call.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
 from freetoken.kernel import exl3 as _exl3_kernel
+from freetoken.kernel.exl3_mgemm import EXL3_MGEMM_MAX_INDICES
 from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl
+from freetoken.utils import init_logger
 
+
+logger = init_logger(__name__)
 
 _MAX_TOP_K = 64
 _MAX_RECONSTRUCT_EXPERTS = 8
@@ -54,6 +59,15 @@ class Exl3Scratch:
     decode_intermediate_cache2: torch.Tensor
     decode_intermediate_cache3: torch.Tensor
     decode_output: torch.Tensor
+    # Packed EXL3 state is optional so the default reconstruct-first boot pays no extra VRAM.
+    mgemm_decode_scratch: object | None = None
+    mgemm_prefill_scratch: object | None = None
+    # Values hold the source bank tensors, keeping pointer tables valid until the cache is
+    # rebuilt.  The key is based on data pointers/shape, so each cache or overlap buffer gets one.
+    mgemm_tables: dict[tuple, object] = field(default_factory=dict)
+    # Static wheel/shape failures are decided during eager warm-up and skip packed attempts during
+    # graph capture and later calls. Route-list capacity failures remain per-call fallbacks.
+    mgemm_disabled: bool = False
 
 
 def prepare_exl3_scratch(
@@ -64,8 +78,9 @@ def prepare_exl3_scratch(
     max_tokens=8192,
     chunk_experts=_MAX_RECONSTRUCT_EXPERTS,
     decode_max_tokens=1,
+    enable_mgemm=False,
 ) -> Exl3Scratch:
-    """Allocate the one reusable reconstruct-first workspace.
+    """Allocate the one reusable EXL3 workspace.
 
     The large buffers are allocated once, before graph setup. Route storage is one
     contiguous one-dimensional allocation so each call can take a contiguous ``[M, top_k]``
@@ -112,7 +127,7 @@ def prepare_exl3_scratch(
         torch.empty((chunk_experts, intermediate_size), dtype=torch.float16, device=device),
         torch.empty((chunk_experts, hidden_size), dtype=torch.float16, device=device),
     )
-    return Exl3Scratch(
+    scratch = Exl3Scratch(
         device=device,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -179,6 +194,26 @@ def prepare_exl3_scratch(
             (decode_max_tokens, hidden_size), dtype=torch.bfloat16, device=device
         ),
     )
+    if enable_mgemm and device.type == "cuda":
+        # The packed route form is capped at 128 indices.  Keep both phase arenas bounded at
+        # that size; prompt groups tile here even though the kernel itself has no size-M ceiling.
+        from freetoken.kernel.exl3_mgemm import prepare_exl3_mgemm_scratch
+
+        max_features = max(hidden_size, intermediate_size)
+        mgemm_rows = EXL3_MGEMM_MAX_INDICES
+        scratch.mgemm_decode_scratch = prepare_exl3_mgemm_scratch(
+            device=device,
+            max_rows=mgemm_rows,
+            max_features=max_features,
+            preallocate_fused=True,
+        )
+        scratch.mgemm_prefill_scratch = prepare_exl3_mgemm_scratch(
+            device=device,
+            max_rows=mgemm_rows,
+            max_features=max_features,
+            preallocate_fused=True,
+        )
+    return scratch
 
 
 def require_exl3_gpu_only(*, device, decode_target="gpu") -> None:
@@ -526,6 +561,132 @@ def _run_bf16_experts(
     return fn(hidden_states, gate_up, down, topk_weights, topk_ids, **kwargs)
 
 
+_MGEMM_FALLBACKS: set[tuple] = set()
+
+
+def _mgemm_tables_for_views(scratch: Exl3Scratch, banks: tuple[torch.Tensor, ...]):
+    """Build one packed pointer table for each distinct cache/overlap bank allocation."""
+    key = tuple(
+        (int(bank.data_ptr()), tuple(bank.shape), tuple(bank.stride()), str(bank.dtype))
+        for bank in banks
+    )
+    tables = scratch.mgemm_tables.get(key)
+    if tables is None:
+        from freetoken.kernel.exl3_mgemm import Exl3MgemmBanks
+
+        tables = Exl3MgemmBanks.from_banks(banks)
+        scratch.mgemm_tables[key] = tables
+    return tables
+
+
+def _log_mgemm_fallback(
+    *, layer_id: int | None, is_prefill: bool, scratch: Exl3Scratch, reason: Exception
+) -> None:
+    """Report one packed-kernel fallback per layer/phase/compiled matrix shape."""
+    key = (
+        layer_id,
+        "prefill" if is_prefill else "decode",
+        scratch.hidden_size,
+        scratch.intermediate_size,
+    )
+    if key in _MGEMM_FALLBACKS:
+        return
+    _MGEMM_FALLBACKS.add(key)
+    logger.warning_rank0(
+        "EXL3 packed expert op falling back to reconstruct-first for layer %s (%s, H=%d, I=%d): %s",
+        layer_id,
+        "prefill" if is_prefill else "decode",
+        scratch.hidden_size,
+        scratch.intermediate_size,
+        reason,
+    )
+
+
+def _run_mgemm_prefill(
+    hidden_states: torch.Tensor,
+    tables,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    activation: str,
+    apply_router_weight_on_input: bool,
+    hidden_act_alpha: float,
+    swiglu_limit: float | None,
+    scratch: Exl3Scratch,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Run prompt routes grouped by expert, tiling each group to the fixed wrapper workspace."""
+    from freetoken.kernel.exl3_mgemm import exl3_mgemm_projection
+
+    packed_scratch = scratch.mgemm_prefill_scratch
+    tile_rows = EXL3_MGEMM_MAX_INDICES
+    if packed_scratch is not None:
+        tile_rows = min(tile_rows, int(packed_scratch.max_rows))
+    if tile_rows <= 0:
+        raise ValueError("EXL3 packed prompt workspace must have positive row capacity")
+
+    out.zero_()
+    for expert in _unique_routed_slots(topk_ids, tables.slot_count):
+        mask = topk_ids == expert
+        token_indices, _route_indices = torch.where(mask)
+        route_weights = topk_weights[mask]
+        for start in range(0, token_indices.numel(), tile_rows):
+            stop = min(start + tile_rows, token_indices.numel())
+            indices = token_indices[start:stop]
+            weights = route_weights[start:stop]
+            group_hidden = hidden_states.index_select(0, indices)
+            if packed_scratch is not None and packed_scratch.group_id_i64 is not None:
+                group_id = packed_scratch.group_id_i64
+                group_id.fill_(expert)
+            else:
+                group_id = torch.tensor(
+                    [expert], dtype=torch.int64, device=hidden_states.device
+                )
+            gate = exl3_mgemm_projection(
+                group_hidden,
+                tables,
+                group_id,
+                projection="gate",
+                scratch=packed_scratch,
+            )
+            up = exl3_mgemm_projection(
+                group_hidden,
+                tables,
+                group_id,
+                projection="up",
+                scratch=packed_scratch,
+            )
+            gate_up = torch.cat((gate, up), dim=-1)
+            if activation == "swiglu_clamp":
+                from freetoken.layers import swiglu_clamp_and_mul
+
+                activated = swiglu_clamp_and_mul(
+                    gate_up,
+                    alpha=float(hidden_act_alpha),
+                    limit=10.0 if swiglu_limit is None else float(swiglu_limit),
+                )
+            elif activation == "silu":
+                from freetoken.layers import silu_and_mul
+
+                activated = silu_and_mul(gate_up)
+            else:
+                raise ValueError(f"unsupported EXL3 mgemm activation {activation!r}")
+
+            if apply_router_weight_on_input:
+                activated = activated * weights.to(dtype=activated.dtype).unsqueeze(1)
+            down = exl3_mgemm_projection(
+                activated,
+                tables,
+                group_id,
+                projection="down",
+                scratch=packed_scratch,
+            )
+            if not apply_router_weight_on_input:
+                down = down * weights.to(dtype=down.dtype).unsqueeze(1)
+            out.index_add_(0, indices, down)
+    return out
+
+
 def fused_experts_exl3(
     hidden_states: torch.Tensor,
     banks,
@@ -538,12 +699,15 @@ def fused_experts_exl3(
     swiglu_limit: float | None,
     hidden_act_alpha: float,
     scratch: Exl3Scratch,
+    expert_op: str = "reconstruct",
+    layer_id: int | None = None,
 ) -> torch.Tensor:
-    """Reconstruct routed EXL3 experts, then run the BF16 grouped path.
+    """Run routed EXL3 experts with packed ``exl3_mgemm`` or reconstruct-first fallback.
 
     Decode uses one fixed-size route chunk, device-side routing compaction, stable bank staging,
-    and a caller-owned BF16 activation workspace.  Prefill keeps the eager multi-chunk path:
-    its variable prompt width is not part of CUDA graph capture.
+    and a caller-owned BF16 activation workspace.  Prefill uses the packed grouped-by-expert
+    form in bounded tiles; both phases fall back to reconstruction when the packed wheel cannot
+    serve the requested compiled shape or route capacity.
     """
     if not isinstance(scratch, Exl3Scratch):
         raise ValueError("fused_experts_exl3 requires an Exl3Scratch workspace")
@@ -595,9 +759,69 @@ def fused_experts_exl3(
         intermediate_size=scratch.intermediate_size,
         device=hidden_states.device,
     )
-    input_buffer = scratch.input_buffer[:rows]
+    if expert_op not in {"reconstruct", "mgemm"}:
+        raise ValueError(
+            f"unsupported EXL3 expert operation {expert_op!r}; use 'reconstruct' or 'mgemm'"
+        )
     output = scratch.output_accumulator[:rows]
     output.zero_()
+    if expert_op == "mgemm" and not scratch.mgemm_disabled:
+        from freetoken.kernel.exl3_mgemm import (
+            Exl3MgemmLimitError,
+            fused_experts_exl3_mgemm,
+        )
+
+        try:
+            tables = _mgemm_tables_for_views(scratch, banks)
+            packed_scratch = (
+                scratch.mgemm_prefill_scratch if is_prefill else scratch.mgemm_decode_scratch
+            )
+            if is_prefill:
+                return _run_mgemm_prefill(
+                    hidden_states,
+                    tables,
+                    topk_weights,
+                    topk_ids,
+                    activation=activation,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    hidden_act_alpha=hidden_act_alpha,
+                    swiglu_limit=swiglu_limit,
+                    scratch=scratch,
+                    out=output,
+                )
+            return fused_experts_exl3_mgemm(
+                hidden_states,
+                tables,
+                topk_weights,
+                topk_ids,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                hidden_act_alpha=hidden_act_alpha,
+                swiglu_limit=swiglu_limit,
+                scratch=packed_scratch,
+                out=output,
+            )
+        except Exl3MgemmLimitError as exc:
+            # A compiled-shape miss is static for this model and must be decided during eager
+            # warm-up; a route-list overflow is dynamic and remains a per-call fallback.
+            if "has no compiled shape" in str(exc):
+                scratch.mgemm_disabled = True
+            _log_mgemm_fallback(
+                layer_id=layer_id, is_prefill=is_prefill, scratch=scratch, reason=exc
+            )
+            output.zero_()
+        except RuntimeError as exc:
+            # A missing optional wheel is a normal static fallback; do not hide unrelated CUDA or
+            # shape failures, which should still stop boot rather than silently change math.
+            if "needs the ExLlamaV3" not in str(exc):
+                raise
+            scratch.mgemm_disabled = True
+            _log_mgemm_fallback(
+                layer_id=layer_id, is_prefill=is_prefill, scratch=scratch, reason=exc
+            )
+            output.zero_()
+
+    input_buffer = scratch.input_buffer[:rows]
     # The BF16 prompt path overwrites its input. Copying once for decode too gives both
     # phases a contiguous fixed-address input and keeps the caller's tensor untouched.
     input_buffer.copy_(hidden_states)

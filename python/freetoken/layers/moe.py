@@ -943,9 +943,8 @@ class OffloadMoELayer(MoELayer):
     ) -> torch.Tensor:
         fmt = cache.quant_format
         if fmt == "exl3":
-            # Reconstruct-first EXL3 is a card-only proof path. Graphs stay disabled by
-            # the proof command because it reads the sorted route set on the host and the
-            # ordinary BF16 operation owns temporary activation buffers.
+            # EXL3 is card-only.  The selected packed operation is fixed at boot; its decode
+            # fallback is resolved on the eager warm-up before any CUDA graph is captured.
             from freetoken.moe.fused_exl3 import (
                 fused_experts_exl3,
                 require_exl3_gpu_only,
@@ -973,6 +972,8 @@ class OffloadMoELayer(MoELayer):
                 swiglu_limit=getattr(self, "swiglu_limit", None),
                 hidden_act_alpha=getattr(self, "hidden_act_alpha", 1.0),
                 scratch=scratch,
+                expert_op=getattr(cache, "exl3_expert_op", "reconstruct"),
+                layer_id=getattr(self, "layer_id", None),
             )
         if fmt in ("nvfp4_marlin", "nvfp4_b12x"):
             # Borrowed W4A16 fused MoE -- Marlin (vLLM, sm_80-99) or b12x

@@ -207,6 +207,34 @@ def test_route_reduction_matches_reconstruct_first_for_glm_activation(dtype):
     torch.testing.assert_close(got.float(), expected.float(), rtol=5e-2, atol=0.5)
 
 
+@cuda
+@pytest.mark.parametrize("apply_router_weight_on_input", (False, True))
+def test_preallocated_full_operation_matches_legacy_workspace(
+    apply_router_weight_on_input,
+):
+    """The graph-sized fixed buffers must preserve both router-weight placements."""
+    device = torch.device("cuda")
+    banks = Exl3MgemmBanks.from_banks(_synthetic_banks(device))
+    hidden = torch.randn((2, _H), dtype=torch.bfloat16, device=device)
+    ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32, device=device)
+    weights = torch.tensor([[0.25, 0.75], [0.6, 0.4]], dtype=torch.float32, device=device)
+    fixed = prepare_exl3_mgemm_scratch(
+        device=device, max_rows=EXL3_MGEMM_MAX_INDICES, max_features=_I,
+        preallocate_fused=True,
+    )
+    legacy = prepare_exl3_mgemm_scratch(device=device, max_rows=4, max_features=_I)
+
+    kwargs = dict(
+        activation="swiglu_clamp",
+        hidden_act_alpha=1.0,
+        swiglu_limit=10.0,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    got = fused_experts_exl3_mgemm(hidden, banks, weights, ids, scratch=fixed, **kwargs)
+    expected = fused_experts_exl3_mgemm(hidden, banks, weights, ids, scratch=legacy, **kwargs)
+    torch.testing.assert_close(got.float(), expected.float(), rtol=5e-2, atol=0.5)
+
+
 def _load_real_banks(model_path: Path, *, experts: int = _E):
     from safetensors import safe_open
 

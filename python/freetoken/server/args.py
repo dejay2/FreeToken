@@ -572,6 +572,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--exl3-expert-op",
+        default=os.getenv("FREETOKEN_EXL3_EXPERT_OP", ServerArgs.exl3_expert_op),
+        choices=["reconstruct", "mgemm"],
+        help=(
+            "EXL3 routed-expert operation: reconstruct (default, rebuilds BF16 rows) or "
+            "mgemm (uses the optional packed ExLlamaV3 kernel and falls back when its "
+            "shape/route limits do not cover a call)."
+        ),
+    )
+
+    parser.add_argument(
         "--expert-load",
         default=ServerArgs.expert_load,
         choices=["auto", "serial", "parallel"],

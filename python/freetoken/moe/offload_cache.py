@@ -145,6 +145,9 @@ class OffloadMoeCache:
     # prefill). The format names its bank layout (_BANK_SCHEMAS) and which kernels
     # may read the banks; the cache machinery itself is layout-agnostic.
     quant_format: str = "bf16"
+    # EXL3 routed-expert operation. The packed path is opt-in and reconstruct-first remains the
+    # default until its live speed/quality result is accepted.
+    exl3_expert_op: str = "reconstruct"
     # Decode mode + bank layout; per-layer CPU routing is cpu_layer_ids. "gpu":
     # GPU-tiled banks, all decode on GPU (stream misses over PCIe into the slot
     # cache, GEMM on GPU). "cpu": native (CPU-readable) banks + a CPU executor;
@@ -171,6 +174,7 @@ class OffloadMoeCache:
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
         assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
+        assert self.exl3_expert_op in ("reconstruct", "mgemm"), self.exl3_expert_op
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None

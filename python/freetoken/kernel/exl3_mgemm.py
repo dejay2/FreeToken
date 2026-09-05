@@ -98,10 +98,27 @@ class Exl3MgemmScratch:
     output_fp16: torch.Tensor
     gate_output_fp16: torch.Tensor
     up_output_fp16: torch.Tensor
+    # Optional fixed-shape buffers for the complete routed operation.  They are allocated only
+    # for the graph-enabled EXL3 path; projection-only callers keep the smaller legacy scratch.
+    route_ids_i64: torch.Tensor | None = None
+    route_weights_fp16: torch.Tensor | None = None
+    route_weights_bf16: torch.Tensor | None = None
+    route_hidden_bf16: torch.Tensor | None = None
+    gate_up_bf16: torch.Tensor | None = None
+    activated_bf16: torch.Tensor | None = None
+    down_output_bf16: torch.Tensor | None = None
+    group_id_i64: torch.Tensor | None = None
 
 
-def prepare_exl3_mgemm_scratch(*, device, max_rows: int, max_features: int) -> Exl3MgemmScratch:
-    """Allocate reusable FP16 input, Hadamard, and output storage."""
+def prepare_exl3_mgemm_scratch(
+    *, device, max_rows: int, max_features: int, preallocate_fused: bool = False
+) -> Exl3MgemmScratch:
+    """Allocate reusable FP16 input, Hadamard, and output storage.
+
+    ``preallocate_fused`` adds the fixed-shape route and BF16 activation buffers used by the
+    graph-safe full MoE operation.  Projection-only callers leave it false to avoid paying for
+    buffers they do not use.
+    """
     device = torch.device(device)
     if device.type == "cuda" and device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
@@ -114,6 +131,30 @@ def prepare_exl3_mgemm_scratch(*, device, max_rows: int, max_features: int) -> E
             f"EXL3 mgemm scratch sizes must be positive, got rows={max_rows}, features={max_features}"
         )
     size = max_rows * max_features
+    fused_buffers = {}
+    if preallocate_fused:
+        # The engine's decode graph is BF16 and uses at most the wheel's 128 route entries.  Keep
+        # the route/activation arena bounded by that contract instead of scaling with a prompt.
+        fused_buffers = {
+            "route_ids_i64": torch.empty(max_rows, dtype=torch.int64, device=device),
+            "route_weights_fp16": torch.empty(max_rows, dtype=torch.float16, device=device),
+            "route_weights_bf16": torch.empty(max_rows, dtype=torch.bfloat16, device=device),
+            # Keep these as flat storage so a narrower model dimension can still be viewed as
+            # contiguous (e.g. GLM-5.3 has H=4096 and I=2048).
+            "route_hidden_bf16": torch.empty(
+                max_rows * max_features, dtype=torch.bfloat16, device=device
+            ),
+            "gate_up_bf16": torch.empty(
+                max_rows * 2 * max_features, dtype=torch.bfloat16, device=device
+            ),
+            "activated_bf16": torch.empty(
+                max_rows * max_features, dtype=torch.bfloat16, device=device
+            ),
+            "down_output_bf16": torch.empty(
+                max_rows * max_features, dtype=torch.bfloat16, device=device
+            ),
+            "group_id_i64": torch.empty(1, dtype=torch.int64, device=device),
+        }
     return Exl3MgemmScratch(
         device=device,
         max_rows=max_rows,
@@ -123,6 +164,7 @@ def prepare_exl3_mgemm_scratch(*, device, max_rows: int, max_features: int) -> E
         output_fp16=torch.empty(size, dtype=torch.float16, device=device),
         gate_output_fp16=torch.empty(size, dtype=torch.float16, device=device),
         up_output_fp16=torch.empty(size, dtype=torch.float16, device=device),
+        **fused_buffers,
     )
 
 
@@ -134,7 +176,7 @@ class Exl3MgemmBanks:
     tensors as fields also keeps the memory behind every pointer table alive.
     """
 
-    __slots__ = ("banks", "ptrs", "slot_count", "device", "k")
+    __slots__ = ("banks", "ptrs", "slot_count", "device", "k", "_shape_support")
 
     def __init__(self, banks: tuple[torch.Tensor, ...], ptrs: tuple[torch.Tensor, ...], *, k: int):
         self.banks = banks
@@ -142,6 +184,21 @@ class Exl3MgemmBanks:
         self.slot_count = int(banks[0].shape[0])
         self.device = banks[0].device
         self.k = int(k)
+        # Shape compatibility is static for a bank allocation. Cache the extension query here so
+        # decode does not ask the wheel about all compiled shapes for every projection call.
+        self._shape_support: dict[str, bool] = {}
+
+    def shape_supported(self, projection: Literal["gate", "up", "down"]) -> bool:
+        supported = self._shape_support.get(projection)
+        if supported is None:
+            _ptr_trellis, _ptr_suh, _ptr_svh, input_features, output_features = self.projection(
+                projection
+            )
+            supported = exl3_mgemm_shape_supported(
+                input_features, output_features, k=self.k
+            )
+            self._shape_support[projection] = bool(supported)
+        return supported
 
     @classmethod
     def from_banks(cls, banks: Sequence[torch.Tensor]) -> "Exl3MgemmBanks":
@@ -388,14 +445,16 @@ def _raw_mgemm(
         device=tables.device,
         output_storage=output_storage,
     )
-    input_buf.copy_(inputs.to(dtype=torch.float16))
+    # copy_ performs the BF16->FP16 cast in the destination without creating a temporary tensor;
+    # this is one of the per-call allocations that would otherwise break CUDA graph capture.
+    input_buf.copy_(inputs)
     a = input_buf.view(batch, rows_per_batch, input_features)
     a_had = had_buf.view(batch, rows_per_batch, input_features)
     c = output_buf.view(batch, rows_per_batch, output_features)
     indices = ids.view(1, -1)
 
     extension = _load_extension()
-    if not exl3_mgemm_shape_supported(input_features, output_features, k=tables.k):
+    if not tables.shape_supported(projection):
         raise Exl3MgemmLimitError(
             f"EXL3 mgemm has no compiled shape for K={tables.k}, "
             f"input={input_features}, output={output_features}"
@@ -527,6 +586,7 @@ def fused_experts_exl3_mgemm(
     hidden_act_alpha: float = 1.0,
     swiglu_limit: float | None = 10.0,
     scratch: Exl3MgemmScratch | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run gate, up, FreeToken activation, and weighted down on packed EXL3 rows.
 
@@ -573,6 +633,125 @@ def fused_experts_exl3_mgemm(
         raise ValueError(
             f"EXL3 mgemm scratch has {scratch.max_rows} rows, needs {route_count} route rows"
         )
+    if out is not None:
+        if not isinstance(out, torch.Tensor) or out.shape != (rows, hidden_states.shape[1]):
+            raise ValueError(
+                "EXL3 mgemm output must have shape "
+                f"[{rows}, {hidden_states.shape[1]}], got {getattr(out, 'shape', None)}"
+            )
+        if out.device != tables.device or out.dtype != hidden_states.dtype or not out.is_contiguous():
+            raise ValueError(
+                "EXL3 mgemm output must be contiguous and match the hidden-state device/dtype"
+            )
+
+    fixed_fused = (
+        scratch is not None
+        and hidden_states.dtype == torch.bfloat16
+        and scratch.route_ids_i64 is not None
+        and scratch.route_weights_fp16 is not None
+        and scratch.route_weights_bf16 is not None
+        and scratch.route_hidden_bf16 is not None
+        and scratch.gate_up_bf16 is not None
+        and scratch.activated_bf16 is not None
+        and scratch.down_output_bf16 is not None
+    )
+    if fixed_fused:
+        route_ids = scratch.route_ids_i64[:route_count]
+        route_ids.copy_(topk_ids.reshape(-1))
+        route_weights = scratch.route_weights_fp16[:route_count]
+        route_weights.copy_(topk_weights.reshape(-1))
+        route_weights_bf16 = scratch.route_weights_bf16[:route_count]
+        route_weights_bf16.copy_(route_weights)
+        hidden_size = int(hidden_states.shape[1])
+        route_hidden = scratch.route_hidden_bf16[: route_count * hidden_size].view(
+            route_count, hidden_size
+        )
+        route_hidden.view(rows, top_k, hidden_size).copy_(hidden_states.unsqueeze(1))
+
+        gate_fp16 = _route_mgemm(
+            route_hidden,
+            tables,
+            "gate",
+            route_ids,
+            weights=None,
+            num_tokens=1,
+            scratch=scratch,
+        )
+        up_fp16 = _route_mgemm(
+            route_hidden,
+            tables,
+            "up",
+            route_ids,
+            weights=None,
+            num_tokens=1,
+            scratch=scratch,
+        )
+        intermediate_size = int(gate_fp16.shape[-1])
+        gate_up = scratch.gate_up_bf16[: route_count * 2 * intermediate_size].view(
+            route_count, 2 * intermediate_size
+        )
+        gate_up[:, :intermediate_size].copy_(gate_fp16)
+        gate_up[:, intermediate_size:].copy_(up_fp16)
+        activated = scratch.activated_bf16[: route_count * intermediate_size].view(
+            route_count, intermediate_size
+        )
+        if activation == "swiglu_clamp":
+            from freetoken.layers import swiglu_clamp_and_mul
+
+            swiglu_clamp_and_mul(
+                gate_up,
+                activated,
+                alpha=float(hidden_act_alpha),
+                limit=10.0 if swiglu_limit is None else float(swiglu_limit),
+            )
+        elif activation == "silu":
+            from freetoken.layers import silu_and_mul
+
+            silu_and_mul(gate_up, activated)
+        else:
+            raise ValueError(f"unsupported EXL3 mgemm activation {activation!r}")
+
+        if apply_router_weight_on_input:
+            # Without extension weights, the route-list call returns one down row per route;
+            # reduce those rows ourselves after applying the router weights to the activation.
+            activated.mul_(route_weights_bf16.view(-1, 1))
+            down_fp16 = _route_mgemm(
+                activated,
+                tables,
+                "down",
+                route_ids,
+                weights=None,
+                num_tokens=1,
+                scratch=scratch,
+            )
+            down_width = int(down_fp16.shape[-1])
+            down = scratch.down_output_bf16[: route_count * down_width].view(
+                route_count, down_width
+            )
+            down.copy_(down_fp16)
+            result = out if out is not None else down.new_empty((rows, down_width))
+            torch.sum(down.view(rows, top_k, -1), dim=1, out=result)
+            return result
+
+        # Passing weights to the extension asks it to reduce each contiguous top-k route group;
+        # its result already has one row per token, not one row per route. Summing a route-shaped
+        # view here would repeat the reduced row top-k times and include stale scratch rows.
+        down_fp16 = _route_mgemm(
+            activated,
+            tables,
+            "down",
+            route_ids,
+            weights=route_weights,
+            num_tokens=rows,
+            scratch=scratch,
+        )
+        down_width = int(down_fp16.shape[-1])
+        down = scratch.down_output_bf16[: rows * down_width].view(rows, down_width)
+        down.copy_(down_fp16)
+        result = out if out is not None else down
+        if result is not down:
+            result.copy_(down)
+        return result
 
     route_ids = topk_ids.reshape(-1).to(dtype=torch.int64).contiguous()
     route_weights = topk_weights.reshape(-1).to(dtype=torch.float16).contiguous()
@@ -629,18 +808,22 @@ def fused_experts_exl3_mgemm(
             num_tokens=1,
             scratch=scratch,
         )
-        return down.view(rows, top_k, -1).sum(dim=1).to(dtype=hidden_states.dtype).clone()
-
-    down = _route_mgemm(
-        activated.reshape(route_count, -1).contiguous(),
-        tables,
-        "down",
-        route_ids,
-        weights=route_weights,
-        num_tokens=rows,
-        scratch=scratch,
-    )
-    return down.to(dtype=hidden_states.dtype).clone()
+        result = down.view(rows, top_k, -1).sum(dim=1).to(dtype=hidden_states.dtype)
+    else:
+        down = _route_mgemm(
+            activated.reshape(route_count, -1).contiguous(),
+            tables,
+            "down",
+            route_ids,
+            weights=route_weights,
+            num_tokens=rows,
+            scratch=scratch,
+        )
+        result = down.to(dtype=hidden_states.dtype)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result.clone()
 
 
 __all__ = [

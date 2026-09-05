@@ -171,6 +171,30 @@ def test_exl3_provider_is_registered_and_layer_dispatches_to_b2_operation(monkey
     assert called["require"] == {"device": hidden.device, "decode_target": "gpu"}
     assert called["operation"][1] is views
     assert called["operation"][4]["scratch"] is scratch
+    assert called["operation"][4]["expert_op"] == "reconstruct"
+    assert called["operation"][4]["layer_id"] is None
+
+
+def test_exl3_mgemm_operation_flag_is_validated_and_preserved():
+    from freetoken.engine.engine import _adjust_config
+
+    config = _config(
+        moe_backend="offload",
+        exl3_expert_op="mgemm",
+        cuda_graph_bs=None,
+        cuda_graph_max_bs=0,
+    )
+    _adjust_config(config)
+    assert config.exl3_expert_op == "mgemm"
+
+    invalid = _config(
+        moe_backend="offload",
+        exl3_expert_op="not-an-operation",
+        cuda_graph_bs=None,
+        cuda_graph_max_bs=0,
+    )
+    with pytest.raises(ValueError, match="exl3-expert-op"):
+        _adjust_config(invalid)
 
 
 def test_exl3_allows_the_single_safe_cuda_graph(monkeypatch):
