@@ -34,24 +34,24 @@ the first five. Two boots, three prompts each:
   ~1,600 decode steps the deeper layers still show 35-79 never-routed experts each out of 288;
   layers 0-2 have none.
 
-Cost of collecting (owned layers named per row; the lead's histogram-only row ran on the
-learned set, so the like-for-like pair is the reviewer's two boots at 391ace6):
+Cost of collecting. The owned-layer set is named per row because the two histogram-only boots
+ran on the learned set, so no pair below is a single-variable A/B of the histogram alone; the
+learned and fixed sets share four of five layers:
 
 | boot | owned layers | short | long-ctx | gen-300w tok/s | cold long-ctx prompt tok/s |
 |---|---|---:|---:|---:|---:|
-| learning off (`--disable-moe-learn-routing`) | `[0, 1, 2, 6, 7]` | 17.79 | 11.22 | 25.02 | 308.57 |
+| learning off (`--disable-moe-learn-routing`), 5fd2e1e | `[0, 1, 2, 6, 7]` | 17.79 | 11.22 | 25.02 | 308.57 |
 | learning on, 5fd2e1e (histogram + `collect_stats`) | `[0, 1, 2, 6, 7]` | 17.49 | **10.57** | 25.08 | 281.63 |
 | learning on, ee97c78 (histogram only) | `[0, 1, 2, 3, 7]` learned | 17.60 | 11.19 | 25.43 | 321.77 |
-| R3 reviewer, 391ace6, learning off | `[0, 1, 2, 6, 7]` | 17.79 | 11.22 | 25.02 | -- |
-| R3 reviewer, 391ace6, learning on (default) | `[0, 1, 2, 3, 7]` learned | 17.72 | 11.22 | 25.26 | 316.02 |
+| learning on, 391ace6 (histogram only), reviewer's boot | `[0, 1, 2, 3, 7]` learned | 17.72 | 11.22 | 25.26 | 316.02 |
 
 5fd2e1e armed the LRU miss counters, prefetch scoring and copy-row counters with the histogram
-(the way `--moe-collect-decode-freq` does): -6 % long-context decode. ee97c78 arms the histogram
-alone and the cost is gone: the reviewer's fresh boots put learning on and off at the same
-11.22 tok/s. The learned layer choice itself made no measurable difference on these three
-prompts (the two sets share four of five layers; layer 3 out-ranks layer 6 on breadth 211 vs
-188 of 288). Cold prefill varies 282-322 across boots on the same code, so single-boot cold
-numbers carry about +-10 %.
+(the way `--moe-collect-decode-freq` does): -6 % long-context decode against the learning-off
+boot. With the histogram alone (ee97c78 and later) two independent fresh boots sit at 11.19
+and 11.22, the learning-off figure, so the remaining cost is below the noise of this bench.
+The learned layer choice itself made no measurable difference on these three prompts (layer 3
+out-ranks layer 6 on breadth 211 vs 188 of 288). Cold prefill varies 282-322 across boots on
+the same code, so single-boot cold numbers carry about +-10 %.
 
 ## Ranking metric versus the measured Qwen order
 
