@@ -230,8 +230,10 @@ def test_preallocated_full_operation_matches_legacy_workspace(
         swiglu_limit=10.0,
         apply_router_weight_on_input=apply_router_weight_on_input,
     )
-    got = fused_experts_exl3_mgemm(hidden, banks, weights, ids, scratch=fixed, **kwargs)
     expected = fused_experts_exl3_mgemm(hidden, banks, weights, ids, scratch=legacy, **kwargs)
+    got = fused_experts_exl3_mgemm(hidden, banks, weights, ids, scratch=fixed, **kwargs)
+    # Reusing the fixed workspace must not overwrite a result returned by the first call.
+    fused_experts_exl3_mgemm(hidden + 1.0, banks, weights, ids, scratch=fixed, **kwargs)
     torch.testing.assert_close(got.float(), expected.float(), rtol=5e-2, atol=0.5)
 
 

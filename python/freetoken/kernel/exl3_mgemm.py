@@ -748,9 +748,9 @@ def fused_experts_exl3_mgemm(
         down_width = int(down_fp16.shape[-1])
         down = scratch.down_output_bf16[: rows * down_width].view(rows, down_width)
         down.copy_(down_fp16)
-        result = out if out is not None else down
-        if result is not down:
-            result.copy_(down)
+        # R4c measured 753.97 max-abs corruption when the next call overwrote this shared view.
+        result = out if out is not None else down.new_empty((rows, down_width))
+        result.copy_(down)
         return result
 
     route_ids = topk_ids.reshape(-1).to(dtype=torch.int64).contiguous()
