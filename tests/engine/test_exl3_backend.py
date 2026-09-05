@@ -124,6 +124,27 @@ def test_exl3_rejects_a_gpu_owned_cpu_layer_overlap():
         _validate_gpu_owned_layers(config, 42)
 
 
+def test_exl3_default_operation_is_mgemm_and_reconstruct_remains_explicit():
+    from freetoken.engine.engine import _adjust_config
+
+    default = _config(
+        moe_backend="offload",
+        cuda_graph_bs=None,
+        cuda_graph_max_bs=0,
+    )
+    _adjust_config(default)
+    assert default.exl3_expert_op == "mgemm"
+
+    reconstruct = _config(
+        moe_backend="offload",
+        exl3_expert_op="reconstruct",
+        cuda_graph_bs=None,
+        cuda_graph_max_bs=0,
+    )
+    _adjust_config(reconstruct)
+    assert reconstruct.exl3_expert_op == "reconstruct"
+
+
 def test_exl3_provider_is_registered_and_layer_dispatches_to_b2_operation(monkeypatch):
     from freetoken.moe.expert_banks import _PROVIDERS, _exl3_banks
     from freetoken.moe.fused_exl3 import fused_experts_exl3, require_exl3_gpu_only
@@ -153,7 +174,11 @@ def test_exl3_provider_is_registered_and_layer_dispatches_to_b2_operation(monkey
     hidden = torch.zeros((1, 128), dtype=torch.bfloat16)
     weights = torch.ones((1, 8), dtype=torch.float32)
     ids = torch.zeros((1, 8), dtype=torch.int32)
-    cache = SimpleNamespace(quant_format="exl3", decode_target="gpu")
+    cache = SimpleNamespace(
+        quant_format="exl3",
+        decode_target="gpu",
+        exl3_expert_op="reconstruct",
+    )
     views = tuple(torch.zeros(1) for _ in range(9))
 
     result = layer._expert_gemm(

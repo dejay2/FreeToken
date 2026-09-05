@@ -811,8 +811,10 @@ def fused_experts_exl3(
             )
             output.zero_()
         except RuntimeError as exc:
-            # A missing optional wheel is a normal static fallback; do not hide unrelated CUDA or
-            # shape failures, which should still stop boot rather than silently change math.
+            # A missing optional wheel is a normal static fallback: mgemm_disabled is sticky, so
+            # later calls use reconstruct. On this model kernel/exl3.py already hard-requires the
+            # same wheel while loading non-routed EXL3 weights, so weight loading fails first;
+            # do not hide unrelated CUDA or shape failures, which must still stop boot.
             if "needs the ExLlamaV3" not in str(exc):
                 raise
             scratch.mgemm_disabled = True

@@ -145,9 +145,10 @@ class OffloadMoeCache:
     # prefill). The format names its bank layout (_BANK_SCHEMAS) and which kernels
     # may read the banks; the cache machinery itself is layout-agnostic.
     quant_format: str = "bf16"
-    # EXL3 routed-expert operation. The packed path is opt-in and reconstruct-first remains the
-    # default until its live speed/quality result is accepted.
-    exl3_expert_op: str = "reconstruct"
+    # EXL3 routed-expert operation. The packed mgemm path is the accepted default: R4e measured
+    # decode 136.26 -> 35.43 ms/token and cold prefill 112.72 -> 238.83 prompt tok/s
+    # (2026-09-05); reconstruct remains the fallback.
+    exl3_expert_op: str = "mgemm"
     # Decode mode + bank layout; per-layer CPU routing is cpu_layer_ids. "gpu":
     # GPU-tiled banks, all decode on GPU (stream misses over PCIe into the slot
     # cache, GEMM on GPU). "cpu": native (CPU-readable) banks + a CPU executor;

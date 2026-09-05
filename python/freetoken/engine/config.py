@@ -325,9 +325,10 @@ class EngineConfig:
     moe_backend: str = "auto"
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
     nvfp4_backend: str = "triton"
-    # EXL3 routed-expert operation: reconstruct-first by default; the packed mgemm path is an
-    # opt-in until its live speed/quality result is accepted (--exl3-expert-op).
-    exl3_expert_op: str = "reconstruct"
+    # EXL3 routed-expert operation. The packed mgemm path is the accepted default: R4e measured
+    # decode 136.26 -> 35.43 ms/token and cold prefill 112.72 -> 238.83 prompt tok/s
+    # (2026-09-05); reconstruct remains the fallback (--exl3-expert-op).
+    exl3_expert_op: str = "mgemm"
     # PLE table backend: "disk" reads rows from the checkpoint files per fill via the Linux
     # io_uring row store (Linux-only); "mmap" demand-pages the safetensors table (the Windows
     # option); "pinned" preloads the whole table into page-locked host RAM.
