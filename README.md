@@ -59,6 +59,7 @@ For More details:
 ## This fork: Windows PLE-mmap, still-picture serving, and the MTP spike
 
 This fork (github.com/dejay2/FreeToken) tracks upstream FlashML-org/FreeToken and adds three features developed and tested on Windows 11 with an RTX 5090 for Qwen3.8-Flash-Next-NVFP4. The branch `mtp-upstream-merge` contains the upstream main branch plus this work.
+The fork is developed on a GPU-less Linux devbox and served from a Windows 11 / RTX 5090 PC running the engine inside WSL.
 
 ### Full-context and concurrency budget
 
