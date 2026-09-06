@@ -33,6 +33,16 @@ def test_validation_reports_bounds_and_choices():
     assert "GpuOwnedLayers" in by_field
 
 
+def test_validation_bounds_the_guess_depth():
+    def messages(settings):
+        return {item["field"]: item["message"] for item in validate_settings(settings)}
+
+    assert "exceeds maximum 5" in messages({"FREETOKEN_MTP_SPEC_DEPTH": 6})["FREETOKEN_MTP_SPEC_DEPTH"]
+    assert "below minimum 1" in messages({"FREETOKEN_MTP_SPEC_DEPTH": 0})["FREETOKEN_MTP_SPEC_DEPTH"]
+    assert "FREETOKEN_MTP_SPEC_DEPTH" in messages({"FREETOKEN_MTP_SPEC_DEPTH": "lots"})
+    assert validate_settings({"FREETOKEN_MTP_SPEC_DEPTH": "3"}) == []
+
+
 def test_validation_rejects_unknown_and_unsafe_paths():
     errors = validate_settings({"NotADial": 1, "ModelPath": "bad\x00path"})
     by_field = {item["field"]: item["message"] for item in errors}

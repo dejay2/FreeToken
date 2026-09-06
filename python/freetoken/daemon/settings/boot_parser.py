@@ -367,7 +367,17 @@ class BootFile:
         for dial in DIALS:
             if dial.source == "env":
                 assignment = document.env_assignments.get(dial.name)
-                values[dial.name] = assignment.value if assignment is not None else dial.default
+                if assignment is None:
+                    values[dial.name] = dial.default
+                elif dial.control == "toggle":
+                    values[dial.name] = assignment.value  # toggles stay as their "1"/"0" text
+                else:
+                    # An env amount (the guess depth) reads back as a number so the page can
+                    # round-trip it; unreadable text is kept as typed for the validator to report.
+                    try:
+                        values[dial.name] = canonical_value(dial, assignment.value)
+                    except (TypeError, ValueError, OverflowError):
+                        values[dial.name] = assignment.value
                 continue
             arg = active.get(dial.name)
             if arg is not None:

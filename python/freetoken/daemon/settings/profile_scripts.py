@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .boot_parser import _LAUNCHER_ORDER, _serialize_value
-from .dials import DIALS, DIAL_BY_NAME, ENV_DIALS, validate_settings
+from .dials import DIALS, DIAL_BY_NAME, ENV_DIALS, canonical_value, validate_settings
 
 
 _DEFAULT_LAUNCHER = r"..\scripts\start-freetoken-windows.ps1"
@@ -72,7 +72,10 @@ def render_boot_script(
     for dial in DIALS:
         if dial.source != "env" or dial.name not in ENV_DIALS:
             continue
-        lines.append(f"$env:{dial.name} = '{_single_quote(_env_text(_setting(settings, dial.name)))}'")
+        value = _setting(settings, dial.name)
+        # Toggles render as 1/0; an env amount (the guess depth) keeps its number.
+        text = _env_text(value) if dial.control == "toggle" else str(canonical_value(dial, value))
+        lines.append(f"$env:{dial.name} = '{_single_quote(text)}'")
 
     launcher = _single_quote(str(launcher_relative))
     lines.extend(["", f"$launcher = Join-Path $PSScriptRoot '{launcher}'", "", "& $launcher `"])

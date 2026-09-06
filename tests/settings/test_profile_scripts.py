@@ -46,6 +46,7 @@ def _qwen_settings() -> dict[str, object]:
         "FREETOKEN_MTP_RESIDENT": "0",
         "FREETOKEN_MTP_SHADOW": "0",
         "FREETOKEN_MTP_SPEC_GRAPH": "0",
+        "FREETOKEN_MTP_SPEC_DEPTH": 3,
     }
 
 
@@ -83,6 +84,7 @@ def _dense_settings() -> dict[str, object]:
         "FREETOKEN_MTP_RESIDENT": "0",
         "FREETOKEN_MTP_SHADOW": "0",
         "FREETOKEN_MTP_SPEC_GRAPH": "0",
+        "FREETOKEN_MTP_SPEC_DEPTH": 5,
     }
 
 
@@ -93,6 +95,7 @@ def test_qwen_profile_script_round_trips_through_boot_parser(tmp_path: Path) -> 
     assert BootFile(path).load() == _qwen_settings()
     assert "-EnableVision `" in path.read_text(encoding="utf-8")
     assert "$env:FREETOKEN_MTP_SPECULATE = '0'" in path.read_text(encoding="utf-8")
+    assert "$env:FREETOKEN_MTP_SPEC_DEPTH = '3'" in path.read_text(encoding="utf-8")
 
 
 def test_dense_profile_script_round_trips_and_omits_false_switches(tmp_path: Path) -> None:

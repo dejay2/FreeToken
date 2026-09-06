@@ -190,9 +190,12 @@ if ($isMoe -and $modelExpertCount -gt 0 -and $MoECacheSize -gt $modelExpertCount
     $MoECacheSize = $modelExpertCount
 }
 if (-not $hasMtp) {
-    # The MTP head is a Qwen3.8 private file; keep every entry switch off for other models.
+    # The MTP head is a Qwen3.8 private file; keep every MTP switch off for other models. Only the
+    # two entry switches earn a note: RESIDENT and SPEC_GRAPH just shape the trick (SPEC_GRAPH is
+    # on by default since 2026-09-05), so they would print a note on every boot of a plain model.
     foreach ($name in 'FREETOKEN_MTP_SPECULATE', 'FREETOKEN_MTP_RESIDENT', 'FREETOKEN_MTP_SHADOW', 'FREETOKEN_MTP_SPEC_GRAPH') {
-        if ((Get-Item -Path "env:$name" -ErrorAction SilentlyContinue).Value -eq '1') {
+        $isEntry = $name -in @('FREETOKEN_MTP_SPECULATE', 'FREETOKEN_MTP_SHADOW')
+        if ($isEntry -and (Get-Item -Path "env:$name" -ErrorAction SilentlyContinue).Value -eq '1') {
             $notes += "$name forced off: this model ships no MTP head"
         }
         Set-Item -Path "env:$name" -Value '0'

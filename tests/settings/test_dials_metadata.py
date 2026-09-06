@@ -45,6 +45,18 @@ def test_auto_sentinels_and_browse_kinds_are_consistent():
             assert dial.options is not None and len(dial.option_labels) == len(dial.options), dial.name
 
 
+def test_the_guess_depth_dial_is_a_small_slider_and_the_fast_path_is_not_hidden():
+    from freetoken.daemon.settings.dials import DIAL_BY_NAME
+
+    depth = DIAL_BY_NAME["FREETOKEN_MTP_SPEC_DEPTH"]
+    assert depth.control == "number" and depth.source == "env"
+    assert (depth.minimum, depth.maximum, depth.default) == (1, 5, 5)
+    assert depth.slider == (1, 5, 1) and not depth.advanced
+    assert depth.group == "Look-ahead speed trick (MTP)"
+    graph = DIAL_BY_NAME["FREETOKEN_MTP_SPEC_GRAPH"]
+    assert graph.default == "1" and not graph.advanced, "off is never the faster choice; measured 2026-09-05"
+
+
 def test_as_dict_carries_the_page_contract():
     doc = DIALS[0].as_dict("x")
     for key in (

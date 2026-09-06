@@ -53,6 +53,16 @@ def test_real_boot_round_trips_and_preserves_comments_and_expressions(tmp_path):
     assert BootFile(path).load()["CudaGraphMaxBS"] == 3
 
 
+def test_boot_file_without_a_depth_line_reads_the_default_and_save_inserts_one(tmp_path):
+    path = copy_boot(tmp_path)
+    boot = BootFile(path)
+    assert boot.load()["FREETOKEN_MTP_SPEC_DEPTH"] == 5, "an env amount reads as a number, not text"
+    result = boot.save({"FREETOKEN_MTP_SPEC_DEPTH": 4})
+    assert result["FREETOKEN_MTP_SPEC_DEPTH"] == 4
+    assert "$env:FREETOKEN_MTP_SPEC_DEPTH = '4'" in path.read_text(encoding="utf-8")
+    assert BootFile(path).load()["FREETOKEN_MTP_SPEC_DEPTH"] == 4
+
+
 def test_save_rejects_invalid_boot_without_rewriting(tmp_path):
     path = copy_boot(tmp_path)
     path.write_text("$env:FREETOKEN_MTP_SPECULATE = '0'\n", encoding="utf-8")

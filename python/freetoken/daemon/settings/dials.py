@@ -424,13 +424,25 @@ DIALS: tuple[Dial, ...] = (
         ),
     ),
     Dial(
-        "FREETOKEN_MTP_SPEC_GRAPH", "toggle", "0", "boolean", "Capture speculation verification cycles inside CUDA graphs for lower latency.",
+        "FREETOKEN_MTP_SPEC_DEPTH", "number", 5, "tokens", "Maximum draft chain length per speculation step (1-5).",
+        "Look-ahead speed trick (MTP)", minimum=1, maximum=5, source="env", engine_mapping="$env:FREETOKEN_MTP_SPEC_DEPTH",
+        plain="How many words to guess ahead", slider=(1, 5, 1), effects=("speed:mixed",),
+        info=(
+            "How many words the guessing head drafts before the main model checks them. Checking "
+            "costs about the same whether it checks one guess or five, so fewer guesses rarely helps: "
+            "measured 2026-09-01 on this PC, 1 and 2 lost to guessing off everywhere and 5 was the "
+            "best. The engine caps this at 5. Only matters when Guess ahead is on."
+        ),
+    ),
+    Dial(
+        "FREETOKEN_MTP_SPEC_GRAPH", "toggle", "1", "boolean", "Capture speculation verification cycles inside CUDA graphs for lower latency.",
         "Look-ahead speed trick (MTP)", source="env", engine_mapping="$env:FREETOKEN_MTP_SPEC_GRAPH",
-        plain="Fast path for guess checking", advanced=True, effects=("speed:up", "boot:up", "vram:up"),
+        plain="Fast path for guess checking", effects=("speed:up", "boot:up", "vram:up"),
         info=(
             "Records the guess-checking step once at start-up so it replays with less overhead each "
-            "time. Start-up takes longer and the recording uses some card memory. Only matters when "
-            "Guess ahead is on."
+            "time. Start-up takes about a second longer and the recordings use a little card memory. "
+            "Off is never the faster choice: measured 2026-09-05 on this PC, a 9,000-token chat "
+            "answered at about 23 words per second with it off. Only matters when Guess ahead is on."
         ),
     ),
     Dial(

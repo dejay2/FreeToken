@@ -38,11 +38,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .dials import DIALS, DIAL_BY_NAME, ENV_DIALS
+from .dials import DIALS, DIAL_BY_NAME, ENV_DIALS, canonical_value
 
 # Dials that only mean something on Windows (the Desktop venv, the local picture packages).
 WINDOWS_ONLY_DIALS = frozenset({"DesktopPython", "VisionPackagesPath"})
 MTP_ENV = ("FREETOKEN_MTP_SPECULATE", "FREETOKEN_MTP_RESIDENT", "FREETOKEN_MTP_SHADOW", "FREETOKEN_MTP_SPEC_GRAPH")
+MTP_ENTRY_ENV = ("FREETOKEN_MTP_SPECULATE", "FREETOKEN_MTP_SHADOW")
 WSL_PIN_BUDGET_FRACTION = 0.85
 
 
@@ -212,7 +213,16 @@ def build_launch(
     notes: list[str] = []
     env = dict(os.environ if base_env is None else base_env)
     for name in ENV_DIALS:
-        env[name] = "1" if _truthy(_get(settings, name)) else "0"
+        dial = DIAL_BY_NAME[name]
+        value = _get(settings, name)
+        if dial.control == "toggle":
+            env[name] = "1" if _truthy(value) else "0"
+            continue
+        # An env amount (the guess depth) goes through as its number, not a 1/0.
+        try:
+            env[name] = str(canonical_value(dial, value))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name} {value!r} is not a valid value: {exc}") from exc
 
     port = _int(_get(settings, "Port"), 2020)
     context = _int(_get(settings, "ContextTokens"))
@@ -224,10 +234,12 @@ def build_launch(
             f"ContextTokens {context} is longer than this model can read ({facts.max_context}, config.json max_position_embeddings)"
         )
 
-    mtp_on = any(env.get(name) == "1" for name in MTP_ENV)
+    # Only the two entry switches turn the trick on; RESIDENT and SPEC_GRAPH just shape it
+    # (SPEC_GRAPH defaults to 1, so counting it would put every boot on the mmap table).
+    mtp_on = any(env.get(name) == "1" for name in MTP_ENTRY_ENV)
     if not facts.has_mtp:
         for name in MTP_ENV:
-            if env.get(name) == "1":
+            if env.get(name) == "1" and name in MTP_ENTRY_ENV:
                 notes.append(f"{name} forced off: this model ships no MTP head")
             env[name] = "0"
         mtp_on = False

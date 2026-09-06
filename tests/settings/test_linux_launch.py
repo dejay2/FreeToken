@@ -61,6 +61,14 @@ def test_mtp_on_forces_the_mmap_table_and_vision_and_parking_pass_through():
     assert "--moe-collect-decode-freq" in plan.argv and _arg(plan, "--cuda-graph-max-bs") == "4"
 
 
+def test_the_guess_depth_reaches_the_engine_as_a_number_and_does_not_count_as_mtp_on():
+    plan = _plan({"FREETOKEN_MTP_SPEC_DEPTH": 3})
+    assert plan.env["FREETOKEN_MTP_SPEC_DEPTH"] == "3"
+    assert _arg(plan, "--ple-backend") == "disk", "a depth alone does not switch MTP on"
+    assert _plan({}).env["FREETOKEN_MTP_SPEC_DEPTH"] == "5", "the catalogue default, not a toggle's 0"
+    assert _plan({"FREETOKEN_MTP_SPEC_DEPTH": "2"}).env["FREETOKEN_MTP_SPEC_DEPTH"] == "2"
+
+
 def test_a_model_without_the_features_gets_the_windows_launcher_notes():
     plan = _plan(
         {"FREETOKEN_MTP_SPECULATE": "1", "EnableVision": True, "KVPark": "ssd", "MoECacheSize": 10, "GpuOwnedLayers": "auto",
