@@ -224,6 +224,14 @@ def build_launch(
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(f"{name} {value!r} is not a valid value: {exc}") from exc
 
+    # The engine refuses a worth-it bar above 1 + depth (engine/config.py resolve_spec_decode);
+    # a shallow chain with the default 2.4 bar would otherwise fail the boot, so cap it here.
+    bar_cap = 1.0 + _int(env.get("FREETOKEN_MTP_SPEC_DEPTH"), 5)
+    bar = float(env["FREETOKEN_MTP_SPEC_MIN_EMITTED"])
+    if bar > bar_cap:
+        notes.append(f"FREETOKEN_MTP_SPEC_MIN_EMITTED {bar:g} capped to {bar_cap:g}: the engine allows at most guesses + 1")
+        env["FREETOKEN_MTP_SPEC_MIN_EMITTED"] = str(bar_cap)
+
     port = _int(_get(settings, "Port"), 2020)
     context = _int(_get(settings, "ContextTokens"))
     if context <= 0:

@@ -57,6 +57,23 @@ def test_the_guess_depth_dial_is_a_small_slider_and_the_fast_path_is_not_hidden(
     assert graph.default == "1" and not graph.advanced, "off is never the faster choice; measured 2026-09-05"
 
 
+def test_the_three_guess_safety_catches_are_dials_in_the_mtp_group():
+    from freetoken.daemon.settings.dials import DIAL_BY_NAME
+
+    cut = DIAL_BY_NAME["FREETOKEN_MTP_SPEC_CONF_CUT"]
+    assert (cut.control, cut.source, cut.numeric_kind) == ("number", "env", "float")
+    assert (cut.minimum, cut.maximum, cut.default) == (0.0, 1.0, 0.8)
+    assert cut.slider == (0, 1, 0.05) and not cut.advanced
+    bar = DIAL_BY_NAME["FREETOKEN_MTP_SPEC_MIN_EMITTED"]
+    assert (bar.control, bar.source, bar.numeric_kind) == ("number", "env", "float")
+    assert (bar.minimum, bar.maximum, bar.default) == (0.0, 6.0, 2.4), "6 = 1 + the deepest chain"
+    assert bar.slider == (0, 6, 0.1) and bar.advanced
+    cost = DIAL_BY_NAME["FREETOKEN_MTP_SPEC_COST_AWARE"]
+    assert (cost.control, cost.source, cost.default) == ("toggle", "env", "1")
+    for dial in (cut, bar, cost):
+        assert dial.group == "Look-ahead speed trick (MTP)", dial.name
+
+
 def test_as_dict_carries_the_page_contract():
     doc = DIALS[0].as_dict("x")
     for key in (

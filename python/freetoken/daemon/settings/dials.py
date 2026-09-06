@@ -446,6 +446,44 @@ DIALS: tuple[Dial, ...] = (
         ),
     ),
     Dial(
+        "FREETOKEN_MTP_SPEC_CONF_CUT", "number", 0.8, "probability", "Stop drafting before the first draft token whose top-1 probability is below this (0 disables).",
+        "Look-ahead speed trick (MTP)", minimum=0.0, maximum=1.0, numeric_kind="float", source="env",
+        engine_mapping="$env:FREETOKEN_MTP_SPEC_CONF_CUT",
+        plain="Stop guessing when unsure below", slider=(0, 1, 0.05), effects=("speed:up",),
+        info=(
+            "Before each guess the guessing head says how sure it is, 0 to 1. The chain stops at the "
+            "first guess below this number, so a chain of 5 may end after 1 or 2 and the doomed "
+            "guesses are never checked. Measured 2026-09-01 over 600 rounds: guesses that landed "
+            "averaged 0.91 sureness, guesses that missed 0.46, so 0.8 separates them well. 0 switches "
+            "the cut off and every round checks the full chain. Only matters when Guess ahead is on."
+        ),
+    ),
+    Dial(
+        "FREETOKEN_MTP_SPEC_COST_AWARE", "toggle", "1", "boolean", "Adapt the speculation bar to measured cycle and plain-step wall time.",
+        "Look-ahead speed trick (MTP)", source="env", engine_mapping="$env:FREETOKEN_MTP_SPEC_COST_AWARE",
+        plain="Set the bar from real timing", effects=("speed:up",),
+        info=(
+            "The server keeps timing how long a guessing round takes against a plain word and moves "
+            "the worth-it bar to match, instead of holding the fixed bar below. Measured 2026-09-01: "
+            "with this on an 8,000-token chat ran at 49.5 words per second, the best of any guessing "
+            "setup, against 11 to 24 percent slower than guessing off with a fixed bar. Leave it on."
+        ),
+    ),
+    Dial(
+        "FREETOKEN_MTP_SPEC_MIN_EMITTED", "number", 2.4, "tokens", "Minimum emitted tokens per speculative cycle before the request falls back to plain decode (0 never falls back).",
+        "Look-ahead speed trick (MTP)", minimum=0.0, maximum=6.0, numeric_kind="float", source="env",
+        engine_mapping="$env:FREETOKEN_MTP_SPEC_MIN_EMITTED",
+        plain="Words a guessing round must earn", slider=(0, 6, 0.1), advanced=True, effects=("speed:mixed",),
+        info=(
+            "A guessing round costs about as much as 2.4 plain words when the sureness cut is on, "
+            "3.6 when it is off. A chat whose rounds keep earning less than this bar is switched back "
+            "to plain typing, with a fresh try now and then. Measured 2026-09-01: prose lost at a 3.2 "
+            "bar with the cut off and recovered as the bar rose to 3.6. If you set the cut to 0, "
+            "raise this to 3.6. 0 means never fall back. The engine caps it at guesses plus one, "
+            "so a chain of 1 cannot hold a bar above 2. Only matters when Guess ahead is on."
+        ),
+    ),
+    Dial(
         "ExpertLoad", "choice", "parallel", "mode", "Strategy for loading expert banks into RAM (parallel uses unbuffered I/O on Windows).",
         "Loading and diagnostics", options=("auto", "serial", "parallel"), engine_mapping="--expert-load <mode>",
         plain="How the model is read at start-up", option_labels=("Automatic", "One file at a time", "Several files at once"),

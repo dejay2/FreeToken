@@ -43,6 +43,18 @@ def test_validation_bounds_the_guess_depth():
     assert validate_settings({"FREETOKEN_MTP_SPEC_DEPTH": "3"}) == []
 
 
+def test_validation_bounds_the_guess_safety_catches():
+    def messages(settings):
+        return {item["field"]: item["message"] for item in validate_settings(settings)}
+
+    assert "exceeds maximum 1.0" in messages({"FREETOKEN_MTP_SPEC_CONF_CUT": 1.5})["FREETOKEN_MTP_SPEC_CONF_CUT"]
+    assert "below minimum 0.0" in messages({"FREETOKEN_MTP_SPEC_CONF_CUT": -0.1})["FREETOKEN_MTP_SPEC_CONF_CUT"]
+    assert "exceeds maximum 6.0" in messages({"FREETOKEN_MTP_SPEC_MIN_EMITTED": 7})["FREETOKEN_MTP_SPEC_MIN_EMITTED"]
+    assert "FREETOKEN_MTP_SPEC_COST_AWARE" in messages({"FREETOKEN_MTP_SPEC_COST_AWARE": "maybe"})
+    assert validate_settings({"FREETOKEN_MTP_SPEC_CONF_CUT": "0.8", "FREETOKEN_MTP_SPEC_MIN_EMITTED": 2.4,
+                              "FREETOKEN_MTP_SPEC_COST_AWARE": "0"}) == []
+
+
 def test_validation_rejects_unknown_and_unsafe_paths():
     errors = validate_settings({"NotADial": 1, "ModelPath": "bad\x00path"})
     by_field = {item["field"]: item["message"] for item in errors}

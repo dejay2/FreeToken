@@ -69,6 +69,21 @@ def test_the_guess_depth_reaches_the_engine_as_a_number_and_does_not_count_as_mt
     assert _plan({"FREETOKEN_MTP_SPEC_DEPTH": "2"}).env["FREETOKEN_MTP_SPEC_DEPTH"] == "2"
 
 
+def test_the_guess_safety_catches_reach_the_engine_and_the_bar_is_capped_at_the_chain():
+    plan = _plan({})
+    assert plan.env["FREETOKEN_MTP_SPEC_CONF_CUT"] == "0.8"
+    assert plan.env["FREETOKEN_MTP_SPEC_MIN_EMITTED"] == "2.4"
+    assert plan.env["FREETOKEN_MTP_SPEC_COST_AWARE"] == "1"
+    assert _arg(plan, "--ple-backend") == "disk" and plan.notes == [], "catches alone do not switch MTP on"
+    custom = _plan({"FREETOKEN_MTP_SPEC_CONF_CUT": 0.65, "FREETOKEN_MTP_SPEC_MIN_EMITTED": "3.6", "FREETOKEN_MTP_SPEC_COST_AWARE": False})
+    assert custom.env["FREETOKEN_MTP_SPEC_CONF_CUT"] == "0.65" and custom.env["FREETOKEN_MTP_SPEC_MIN_EMITTED"] == "3.6"
+    assert custom.env["FREETOKEN_MTP_SPEC_COST_AWARE"] == "0"
+    # The engine refuses a bar above 1 + depth, so a shallow chain caps the bar with a note.
+    capped = _plan({"FREETOKEN_MTP_SPEC_DEPTH": 1, "FREETOKEN_MTP_SPEC_MIN_EMITTED": 2.4})
+    assert capped.env["FREETOKEN_MTP_SPEC_MIN_EMITTED"] == "2.0"
+    assert any("capped" in note and "FREETOKEN_MTP_SPEC_MIN_EMITTED" in note for note in capped.notes)
+
+
 def test_a_model_without_the_features_gets_the_windows_launcher_notes():
     plan = _plan(
         {"FREETOKEN_MTP_SPECULATE": "1", "EnableVision": True, "KVPark": "ssd", "MoECacheSize": 10, "GpuOwnedLayers": "auto",
