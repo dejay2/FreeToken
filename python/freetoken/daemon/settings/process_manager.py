@@ -912,21 +912,14 @@ class ProcessManager:
             settings = {}
         enabled_val = settings.get("MemoryGovernor", True)
         enabled = str(enabled_val).strip().lower() in {"1", "true", "yes", "on"} if not isinstance(enabled_val, bool) else enabled_val
-        layers = {"owned": 0, "pinned": 0, "disk": 0}
-        try:
-            res = self._get_json(f"http://127.0.0.1:{self.port}/v1/cache/residency", timeout=1.0)
-            if isinstance(res, dict):
-                layers = {
-                    "owned": res.get("owned", 0),
-                    "pinned": res.get("pinned", 0),
-                    "disk": res.get("disk", 0),
-                }
-        except Exception:
-            pass
+        # No loop, no numbers. Never touch the server port from here: GET /api/status runs
+        # on every page poll and must answer within the 0.5 s the memory-fit tests hold it
+        # to, and this path bypasses the injected readiness/stats probes (a stray listener
+        # on the port, such as an ssh tunnel, made every status call block for a second).
         return {
             "enabled": enabled,
             "last_action": None,
-            "layers": layers,
+            "layers": {"owned": 0, "pinned": 0, "disk": 0},
             "free_vram_gb": 0.0,
             "free_ram_gb": 0.0,
         }

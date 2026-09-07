@@ -194,3 +194,38 @@ def test_decide_ram_tight_flag():
     )
     for a in actions:
         assert a.ram_tight is False
+
+
+def test_note_step_done_counts_interval_and_flap_window_from_completion():
+    vram_cushion = 4 * GIB
+    rung = int(1.33 * GIB)
+    margin = int(0.5 * GIB)
+    up_threshold = vram_cushion + rung + margin
+    policy = GovernorPolicy(
+        vram_cushion=vram_cushion,
+        ram_cushion=8 * GIB,
+        rung_bytes=rung,
+        margin=margin,
+        step_interval=5.0,
+        up_hold=60.0,
+    )
+    policy.decide(now=0.0, free_vram=up_threshold + GIB, free_ram=9 * GIB)
+    actions = policy.decide(now=60.0, free_vram=up_threshold + GIB, free_ram=9 * GIB)
+    assert [a.direction for a in actions] == ["up"]
+
+    # The step's rebuild took 8 s; the loop re-stamps the axis when the POST returns.
+    policy.note_step_done("vram", 68.0)
+
+    # Without the re-stamp this tick (10 s after the step was chosen) would be outside the
+    # 5 s flap window and would fire a plain down step; from completion it is 2 s in.
+    actions = policy.decide(now=70.0, free_vram=vram_cushion - GIB, free_ram=9 * GIB)
+    assert actions == []
+    assert policy._state["vram"]["up_hold"] == 120.0
+
+    # One step per interval, counted from completion: 68 + 5 = 73.
+    assert policy.decide(now=72.0, free_vram=vram_cushion - GIB, free_ram=9 * GIB) == []
+    actions = policy.decide(now=73.0, free_vram=vram_cushion - GIB, free_ram=9 * GIB)
+    assert [a.direction for a in actions] == ["down"]
+
+    # An axis the policy has not seen yet is a no-op, not a KeyError.
+    policy.note_step_done("ram", 73.0)

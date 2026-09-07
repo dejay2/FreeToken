@@ -26,6 +26,7 @@ for name in [
     "freetoken.daemon.settings.dials",
     "freetoken.daemon.settings.boot_parser",
     "freetoken.daemon.settings.process_manager",
+    "freetoken.daemon.settings.governor",
     "freetoken.daemon.settings.memory_fit",
     "freetoken.daemon.settings.profiles_manager",
     "freetoken.daemon.settings.app",

@@ -129,6 +129,18 @@ class GovernorPolicy:
         self.max_hold = float(max_hold)
         self._state: dict[str, Any] = {}
 
+    def note_step_done(self, axis: str, now: float) -> None:
+        """Re-stamp ``axis``'s last step at the moment its POST returned.
+
+        ``decide`` stamps the step when it is chosen, but a step is a rebuild that takes
+        seconds (graph recapture, a 1.33 GiB layer move). Counting the 5 s interval and the
+        flap window from the *start* meant a step-up whose rebuild took 6 s could never be
+        seen "tripping the cushion within the interval" (the next tick was already past it),
+        and the next step could fire the moment a long rebuild finished."""
+        axis_state = self._state.get(axis)
+        if axis_state is not None:
+            axis_state["last_step_time"] = float(now)
+
     def decide(
         self,
         now: float,
@@ -228,6 +240,7 @@ class GovernorLoop(threading.Thread):
         self.last_free_vram: int | None = None
         self.last_free_ram: int | None = None
         self.last_moe_cache_size: int | None = None
+        self._floor_logged: dict[str, bool] = {}
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -270,6 +283,9 @@ class GovernorLoop(threading.Thread):
         actions = self.policy.decide(now, free_vram, free_ram)
         for action in actions:
             self._execute_action(action, free_vram, free_ram)
+            # The POST blocks for the whole rebuild; the interval and the flap window count
+            # from its completion, not from when the step was chosen.
+            self.policy.note_step_done(action.axis, time.monotonic())
 
     def _execute_action(self, action: Action, free_vram: int, free_ram: int) -> None:
         url = f"http://127.0.0.1:{self.http_port}/v1/cache/step"
@@ -300,6 +316,17 @@ class GovernorLoop(threading.Thread):
         if reply.get("reason") == "disk rung not built" or "disk rung not built" in str(reply.get("error", "")):
             logger.info("governor: %s %s -> disk rung not built, retrying later", action.axis, action.direction)
             return
+        if reply.get("status") == "unsupported":
+            # TP > 1 or a cache without runtime rebuild (a dense model): permanent for this
+            # boot. Every retry would flip the API's maintenance state for nothing, so stop
+            # here; the next server start builds a fresh loop.
+            logger.warning(
+                "governor: server reports cache steps unsupported (%s); governor idle until the next start",
+                reply.get("error", ""),
+            )
+            self.enabled = False
+            self.last_action = "off: " + str(reply.get("error", "steps unsupported"))
+            return
 
         if isinstance(reply.get("layers"), dict):
             self.last_layers = {
@@ -317,17 +344,30 @@ class GovernorLoop(threading.Thread):
         old_vram_gb = free_vram / GIB
         new_vram_gb = vram_free_bytes / GIB
 
+        at_floor_only = False
         if old_slots is not None and new_slots is not None and old_slots != new_slots:
             change_desc = f"slots {old_slots}->{new_slots}"
         elif applied:
             change_desc = str(applied)
         elif reply.get("at_floor"):
             change_desc = "at floor"
+            at_floor_only = True
         else:
             change_desc = reply.get("status", "none")
 
-        log_line = f"governor: {action.axis} {action.direction} -> {change_desc} (free {old_vram_gb:.1f}->{new_vram_gb:.1f} GiB)"
-        logger.info(log_line)
+        if action.axis == "ram":
+            # The step reply carries no RAM figure; log the reading the decision used.
+            free_desc = f"free RAM {free_ram / GIB:.1f} GiB"
+        else:
+            free_desc = f"free {old_vram_gb:.1f}->{new_vram_gb:.1f} GiB"
+        log_line = f"governor: {action.axis} {action.direction} -> {change_desc} ({free_desc})"
+        # At the floor the policy keeps asking every 5 s (the KV rung opens when the server
+        # goes idle), so say it once per floor episode and whisper the repeats.
+        if at_floor_only and self._floor_logged.get(action.axis):
+            logger.debug(log_line)
+        else:
+            logger.info(log_line)
+        self._floor_logged[action.axis] = at_floor_only
         self.last_action = log_line
 
     def _query_residency(self) -> None:
