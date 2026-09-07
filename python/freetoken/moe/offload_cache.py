@@ -968,11 +968,7 @@ class OffloadMoeCache:
 
     @property
     def owned_layer_count(self) -> int:
-        class _IntWithCall(int):
-            def __call__(self) -> int:
-                return int(self)
-
-        return _IntWithCall(len(self.gpu_owned_layer_ids))
+        return len(self.gpu_owned_layer_ids)
 
     @property
     def has_disk_layers(self) -> bool:

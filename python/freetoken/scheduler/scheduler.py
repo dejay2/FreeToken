@@ -313,20 +313,12 @@ class Scheduler(SchedulerIOMixin):
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
         # NOT a gate — those requests are already freed (no live GPU/page resources).
-        # MoE-only rebuild may execute when last_data is None even if decode_manager.runnable.
-        if self._pending_rebuild is not None and last_data is None:
-            is_moe_only = (
-                getattr(self._pending_rebuild, "num_pages", None) is None
-                and getattr(self._pending_rebuild, "num_mamba_slots", None) is None
-                and getattr(self._pending_rebuild, "num_swa_pages", None) is None
-            )
-            can_rebuild = (
-                not self.prefill_manager.runnable
-                if is_moe_only
-                else not (self.prefill_manager.runnable or self.decode_manager.runnable)
-            )
-            if can_rebuild:
-                self._execute_pending_rebuild()
+        # A MoE-only rebuild (slot cache and/or layer residency; no KV, GDN or window change)
+        # may run at a decode step boundary with requests in flight: their state lives in the
+        # KV pages and the GDN state pool, both untouched, and last_data is None means the
+        # previous batch is drained (rebuild_cache still host-syncs). Never mid prefill chunk.
+        if self._pending_rebuild is not None and last_data is None and self._rebuild_can_run():
+            self._execute_pending_rebuild()
 
         # Order this iteration's host->device token_pool copies (issued on ``self.stream``
         # during scheduling) after the previous batch's sampled-token writes (issued on the
@@ -352,7 +344,18 @@ class Scheduler(SchedulerIOMixin):
                 self.stream.wait_stream(self.engine.stream)
                 return None
 
-        forward_input = self._schedule_next_batch()
+        if (
+            self._pending_rebuild is not None
+            and self._is_moe_only_rebuild(self._pending_rebuild)
+            and not self.prefill_manager.runnable
+        ):
+            # Drain toward the MoE-only rebuild: launch nothing this iteration so the next one
+            # starts with last_data None and executes it above, then decode resumes. Without
+            # this the overlap loop always has a batch in flight while a request decodes and
+            # the between-step path is unreachable (the step waits for the request to end).
+            forward_input = None
+        else:
+            forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
@@ -395,20 +398,9 @@ class Scheduler(SchedulerIOMixin):
         # Non-overlap mode has no last_data to drain; execute a queued rebuild as soon as
         # the scheduler is idle (no pending prefill / running decode). Without this, a
         # rebuild in DISABLE_OVERLAP_SCHEDULING mode stays pending until the HTTP timeout.
-        # MoE-only rebuild may execute even if decode_manager.runnable.
-        if self._pending_rebuild is not None:
-            is_moe_only = (
-                getattr(self._pending_rebuild, "num_pages", None) is None
-                and getattr(self._pending_rebuild, "num_mamba_slots", None) is None
-                and getattr(self._pending_rebuild, "num_swa_pages", None) is None
-            )
-            can_rebuild = (
-                not self.prefill_manager.runnable
-                if is_moe_only
-                else not (self.prefill_manager.runnable or self.decode_manager.runnable)
-            )
-            if can_rebuild:
-                self._execute_pending_rebuild()
+        # A MoE-only rebuild may execute between decode steps (see overlap_loop).
+        if self._pending_rebuild is not None and self._rebuild_can_run():
+            self._execute_pending_rebuild()
 
         # Non-overlap mode already drains what it launches, so the speculative step needs no
         # early drain here -- only the same dispatch.
@@ -908,21 +900,17 @@ class Scheduler(SchedulerIOMixin):
             else:
                 self._pending_rebuild = msg
         elif isinstance(msg, CacheStepBackendMsg):
+            # Never run a step inline here: in overlap mode the batch launched last iteration
+            # may still be executing on the GPU (self._last_data), and step_memory rebuilds
+            # pools and graphs. Queue it for the safe point like a rebuild.
             if self.config.tp_info.size > 1:
                 self._reply_step(msg.request_id, "unsupported", error="step unsupported under TP > 1")
+            elif not self.cache_manager.supports_runtime_rebuild:
+                self._reply_step(msg.request_id, "unsupported", error="this model's cache does not support runtime rebuild")
+            elif self._pending_rebuild is not None:
+                self._reply_step(msg.request_id, "busy", error="another rebuild or step is queued")
             else:
-                is_idle = not (self.prefill_manager.runnable or self.decode_manager.runnable)
-                try:
-                    res = self.engine.step_memory(
-                        axis=msg.axis,
-                        direction=msg.direction,
-                        ram_tight=msg.ram_tight,
-                        is_idle=is_idle,
-                    )
-                    self._reply_step(msg.request_id, "ok", res)
-                except Exception as e:
-                    logger.error(f"step_memory failed: {e!r}")
-                    self._reply_step(msg.request_id, "failed", error=str(e))
+                self._pending_rebuild = msg
         elif isinstance(msg, CacheResidencyBackendMsg):
             try:
                 rep = self.engine.residency_report()
@@ -990,13 +978,20 @@ class Scheduler(SchedulerIOMixin):
         result: dict | None = None,
         error: str | None = None,
     ) -> None:
+        res = result or {}
+        report = self.engine.residency_report() if status == "ok" else {}
         self.send_result(
             [
                 CacheStepResultMsg(
                     request_id=request_id,
                     status=status,
-                    result=result or {},
-                    error=error,
+                    applied=res.get("applied"),
+                    layer=res.get("layer"),
+                    at_floor=bool(res.get("at_floor", False)),
+                    moe_cache_size=int(res.get("moe_cache_size", 0) or 0),
+                    layers={k: report.get(k, 0) for k in ("owned", "pinned", "disk")} if report else None,
+                    vram_free_bytes=int(res.get("vram_free_bytes", 0) or 0),
+                    error=error or res.get("reason"),
                 )
             ]
         )
@@ -1013,7 +1008,7 @@ class Scheduler(SchedulerIOMixin):
                 CacheResidencyResultMsg(
                     request_id=request_id,
                     status=status,
-                    report=report or {},
+                    residency=report or {},
                     error=error,
                 )
             ]
@@ -1082,12 +1077,67 @@ class Scheduler(SchedulerIOMixin):
             [RoutingStatsResultMsg(request_id=msg.request_id, stats=stats, error=error)]
         )
 
+    @staticmethod
+    def _is_moe_only_rebuild(msg) -> bool:
+        """True when the queued work touches only the MoE slot cache / layer residency.
+
+        A governor step counts as MoE-only: its KV rung is idle-only by construction
+        (step_memory gets is_idle at execution time), so queuing it never needs an idle wait.
+        """
+        if isinstance(msg, CacheStepBackendMsg):
+            return True
+        if not isinstance(msg, CacheRebuildBackendMsg):
+            return False  # unknown work waits for idle, as every rebuild did before J1
+        return msg.num_pages is None and msg.num_mamba_slots is None and msg.num_swa_pages is None
+
+    def _rebuild_can_run(self) -> bool:
+        if self.prefill_manager.runnable:
+            return False  # never mid prefill chunk
+        if self._is_moe_only_rebuild(self._pending_rebuild):
+            return True
+        return not self.decode_manager.runnable
+
+    def _execute_pending_step(self, msg: CacheStepBackendMsg) -> None:
+        """Run a governor step at the safe point through rebuild_cache (not the engine directly)."""
+        from freetoken.engine.engine import CacheRebuildRejected
+
+        is_idle = not (self.prefill_manager.runnable or self.decode_manager.runnable)
+        self.engine.rebuild_teardown_started = False
+        try:
+            res = self.engine.step_memory(
+                axis=msg.axis,
+                direction=msg.direction,
+                ram_tight=msg.ram_tight,
+                is_idle=is_idle,
+                rebuild=self.rebuild_cache,
+            )
+        except CacheRebuildRejected as e:
+            logger.warning(f"cache step rejected: {e}")
+            self._reply_step(msg.request_id, "rejected", error=str(e))
+            return
+        except Exception as e:  # noqa: BLE001
+            if not getattr(self.engine, "rebuild_teardown_started", True):
+                logger.error(f"cache step failed before teardown: {e!r} — old cache intact")
+                self._reply_step(msg.request_id, "rejected", error=repr(e))
+                return
+            # No geometry rollback for a step (which pool it touched is inside step_memory);
+            # the frontend latches failed on this status. Follow-up: roll a failed rung back.
+            logger.error(f"cache step failed after teardown: {e!r} — latching failed")
+            self._reply_step(msg.request_id, "failed", error=repr(e))
+            return
+        if res.get("applied"):
+            self._log_cache_geometry(f"Cache stepped ({res['applied']})")
+        self._reply_step(msg.request_id, "ok", res)
+
     def _execute_pending_rebuild(self) -> None:
         from freetoken.engine.engine import CacheRebuildRejected
 
         msg = self._pending_rebuild
         assert msg is not None
         self._pending_rebuild = None
+        if isinstance(msg, CacheStepBackendMsg):
+            self._execute_pending_step(msg)
+            return
         requested = {
             "moe_cache_size": msg.moe_cache_size,
             "num_pages": msg.num_pages,

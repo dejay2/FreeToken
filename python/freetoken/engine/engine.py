@@ -1270,12 +1270,14 @@ class Engine:
                 old = self.moe_offload_cache.bank_sources[name][layer_id]
                 old_t = getattr(old, "tensor", old)
                 shape, dtype = old_t.shape, old_t.dtype
-                try:
-                    if self.device.type == "cuda":
-                        bank = HostBank(shape, dtype, backing="cuda")
-                    else:
-                        bank = HostBank(shape, dtype)
-                except Exception:
+                # Born-pinned (cudaHostAlloc) on a CUDA engine: the fused copy kernel needs a
+                # device alias for the new bank, and only a pinned+mapped bank has one. An
+                # mmap-backed fallback would build a pointer table the GPU cannot dereference,
+                # so a failed pinned allocation must raise (the scheduler reports the step
+                # failed) rather than degrade silently. CPU engines (tests) take the default.
+                if self.device.type == "cuda":
+                    bank = HostBank(shape, dtype, backing="cuda")
+                else:
                     bank = HostBank(shape, dtype)
                 bank.tensor.copy_(old_t)
                 if layer_id not in self._host_banks:
@@ -1286,6 +1288,11 @@ class Engine:
             self.moe_offload_cache.rebind_layer(layer_id, HostResidency.PINNED.value, new_banks)
             self._gpu_owned_layer_ids = self.moe_offload_cache.gpu_owned_layer_ids
             self._stash_vram_ledger_inputs(self.moe_offload_cache.bank_sources, self._gpu_owned_layer_ids)
+            # step-up promotes in reverse demotion order (design note: "Up: reverse")
+            demoted = getattr(self, "_demoted_layers", None)
+            if demoted is None:
+                demoted = self._demoted_layers = []
+            demoted.append(layer_id)
 
         elif target == HostResidency.GPU_OWNED.value:
             new_banks = {}
@@ -1306,6 +1313,9 @@ class Engine:
             self.moe_offload_cache.rebind_layer(layer_id, HostResidency.GPU_OWNED.value, new_banks)
             self._gpu_owned_layer_ids = self.moe_offload_cache.gpu_owned_layer_ids
             self._stash_vram_ledger_inputs(self.moe_offload_cache.bank_sources, self._gpu_owned_layer_ids)
+            demoted = getattr(self, "_demoted_layers", None)
+            if demoted and layer_id in demoted:
+                demoted.remove(layer_id)
         else:
             raise NotImplementedError(f"unsupported target residency {target!r} in J1")
 
@@ -1316,8 +1326,14 @@ class Engine:
         ram_tight: bool = False,
         *,
         is_idle: bool | None = None,
+        rebuild=None,
     ) -> dict:
         """Step memory usage up or down along the specified axis.
+
+        ``rebuild`` is the callable that performs the rebuild; the scheduler passes its own
+        ``rebuild_cache`` (host sync, prefix-cache invalidation for a KV rung, page-manager
+        re-thread) so a step never bypasses the safe point. Defaults to
+        :meth:`rebuild_runtime_cache` for direct engine use.
 
         VRAM down ladder:
           1. gpu_owned layer -> pinned (highest layer id)
@@ -1335,6 +1351,7 @@ class Engine:
             raise ValueError(f"unknown direction {direction!r} (expected 'down' or 'up')")
 
         cache = self.moe_offload_cache
+        rebuild = rebuild or self.rebuild_runtime_cache
         num_experts = (
             getattr(self.config.model_config, "num_experts", 512)
             if hasattr(self.config, "model_config")
@@ -1355,7 +1372,7 @@ class Engine:
             # 1. gpu_owned -> pinned
             if cache is not None and self._gpu_owned_layer_ids:
                 layer_id = max(self._gpu_owned_layer_ids)
-                self.rebuild_runtime_cache(layer_moves=[(layer_id, "pinned")])
+                rebuild(layer_moves=[(layer_id, "pinned")])
                 return {
                     "applied": "gpu_owned->pinned",
                     "layer": layer_id,
@@ -1367,7 +1384,7 @@ class Engine:
             # 2. slots -512
             if cache is not None and current_slots > slot_floor:
                 new_slots = max(slot_floor, current_slots - 512)
-                self.rebuild_runtime_cache(moe_cache_size=new_slots)
+                rebuild(moe_cache_size=new_slots)
                 idle = True if is_idle is None else is_idle
                 can_shrink_kv = idle and getattr(self, "num_pages", 0) > 1
                 at_floor = (new_slots == slot_floor and not can_shrink_kv)
@@ -1384,7 +1401,7 @@ class Engine:
             init_pages = getattr(self, "_initial_num_pages", None) or getattr(self, "num_pages", 0)
             kv_floor = max(1, int(init_pages * 0.75))
             if idle and getattr(self, "num_pages", 0) > kv_floor:
-                self.rebuild_runtime_cache(num_pages=kv_floor)
+                rebuild(num_pages=kv_floor)
                 return {
                     "applied": "kv",
                     "layer": None,
@@ -1406,7 +1423,7 @@ class Engine:
             idle = True if is_idle is None else is_idle
             init_pages = getattr(self, "_initial_num_pages", None)
             if idle and init_pages and self.num_pages < init_pages:
-                self.rebuild_runtime_cache(num_pages=init_pages)
+                rebuild(num_pages=init_pages)
                 return {
                     "applied": "kv",
                     "layer": None,
@@ -1418,7 +1435,7 @@ class Engine:
             init_slots = getattr(self, "_initial_moe_cache_size", None)
             if init_slots and current_slots < init_slots:
                 new_slots = min(init_slots, current_slots + 512)
-                self.rebuild_runtime_cache(moe_cache_size=new_slots)
+                rebuild(moe_cache_size=new_slots)
                 return {
                     "applied": "slots",
                     "layer": None,
@@ -1431,18 +1448,21 @@ class Engine:
                 all_layers = set(range(cache.num_layers))
                 candidates = sorted(all_layers - self._gpu_owned_layer_ids)
                 if len(candidates) > 1:
-                    layer_id = candidates[0]
-                    try:
-                        self.rebuild_runtime_cache(layer_moves=[(layer_id, "gpu_owned")])
-                        return {
-                            "applied": "pinned->gpu_owned",
-                            "layer": layer_id,
-                            "moe_cache_size": cache.cache_size,
-                            "at_floor": False,
-                            "vram_free_bytes": free_vram,
-                        }
-                    except Exception:
-                        pass
+                    # Reverse demotion order first (the layer the boot ranked highest went
+                    # last); a never-owned layer falls back to the lowest streaming id.
+                    demoted = [l for l in getattr(self, "_demoted_layers", []) if l in candidates]
+                    layer_id = demoted[-1] if demoted else candidates[0]
+                    # No try/except here: a failure after teardown must reach the scheduler,
+                    # which owns the failed/rollback reply; swallowing it would report
+                    # "nothing applied" from an engine that can no longer serve.
+                    rebuild(layer_moves=[(layer_id, "gpu_owned")])
+                    return {
+                        "applied": "pinned->gpu_owned",
+                        "layer": layer_id,
+                        "moe_cache_size": cache.cache_size,
+                        "at_floor": False,
+                        "vram_free_bytes": free_vram,
+                    }
 
             return {
                 "applied": None,
@@ -1518,6 +1538,22 @@ class Engine:
                 raise CacheRebuildRejected(
                     "cannot move all layers to gpu_owned; at least one streaming layer required"
                 )
+            # A promotion allocates one full expert layer on the card AFTER the graphs are torn
+            # down; check it fits now so an OOM cannot strand the engine without graphs.
+            promote_bytes = sum(
+                sum(
+                    t.numel() * t.element_size()
+                    for t in (self.moe_offload_cache.bank_sources[n][lid] for n in self.moe_offload_cache.bank_schema)
+                )
+                for lid, tgt in layer_moves if tgt == "gpu_owned"
+            )
+            if promote_bytes and self.device.type == "cuda":
+                free_now = self._sync_get_memory()[0]
+                if free_now < promote_bytes + (256 << 20):
+                    raise CacheRebuildRejected(
+                        f"promoting {promote_bytes >> 20} MiB of expert banks to the card needs "
+                        f"more than the {free_now >> 20} MiB free (256 MiB margin)"
+                    )
 
         if moe_cache_size is not None:
             if self.moe_offload_cache is None:
@@ -1535,6 +1571,9 @@ class Engine:
                 raise CacheRebuildRejected(
                     "num_mamba_slots requested but this model has no GDN state pool"
                 )
+            # num_mamba_slots is the USABLE slot count (what the user sets and the status bar
+            # shows); the pool also reserves a padding sink (slot 0), so the physical pool is
+            # num_mamba_slots + 1. _linear_pool_min_slots is the physical floor -> usable - 1.
             min_usable = _linear_pool_min_slots(config) - 1
             if num_mamba_slots < min_usable:
                 raise CacheRebuildRejected(
@@ -1543,6 +1582,8 @@ class Engine:
                     f"needed to run; admission would deadlock"
                 )
         if num_swa_pages is not None:
+            # An absolute window pin for the radix-SWA window pool (Gemma) or the DSV4 window tier;
+            # meaningless for dense/MHA models and the naive SWA path (concurrency x window).
             if not _supports_swa_ratio(config):
                 raise CacheRebuildRejected(
                     "num_swa_pages requested but this model has no window pool "
@@ -1553,8 +1594,13 @@ class Engine:
                     f"num_swa_pages must be positive, got {num_swa_pages}"
                 )
 
-        # 0b. Pool-family budget fit-check BEFORE any destructive free
+        # 0b. Pool-family budget fit-check BEFORE any destructive free: an unfit geometry
+        #     must reject (recoverable) so the old caches stay intact and serving continues,
+        #     rather than freeing and then OOMing into permanent failure. The engine supplies
+        #     the memory account; the pool answers whether its target geometry fits.
         target_moe, per_expert_bytes = self._target_moe_and_expert_bytes(moe_cache_size)
+        # Price the sibling GDN state pool at ITS target (physical slots = usable + padding
+        # sink) and hand the bytes in -- the KV pool only budgets its own tiers.
         target_mamba = (
             num_mamba_slots + 1
             if num_mamba_slots is not None
@@ -1574,9 +1620,19 @@ class Engine:
         )
 
         torch.cuda.synchronize(self.device)
+        # Preserve the CUDA-graph batch-size set resolved at startup. The auto heuristic keys
+        # off free memory, which is far smaller now that the caches are resident (post-cache
+        # free << startup pre-load free), so re-deriving it here would silently drop large
+        # batch sizes after the first rebuild. Reusing the already-resolved list keeps the
+        # captured coverage identical (the fit-check above guarantees the graph headroom fits).
         prior_graph_bs = self.graph_runner.graph_bs_list
+        # Point of no return for the scheduler's rollback logic: from here the live graphs and
+        # pools start being freed. A failure BEFORE this flag flips leaves the engine serving
+        # untouched (no rollback needed); after it, only a rebuild restores service.
         self.rebuild_teardown_started = True
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
+        # The speculative verify graphs go first: they bake KV-pool and page-table addresses,
+        # and reset_capture drops the QSA verify metadata they replay against.
         spec_graph_widths = ()
         if self.spec_graph_runner is not None:
             spec_graph_widths = self.spec_graph_runner.widths
@@ -1585,28 +1641,38 @@ class Engine:
         self.attn_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
 
-        # 2. Apply layer moves before moe_offload_cache.rebuild
+        # 2. Apply layer moves before moe_offload_cache.rebuild: a move swaps the layer's bank
+        #    sources and re-derives the fused-copy pointer tables, and the slot-cache rebuild
+        #    below (when requested) reads those tables' geometry.
         if layer_moves:
             for layer_id, target in layer_moves:
                 self._move_layer(layer_id, target)
 
         # Resize caches in place (each frees its old GPU tensors before allocating).
+        # Pin the new window first (validated above) so any KV-pool rebuild below sizes the window
+        # to it (_dsv4_pool_sizes / _swa_paged_num_tokens read config.swa_num_pages_override).
+        # frozen EngineConfig — mutate in place like the moe_cache_size path; `config.x = y` raises
+        # FrozenInstanceError, which here aborts the rebuild after the CUDA graphs are gone (→ 503).
         if num_swa_pages is not None:
             object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
         if moe_cache_size is not None:
             assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
             if self.moe_offload_cache.quant_format == "exl3":
+                # Packed pointer tables retain references to the old slot tensors. Drop them
+                # before rebuild so resizing can actually release that allocation; the next
+                # eager call rebuilds tables for the new bank addresses before graph capture.
                 scratch = getattr(self.moe_offload_cache, "exl3_scratch", None)
                 tables = getattr(scratch, "mgemm_tables", None)
                 if tables is not None:
                     tables.clear()
             self.moe_offload_cache.rebuild(moe_cache_size)
-            object.__setattr__(config, "moe_cache_size", moe_cache_size)
-        elif layer_moves:
-            if hasattr(config, "_moe_cache_size_requested"):
-                num_experts = getattr(config.model_config, "num_experts", 0)
-                new_total = config.moe_cache_size + len(self._gpu_owned_layer_ids) * num_experts
-                object.__setattr__(config, "_moe_cache_size_requested", new_total)
+        elif layer_moves and hasattr(config, "_moe_cache_size_requested"):
+            # The LRU is untouched by a move, so the operator's total budget (LRU + owned
+            # charge, see _charge_gpu_owned_layers_to_cache_size) shrinks or grows by one
+            # layer's worth of slots; the ledger quotes this number.
+            num_experts = getattr(config.model_config, "num_experts", 0)
+            new_total = config.moe_cache_size + len(self._gpu_owned_layer_ids) * num_experts
+            object.__setattr__(config, "_moe_cache_size_requested", new_total)
         if num_pages is not None:
             # sets self.num_pages (rebuilds KV + window)
             self._resize_kv_pool(config, num_pages, num_swa_pages)

@@ -109,7 +109,6 @@ class CacheRebuildMsg(BaseTokenizerMsg):
     num_swa_pages: int | None = None
     mode: str = "if_idle"
     layer_moves: list[tuple[int, str]] | None = None
-    step: tuple[str, str] | None = None
 
 
 @dataclass
@@ -138,9 +137,11 @@ class CacheStepMsg(BaseTokenizerMsg):
 
 @dataclass
 class CacheStepResultMsg(BaseTokenizerMsg):
+    # scheduler -> detokenizer worker (passthrough to CacheStepReply).
     request_id: str
-    status: str  # "ok" | "busy" | "failed" | "timeout"
+    status: str  # "ok" | "rejected" | "busy" | "unsupported" | "failed"
     applied: str | None = None
+    layer: int | None = None
     at_floor: bool = False
     moe_cache_size: int = 0
     layers: dict | None = None

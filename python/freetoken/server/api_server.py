@@ -329,7 +329,18 @@ class FrontendManager:
             if isinstance(msg, CacheStepReply):
                 fut = self.rebuild_futures.pop(msg.request_id, None)
                 if fut is not None and not fut.done():
-                    fut.set_result({"status": msg.status, "result": msg.result, "error": msg.error})
+                    fut.set_result(
+                        {
+                            "status": msg.status,
+                            "applied": msg.applied,
+                            "layer": msg.layer,
+                            "at_floor": msg.at_floor,
+                            "moe_cache_size": msg.moe_cache_size,
+                            "layers": msg.layers,
+                            "vram_free_bytes": msg.vram_free_bytes,
+                            "error": msg.error,
+                        }
+                    )
                 if self.fatal_error is not None:
                     self.maintenance_state = "failed"
                 else:
@@ -340,9 +351,9 @@ class FrontendManager:
             if isinstance(msg, CacheResidencyReply):
                 fut = self.routing_futures.pop(msg.request_id, None)
                 if fut is not None and not fut.done():
-                    fut.set_result({"status": msg.status, "report": msg.report, "error": msg.error})
-                if msg.status == "ok" and isinstance(msg.report, dict):
-                    self._residency_cache = msg.report
+                    fut.set_result({"status": msg.status, "report": msg.residency, "error": msg.error})
+                if msg.status == "ok" and isinstance(msg.residency, dict):
+                    self._residency_cache = msg.residency
                     self._residency_time = time.monotonic()
                 continue
             if isinstance(msg, RoutingStatsReply):
@@ -386,9 +397,6 @@ class FrontendManager:
         fut = self.rebuild_futures.pop(msg.request_id, None)
         if fut is not None and not fut.done():
             fut.set_result(self.last_rebuild)
-        if getattr(msg, "residency_report", None):
-            self._residency_cache = msg.residency_report
-            self._residency_time = time.monotonic()
         if self.fatal_error is not None:
             # A dead backend stays failed regardless of any (possibly stale/buffered) reply.
             self.maintenance_state = "failed"
@@ -764,7 +772,6 @@ async def dispatch_step(
         out = {"status": "ok"}
         if isinstance(res, dict):
             out.update(res)
-            out["result"] = res
         return out
 
     request_id = str(uuid.uuid4())
@@ -790,13 +797,7 @@ async def dispatch_step(
         return {"status": "failed", "error": f"failed to dispatch cache step: {e!r}"}
     try:
         reply = await asyncio.wait_for(fut, timeout=timeout)
-        out = {"status": reply.get("status", "ok")}
-        if "result" in reply and isinstance(reply["result"], dict):
-            out.update(reply["result"])
-            out["result"] = reply["result"]
-        if "error" in reply and reply["error"]:
-            out["error"] = reply["error"]
-        return out
+        return {k: v for k, v in reply.items() if v is not None or k == "applied"}
     except asyncio.TimeoutError:
         state.rebuild_futures.pop(request_id, None)
         return {"status": "timeout", "request_id": request_id}

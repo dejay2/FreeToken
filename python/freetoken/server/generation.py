@@ -14,6 +14,7 @@ it depends on none of them.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 from collections.abc import AsyncIterator
@@ -285,6 +286,8 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
     uid = state.new_user()
+    if inspect.isawaitable(uid):  # queued behind a cache rebuild / governor step
+        uid = await uid
     await state.send_one(
         TokenizeMsg(
             uid=uid,

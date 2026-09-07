@@ -221,3 +221,43 @@ def test_residency_report():
     assert rep["disk"] == 0
     assert rep["moe_cache_size"] == 8
     assert rep["layers"] == {0: "gpu_owned", 1: "pinned", 2: "pinned"}
+
+
+def test_step_memory_uses_the_rebuild_callable_for_every_rung():
+    """The scheduler passes its own rebuild_cache so a step never bypasses the safe point."""
+    eng = FakeEngine(num_layers=4, num_experts=4, cache_size=1024, owned_layers=(2,), num_pages=100)
+    seen: list[dict] = []
+
+    def via_scheduler(**kwargs):
+        seen.append(kwargs)
+        eng._mock_rebuild(**kwargs)
+
+    for _ in range(4):
+        eng.step_memory("vram", "down", is_idle=True, rebuild=via_scheduler)
+    assert [sorted(k for k, v in kw.items() if v is not None) for kw in seen] == [
+        ["layer_moves"], ["moe_cache_size"], ["moe_cache_size"], ["num_pages"],
+    ]
+    assert eng.rebuild_runtime_cache.call_count == 0
+
+
+def test_step_up_promotes_in_reverse_demotion_order():
+    eng = FakeEngine(num_layers=5, num_experts=4, cache_size=4, owned_layers=(1, 3), num_pages=100)
+    assert eng.step_memory("vram", "down", is_idle=True)["layer"] == 3
+    assert eng.step_memory("vram", "down", is_idle=True)["layer"] == 1
+    assert eng._demoted_layers == [3, 1]
+    # up: the layer demoted last comes back first, then the one before it
+    assert eng.step_memory("vram", "up", is_idle=True)["layer"] == 1
+    assert eng.step_memory("vram", "up", is_idle=True)["layer"] == 3
+    assert eng._demoted_layers == []
+    assert eng._gpu_owned_layer_ids == frozenset({1, 3})
+
+
+def test_step_up_promotion_failure_propagates():
+    """A rebuild failure after teardown must reach the scheduler, not become 'nothing applied'."""
+    eng = FakeEngine(num_layers=4, num_experts=4, cache_size=4, owned_layers=(), num_pages=100)
+
+    def boom(**kwargs):
+        raise RuntimeError("cuda oom during promotion")
+
+    with pytest.raises(RuntimeError, match="promotion"):
+        eng.step_memory("vram", "up", is_idle=True, rebuild=boom)

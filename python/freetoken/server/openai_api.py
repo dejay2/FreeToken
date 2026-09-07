@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 import uuid
@@ -396,6 +397,8 @@ async def handle_completion(
         if len(prompts) != 1:
             return create_error_response("Streaming completions only support a single text prompt")
         uid = state.new_user()
+        if inspect.isawaitable(uid):  # queued behind a cache rebuild / governor step
+            uid = await uid
         await state.send_one(
             TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(req, model_sampling))
         )
@@ -410,6 +413,8 @@ async def handle_completion(
     cached_tokens = 0
     for index, prompt in enumerate(prompts):
         uid = state.new_user()
+        if inspect.isawaitable(uid):
+            uid = await uid
         await state.send_one(TokenizeMsg(uid=uid, text=prompt, sampling_params=_resolve_sampling(req, model_sampling)))
         text = ""
         finish_reason = "stop"

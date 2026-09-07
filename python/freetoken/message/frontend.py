@@ -75,17 +75,15 @@ class CacheRebuildReply(BaseFrontendMsg):
     mamba_slots: int = 0
     num_swa_pages: int = 0
     error: str | None = None
-    applied: str | None = None
-    at_floor: bool = False
-    layers: dict | None = None
-    vram_free_bytes: int = 0
 
 
 @dataclass
 class CacheStepReply(BaseFrontendMsg):
+    # detokenizer worker -> api server: result of a /v1/cache/step request.
     request_id: str
-    status: str  # "ok" | "busy" | "failed" | "timeout"
+    status: str  # "ok" | "rejected" | "busy" | "unsupported" | "failed"
     applied: str | None = None
+    layer: int | None = None
     at_floor: bool = False
     moe_cache_size: int = 0
     layers: dict | None = None
@@ -95,6 +93,7 @@ class CacheStepReply(BaseFrontendMsg):
 
 @dataclass
 class CacheResidencyReply(BaseFrontendMsg):
+    # detokenizer worker -> api server: result of a GET /v1/cache/residency request.
     request_id: str
     status: str = "ok"
     residency: dict | None = None
