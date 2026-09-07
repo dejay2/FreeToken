@@ -902,6 +902,92 @@ class OffloadMoeCache:
         assert views is not None, f"layer {layer_id} is not GPU-owned"
         return views
 
+    def rebind_layer(
+        self,
+        layer_id: int,
+        residency: str,
+        banks: dict[str, torch.Tensor] | None = None,
+    ) -> None:
+        """Move one MoE layer between residency classes at runtime.
+
+        Updates bank_sources[name][layer_id], layer_residency[layer_id], gpu_owned_layer_ids,
+        resident_banks, _unpinned_layers, _first_streaming_layer, then re-runs _init_fused_copy()
+        and the prefill-overlap validity check.
+        For residency == 'gpu_owned' banks are device tensors; for 'pinned' host tensors;
+        for 'disk' None. Refuses to leave zero streaming layers.
+        """
+        from freetoken.moe.host_banks import HostResidency
+
+        if not (0 <= layer_id < self.num_layers):
+            raise IndexError(f"layer_id {layer_id} out of bounds for num_layers {self.num_layers}")
+
+        if residency == HostResidency.GPU_OWNED.value:
+            new_owned = frozenset(self.gpu_owned_layer_ids | {layer_id})
+        else:
+            new_owned = frozenset(self.gpu_owned_layer_ids - {layer_id})
+
+        streaming_layers = set(range(self.num_layers)) - new_owned
+        if not streaming_layers:
+            raise ValueError(
+                "every MoE layer is GPU-owned; there is no streaming layer left to size the "
+                "slot cache from (drop --moe-gpu-owned-layers or own fewer layers)"
+            )
+
+        new_residency = list(self.layer_residency)
+        new_residency[layer_id] = residency
+
+        new_unpinned = frozenset(
+            i for i, r in enumerate(new_residency)
+            if r not in (HostResidency.PINNED.value, HostResidency.GPU_OWNED.value)
+        )
+        if new_unpinned and self.prefill_overlap:
+            raise ValueError(
+                "prefill overlap DMAs from registered banks; it must be disabled "
+                "when any layer is LOCKED/PAGEABLE/DISK (the engine does this)"
+            )
+
+        self.gpu_owned_layer_ids = new_owned
+        self.layer_residency = new_residency
+        self._unpinned_layers = new_unpinned
+        self._first_streaming_layer = min(streaming_layers)
+
+        if banks is not None:
+            for name in self.bank_schema:
+                assert name in banks, f"bank {name!r} missing from banks dict"
+                self.bank_sources[name][layer_id] = banks[name]
+
+        if residency == HostResidency.GPU_OWNED.value:
+            assert banks is not None, "gpu_owned residency requires device tensor banks"
+            self.resident_banks[layer_id] = tuple(self.bank_sources[n][layer_id] for n in self.bank_schema)
+        else:
+            self.resident_banks.pop(layer_id, None)
+
+        self._build_copy_plan()
+
+    _init_fused_copy = _build_fused_copy_plan
+
+    @property
+    def owned_layer_count(self) -> int:
+        class _IntWithCall(int):
+            def __call__(self) -> int:
+                return int(self)
+
+        return _IntWithCall(len(self.gpu_owned_layer_ids))
+
+    @property
+    def has_disk_layers(self) -> bool:
+        from freetoken.moe.host_banks import HostResidency
+
+        return any(r == HostResidency.DISK.value for r in self.layer_residency)
+
+    def is_disk_layer(self, layer_id: int) -> bool:
+        from freetoken.moe.host_banks import HostResidency
+
+        return (
+            0 <= layer_id < len(self.layer_residency)
+            and self.layer_residency[layer_id] == HostResidency.DISK.value
+        )
+
     def _init_prefill_overlap_buffers(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         self._prefill_buffer_layer = [None, None]
