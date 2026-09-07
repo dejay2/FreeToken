@@ -74,6 +74,16 @@ def _int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+GIB = 1024 ** 3
+
+
 # ----------------------------------------------------------------------------- model facts
 
 
@@ -335,9 +345,15 @@ def build_launch(
         argv += ["--moe-gpu-owned-layers", owned]
     reserve = _int(_get(settings, "MoEVramReserveBytes"), -1)
     headroom = _int(_get(settings, "MoECacheHeadroomBytes"), -1)
-    if _truthy(settings.get("MemoryGovernor")) and reserve == 0:
-        gov_vram_gb = float(_get(settings, "GovernorVRAMFreeGB") if _get(settings, "GovernorVRAMFreeGB") is not None else 1.5)
-        reserve = int(round(gov_vram_gb * (1024 ** 3)))
+    if facts.is_moe and _truthy(_get(settings, "MemoryGovernor")):
+        # The governor's card cushion rides on --moe-cache-headroom-bytes, the free VRAM the
+        # auto slot sizing leaves after every reservation, which the engine adds ON TOP of the
+        # post-cache reserve (graph pools, MTP head). Putting it on --moe-vram-reserve-bytes
+        # instead would replace that reserve, so the graph pools would eat 0.75 GiB of the
+        # cushion and the governor would step down right after boot (R3 review, 2026-09-07).
+        # A larger explicit headroom dial wins; auto (-1) and 0 give way to the cushion.
+        cushion = int(round(_float(_get(settings, "GovernorVRAMFreeGB"), 1.5) * GIB))
+        headroom = max(headroom if headroom > 0 else 0, cushion)
     if facts.is_moe and reserve >= 0:
         argv += ["--moe-vram-reserve-bytes", str(reserve)]
     if facts.is_moe and headroom >= 0:

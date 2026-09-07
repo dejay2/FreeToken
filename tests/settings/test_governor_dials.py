@@ -105,84 +105,51 @@ def test_governor_dials_save_and_load(tmp_path: Path) -> None:
     assert "-MemoryGovernor" not in content_off
 
 
-def test_governor_reserve_mapping_in_build_launch() -> None:
-    # 1. When MemoryGovernor is True and MoEVramReserveBytes is 0:
-    # Cushion bytes = round(1.5 * 1024**3) = 1610612736
-    plan1 = build_launch(
-        {
-            "ModelPath": "/models/demo",
-            "MoEVramReserveBytes": 0,
-            "MemoryGovernor": True,
-            "GovernorVRAMFreeGB": 1.5,
-        },
-        python="py",
-        base_env={},
-        facts=_facts(),
-        wsl=False,
-    )
-    expected_cushion = str(int(round(1.5 * (1024 ** 3))))
-    assert _arg(plan1, "--moe-vram-reserve-bytes") == expected_cushion
+def _plan(settings: dict) -> object:
+    return build_launch({"ModelPath": "/models/demo", **settings}, python="py", base_env={}, facts=_facts(), wsl=False)
 
-    # 2. When MemoryGovernor is False and MoEVramReserveBytes is 0:
-    # Pass 0 directly
-    plan2 = build_launch(
-        {
-            "ModelPath": "/models/demo",
-            "MoEVramReserveBytes": 0,
-            "MemoryGovernor": False,
-        },
-        python="py",
-        base_env={},
-        facts=_facts(),
-        wsl=False,
-    )
-    assert _arg(plan2, "--moe-vram-reserve-bytes") == "0"
 
-    # 3. When MoEVramReserveBytes is explicitly > 0 (e.g. 2 GiB):
-    # Preserved as-is
-    plan3 = build_launch(
-        {
-            "ModelPath": "/models/demo",
-            "MoEVramReserveBytes": 2 * (1024 ** 3),
-            "MemoryGovernor": True,
-            "GovernorVRAMFreeGB": 1.5,
-        },
-        python="py",
-        base_env={},
-        facts=_facts(),
-        wsl=False,
-    )
-    assert _arg(plan3, "--moe-vram-reserve-bytes") == str(2 * (1024 ** 3))
+def test_governor_cushion_maps_onto_headroom_never_the_reserve() -> None:
+    cushion_1_5 = str(int(round(1.5 * (1024 ** 3))))
+    two_gib = 2 * (1024 ** 3)
 
-    # 4. When MoEVramReserveBytes is -1 (auto):
-    # Flag is omitted
-    plan4 = build_launch(
-        {
-            "ModelPath": "/models/demo",
-            "MoEVramReserveBytes": -1,
-            "MemoryGovernor": True,
-        },
-        python="py",
-        base_env={},
-        facts=_facts(),
-        wsl=False,
-    )
-    assert "--moe-vram-reserve-bytes" not in plan4.argv
+    # Governor on, headroom dial auto (-1): the cushion becomes the headroom; the reserve flag
+    # keeps its own auto (-1 = omitted, so the engine still adds its graph/MTP reserve on top).
+    plan = _plan({"MemoryGovernor": True, "GovernorVRAMFreeGB": 1.5})
+    assert _arg(plan, "--moe-cache-headroom-bytes") == cushion_1_5
+    assert "--moe-vram-reserve-bytes" not in plan.argv
 
-    # 5. Custom GovernorVRAMFreeGB (e.g. 2.0 GiB) with MoEVramReserveBytes=0:
-    plan5 = build_launch(
-        {
-            "ModelPath": "/models/demo",
-            "MoEVramReserveBytes": 0,
-            "MemoryGovernor": True,
-            "GovernorVRAMFreeGB": 2.0,
-        },
-        python="py",
-        base_env={},
-        facts=_facts(),
-        wsl=False,
-    )
-    assert _arg(plan5, "--moe-vram-reserve-bytes") == str(int(round(2.0 * (1024 ** 3))))
+    # The settings dict may lack the keys entirely: the dial defaults (on, 1.5) apply.
+    plan = _plan({})
+    assert _arg(plan, "--moe-cache-headroom-bytes") == cushion_1_5
+    assert "--moe-vram-reserve-bytes" not in plan.argv
+
+    # A larger explicit headroom dial wins over the cushion; a smaller one gives way.
+    plan = _plan({"MemoryGovernor": True, "GovernorVRAMFreeGB": 1.5, "MoECacheHeadroomBytes": two_gib})
+    assert _arg(plan, "--moe-cache-headroom-bytes") == str(two_gib)
+    plan = _plan({"MemoryGovernor": True, "GovernorVRAMFreeGB": 2.0, "MoECacheHeadroomBytes": 1024})
+    assert _arg(plan, "--moe-cache-headroom-bytes") == str(two_gib)
+
+    # An explicit 0 headroom is not "positive": the cushion still applies while the governor is on.
+    plan = _plan({"MemoryGovernor": True, "GovernorVRAMFreeGB": 1.5, "MoECacheHeadroomBytes": 0})
+    assert _arg(plan, "--moe-cache-headroom-bytes") == cushion_1_5
+
+    # The reserve dial is passed through untouched whatever the governor does.
+    plan = _plan({"MemoryGovernor": True, "MoEVramReserveBytes": 0})
+    assert _arg(plan, "--moe-vram-reserve-bytes") == "0"
+    plan = _plan({"MemoryGovernor": True, "MoEVramReserveBytes": two_gib})
+    assert _arg(plan, "--moe-vram-reserve-bytes") == str(two_gib)
+
+    # Governor off: today's behaviour exactly (auto headroom omitted, explicit values as typed).
+    plan = _plan({"MemoryGovernor": False})
+    assert "--moe-cache-headroom-bytes" not in plan.argv and "--moe-vram-reserve-bytes" not in plan.argv
+    plan = _plan({"MemoryGovernor": False, "MoECacheHeadroomBytes": 0, "MoEVramReserveBytes": 0})
+    assert _arg(plan, "--moe-cache-headroom-bytes") == "0" and _arg(plan, "--moe-vram-reserve-bytes") == "0"
+
+    # A dense model gets neither flag.
+    plan = build_launch({"ModelPath": "/models/demo", "MemoryGovernor": True}, python="py", base_env={},
+                        facts=_facts(is_moe=False, expert_count=0, model_type="dense"), wsl=False)
+    assert "--moe-cache-headroom-bytes" not in plan.argv
 
 
 def test_estimate_counts_governor_cushion(tmp_path: Path) -> None:
@@ -286,11 +253,11 @@ def test_estimate_counts_governor_cushion(tmp_path: Path) -> None:
 
     service = MemoryFitService(snapshot=snapshot, runner=FakeRunner())
 
-    # Estimate with MemoryGovernor=True and MoEVramReserveBytes=0
+    # Estimate with the governor on: the child gets the cushion as headroom, the same flag the
+    # boot gets, so memory_plan counts it (fixed_with_post = ... + policy_reserve + headroom).
     service.estimate_settings(
         {
             "ModelPath": str(model_dir),
-            "MoEVramReserveBytes": 0,
             "MemoryGovernor": True,
             "GovernorVRAMFreeGB": 1.5,
         },
@@ -301,6 +268,6 @@ def test_estimate_counts_governor_cushion(tmp_path: Path) -> None:
     assert len(child_requests) == 1
     child_argv = child_requests[0]["argv"]
     expected_cushion = str(int(round(1.5 * (1024 ** 3))))
-    assert "--moe-vram-reserve-bytes" in child_argv
-    cushion_idx = child_argv.index("--moe-vram-reserve-bytes") + 1
+    assert "--moe-vram-reserve-bytes" not in child_argv
+    cushion_idx = child_argv.index("--moe-cache-headroom-bytes") + 1
     assert child_argv[cushion_idx] == expected_cushion

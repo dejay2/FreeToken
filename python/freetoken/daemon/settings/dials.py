@@ -359,24 +359,27 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "MemoryGovernor", "toggle", True, "boolean",
-        "Automatically step expert layers down the VRAM/RAM ladder and shrink pools when free memory drops below cushion, stepping back up when memory returns; the card cushion is also left free at boot.",
+        "Automatically step expert layers down the VRAM/RAM ladder and shrink pools when free memory drops below cushion, stepping back up when memory returns; the card cushion is also the boot's free-VRAM headroom (--moe-cache-headroom-bytes).",
         "Expert slots and card memory",
         plain="Give memory back to games and other programs automatically",
         effects=("speed:down",),
         info=(
             "Steps expert layers between GPU memory, host RAM, and SSD disk storage when other apps or games "
-            "use memory, keeping the server alive; the card cushion is also left free at boot."
+            "use memory, keeping the server alive. At start-up the card cushion below is also the free "
+            "memory the expert slot sizing leaves untouched (the same thing 'Free card memory cushion' "
+            "sets by hand; the larger of the two wins)."
         ),
     ),
     Dial(
         "GovernorVRAMFreeGB", "number", 1.5, "GB",
-        "Free card memory cushion the governor maintains by stepping layers down or shrinking pools (also left free at boot).",
+        "Free card memory cushion the governor maintains by stepping layers down or shrinking pools; at boot it is passed as --moe-cache-headroom-bytes (never as the post-cache reserve).",
         "Expert slots and card memory", minimum=0.0, maximum=128.0, numeric_kind="float",
         plain="Keep this much of the card free", slider=(0.0, 16.0, 0.25),
         effects=("vram:up", "speed:down"),
         info=(
             "Card memory that must stay free for other programs. Below this cushion, the governor steps expert layers "
-            "down or shrinks pools to free VRAM; this cushion is also reserved at boot."
+            "down or shrinks pools to free VRAM. At start-up the slot sizing also leaves this much free, on top of "
+            "what the graphs and the guess-ahead head reserve for themselves."
         ),
     ),
     Dial(

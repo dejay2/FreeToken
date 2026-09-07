@@ -28,7 +28,7 @@ def _arg(plan, flag):
 def test_the_fast_single_chat_profile_maps_like_the_windows_launcher():
     plan = _plan({
         "Port": 2020, "ContextTokens": 65536, "KVCacheTokens": 65536, "MaxRunningRequests": 1,
-        "MoECacheSize": 6750, "MoEVramReserveBytes": 0, "MoECacheHeadroomBytes": 0, "DenseQuant": "int8",
+        "MoECacheSize": 6750, "MoEVramReserveBytes": 0, "MoECacheHeadroomBytes": 0, "MemoryGovernor": False, "DenseQuant": "int8",
         "EmbedHost": True, "EnableVision": False, "ExpertLoad": "parallel", "EnableCacheReport": True,
         "CollectRoutingStats": False, "GpuOwnedLayers": "", "CudaGraphMaxBS": -1, "KVPark": "off",
     })
