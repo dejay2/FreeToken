@@ -61,3 +61,24 @@ Fixes to make before the governor stays on by default:
    graphs.
 5. Windows launcher parameters for the three new dials (R3 finding 5), and `/v1/cache/residency`
    should wait like the chat routes instead of answering 503 during a rebuild.
+
+## Recall fix, verified 19:41-19:48 (branch at a35d804, governor ON)
+
+Changes: disk-copy reads and writes drop their page-cache pages (`posix_fadvise DONTNEED`,
+O_DIRECT for aligned whole-bank recalls) in `moe/disk_banks.py` (01d84ad); the RAM-axis
+step-up needs cushion + 2 rungs + margin, an up step gets a 10 s grace during which only a
+hard squeeze (free < cushion - rung) may spill, and `high_since` survives an up step so recalls
+burst every 5 s once the first hold is served (`daemon/settings/governor.py`, a35d804);
+`C:\Users\jay\.wslconfig` gained `[experimental] autoMemoryReclaim=gradual` and WSL was restarted.
+
+Same hard squeeze as before (grab 6 then 8 GB of Windows RAM, hold 45 s, hammer running):
+
+| Item | Result |
+|---|---|
+| 2. Zero failed requests | PASS: 159 requests, 0 failed, min 4.6 tok/s during the spills, max first-token wait 13.6 s. |
+| 3. Full recovery within 5 min | PASS: 6 spills 19:41:18-19:41:49; recalls 19:42:57-19:43:35 (six in 38 s, burst) while the grab still held 8 GB, because Windows reported 15 GB free after WSL handed the spilled memory back; graphs recaptured 19:43:35; bench 55.8 tok/s = the old-code baseline. |
+| 4. Windows free memory restored | PASS: 7.66 GB before the squeeze, 12.17 GB after (WSL now returns freed memory on its own). |
+| Boot time | 130 s to healthy on the fresh VM (the 215-335 s boots earlier in the day were under a bloated page cache). |
+
+Still open: Jay's real-game check; Windows launcher parameters for the three governor dials;
+`/v1/cache/residency` answers 503 during a rebuild (cosmetic; the chat routes wait).
