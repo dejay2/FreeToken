@@ -1,0 +1,292 @@
+$ PYTHONPATH=python .venv/bin/python -m pytest tests/daemon tests/settings tests/server -q
+..................................................F.................ss.. [  8%]
+........................................................FF.............. [ 17%]
+........................................................................ [ 26%]
+........................................................................ [ 35%]
+........................................................................ [ 44%]
+........................................................................ [ 53%]
+........................................................................ [ 62%]
+..................................................F..................... [ 71%]
+........................................................................ [ 80%]
+........................................................................ [ 88%]
+........................................................................ [ 97%]
+.................                                                        [100%]
+=================================== FAILURES ===================================
+_____________ test_unresolvable_paths_fall_back_to_the_drive_list ______________
+
+tmp_path = PosixPath('/tmp/pytest-of-jay/pytest-316/test_unresolvable_paths_fall_b0')
+
+    def test_unresolvable_paths_fall_back_to_the_drive_list(tmp_path):
+        assert resolve_start("") is None
+        assert resolve_start("(Join-Path $env:LOCALAPPDATA 'x')") is None
+        assert resolve_start("$visionPackages") is None
+        listing = list_directory("Q:\\does\\not\\exist\\anywhere\\really", "folder")
+>       assert listing["path"] == ""
+E       AssertionError: assert '/home/jay/projects/FreeToken' == ''
+E         
+E         + /home/jay/projects/FreeToken
+
+tests/settings/test_browse.py:53: AssertionError
+________ test_checkpoint_metadata_scanned_once_across_candidates[False] ________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x78db9866fd90>
+tmp_path = PosixPath('/tmp/pytest-of-jay/pytest-316/test_checkpoint_metadata_scann0')
+startup_budget_case = (namespace(model_config=namespace(is_moe=True, num_moe_layers=4, num_experts=8, hidden_size=32, moe_intermediate_size=...rt_load='auto'), {'capacity': 34359738368, 'weights_gpu': 4294967296, 'fixed_pool': 0, 'state_bytes': 1073741824, ...})
+ftw = False
+
+    @pytest.mark.parametrize("ftw", [False, True])
+    def test_checkpoint_metadata_scanned_once_across_candidates(monkeypatch, tmp_path, startup_budget_case, ftw):
+        import builtins
+        from freetoken.daemon.settings import model_info
+        from freetoken.engine import engine
+        from freetoken.kvcache import linear_state_pool
+        from freetoken.models import weight
+        from freetoken.moe import expert_banks
+    
+        config, _ = startup_budget_case
+        config.model_path = str(tmp_path)
+        config.model_config.num_moe_layers, config.model_config.num_experts = 4, 8
+        config.model_config.hidden_size = config.model_config.moe_intermediate_size = 32
+        config.model_config.expert_quant = "bf16"
+        config.tp_info = SimpleNamespace(size=1)
+        config.moe_cpu_layers, config.moe_gpu_owned_layers = None, ""
+        config.expert_load = "auto"
+        config.num_page_override = 2
+        config.kv_reserve_tokens = 64
+        config.moe_cache_size = 16
+        (tmp_path / "config.json").write_text(json.dumps({
+            "architectures": ["Qwen3MoeForCausalLM"], "num_hidden_layers": 4, "num_experts": 8,
+            "hidden_size": 32, "moe_intermediate_size": 32, "max_position_embeddings": 1024,
+        }))
+        if ftw:
+            (tmp_path / "freetoken_weight.json").write_text(json.dumps({"tensors": [{"kind": "experts_bank", "nbytes": 4096}]}))
+        else:
+            for i in range(2):
+                header = json.dumps({f"model.layers.{i}.experts.0.weight": {"dtype": "BF16", "shape": [2], "data_offsets": [0, 4]}}).encode()
+                (tmp_path / f"shard-{i}.safetensors").write_bytes(struct.pack("<Q", len(header)) + header)
+        calls = {"model": 0, "ftw": 0, "scattered": 0, "header_open": 0, "candidates": 0}
+    
+        def counted(name, function):
+            def call(*args, **kwargs):
+                calls[name] += 1
+                return function(*args, **kwargs)
+            return call
+    
+        real_open = builtins.open
+        def opened(path, *args, **kwargs):
+            if str(path).endswith(".safetensors"):
+                calls["header_open"] += 1
+            return real_open(path, *args, **kwargs)
+    
+        def candidate(_base, settings, **_kwargs):
+            calls["candidates"] += 1
+            result = copy.copy(config)
+            result.moe_cache_size = settings["MoECacheSize"]
+            result.moe_gpu_owned_layers = settings["GpuOwnedLayers"]
+            return result
+    
+        monkeypatch.setattr(builtins, "open", opened)
+        monkeypatch.setattr(model_info, "read_model", counted("model", model_info.read_model))
+        monkeypatch.setattr(expert_banks, "ftw_bank_bytes", counted("ftw", expert_banks.ftw_bank_bytes))
+        monkeypatch.setattr(weight, "experts_scattered", counted("scattered", weight.experts_scattered))
+        monkeypatch.setattr(engine, "_cpu_moe_executor_viable", lambda _config: True)
+        monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", str(2048 / (1 << 30)))
+        monkeypatch.setattr(memory_plan, "_parse_config", lambda *_args: config)
+        monkeypatch.setattr(memory_plan, "_candidate_config", candidate)
+        monkeypatch.setattr(memory_plan, "_meta_model", lambda _config: SimpleNamespace())
+        monkeypatch.setattr(linear_state_pool, "state_pool_bytes", lambda _config: 0)
+        request = {
+            "version": 1, "argv": [],
+            "settings": {"ModelPath": str(tmp_path), "MoECacheSize": 16, "GpuOwnedLayers": "", "ContextTokens": 64, "KVCacheTokens": 128},
+            "machine": {"ram_free_bytes": 0, "ram_total_bytes": 32 << 30,
+                        "vram_free_bytes": 32 << 30, "vram_total_bytes": 32 << 30},
+        }
+        for request_count in (1, 2):
+            result = memory_plan.estimate_request(request)
+            assert result["status"] == "ok", result
+>           assert calls["candidates"] > 2
+E           assert 2 > 2
+
+tests/settings/test_memory_plan.py:204: AssertionError
+----------------------------- Captured stdout call -----------------------------
+[1m[2026-09-07|19:37:08][0m [32mINFO    [0m --moe-cpu-layers auto: banks 0.00 GiB > pin budget 0.00 GiB; locking 4 head+tail MoE layers for CPU decode ([0, 1, 2, 3])
+[1m[2026-09-07|19:37:08][0m [32mINFO    [0m Allocating 128 tokens for KV cache, K + V = 0.00 GiB
+[1m[2026-09-07|19:37:08][0m [32mINFO    [0m --moe-cpu-layers auto: banks 0.00 GiB > pin budget 0.00 GiB; locking 4 head+tail MoE layers for CPU decode ([0, 1, 2, 3])
+[1m[2026-09-07|19:37:08][0m [32mINFO    [0m Allocating 128 tokens for KV cache, K + V = 0.00 GiB
+[1m[2026-09-07|19:37:08][0m [32mINFO    [0m --moe-cpu-layers auto: banks 0.00 GiB > pin budget 0.00 GiB; locking 4 head+tail MoE layers for CPU decode ([0, 1, 2, 3])
+[1m[2026-09-07|19:37:08][0m [32mINFO    [0m Allocating 128 tokens for KV cache, K + V = 0.00 GiB
+[1m[2026-09-07|19:37:08][0m [32mINFO    [0m --moe-cpu-layers auto: banks 0.00 GiB > pin budget 0.00 GiB; locking 4 head+tail MoE layers for CPU decode ([0, 1, 2, 3])
+[1m[2026-09-07|19:37:08][0m [32mINFO    [0m Allocating 128 tokens for KV cache, K + V = 0.00 GiB
+------------------------------ Captured log call -------------------------------
+INFO     freetoken.engine.engine:logger.py:111 --moe-cpu-layers auto: banks 0.00 GiB > pin budget 0.00 GiB; locking 4 head+tail MoE layers for CPU decode ([0, 1, 2, 3])
+INFO     freetoken.kvcache.base:base.py:87 Allocating 128 tokens for KV cache, K + V = 0.00 GiB
+INFO     freetoken.engine.engine:logger.py:111 --moe-cpu-layers auto: banks 0.00 GiB > pin budget 0.00 GiB; locking 4 head+tail MoE layers for CPU decode ([0, 1, 2, 3])
+INFO     freetoken.kvcache.base:base.py:87 Allocating 128 tokens for KV cache, K + V = 0.00 GiB
+INFO     freetoken.engine.engine:logger.py:111 --moe-cpu-layers auto: banks 0.00 GiB > pin budget 0.00 GiB; locking 4 head+tail MoE layers for CPU decode ([0, 1, 2, 3])
+INFO     freetoken.kvcache.base:base.py:87 Allocating 128 tokens for KV cache, K + V = 0.00 GiB
+INFO     freetoken.engine.engine:logger.py:111 --moe-cpu-layers auto: banks 0.00 GiB > pin budget 0.00 GiB; locking 4 head+tail MoE layers for CPU decode ([0, 1, 2, 3])
+INFO     freetoken.kvcache.base:base.py:87 Allocating 128 tokens for KV cache, K + V = 0.00 GiB
+________ test_checkpoint_metadata_scanned_once_across_candidates[True] _________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x78db9ad83b60>
+tmp_path = PosixPath('/tmp/pytest-of-jay/pytest-316/test_checkpoint_metadata_scann1')
+startup_budget_case = (namespace(model_config=namespace(is_moe=True, num_moe_layers=4, num_experts=8, hidden_size=32, moe_intermediate_size=...rt_load='auto'), {'capacity': 34359738368, 'weights_gpu': 4294967296, 'fixed_pool': 0, 'state_bytes': 1073741824, ...})
+ftw = True
+
+    @pytest.mark.parametrize("ftw", [False, True])
+    def test_checkpoint_metadata_scanned_once_across_candidates(monkeypatch, tmp_path, startup_budget_case, ftw):
+        import builtins
+        from freetoken.daemon.settings import model_info
+        from freetoken.engine import engine
+        from freetoken.kvcache import linear_state_pool
+        from freetoken.models import weight
+        from freetoken.moe import expert_banks
+    
+        config, _ = startup_budget_case
+        config.model_path = str(tmp_path)
+        config.model_config.num_moe_layers, config.model_config.num_experts = 4, 8
+        config.model_config.hidden_size = config.model_config.moe_intermediate_size = 32
+        config.model_config.expert_quant = "bf16"
+        config.tp_info = SimpleNamespace(size=1)
+        config.moe_cpu_layers, config.moe_gpu_owned_layers = None, ""
+        config.expert_load = "auto"
+        config.num_page_override = 2
+        config.kv_reserve_tokens = 64
+        config.moe_cache_size = 16
+        (tmp_path / "config.json").write_text(json.dumps({
+            "architectures": ["Qwen3MoeForCausalLM"], "num_hidden_layers": 4, "num_experts": 8,
+            "hidden_size": 32, "moe_intermediate_size": 32, "max_position_embeddings": 1024,
+        }))
+        if ftw:
+            (tmp_path / "freetoken_weight.json").write_text(json.dumps({"tensors": [{"kind": "experts_bank", "nbytes": 4096}]}))
+        else:
+            for i in range(2):
+                header = json.dumps({f"model.layers.{i}.experts.0.weight": {"dtype": "BF16", "shape": [2], "data_offsets": [0, 4]}}).encode()
+                (tmp_path / f"shard-{i}.safetensors").write_bytes(struct.pack("<Q", len(header)) + header)
+        calls = {"model": 0, "ftw": 0, "scattered": 0, "header_open": 0, "candidates": 0}
+    
+        def counted(name, function):
+            def call(*args, **kwargs):
+                calls[name] += 1
+                return function(*args, **kwargs)
+            return call
+    
+        real_open = builtins.open
+        def opened(path, *args, **kwargs):
+            if str(path).endswith(".safetensors"):
+                calls["header_open"] += 1
+            return real_open(path, *args, **kwargs)
+    
+        def candidate(_base, settings, **_kwargs):
+            calls["candidates"] += 1
+            result = copy.copy(config)
+            result.moe_cache_size = settings["MoECacheSize"]
+            result.moe_gpu_owned_layers = settings["GpuOwnedLayers"]
+            return result
+    
+        monkeypatch.setattr(builtins, "open", opened)
+        monkeypatch.setattr(model_info, "read_model", counted("model", model_info.read_model))
+        monkeypatch.setattr(expert_banks, "ftw_bank_bytes", counted("ftw", expert_banks.ftw_bank_bytes))
+        monkeypatch.setattr(weight, "experts_scattered", counted("scattered", weight.experts_scattered))
+        monkeypatch.setattr(engine, "_cpu_moe_executor_viable", lambda _config: True)
+        monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", str(2048 / (1 << 30)))
+        monkeypatch.setattr(memory_plan, "_parse_config", lambda *_args: config)
+        monkeypatch.setattr(memory_plan, "_candidate_config", candidate)
+        monkeypatch.setattr(memory_plan, "_meta_model", lambda _config: SimpleNamespace())
+        monkeypatch.setattr(linear_state_pool, "state_pool_bytes", lambda _config: 0)
+        request = {
+            "version": 1, "argv": [],
+            "settings": {"ModelPath": str(tmp_path), "MoECacheSize": 16, "GpuOwnedLayers": "", "ContextTokens": 64, "KVCacheTokens": 128},
+            "machine": {"ram_free_bytes": 0, "ram_total_bytes": 32 << 30,
+                        "vram_free_bytes": 32 << 30, "vram_total_bytes": 32 << 30},
+        }
+        for request_count in (1, 2):
+            result = memory_plan.estimate_request(request)
+            assert result["status"] == "ok", result
+>           assert calls["candidates"] > 2
+E           assert 2 > 2
+
+tests/settings/test_memory_plan.py:204: AssertionError
+----------------------------- Captured stdout call -----------------------------
+[1m[2026-09-07|19:37:08][0m [32mINFO    [0m --moe-cpu-layers auto: banks 0.00 GiB > pin budget 0.00 GiB; locking 2 head+tail MoE layers for CPU decode ([0, 3])
+[1m[2026-09-07|19:37:08][0m [32mINFO    [0m Allocating 128 tokens for KV cache, K + V = 0.00 GiB
+[1m[2026-09-07|19:37:08][0m [32mINFO    [0m --moe-cpu-layers auto: banks 0.00 GiB > pin budget 0.00 GiB; locking 2 head+tail MoE layers for CPU decode ([0, 3])
+[1m[2026-09-07|19:37:08][0m [32mINFO    [0m Allocating 128 tokens for KV cache, K + V = 0.00 GiB
+[1m[2026-09-07|19:37:08][0m [32mINFO    [0m --moe-cpu-layers auto: banks 0.00 GiB > pin budget 0.00 GiB; locking 2 head+tail MoE layers for CPU decode ([0, 3])
+[1m[2026-09-07|19:37:08][0m [32mINFO    [0m Allocating 128 tokens for KV cache, K + V = 0.00 GiB
+[1m[2026-09-07|19:37:08][0m [32mINFO    [0m --moe-cpu-layers auto: banks 0.00 GiB > pin budget 0.00 GiB; locking 2 head+tail MoE layers for CPU decode ([0, 3])
+[1m[2026-09-07|19:37:08][0m [32mINFO    [0m Allocating 128 tokens for KV cache, K + V = 0.00 GiB
+------------------------------ Captured log call -------------------------------
+INFO     freetoken.engine.engine:logger.py:111 --moe-cpu-layers auto: banks 0.00 GiB > pin budget 0.00 GiB; locking 2 head+tail MoE layers for CPU decode ([0, 3])
+INFO     freetoken.kvcache.base:base.py:87 Allocating 128 tokens for KV cache, K + V = 0.00 GiB
+INFO     freetoken.engine.engine:logger.py:111 --moe-cpu-layers auto: banks 0.00 GiB > pin budget 0.00 GiB; locking 2 head+tail MoE layers for CPU decode ([0, 3])
+INFO     freetoken.kvcache.base:base.py:87 Allocating 128 tokens for KV cache, K + V = 0.00 GiB
+INFO     freetoken.engine.engine:logger.py:111 --moe-cpu-layers auto: banks 0.00 GiB > pin budget 0.00 GiB; locking 2 head+tail MoE layers for CPU decode ([0, 3])
+INFO     freetoken.kvcache.base:base.py:87 Allocating 128 tokens for KV cache, K + V = 0.00 GiB
+INFO     freetoken.engine.engine:logger.py:111 --moe-cpu-layers auto: banks 0.00 GiB > pin budget 0.00 GiB; locking 2 head+tail MoE layers for CPU decode ([0, 3])
+INFO     freetoken.kvcache.base:base.py:87 Allocating 128 tokens for KV cache, K + V = 0.00 GiB
+________________ test_ple_backend_is_exposed_by_the_server_cli _________________
+
+    def test_ple_backend_is_exposed_by_the_server_cli():
+        config = _Config({"architectures": ["Qwen4ExpForConditionalGeneration"],
+                          "torch_dtype": "bfloat16"})
+        with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+            default, _ = parse_args(["--model", ANON_PATH])
+            mapped, _ = parse_args(["--model", ANON_PATH, "--ple-backend", "mmap"])
+>       assert default.ple_backend == "pinned"
+E       AssertionError: assert 'disk' == 'pinned'
+E         
+E         - pinned
+E         + disk
+
+tests/server/test_parser_auto_selection.py:105: AssertionError
+----------------------------- Captured stdout call -----------------------------
+[1m[2026-09-07|19:37:10][0m [32mINFO    [0m Parsed arguments:
+ServerArgs(model_path='/models/anon', tp_info=DistributedInfo(rank=0, size=1), dtype=torch.bfloat16, kv_dtype='bf16', kv_park='off', kv_park_idle_ms=0, kv_park_min_tokens=8192, kv_park_ram_gib=2.0, kv_park_ssd_dir='~/.cache/freetoken/kv-park', kv_park_ssd_gib=32.0, kv_park_window_mib=256, max_running_req=4, attention_backend='auto', moe_backend='auto', nvfp4_backend='triton', exl3_expert_op='mgemm', ple_backend='disk', expert_load='auto', moe_cache_size=0, moe_cache_rate=None, moe_cache_auto=False, kv_reserve_tokens=8192, moe_cache_policy='lru', moe_prefill_overlap=True, moe_prefill_hit_d2d=False, moe_collect_stats=False, moe_collect_decode_freq=False, moe_learn_routing=True, moe_cpu_threads=0, moe_cpu_layers=None, moe_gpu_owned_layers=None, moe_disk_copy=None, moe_disk_copy_dir=None, moe_vram_reserve_bytes=-1, moe_cache_headroom_bytes=1610612736, moe_hybrid_max_fetch=-1, cuda_graph_bs=None, cuda_graph_max_bs=None, page_size=1, memory_ratio=0.9, linear_state_cache_ratio=2.0, swa_full_tokens_ratio=0.2, swa_num_pages_override=None, distributed_timeout=60.0, use_dummy_weight=False, use_pynccl=True, max_seq_len_override=None, num_page_override=None, num_token_override=None, max_extend_tokens=8192, cache_type='radix', offline_mode=False, decode_log_interval=40, special_token_ckpt=False, _unique_suffix='.pid=2321138', server_host='127.0.0.1', server_port=1919, num_tokenizer=0, silent_output=False, shell_mode=False, served_model_name='anon', tool_call_parser='qwen3_coder', reasoning_parser='qwen3', sampling_defaults='model', max_output_tokens=None, enable_cache_report=False, cors_origins='tauri://localhost,http://tauri.localhost,http://localhost:1420', gpu=(), gpu_assigned=None)
+[1m[2026-09-07|19:37:10][0m [32mINFO    [0m Parsed arguments:
+ServerArgs(model_path='/models/anon', tp_info=DistributedInfo(rank=0, size=1), dtype=torch.bfloat16, kv_dtype='bf16', kv_park='off', kv_park_idle_ms=0, kv_park_min_tokens=8192, kv_park_ram_gib=2.0, kv_park_ssd_dir='~/.cache/freetoken/kv-park', kv_park_ssd_gib=32.0, kv_park_window_mib=256, max_running_req=4, attention_backend='auto', moe_backend='auto', nvfp4_backend='triton', exl3_expert_op='mgemm', ple_backend='mmap', expert_load='auto', moe_cache_size=0, moe_cache_rate=None, moe_cache_auto=False, kv_reserve_tokens=8192, moe_cache_policy='lru', moe_prefill_overlap=True, moe_prefill_hit_d2d=False, moe_collect_stats=False, moe_collect_decode_freq=False, moe_learn_routing=True, moe_cpu_threads=0, moe_cpu_layers=None, moe_gpu_owned_layers=None, moe_disk_copy=None, moe_disk_copy_dir=None, moe_vram_reserve_bytes=-1, moe_cache_headroom_bytes=1610612736, moe_hybrid_max_fetch=-1, cuda_graph_bs=None, cuda_graph_max_bs=None, page_size=1, memory_ratio=0.9, linear_state_cache_ratio=2.0, swa_full_tokens_ratio=0.2, swa_num_pages_override=None, distributed_timeout=60.0, use_dummy_weight=False, use_pynccl=True, max_seq_len_override=None, num_page_override=None, num_token_override=None, max_extend_tokens=8192, cache_type='radix', offline_mode=False, decode_log_interval=40, special_token_ckpt=False, _unique_suffix='.pid=2321138', server_host='127.0.0.1', server_port=1919, num_tokenizer=0, silent_output=False, shell_mode=False, served_model_name='anon', tool_call_parser='qwen3_coder', reasoning_parser='qwen3', sampling_defaults='model', max_output_tokens=None, enable_cache_report=False, cors_origins='tauri://localhost,http://tauri.localhost,http://localhost:1420', gpu=(), gpu_assigned=None)
+=============================== warnings summary ===============================
+.venv/lib/python3.13/site-packages/fastapi/testclient.py:1
+  /home/jay/projects/FreeToken/.venv/lib/python3.13/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+.venv/lib/python3.13/site-packages/starlette/testclient.py:53
+  /home/jay/projects/FreeToken/.venv/lib/python3.13/site-packages/starlette/testclient.py:53: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.
+    _PortalFactoryType = Callable[[], AbstractContextManager[anyio.abc.BlockingPortal]]
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/settings/test_browse.py::test_unresolvable_paths_fall_back_to_the_drive_list
+FAILED tests/settings/test_memory_plan.py::test_checkpoint_metadata_scanned_once_across_candidates[False]
+FAILED tests/settings/test_memory_plan.py::test_checkpoint_metadata_scanned_once_across_candidates[True]
+FAILED tests/server/test_parser_auto_selection.py::test_ple_backend_is_exposed_by_the_server_cli
+4 failed, 803 passed, 2 skipped, 2 warnings in 9.22s
+
+$ git diff --check
+
+$ git status --porcelain
+?? CLAUDE.md
+?? CONTEXT-MAP.md
+?? docs/design/2026-08-31-qwen38-fast-verifier-safety-measurement-repair-design.md
+?? docs/design/2026-08-31-qwen38-fast-verifier-spike-design.md
+?? docs/design/2026-08-31-qwen38-mtp-feasibility-spike-design.md
+?? docs/plans/2026-08-31-qwen38-fast-verifier-safety-measurement-repair-plan-progress.md
+?? docs/plans/2026-08-31-qwen38-fast-verifier-safety-measurement-repair-plan.md
+?? docs/plans/2026-08-31-qwen38-fast-verifier-spike-plan-progress.md
+?? docs/plans/2026-08-31-qwen38-fast-verifier-spike-plan.md
+?? docs/plans/2026-08-31-qwen38-fast-verifier-state-diagnostic-plan-progress.md
+?? docs/plans/2026-08-31-qwen38-fast-verifier-state-diagnostic-plan.md
+?? docs/plans/2026-08-31-qwen38-mtp-feasibility-spike-plan.md
+?? docs/plans/2026-08-31-qwen38-mtp-graph-width-live-retry-plan-progress.md
+?? docs/plans/2026-08-31-qwen38-mtp-graph-width-live-retry-plan.md
+?? docs/plans/2026-08-31-qwen38-mtp-graph-width-ple-repair-plan-progress.md
+?? docs/plans/2026-08-31-qwen38-mtp-graph-width-ple-repair-plan.md
+?? docs/research/fp8-kv-cache-qwen38-2026-09-02.md
+?? docs/research/measurements-moe-cache-sweep-2026-09-02.json
+?? docs/research/measurements-moe-cache-sweep-2026-09-02.md
+?? prompts/
+?? serve-pr279-windows-safe.cmd
+?? serve-pr279.cmd
+?? windows-shim/
+
+pytest_exit=1 diff_check_exit=0

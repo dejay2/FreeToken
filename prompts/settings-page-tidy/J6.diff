@@ -1,0 +1,779 @@
+diff --git a/python/freetoken/daemon/settings/app.py b/python/freetoken/daemon/settings/app.py
+index da71fb9..eeff7d8 100644
+--- a/python/freetoken/daemon/settings/app.py
++++ b/python/freetoken/daemon/settings/app.py
+@@ -312,6 +312,9 @@ def create_app(
+             saved = boot.save(changes)
+             profiles.sync_active(saved)
+             refresh_model_roots()
++            apply_governor = getattr(process_manager, "apply_governor_settings", None)
++            if callable(apply_governor):
++                apply_governor(saved)
+         except BootValidationError as exc:
+             return _validation_response(exc.errors)
+         except BootParseError as exc:
+diff --git a/python/freetoken/daemon/settings/boot_parser.py b/python/freetoken/daemon/settings/boot_parser.py
+index 1be8b4d..00ba253 100644
+--- a/python/freetoken/daemon/settings/boot_parser.py
++++ b/python/freetoken/daemon/settings/boot_parser.py
+@@ -127,6 +127,13 @@ _LAUNCHER_ORDER = (
+     "MemoryGovernor",
+     "GovernorVRAMFreeGB",
+     "GovernorRAMFreeGB",
++    "GovernorUpMarginGB",
++    "GovernorStepIntervalS",
++    "GovernorUpHoldS",
++    "GovernorMaxHoldS",
++    "GovernorPostUpGraceS",
++    "GovernorRAMRungsBeforeUp",
++    "GovernorVRAMRungsBeforeUp",
+ )
+ _ORDER_INDEX = {name: index for index, name in enumerate(_LAUNCHER_ORDER)}
+ 
+@@ -385,6 +392,10 @@ class BootFile:
+             arg = active.get(dial.name)
+             if arg is not None:
+                 values[dial.name] = _value_from_raw(arg.raw_value)
++            elif dial.source == "helper":
++                # Helper-only dials are absent from older profiles until the page saves them;
++                # keep those profiles' load snapshots stable while still reading explicit lines.
++                continue
+             elif dial.control == "toggle":
+                 values[dial.name] = False
+             elif dial.name == "KVPark":
+diff --git a/python/freetoken/daemon/settings/dials.py b/python/freetoken/daemon/settings/dials.py
+index d11cadd..5a19492 100644
+--- a/python/freetoken/daemon/settings/dials.py
++++ b/python/freetoken/daemon/settings/dials.py
+@@ -124,6 +124,10 @@ GROUP_INFO: dict[str, dict[str, str]] = {
+         "plain": "Card memory",
+         "info": "How the graphics card's 32 GB is split between ready-to-use expert pieces, chat memory and a safety cushion. The main speed dial lives here.",
+     },
++    "Memory governor": {
++        "plain": "Memory governor",
++        "info": "Automatically move expert layers between the card, PC memory and disk as other programs use memory.",
++    },
+     "Picture input": {
+         "plain": "Pictures",
+         "info": "Let chats include pictures, and choose where the picture weights wait.",
+@@ -360,7 +364,7 @@ DIALS: tuple[Dial, ...] = (
+     Dial(
+         "MemoryGovernor", "toggle", True, "boolean",
+         "Automatically step expert layers down the VRAM/RAM ladder and shrink pools when free memory drops below cushion, stepping back up when memory returns; the card cushion is also the boot's free-VRAM headroom (--moe-cache-headroom-bytes).",
+-        "Expert slots and card memory",
++        "Memory governor",
+         plain="Give memory back to games and other programs automatically",
+         effects=("speed:down",),
+         info=(
+@@ -373,7 +377,7 @@ DIALS: tuple[Dial, ...] = (
+     Dial(
+         "GovernorVRAMFreeGB", "number", 1.5, "GB",
+         "Free card memory cushion the governor maintains by stepping layers down or shrinking pools; at boot it is passed as --moe-cache-headroom-bytes (never as the post-cache reserve).",
+-        "Expert slots and card memory", minimum=0.0, maximum=128.0, numeric_kind="float",
++        "Memory governor", minimum=0.0, maximum=128.0, numeric_kind="float",
+         plain="Keep this much of the card free", slider=(0.0, 16.0, 0.25),
+         effects=("vram:up", "speed:down"),
+         info=(
+@@ -385,7 +389,7 @@ DIALS: tuple[Dial, ...] = (
+     Dial(
+         "GovernorRAMFreeGB", "number", 4.0, "GB",
+         "Free main memory cushion the governor maintains by spilling pinned expert layers to SSD disk storage.",
+-        "Expert slots and card memory", minimum=0.0, maximum=1024.0, numeric_kind="float",
++        "Memory governor", minimum=0.0, maximum=1024.0, numeric_kind="float",
+         plain="Keep this much main memory free", slider=(0.0, 64.0, 1.0),
+         effects=("ram:up", "speed:down"),
+         info=(
+@@ -393,6 +397,83 @@ DIALS: tuple[Dial, ...] = (
+             "layers to SSD disk storage to free host memory."
+         ),
+     ),
++    Dial(
++        "GovernorUpMarginGB", "number", 0.5, "GB", "Extra headroom before stepping back up.",
++        "Memory governor", minimum=0.0, maximum=8.0, numeric_kind="float", source="helper",
++        plain="Extra headroom before stepping back up", slider=(0.0, 8.0, 0.25), advanced=True,
++        effects=("vram:up", "ram:up"),
++        info=(
++            "Extra free memory required before the governor recalls one more expert layer. "
++            "A larger cushion makes recalls safer after a busy game or another memory-hungry program, "
++            "but keeps more layers parked away from the card."
++        ),
++    ),
++    Dial(
++        "GovernorStepIntervalS", "number", 5.0, "s", "Check interval.",
++        "Memory governor", minimum=1.0, maximum=60.0, numeric_kind="float", source="helper",
++        plain="Check interval", slider=(1.0, 60.0, 1.0), advanced=True,
++        effects=("speed:mixed",),
++        info=(
++            "How often the helper checks card and PC memory. Shorter intervals react sooner when a game "
++            "starts using memory, while longer intervals make fewer checks. The default five-second check "
++            "is the measured balance for the serving box."
++        ),
++    ),
++    Dial(
++        "GovernorUpHoldS", "number", 60.0, "s", "Wait before the first step back up.",
++        "Memory governor", minimum=0.0, maximum=600.0, numeric_kind="float", source="helper",
++        plain="Wait before the first step back up", slider=(0.0, 600.0, 5.0), advanced=True,
++        effects=("speed:down",),
++        info=(
++            "How long memory must remain comfortably above its cushion before the first layer is recalled. "
++            "This wait prevents a brief burst of free memory from immediately bringing a layer back and "
++            "then forcing it out again."
++        ),
++    ),
++    Dial(
++        "GovernorMaxHoldS", "number", 600.0, "s", "Longest wait when recovery keeps tripping the cushion.",
++        "Memory governor", minimum=60.0, maximum=3600.0, numeric_kind="float", source="helper",
++        plain="Longest wait when recovery keeps tripping the cushion", slider=(60.0, 3600.0, 30.0), advanced=True,
++        effects=("speed:down",),
++        info=(
++            "The largest recovery wait the helper may use after free memory repeatedly falls back below "
++            "the cushion. Raising it makes repeated recalls less likely, but also delays recovery after "
++            "memory pressure has gone away."
++        ),
++    ),
++    Dial(
++        "GovernorPostUpGraceS", "number", 10.0, "s", "Grace after a recall before the memory side may step down.",
++        "Memory governor", minimum=0.0, maximum=120.0, numeric_kind="float", source="helper",
++        plain="Grace after a recall before stepping down", slider=(0.0, 120.0, 5.0), advanced=True,
++        effects=("speed:mixed",),
++        info=(
++            "After a layer is recalled, this grace period protects the memory side from reacting to the "
++            "temporary cost of that move. A longer grace reduces flap between rungs; a shorter one reacts "
++            "faster to a genuine new squeeze."
++        ),
++    ),
++    Dial(
++        "GovernorRAMRungsBeforeUp", "number", 2, "rungs", "Layers of room needed before a memory recall.",
++        "Memory governor", minimum=1, maximum=4, source="helper",
++        plain="Layers of room needed before a memory recall", slider=(1, 4, 1), advanced=True,
++        effects=("ram:up",),
++        info=(
++            "How many full expert-layer sizes of free PC memory are required before the helper moves one "
++            "layer back from disk. More room protects against the memory cost of a recall, at the cost of "
++            "keeping more layers on disk."
++        ),
++    ),
++    Dial(
++        "GovernorVRAMRungsBeforeUp", "number", 1, "rungs", "Layers of room needed before a card recall.",
++        "Memory governor", minimum=1, maximum=4, source="helper",
++        plain="Layers of room needed before a card recall", slider=(1, 4, 1), advanced=True,
++        effects=("vram:up",),
++        info=(
++            "How many full expert-layer sizes of free card memory are required before the helper moves one "
++            "layer back to the GPU. More room makes recalls safer, but delays using the card's recovered "
++            "memory for speed."
++        ),
++    ),
+     Dial(
+         "EmbedHost", "toggle", True, "boolean", "Pin the 1.27 GB token embedding table in host RAM to free GPU VRAM for expert slots.",
+         "Expert slots and card memory", engine_mapping="$env:FREETOKEN_EMBED_HOST='1'",
+diff --git a/python/freetoken/daemon/settings/governor.py b/python/freetoken/daemon/settings/governor.py
+index 07154c5..56fd99c 100644
+--- a/python/freetoken/daemon/settings/governor.py
++++ b/python/freetoken/daemon/settings/governor.py
+@@ -23,9 +23,9 @@ from .memory_fit import _read_vram_snapshot
+ logger = logging.getLogger("freetoken.daemon.settings.governor")
+ 
+ GIB = 1024 ** 3
+-# On 2026-09-07 each 1.33 GiB recall grew the page cache by another 1.33 GiB, dropping
+-# Windows free memory by about 2.7 GiB and trapping the governor at its 4.7-4.9 GiB cushion.
+-DEFAULT_RUNG_BYTES = int(1.33 * GIB)  # 1.33 GiB per Qwen MoE layer
++# Fallback only when /v1/cache/residency cannot report the live model size. The 1.33 GiB
++# value is the measured Qwen3.8 MoE-layer number (2026-09-07), not a universal rung size.
++DEFAULT_RUNG_BYTES = int(1.33 * GIB)
+ DEFAULT_MARGIN_BYTES = int(0.5 * GIB)  # 0.5 GiB step-up margin
+ DEFAULT_STEP_INTERVAL = 5.0  # 5 s
+ DEFAULT_POST_UP_GRACE_MULTIPLIER = 2.0  # two intervals after a recall before ordinary down
+@@ -129,11 +129,10 @@ def read_free_windows_ram_bytes() -> int:
+ 
+ 
+ class GovernorPolicy:
+-    """Decide cache steps while shielding RAM recalls from their own memory cost.
++    """Decide cache steps while shielding recalls from their own memory cost.
+ 
+-    The RAM axis needs two free rungs before recalling another layer, and every up step
+-    gets a two-interval grace window so the 1.33 GiB recall cannot immediately cause a
+-    compensating spill; the measured reason is recorded with the constants above.
++    The default RAM and VRAM rung counts preserve the measured Qwen behaviour, while the
++    live model report can replace ``rung_bytes`` for other expert-bank layouts.
+     """
+ 
+     def __init__(
+@@ -146,6 +145,8 @@ class GovernorPolicy:
+         up_hold: float = DEFAULT_UP_HOLD,
+         max_hold: float = DEFAULT_MAX_HOLD,
+         post_up_grace: float | None = None,
++        ram_rungs_before_up: int = 2,
++        vram_rungs_before_up: int = 1,
+     ) -> None:
+         self.vram_cushion = int(vram_cushion)
+         self.ram_cushion = int(ram_cushion)
+@@ -159,6 +160,8 @@ class GovernorPolicy:
+         )
+         self.up_hold = float(up_hold)
+         self.max_hold = float(max_hold)
++        self.ram_rungs_before_up = int(ram_rungs_before_up)
++        self.vram_rungs_before_up = int(vram_rungs_before_up)
+         self._state: dict[str, Any] = {}
+ 
+     def note_step_done(self, axis: str, now: float) -> None:
+@@ -188,9 +191,9 @@ class GovernorPolicy:
+         for axis in ("vram", "ram"):
+             free = free_vram if axis == "vram" else free_ram
+             cushion = self.vram_cushion if axis == "vram" else self.ram_cushion
+-            # RAM recalls immediately consume a full rung and the live flap showed that
+-            # one-rung headroom was not enough; VRAM keeps the original one-rung threshold.
+-            rungs_before_up = 2 if axis == "ram" else 1
++            rungs_before_up = (
++                self.ram_rungs_before_up if axis == "ram" else self.vram_rungs_before_up
++            )
+             up_threshold = cushion + rungs_before_up * self.rung_bytes + self.margin
+ 
+             axis_state = state.setdefault(
+@@ -283,6 +286,7 @@ class GovernorLoop(threading.Thread):
+         self.last_free_vram: int | None = None
+         self.last_free_ram: int | None = None
+         self.last_moe_cache_size: int | None = None
++        self._last_residency_query = -float("inf")
+         self._floor_logged: dict[str, bool] = {}
+ 
+     def stop(self) -> None:
+@@ -319,10 +323,16 @@ class GovernorLoop(threading.Thread):
+         self.last_free_vram = free_vram
+         self.last_free_ram = free_ram
+ 
+-        if self.last_moe_cache_size is None:
++        now = time.monotonic()
++        # The model's expert-bank size is stable for a boot, but query it periodically so a
++        # late-starting server (or a transiently unavailable first reply) can correct the
++        # Qwen fallback without adding a request on every 2 s governor tick.
++        if now - self._last_residency_query >= 60.0:
++            self._last_residency_query = now
+             self._query_residency()
++            # Do not charge the residency HTTP round trip to the policy's step interval.
++            now = time.monotonic()
+ 
+-        now = time.monotonic()
+         actions = self.policy.decide(now, free_vram, free_ram)
+         for action in actions:
+             self._execute_action(action, free_vram, free_ram)
+@@ -427,6 +437,11 @@ class GovernorLoop(threading.Thread):
+                     }
+                     if "moe_cache_size" in rep:
+                         self.last_moe_cache_size = rep["moe_cache_size"]
++                    try:
++                        layer_bytes = int(rep.get("layer_bytes", 0) or 0)
++                    except (TypeError, ValueError, OverflowError):
++                        layer_bytes = 0
++                    self.policy.rung_bytes = layer_bytes if layer_bytes > 0 else DEFAULT_RUNG_BYTES
+         except Exception:  # noqa: BLE001
+             pass
+ 
+diff --git a/python/freetoken/daemon/settings/linux_launch.py b/python/freetoken/daemon/settings/linux_launch.py
+index 7f8070a..157dcd3 100644
+--- a/python/freetoken/daemon/settings/linux_launch.py
++++ b/python/freetoken/daemon/settings/linux_launch.py
+@@ -358,6 +358,8 @@ def build_launch(
+         argv += ["--moe-vram-reserve-bytes", str(reserve)]
+     if facts.is_moe and headroom >= 0:
+         argv += ["--moe-cache-headroom-bytes", str(headroom)]
++    # The governor's timing and rung controls are helper-only knobs. They are read by the
++    # torch-free settings watcher, not passed to the model server's launch command.
+     graph_bs = _int(_get(settings, "CudaGraphMaxBS"), -1)
+     if graph_bs >= 0:
+         argv += ["--cuda-graph-max-bs", str(graph_bs)]
+diff --git a/python/freetoken/daemon/settings/process_manager.py b/python/freetoken/daemon/settings/process_manager.py
+index 6c63066..8ead7b4 100644
+--- a/python/freetoken/daemon/settings/process_manager.py
++++ b/python/freetoken/daemon/settings/process_manager.py
+@@ -7,6 +7,7 @@ import copy
+ import datetime as _datetime
+ import inspect
+ import json
++import logging
+ import os
+ import signal
+ import subprocess
+@@ -21,6 +22,9 @@ from pathlib import Path
+ from typing import Any, Callable, Iterator
+ 
+ 
++logger = logging.getLogger("freetoken.daemon.settings.process_manager")
++
++
+ FAILURE_SIGNATURES = (
+     "Traceback (most recent call last):",
+     "CUDA out of memory",
+@@ -868,9 +872,40 @@ class ProcessManager:
+         }
+         return result
+ 
++    def _governor_policy(self, settings: dict[str, Any]) -> tuple[Any, bool]:
++        """Build the helper policy and enabled flag without importing torch or the engine."""
++        from .governor import GIB, GovernorPolicy
++
++        enabled_val = settings.get("MemoryGovernor", True)
++        enabled = (
++            str(enabled_val).strip().lower() in {"1", "true", "yes", "on"}
++            if not isinstance(enabled_val, bool)
++            else enabled_val
++        )
++
++        def _number(name: str, default: float) -> float:
++            value = settings.get(name)
++            return float(default if value is None else value)
++
++        vram_gb = _number("GovernorVRAMFreeGB", 1.5)
++        ram_gb = _number("GovernorRAMFreeGB", 4.0)
++        margin_gb = _number("GovernorUpMarginGB", 0.5)
++        policy = GovernorPolicy(
++            vram_cushion=int(round(vram_gb * GIB)),
++            ram_cushion=int(round(ram_gb * GIB)),
++            margin=int(round(margin_gb * GIB)),
++            step_interval=_number("GovernorStepIntervalS", 5.0),
++            up_hold=_number("GovernorUpHoldS", 60.0),
++            max_hold=_number("GovernorMaxHoldS", 600.0),
++            post_up_grace=_number("GovernorPostUpGraceS", 10.0),
++            ram_rungs_before_up=int(round(_number("GovernorRAMRungsBeforeUp", 2))),
++            vram_rungs_before_up=int(round(_number("GovernorVRAMRungsBeforeUp", 1))),
++        )
++        return policy, enabled
++
+     def start_governor(self, settings: dict[str, Any] | None = None) -> None:
+         try:
+-            from .governor import GIB, GovernorLoop, GovernorPolicy
++            from .governor import GovernorLoop
+         except ImportError:
+             return
+         if settings is None:
+@@ -880,19 +915,38 @@ class ProcessManager:
+                 settings = BootFile(self.boot_file).load()
+             except Exception:
+                 settings = {}
+-        enabled_val = settings.get("MemoryGovernor", True)
+-        enabled = str(enabled_val).strip().lower() in {"1", "true", "yes", "on"} if not isinstance(enabled_val, bool) else enabled_val
+-        vram_gb = float(settings.get("GovernorVRAMFreeGB") if settings.get("GovernorVRAMFreeGB") is not None else 1.5)
+-        ram_gb = float(settings.get("GovernorRAMFreeGB") if settings.get("GovernorRAMFreeGB") is not None else 4.0)
+-        policy = GovernorPolicy(
+-            vram_cushion=int(round(vram_gb * GIB)),
+-            ram_cushion=int(round(ram_gb * GIB)),
+-        )
++        policy, enabled = self._governor_policy(settings)
+         self.stop_governor()
+         self._governor = GovernorLoop(self, policy, http_port=self.port)
+         self._governor.enabled = enabled
+         self._governor.start()
+ 
++    def apply_governor_settings(self, settings: dict[str, Any]) -> None:
++        """Swap policy values in the running watcher without restarting the model server."""
++        from .governor import GIB
++
++        policy, enabled = self._governor_policy(settings)
++        with self._lock:
++            loop = self._governor
++            if loop is not None:
++                loop.policy = policy
++                loop.enabled = enabled
++        logger.info(
++            "governor settings applied: enabled=%s vram_cushion=%.2fGiB ram_cushion=%.2fGiB "
++            "margin=%.2fGiB interval=%.1fs up_hold=%.1fs max_hold=%.1fs grace=%.1fs "
++            "ram_rungs=%d vram_rungs=%d",
++            enabled,
++            policy.vram_cushion / GIB,
++            policy.ram_cushion / GIB,
++            policy.margin / GIB,
++            policy.step_interval,
++            policy.up_hold,
++            policy.max_hold,
++            policy.post_up_grace,
++            policy.ram_rungs_before_up,
++            policy.vram_rungs_before_up,
++        )
++
+     def stop_governor(self) -> None:
+         if self._governor is not None:
+             try:
+diff --git a/python/freetoken/daemon/settings/profile_scripts.py b/python/freetoken/daemon/settings/profile_scripts.py
+index a51a967..8331e16 100644
+--- a/python/freetoken/daemon/settings/profile_scripts.py
++++ b/python/freetoken/daemon/settings/profile_scripts.py
+@@ -85,6 +85,9 @@ def render_boot_script(
+         dial = DIAL_BY_NAME.get(name)
+         if dial is None:
+             continue
++        if dial.source == "helper" and name not in settings:
++            # Older profiles omit helper-only knobs until a page Save supplies them.
++            continue
+         value = _setting(settings, name)
+         if dial.control == "toggle":
+             if _enabled(value):
+diff --git a/python/freetoken/engine/engine.py b/python/freetoken/engine/engine.py
+index c29802a..c0e63bd 100644
+--- a/python/freetoken/engine/engine.py
++++ b/python/freetoken/engine/engine.py
+@@ -1762,7 +1762,22 @@ class Engine:
+                 "owned": 0,
+                 "pinned": 0,
+                 "disk": 0,
++                "layer_bytes": 0,
+             }
++        layer_bytes = 0
++        try:
++            from freetoken.engine.cache_budget import expert_bytes_per_slot
++
++            model_config = getattr(self.config, "model_config", None)
++            num_experts = int(getattr(model_config, "num_experts", 0) or 0)
++            if num_experts and self.moe_offload_cache.bank_sources:
++                per_expert_bytes = expert_bytes_per_slot(
++                    self.moe_offload_cache.bank_sources,
++                    getattr(self, "_gpu_owned_layer_ids", frozenset()),
++                )
++                layer_bytes = num_experts * int(per_expert_bytes)
++        except Exception:  # noqa: BLE001 - unknown bank geometry reports zero to the helper
++            layer_bytes = 0
+         # String keys on purpose: this dict rides inside CacheResidencyResultMsg through the
+         # tokenizer/detokenizer workers, whose msgpack decoder runs with strict_map_key (int
+         # keys raise "int is not allowed for map key"). Seen live 2026-09-07: the first
+@@ -1777,6 +1792,7 @@ class Engine:
+             "owned": owned,
+             "pinned": pinned,
+             "disk": disk,
++            "layer_bytes": layer_bytes,
+         }
+ 
+     @torch.inference_mode()
+diff --git a/python/freetoken/server/api_server.py b/python/freetoken/server/api_server.py
+index f593875..212442f 100644
+--- a/python/freetoken/server/api_server.py
++++ b/python/freetoken/server/api_server.py
+@@ -869,7 +869,7 @@ async def cache_step(req: CacheStepRequest):
+ 
+ @app.get("/v1/cache/residency")
+ async def cache_residency(timeout: float = 10.0):
+-    """Report current layer residency and cache sizes."""
++    """Report current layer residency, cache sizes, and model-derived ``layer_bytes``."""
+     state = get_global_state()
+     now = time.monotonic()
+     if state._residency_cache is not None and (now - state._residency_time) < 5.0:
+diff --git a/tests/daemon/test_governor_policy.py b/tests/daemon/test_governor_policy.py
+index 0bc3f3e..ec05e5b 100644
+--- a/tests/daemon/test_governor_policy.py
++++ b/tests/daemon/test_governor_policy.py
+@@ -80,6 +80,26 @@ def test_decide_up_only_after_hold():
+     assert actions[0] == Action(axis="vram", direction="up", ram_tight=False)
+ 
+ 
++def test_configured_rung_counts_control_each_up_threshold():
++    policy = GovernorPolicy(
++        vram_cushion=4 * GIB,
++        ram_cushion=8 * GIB,
++        rung_bytes=GIB,
++        margin=0,
++        step_interval=1.0,
++        up_hold=1.0,
++        ram_rungs_before_up=3,
++        vram_rungs_before_up=2,
++    )
++    high_vram = 4 * GIB + 2 * GIB + 1
++    high_ram = 8 * GIB + 3 * GIB + 1
++    assert policy.decide(now=0.0, free_vram=high_vram, free_ram=high_ram) == []
++    assert policy.decide(now=1.0, free_vram=high_vram, free_ram=high_ram) == [
++        Action(axis="vram", direction="up", ram_tight=False),
++        Action(axis="ram", direction="up", ram_tight=False),
++    ]
++
++
+ def test_ram_up_threshold_requires_two_rungs_while_vram_keeps_one():
+     vram_cushion = 4 * GIB
+     ram_cushion = 8 * GIB
+diff --git a/tests/server/test_rebuild_wait_queue.py b/tests/server/test_rebuild_wait_queue.py
+index 1424afd..2f960c3 100644
+--- a/tests/server/test_rebuild_wait_queue.py
++++ b/tests/server/test_rebuild_wait_queue.py
+@@ -211,7 +211,8 @@ class _FakeBackend:
+             reply = CacheResidencyReply(
+                 request_id=msg.request_id, status="ok",
+                 residency={"layers": {"3": "pinned"}, "moe_cache_size": 6144,
+-                           "owned": self.owned, "pinned": 48 - self.owned, "disk": 0},
++                           "owned": self.owned, "pinned": 48 - self.owned, "disk": 0,
++                           "layer_bytes": 987654321},
+             )
+             asyncio.get_running_loop().call_soon(self.manager._resolve_residency, reply)
+ 
+@@ -239,6 +240,7 @@ async def test_cache_step_and_residency_round_trip():
+         res = await cache_residency()
+         assert res["owned"] == 3 and res["pinned"] == 45
+         assert res["layers"]["3"] == "pinned"  # string keys end to end (msgpack strict_map_key)
++        assert res["layer_bytes"] == 987654321
+         assert len(backend.sent) == 2
+         # <5 s old: served from the cache, no second wire round trip
+         backend.owned = 99
+diff --git a/tests/settings/test_governor_dials.py b/tests/settings/test_governor_dials.py
+index 6a6e7a2..89469f4 100644
+--- a/tests/settings/test_governor_dials.py
++++ b/tests/settings/test_governor_dials.py
+@@ -45,7 +45,7 @@ def test_governor_dials_metadata_and_validation() -> None:
+     gov = dials.DIAL_BY_NAME["MemoryGovernor"]
+     assert gov.control == "toggle"
+     assert gov.default is True
+-    assert gov.group == "Expert slots and card memory"
++    assert gov.group == "Memory governor"
+     assert list(gov.effects) == ["speed:down"]
+ 
+     vram = dials.DIAL_BY_NAME["GovernorVRAMFreeGB"]
+@@ -70,6 +70,24 @@ def test_governor_dials_metadata_and_validation() -> None:
+     assert dials.canonical_value(vram, 2.0) == 2.0
+     assert dials.canonical_value(ram, 8.0) == 8.0
+ 
++    expected = {
++        "GovernorUpMarginGB": (0.5, 0.0, 8.0),
++        "GovernorStepIntervalS": (5.0, 1.0, 60.0),
++        "GovernorUpHoldS": (60.0, 0.0, 600.0),
++        "GovernorMaxHoldS": (600.0, 60.0, 3600.0),
++        "GovernorPostUpGraceS": (10.0, 0.0, 120.0),
++        "GovernorRAMRungsBeforeUp": (2, 1, 4),
++        "GovernorVRAMRungsBeforeUp": (1, 1, 4),
++    }
++    for name, (default, minimum, maximum) in expected.items():
++        dial = dials.DIAL_BY_NAME[name]
++        assert dial.group == "Memory governor"
++        assert dial.default == default
++        assert dial.minimum == minimum and dial.maximum == maximum
++        assert dial.source == "helper"
++        assert dial.advanced is True
++        assert not dials.validate_settings({name: default})
++
+ 
+ def test_governor_dials_save_and_load(tmp_path: Path) -> None:
+     boot_path = _copy_boot(tmp_path)
+@@ -80,21 +98,41 @@ def test_governor_dials_save_and_load(tmp_path: Path) -> None:
+         "MemoryGovernor": True,
+         "GovernorVRAMFreeGB": 2.5,
+         "GovernorRAMFreeGB": 8.0,
++        "GovernorUpMarginGB": 0.75,
++        "GovernorStepIntervalS": 7.5,
++        "GovernorUpHoldS": 90.0,
++        "GovernorMaxHoldS": 900.0,
++        "GovernorPostUpGraceS": 15.0,
++        "GovernorRAMRungsBeforeUp": 3,
++        "GovernorVRAMRungsBeforeUp": 2,
+     })
+     assert saved["MemoryGovernor"] is True
+     assert saved["GovernorVRAMFreeGB"] == 2.5
+     assert saved["GovernorRAMFreeGB"] == 8.0
++    assert saved["GovernorUpMarginGB"] == 0.75
++    assert saved["GovernorRAMRungsBeforeUp"] == 3
+ 
+     # Reload from disk to verify persistence
+     reloaded = BootFile(boot_path).load()
+     assert reloaded["MemoryGovernor"] is True
+     assert reloaded["GovernorVRAMFreeGB"] == 2.5
+     assert reloaded["GovernorRAMFreeGB"] == 8.0
++    assert reloaded["GovernorUpMarginGB"] == 0.75
++    assert reloaded["GovernorStepIntervalS"] == 7.5
++    assert reloaded["GovernorUpHoldS"] == 90.0
++    assert reloaded["GovernorMaxHoldS"] == 900.0
++    assert reloaded["GovernorPostUpGraceS"] == 15.0
++    assert reloaded["GovernorRAMRungsBeforeUp"] == 3
++    assert reloaded["GovernorVRAMRungsBeforeUp"] == 2
+ 
+     content = boot_path.read_text(encoding="utf-8")
+     assert "-MemoryGovernor" in content
+     assert "-GovernorVRAMFreeGB 2.5" in content
+     assert "-GovernorRAMFreeGB 8" in content
++    assert "-GovernorUpMarginGB 0.75" in content
++    assert "-GovernorStepIntervalS 7.5" in content
++    assert "-GovernorRAMRungsBeforeUp 3" in content
++    assert content.index("-GovernorRAMFreeGB") < content.index("-GovernorUpMarginGB")
+ 
+     # Now turn MemoryGovernor off and save again
+     saved_off = boot.save({"MemoryGovernor": False})
+@@ -105,10 +143,49 @@ def test_governor_dials_save_and_load(tmp_path: Path) -> None:
+     assert "-MemoryGovernor" not in content_off
+ 
+ 
++def test_governor_defaults_are_written_as_helper_lines(tmp_path: Path) -> None:
++    boot_path = _copy_boot(tmp_path)
++    defaults = {
++        name: dials.DIAL_BY_NAME[name].default
++        for name in (
++            "GovernorUpMarginGB", "GovernorStepIntervalS", "GovernorUpHoldS",
++            "GovernorMaxHoldS", "GovernorPostUpGraceS", "GovernorRAMRungsBeforeUp",
++            "GovernorVRAMRungsBeforeUp",
++        )
++    }
++    BootFile(boot_path).save(defaults)
++    text = boot_path.read_text(encoding="utf-8")
++    assert "-GovernorUpMarginGB 0.5" in text
++    assert "-GovernorStepIntervalS 5" in text
++    assert "-GovernorUpHoldS 60" in text
++    assert "-GovernorMaxHoldS 600" in text
++    assert "-GovernorPostUpGraceS 10" in text
++    assert "-GovernorRAMRungsBeforeUp 2" in text
++    assert "-GovernorVRAMRungsBeforeUp 1" in text
++    assert BootFile(boot_path).load()["GovernorVRAMRungsBeforeUp"] == 1
++
++
+ def _plan(settings: dict) -> object:
+     return build_launch({"ModelPath": "/models/demo", **settings}, python="py", base_env={}, facts=_facts(), wsl=False)
+ 
+ 
++def test_governor_helper_dials_do_not_enter_server_launch() -> None:
++    plan = _plan({
++        "GovernorUpMarginGB": 8.0,
++        "GovernorStepIntervalS": 60.0,
++        "GovernorUpHoldS": 600.0,
++        "GovernorMaxHoldS": 3600.0,
++        "GovernorPostUpGraceS": 120.0,
++        "GovernorRAMRungsBeforeUp": 4,
++        "GovernorVRAMRungsBeforeUp": 4,
++    })
++    assert not any(name in plan.argv for name in (
++        "GovernorUpMarginGB", "GovernorStepIntervalS", "GovernorUpHoldS",
++        "GovernorMaxHoldS", "GovernorPostUpGraceS", "GovernorRAMRungsBeforeUp",
++        "GovernorVRAMRungsBeforeUp",
++    ))
++
++
+ def test_governor_cushion_maps_onto_headroom_never_the_reserve() -> None:
+     cushion_1_5 = str(int(round(1.5 * (1024 ** 3))))
+     two_gib = 2 * (1024 ** 3)
+diff --git a/tests/settings/test_governor_loop.py b/tests/settings/test_governor_loop.py
+index 314ddc2..ef7f75b 100644
+--- a/tests/settings/test_governor_loop.py
++++ b/tests/settings/test_governor_loop.py
+@@ -104,6 +104,37 @@ def test_floor_is_logged_once_per_episode(monkeypatch, caplog):
+     ]
+ 
+ 
++def test_residency_layer_bytes_updates_rung_and_zero_uses_qwen_fallback(monkeypatch):
++    class _ResidencyResponse:
++        def __init__(self, body):
++            self.payload = json.dumps(body).encode("utf-8")
++
++        def __enter__(self):
++            return self
++
++        def __exit__(self, *exc):
++            return False
++
++        def read(self):
++            return self.payload
++
++    replies = iter((
++        {"layers": {}, "moe_cache_size": 6144, "layer_bytes": 987654321},
++        {"layers": {}, "moe_cache_size": 6144, "layer_bytes": 0},
++    ))
++
++    def residency(url_request, timeout=None):
++        return _ResidencyResponse(next(replies))
++
++    monkeypatch.setattr(governor.urllib.request, "urlopen", residency)
++    pm = SimpleNamespace(server_status=lambda: {"reachable": True, "state": "serving"})
++    loop = GovernorLoop(pm, GovernorPolicy(vram_cushion=2 * GIB, ram_cushion=4 * GIB), http_port=2020)
++    loop._query_residency()
++    assert loop.policy.rung_bytes == 987654321
++    loop._query_residency()
++    assert loop.policy.rung_bytes == governor.DEFAULT_RUNG_BYTES
++
++
+ def test_server_down_or_timeout_never_raises(monkeypatch):
+     def boom(req, timeout=None):
+         raise urllib.error.URLError("connection refused")
+@@ -135,6 +166,7 @@ def test_tick_restamps_the_axis_when_the_post_returns(monkeypatch):
+     pm = SimpleNamespace(server_status=lambda: {"reachable": True, "state": "serving"})
+     loop = GovernorLoop(pm, GovernorPolicy(vram_cushion=2 * GIB, ram_cushion=4 * GIB))
+     loop.last_moe_cache_size = 6144
++    loop._last_residency_query = clock["t"]  # this test isolates POST timing from the minute refresh
+     loop._tick()
+     assert len(server.requests) == 1
+     assert loop.policy._state["vram"]["last_step_time"] == 108.0
+@@ -178,6 +210,8 @@ def test_start_governor_without_settings_reads_the_boot_file(tmp_path, monkeypat
+     class FakeLoop:
+         def __init__(self, pm, policy, http_port=2020):
+             started["policy"] = policy
++            started["loop"] = self
++            self.policy = policy
+             self.enabled = None
+ 
+         def start(self):
+@@ -197,12 +231,76 @@ def test_start_governor_without_settings_reads_the_boot_file(tmp_path, monkeypat
+ 
+     boot = tmp_path / "boot-2020.ps1"
+     shutil.copy2(Path(__file__).parents[2] / "boot-2020.ps1", boot)
+-    BootFile(boot).save({"MemoryGovernor": True, "GovernorVRAMFreeGB": 2.5, "GovernorRAMFreeGB": 6})
++    BootFile(boot).save({
++        "MemoryGovernor": True,
++        "GovernorVRAMFreeGB": 2.5,
++        "GovernorRAMFreeGB": 6,
++        "GovernorUpMarginGB": 0.75,
++        "GovernorStepIntervalS": 7,
++        "GovernorUpHoldS": 90,
++        "GovernorMaxHoldS": 900,
++        "GovernorPostUpGraceS": 15,
++        "GovernorRAMRungsBeforeUp": 3,
++        "GovernorVRAMRungsBeforeUp": 2,
++    })
+     pm = ProcessManager(boot_file=boot, stop_script=tmp_path / "stop.ps1", log_path=tmp_path / "log", lock_path=tmp_path / "lock", port=2020)
+     pm.start_governor()
+     try:
+         assert started.get("running") is True
+-        assert started["policy"].vram_cushion == int(round(2.5 * gov.GIB))
+-        assert started["policy"].ram_cushion == int(round(6 * gov.GIB))
++        policy = started["policy"]
++        assert policy.vram_cushion == int(round(2.5 * gov.GIB))
++        assert policy.ram_cushion == int(round(6 * gov.GIB))
++        assert policy.margin == int(round(0.75 * gov.GIB))
++        assert policy.step_interval == 7.0
++        assert policy.up_hold == 90.0
++        assert policy.max_hold == 900.0
++        assert policy.post_up_grace == 15.0
++        assert policy.ram_rungs_before_up == 3
++        assert policy.vram_rungs_before_up == 2
+     finally:
+         pm.stop_governor()
++
++
++def test_apply_governor_settings_swaps_running_policy_without_server_call(tmp_path, caplog):
++    calls = []
++    pm = ProcessManager(
++        boot_file=tmp_path / "boot.ps1",
++        stop_script=tmp_path / "stop.ps1",
++        log_path=tmp_path / "server.log",
++        lock_path=tmp_path / "gpu.lock",
++        readiness=lambda: calls.append("readiness") or {"state": "serving"},
++        stats=lambda: calls.append("stats") or {},
++        gpu_probe=lambda: calls.append("gpu") or {},
++        platform_windows=False,
++    )
++    old_policy = GovernorPolicy(vram_cushion=2 * GIB, ram_cushion=4 * GIB)
++    loop = GovernorLoop(pm, old_policy)
++    loop.enabled = True
++    pm._governor = loop
++
++    with caplog.at_level(logging.INFO, logger="freetoken.daemon.settings.process_manager"):
++        pm.apply_governor_settings({
++            "MemoryGovernor": True,
++            "GovernorVRAMFreeGB": 3.0,
++            "GovernorRAMFreeGB": 7.0,
++            "GovernorUpMarginGB": 1.25,
++            "GovernorStepIntervalS": 9.0,
++            "GovernorUpHoldS": 12.0,
++            "GovernorMaxHoldS": 120.0,
++            "GovernorPostUpGraceS": 18.0,
++            "GovernorRAMRungsBeforeUp": 4,
++            "GovernorVRAMRungsBeforeUp": 3,
++        })
++
++    assert loop.policy is not old_policy
++    assert loop.policy.vram_cushion == int(3 * GIB)
++    assert loop.policy.ram_cushion == int(7 * GIB)
++    assert loop.policy.margin == int(1.25 * GIB)
++    assert loop.policy.step_interval == 9.0
++    assert loop.policy.up_hold == 12.0
++    assert loop.policy.max_hold == 120.0
++    assert loop.policy.post_up_grace == 18.0
++    assert loop.policy.ram_rungs_before_up == 4
++    assert loop.policy.vram_rungs_before_up == 3
++    assert calls == []
++    assert "governor settings applied" in caplog.text
