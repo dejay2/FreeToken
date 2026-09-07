@@ -152,6 +152,7 @@ class ProcessManager:
         self._process: Any = None
         self._start_log_offset = 0
         self._temporary_boot_files: set[Path] = set()
+        self._governor: Any = None
         self._lock = threading.RLock()
 
     # ---- job API ---------------------------------------------------------
@@ -320,6 +321,7 @@ class ProcessManager:
         self.run_stop()
 
     def run_stop(self) -> Any:
+        self.stop_governor()
         if not self.platform_windows:
             return self._run_stop_linux()
         command = [
@@ -746,6 +748,7 @@ class ProcessManager:
             job.completed_at = self._iso_now()
             if self._active_id == job_id:
                 self._active_id = None
+        self.start_governor(settings=job.settings_snapshot)
 
     def _finish(self, job_id: str, stage: str, progress: str, error: str | None = None) -> None:
         with self._lock:
@@ -864,6 +867,69 @@ class ProcessManager:
             "gpuUtilPercent": int(util) if isinstance(util, (int, float)) else 0,
         }
         return result
+
+    def start_governor(self, settings: dict[str, Any] | None = None) -> None:
+        try:
+            from .governor import GIB, GovernorLoop, GovernorPolicy
+        except ImportError:
+            return
+        if settings is None:
+            try:
+                from .boot_parser import BootFile
+
+                settings = BootFile(self.boot_file).load()
+            except Exception:
+                settings = {}
+        enabled_val = settings.get("MemoryGovernor", True)
+        enabled = str(enabled_val).strip().lower() in {"1", "true", "yes", "on"} if not isinstance(enabled_val, bool) else enabled_val
+        vram_gb = float(settings.get("GovernorVRAMFreeGB") if settings.get("GovernorVRAMFreeGB") is not None else 1.5)
+        ram_gb = float(settings.get("GovernorRAMFreeGB") if settings.get("GovernorRAMFreeGB") is not None else 4.0)
+        policy = GovernorPolicy(
+            vram_cushion=int(round(vram_gb * GIB)),
+            ram_cushion=int(round(ram_gb * GIB)),
+        )
+        self.stop_governor()
+        self._governor = GovernorLoop(self, policy, http_port=self.port)
+        self._governor.enabled = enabled
+        self._governor.start()
+
+    def stop_governor(self) -> None:
+        if self._governor is not None:
+            try:
+                self._governor.stop()
+            except Exception:
+                pass
+            self._governor = None
+
+    def governor_status(self) -> dict[str, Any]:
+        if self._governor is not None:
+            return self._governor.status()
+        try:
+            from .boot_parser import BootFile
+
+            settings = BootFile(self.boot_file).load()
+        except Exception:
+            settings = {}
+        enabled_val = settings.get("MemoryGovernor", True)
+        enabled = str(enabled_val).strip().lower() in {"1", "true", "yes", "on"} if not isinstance(enabled_val, bool) else enabled_val
+        layers = {"owned": 0, "pinned": 0, "disk": 0}
+        try:
+            res = self._get_json(f"http://127.0.0.1:{self.port}/v1/cache/residency", timeout=1.0)
+            if isinstance(res, dict):
+                layers = {
+                    "owned": res.get("owned", 0),
+                    "pinned": res.get("pinned", 0),
+                    "disk": res.get("disk", 0),
+                }
+        except Exception:
+            pass
+        return {
+            "enabled": enabled,
+            "last_action": None,
+            "layers": layers,
+            "free_vram_gb": 0.0,
+            "free_ram_gb": 0.0,
+        }
 
     def _iso_now(self) -> str:
         stamp = _datetime.datetime.fromtimestamp(self._wall_now(), tz=_datetime.timezone.utc)

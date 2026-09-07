@@ -1081,6 +1081,9 @@
       const used = Number(gpu.vramUsedMb || 0); const total = Number(gpu.vramTotalMb || 0); const percent = total ? Math.min(100, used / total * 100) : 0;
       $('server-pill').innerHTML = `<span class="dot ${escapeHtml(stateName)}"></span> Main server: <strong>${escapeHtml(pretty)}</strong>${server.uptimeS ? `<span class="muted">· up ${escapeHtml(fmtUptime(server.uptimeS))}</span>` : ''}`;
       const parkingText = parking.mode && parking.mode !== 'off' ? `${escapeHtml(parking.mode.toUpperCase())} · ${escapeHtml(parking.parkedCount ?? 0)} parked${parking.lastRestoreMs ? ` · last restore ${escapeHtml(Math.round(parking.lastRestoreMs))} ms` : ''}` : 'Off';
+      const governor = body.governor || {};
+      const govLayers = governor.layers || {};
+      const govText = governor.enabled === false ? 'Off' : (governor.last_action ? escapeHtml(governor.last_action) : 'Watching');
       $('status').innerHTML = [
         `<div class="stat"><span class="small">Main server</span><strong><span class="dot ${escapeHtml(stateName)}"></span>${escapeHtml(pretty)}</strong><div class="sub">Door ${escapeHtml(server.port ?? '')}${server.uptimeS ? ` · up ${escapeHtml(fmtUptime(server.uptimeS))}` : ''}</div></div>`,
         `<div class="stat"><span class="small">This settings page</span><strong><span class="dot serving"></span>${escapeHtml(body.helper?.status === 'up' ? 'Up' : (body.helper?.status || 'unknown'))}</strong><div class="sub">v${escapeHtml(body.helper?.version || '')} · up ${escapeHtml(fmtUptime(body.helper?.uptimeS))}</div></div>`,
@@ -1089,6 +1092,7 @@
         `<div class="stat"><span class="small">Expert slots on the card</span><strong>${escapeHtml(geometry.moeCacheSize ? fmt(geometry.moeCacheSize) : '—')}</strong><div class="sub">${escapeHtml((geometry.gpuOwnedLayers || []).length)} layers kept whole</div></div>`,
         `<div class="stat"><span class="small">Chat memory</span><strong>${escapeHtml(geometry.numPages ? fmt(geometry.numPages * (geometry.pageSize || 1)) : '—')}</strong><div class="sub">${geometry.numPages ? `${escapeHtml(fmt(geometry.numPages))} pages of ${escapeHtml(fmt(geometry.pageSize || 0))} tokens` : 'not running'}</div></div>`,
         `<div class="stat"><span class="small">Idle chats kept</span><strong>${parkingText}</strong>${parking.lastError ? `<div class="error">${escapeHtml(parking.lastError)}</div>` : ''}</div>`,
+        `<div class="stat"><span class="small">Memory governor</span><strong>${escapeHtml(govLayers.owned ?? 0)} owned · ${escapeHtml(govLayers.pinned ?? 0)} pinned · ${escapeHtml(govLayers.disk ?? 0)} disk</strong><div class="sub">${govText}</div></div>`,
       ].join('');
       $('status-updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
       $('server-tab-count').hidden = !server.activeRequests; $('server-tab-count').textContent = `${server.activeRequests || 0} busy`;

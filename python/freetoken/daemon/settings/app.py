@@ -447,6 +447,13 @@ def create_app(
                 "vramTotalMb": int(server.get("vramTotalMb", 0) or 0),
                 "gpuUtilPercent": int(server.get("gpuUtilPercent", 0) or 0),
             },
+            "governor": process_manager.governor_status() if hasattr(process_manager, "governor_status") else {
+                "enabled": True,
+                "last_action": None,
+                "layers": {"owned": 0, "pinned": 0, "disk": 0},
+                "free_vram_gb": 0.0,
+                "free_ram_gb": 0.0,
+            },
             "currentJob": process_manager.current_job(),
         }
 
