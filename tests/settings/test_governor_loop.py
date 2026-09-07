@@ -165,3 +165,44 @@ def test_status_path_reads_the_boot_file_and_never_dials_the_server(tmp_path, mo
     assert status["layers"] == {"owned": 0, "pinned": 0, "disk": 0}
     assert status["last_action"] is None
     assert isinstance(status["enabled"], bool)
+
+
+def test_start_governor_without_settings_reads_the_boot_file(tmp_path, monkeypatch):
+    """The helper entry point starts the governor with no snapshot (adopted server after a
+    helper restart); it must read the cushions from the boot file and start the loop."""
+    from freetoken.daemon.settings import governor as gov
+    from freetoken.daemon.settings.process_manager import ProcessManager
+
+    started = {}
+
+    class FakeLoop:
+        def __init__(self, pm, policy, http_port=2020):
+            started["policy"] = policy
+            self.enabled = None
+
+        def start(self):
+            started["running"] = True
+
+        def stop(self):
+            started["running"] = False
+
+        def status(self):
+            return {}
+
+    monkeypatch.setattr(gov, "GovernorLoop", FakeLoop)
+    import shutil
+    from pathlib import Path
+
+    from freetoken.daemon.settings.boot_parser import BootFile
+
+    boot = tmp_path / "boot-2020.ps1"
+    shutil.copy2(Path(__file__).parents[2] / "boot-2020.ps1", boot)
+    BootFile(boot).save({"MemoryGovernor": True, "GovernorVRAMFreeGB": 2.5, "GovernorRAMFreeGB": 6})
+    pm = ProcessManager(boot_file=boot, stop_script=tmp_path / "stop.ps1", log_path=tmp_path / "log", lock_path=tmp_path / "lock", port=2020)
+    pm.start_governor()
+    try:
+        assert started.get("running") is True
+        assert started["policy"].vram_cushion == int(round(2.5 * gov.GIB))
+        assert started["policy"].ram_cushion == int(round(6 * gov.GIB))
+    finally:
+        pm.stop_governor()

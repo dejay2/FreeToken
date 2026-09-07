@@ -44,11 +44,19 @@ def main(argv: list[str] | None = None) -> int:
         log_path=args.log_file,
         version=HELPER_VERSION,
     )
+    # Start the memory governor with the helper, not only from a page-driven Start: a helper
+    # restart adopts a model server that is already serving (helper 1.3.0), and without this
+    # the adopted server ran with no governor at all (seen live 2026-09-07 18:06: status stuck
+    # at zeros after `systemctl --user restart freetoken-settings`). The loop idles while no
+    # server is serving and picks the adopted one up on its next tick; a page Start re-reads
+    # the cushions and replaces it.
+    process_manager.start_governor()
     try:
         import uvicorn
 
         uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info")
     finally:
+        process_manager.stop_governor()
         process_manager.close()
     return 0
 
