@@ -617,4 +617,3 @@ def test_disk_materialize_layer(tmp_path: Path):
     for b_idx, (per_layer, slot_cache) in enumerate(cache.banks):
         name = schema[b_idx]
         assert torch.equal(slot_cache[:num_experts], orig_banks[name][0])
-
