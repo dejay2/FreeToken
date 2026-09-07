@@ -26,6 +26,14 @@ from freetoken.message import (
     CacheRebuildMsg,
     CacheRebuildReply,
     CacheRebuildResultMsg,
+    CacheResidencyBackendMsg,
+    CacheResidencyMsg,
+    CacheResidencyReply,
+    CacheResidencyResultMsg,
+    CacheStepBackendMsg,
+    CacheStepMsg,
+    CacheStepReply,
+    CacheStepResultMsg,
     DetokenizeMsg,
     ErrorReplyMsg,
     PromptAdmittedMsg,
@@ -360,6 +368,98 @@ class _MultimodalProcessor:
         }
 
 
+# Every control type the worker forwards or absorbs; a message outside this tuple (and outside
+# the tokenize/detokenize/abort sets) trips the accounting assert in the loop below, which is
+# how a missing passthrough shows up: the worker exits instead of silently dropping the request.
+_CONTROL_MSG_TYPES = (
+    CacheParkStatusMsg,
+    CacheRebuildMsg,
+    CacheRebuildResultMsg,
+    CacheResidencyMsg,
+    CacheResidencyResultMsg,
+    CacheStepMsg,
+    CacheStepResultMsg,
+    ErrorReplyMsg,
+    PromptAdmittedMsg,
+    RoutingStatsMsg,
+    RoutingStatsResultMsg,
+)
+
+
+def _forward_control_msg(m, send_backend, send_frontend) -> bool:
+    """Forward one control message api -> scheduler or scheduler -> api. Returns True if forwarded.
+
+    Field by field, no ``**vars``: the tokenizer and backend/frontend shapes are deliberately
+    separate dataclasses (see freetoken/message), so a new field must be threaded here.
+    """
+    if isinstance(m, CacheParkStatusMsg):
+        send_frontend.put(CacheParkStatusReply(status=m.status))
+    elif isinstance(m, CacheRebuildMsg):
+        send_backend.put(
+            CacheRebuildBackendMsg(
+                request_id=m.request_id,
+                moe_cache_size=m.moe_cache_size,
+                num_pages=m.num_pages,
+                num_mamba_slots=m.num_mamba_slots,
+                num_swa_pages=m.num_swa_pages,
+                mode=m.mode,
+                layer_moves=m.layer_moves,
+            )
+        )
+    elif isinstance(m, CacheStepMsg):
+        send_backend.put(
+            CacheStepBackendMsg(
+                request_id=m.request_id,
+                axis=m.axis,
+                direction=m.direction,
+                ram_tight=m.ram_tight,
+            )
+        )
+    elif isinstance(m, CacheResidencyMsg):
+        send_backend.put(CacheResidencyBackendMsg(request_id=m.request_id))
+    elif isinstance(m, RoutingStatsMsg):
+        send_backend.put(RoutingStatsBackendMsg(request_id=m.request_id, reset=m.reset))
+    elif isinstance(m, RoutingStatsResultMsg):
+        send_frontend.put(RoutingStatsReply(request_id=m.request_id, stats=m.stats, error=m.error))
+    elif isinstance(m, CacheRebuildResultMsg):
+        send_frontend.put(
+            CacheRebuildReply(
+                request_id=m.request_id,
+                status=m.status,
+                moe_cache_size=m.moe_cache_size,
+                num_pages=m.num_pages,
+                mamba_slots=m.mamba_slots,
+                num_swa_pages=m.num_swa_pages,
+                error=m.error,
+            )
+        )
+    elif isinstance(m, CacheStepResultMsg):
+        send_frontend.put(
+            CacheStepReply(
+                request_id=m.request_id,
+                status=m.status,
+                applied=m.applied,
+                layer=m.layer,
+                at_floor=m.at_floor,
+                moe_cache_size=m.moe_cache_size,
+                layers=m.layers,
+                vram_free_bytes=m.vram_free_bytes,
+                error=m.error,
+            )
+        )
+    elif isinstance(m, CacheResidencyResultMsg):
+        send_frontend.put(
+            CacheResidencyReply(
+                request_id=m.request_id,
+                status=m.status,
+                residency=m.residency,
+                error=m.error,
+            )
+        )
+    else:
+        return False
+    return True
+
 @torch.inference_mode()
 def tokenize_worker(
     *,
@@ -406,58 +506,11 @@ def tokenize_worker(
             prompt_admitted_msg = [m for m in pending_msg if isinstance(m, PromptAdmittedMsg)]
             error_reply_msg = [m for m in pending_msg if isinstance(m, ErrorReplyMsg)]
             # Control messages are pure passthrough (no tokenization): CacheRebuildMsg /
-            # RoutingStatsMsg (api -> scheduler) and status/result replies (scheduler -> api).
+            # CacheStepMsg / CacheResidencyMsg / RoutingStatsMsg (api -> scheduler) and
+            # status/result replies (scheduler -> api).
             for m in pending_msg:
-                if isinstance(m, CacheParkStatusMsg):
-                    send_frontend.put(CacheParkStatusReply(status=m.status))
-                elif isinstance(m, CacheRebuildMsg):
-                    send_backend.put(
-                        CacheRebuildBackendMsg(
-                            request_id=m.request_id,
-                            moe_cache_size=m.moe_cache_size,
-                            num_pages=m.num_pages,
-                            num_mamba_slots=m.num_mamba_slots,
-                            num_swa_pages=m.num_swa_pages,
-                            mode=m.mode,
-                        )
-                    )
-                elif isinstance(m, RoutingStatsMsg):
-                    send_backend.put(
-                        RoutingStatsBackendMsg(request_id=m.request_id, reset=m.reset)
-                    )
-                elif isinstance(m, RoutingStatsResultMsg):
-                    send_frontend.put(
-                        RoutingStatsReply(
-                            request_id=m.request_id, stats=m.stats, error=m.error
-                        )
-                    )
-                elif isinstance(m, CacheRebuildResultMsg):
-                    send_frontend.put(
-                        CacheRebuildReply(
-                            request_id=m.request_id,
-                            status=m.status,
-                            moe_cache_size=m.moe_cache_size,
-                            num_pages=m.num_pages,
-                            mamba_slots=m.mamba_slots,
-                            num_swa_pages=m.num_swa_pages,
-                            error=m.error,
-                        )
-                    )
-            n_control = sum(
-                isinstance(
-                    m,
-                    (
-                        CacheParkStatusMsg,
-                        CacheRebuildMsg,
-                        CacheRebuildResultMsg,
-                        ErrorReplyMsg,
-                        PromptAdmittedMsg,
-                        RoutingStatsMsg,
-                        RoutingStatsResultMsg,
-                    ),
-                )
-                for m in pending_msg
-            )
+                _forward_control_msg(m, send_backend, send_frontend)
+            n_control = sum(isinstance(m, _CONTROL_MSG_TYPES) for m in pending_msg)
             assert (
                 len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) + n_control
                 == len(pending_msg)
