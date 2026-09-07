@@ -220,7 +220,10 @@ def test_residency_report():
     assert rep["pinned"] == 2
     assert rep["disk"] == 0
     assert rep["moe_cache_size"] == 8
-    assert rep["layers"] == {0: "gpu_owned", 1: "pinned", 2: "pinned"}
+    assert rep["layers"] == {"0": "gpu_owned", "1": "pinned", "2": "pinned"}
+    # the report crosses the ZMQ/msgpack hop with strict map keys; int keys crash the worker
+    import msgpack
+    assert msgpack.unpackb(msgpack.packb(rep), raw=False, strict_map_key=True) == rep
 
 
 def test_step_memory_uses_the_rebuild_callable_for_every_rung():

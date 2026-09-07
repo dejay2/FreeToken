@@ -1763,7 +1763,11 @@ class Engine:
                 "pinned": 0,
                 "disk": 0,
             }
-        layers = {i: r for i, r in enumerate(self.moe_offload_cache.layer_residency)}
+        # String keys on purpose: this dict rides inside CacheResidencyResultMsg through the
+        # tokenizer/detokenizer workers, whose msgpack decoder runs with strict_map_key (int
+        # keys raise "int is not allowed for map key"). Seen live 2026-09-07: the first
+        # /v1/cache/residency after boot killed freetoken-detokenizer-0 and took the API down.
+        layers = {str(i): r for i, r in enumerate(self.moe_offload_cache.layer_residency)}
         owned = sum(1 for r in layers.values() if r == "gpu_owned")
         pinned = sum(1 for r in layers.values() if r == "pinned")
         disk = sum(1 for r in layers.values() if r == "disk")

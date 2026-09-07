@@ -210,7 +210,7 @@ class _FakeBackend:
         else:  # CacheResidencyMsg
             reply = CacheResidencyReply(
                 request_id=msg.request_id, status="ok",
-                residency={"layers": {3: "pinned"}, "moe_cache_size": 6144,
+                residency={"layers": {"3": "pinned"}, "moe_cache_size": 6144,
                            "owned": self.owned, "pinned": 48 - self.owned, "disk": 0},
             )
             asyncio.get_running_loop().call_soon(self.manager._resolve_residency, reply)
@@ -238,7 +238,7 @@ async def test_cache_step_and_residency_round_trip():
 
         res = await cache_residency()
         assert res["owned"] == 3 and res["pinned"] == 45
-        assert res["layers"][3] == "pinned"  # int key here; "3" once JSON-encoded over HTTP
+        assert res["layers"]["3"] == "pinned"  # string keys end to end (msgpack strict_map_key)
         assert len(backend.sent) == 2
         # <5 s old: served from the cache, no second wire round trip
         backend.owned = 99
