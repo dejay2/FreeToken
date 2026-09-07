@@ -618,6 +618,49 @@ def test_linux_branch_stops_through_proc_and_starts_the_mapped_command(tmp_path,
     assert "linux stop" in log and "freetoken.cli serve" in log
 
 
+@pytest.mark.parametrize("platform_windows", [False, True])
+@pytest.mark.parametrize("fresh_failure", [False, True])
+def test_start_scans_only_its_own_log_output(tmp_path, platform_windows, fresh_failure):
+    log = tmp_path / "server.log"
+    old_output = "earlier boot — failed\nTraceback (most recent call last):\n"
+    log.write_text(old_output, encoding="utf-8")
+    executor = ManualExecutor()
+    statuses = iter([{"state": "loading"}, {"state": "serving"}])
+    commands = []
+
+    def popen(command, *, stdout, **_kwargs):
+        commands.append(command)
+        stdout.write(b"CUDA out of memory: current boot\n" if fresh_failure else b"Loading model\n")
+        return FakeProcess()
+
+    manager = ProcessManager(
+        boot_file=tmp_path / "boot.ps1", stop_script=tmp_path / "stop.ps1",
+        log_path=log, lock_path=tmp_path / "gpu.lock",
+        executor=executor, platform_windows=platform_windows,
+        popen=popen, readiness=lambda: next(statuses),
+        sleep=lambda _: None, poll_interval=0,
+        launch_builder=lambda settings, **_: FakeLaunch(
+            ["python", "--moe-cache-size", str(settings["MoECacheSize"])], {}),
+    )
+    job_id = manager.start("start", force=True,
+                           settings=None if platform_windows else {"MoECacheSize": 12000})
+    executor.run_next()
+    job = manager.job(job_id)
+    assert job["stage"] == ("failed" if fresh_failure else "serving")
+    assert job["error"] == ("CUDA out of memory: current boot" if fresh_failure else None)
+    if not platform_windows:
+        assert commands == [["python", "--moe-cache-size", "12000"]]
+    assert log.read_text(encoding="utf-8").startswith(old_output)
+
+    # A second start must advance the boundary, including past the first start's failure.
+    fresh_failure = False
+    statuses = iter([{"state": "loading"}, {"state": "serving"}])
+    next_job = manager.start("start", settings=None if platform_windows else {"MoECacheSize": 6144})
+    executor.run_next()
+    assert manager.job(next_job)["stage"] == "serving"
+    assert manager.job(next_job)["error"] is None
+
+
 def test_failure_signatures_are_detected():
     assert ProcessManager.failure_from_log("RuntimeError: broken")
     assert ProcessManager.failure_from_log("CUDA out of memory")

@@ -150,6 +150,7 @@ class ProcessManager:
         self._jobs: dict[str, LifecycleJob] = {}
         self._active_id: str | None = None
         self._process: Any = None
+        self._start_log_offset = 0
         self._temporary_boot_files: set[Path] = set()
         self._lock = threading.RLock()
 
@@ -446,6 +447,10 @@ class ProcessManager:
     ) -> Any:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("ab", buffering=0) as log:
+            # The retained log can contain failures from earlier boots. On WSL this made a
+            # fresh override fail in the same second as spawn (J5, 2026-09-07). Keep history
+            # for the log viewer, but attribute readiness failures only to this start.
+            self._start_log_offset = log.tell()
             separator = f"\n===== settings helper start {_datetime.datetime.now().isoformat()} =====\n".encode()
             log.write(separator)
             if not self.platform_windows:
@@ -772,7 +777,8 @@ class ProcessManager:
             with self.log_path.open("rb") as fh:
                 fh.seek(0, os.SEEK_END)
                 size = fh.tell()
-                fh.seek(max(0, size - max_bytes), os.SEEK_SET)
+                start = self._start_log_offset if size >= self._start_log_offset else 0
+                fh.seek(max(start, size - max_bytes), os.SEEK_SET)
                 return fh.read().decode("utf-8", "replace")
         except (FileNotFoundError, OSError):
             return ""
