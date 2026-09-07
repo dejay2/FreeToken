@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import os
 import signal
@@ -25,11 +26,25 @@ from freetoken.message import (
     CacheParkStatusReply,
     CacheRebuildMsg,
     CacheRebuildReply,
+    CacheResidencyMsg,
+    CacheResidencyReply,
+    CacheStepMsg,
+    CacheStepReply,
     RoutingStatsMsg,
     RoutingStatsReply,
     TokenizeMsg,
     UserReply,
 )
+
+
+class _AwaitableInt(int):
+    """An int that can also be awaited in an async context."""
+
+    def __await__(self):
+        async def _ret():
+            return int(self)
+
+        return _ret().__await__()
 from freetoken.utils import (
     ZmqAsyncPullQueue,
     ZmqAsyncPushQueue,
@@ -224,12 +239,20 @@ class FrontendManager:
     _frontend_tokenizer_lock: Any = field(default_factory=threading.Lock)
     # One-shot guard for warm_frontend_tokenizer(); benign if two polls race it.
     _frontend_warm_started: bool = False
+    # Event set when not rebuilding; cleared when rebuilding starts
+    rebuild_done: asyncio.Event = field(default_factory=asyncio.Event)
+    _residency_cache: Dict[str, Any] | None = None
+    _residency_time: float = 0.0
 
     def __post_init__(self) -> None:
         if self.stats is None:
             self.stats = StatsTracker()
         self.parking_status["mode"] = getattr(self.config, "kv_park", "off")
         self.kv_dtype = str(getattr(self.config, "kv_dtype", "bf16"))
+        if self.maintenance_state != "rebuilding":
+            self.rebuild_done.set()
+        else:
+            self.rebuild_done.clear()
 
     def frontend_tokenizer(self) -> Any:
         """Lazily build and cache the frontend-side tokenizer used by count_tokens (see the
@@ -258,17 +281,41 @@ class FrontendManager:
 
         threading.Thread(target=_warm, daemon=True, name="frontend-tokenizer-warm").start()
 
-    def new_user(self) -> int:
-        if self.maintenance_state != "serving":
-            raise AdmissionClosedError(
-                f"server unavailable: engine is {self.maintenance_state}"
-            )
+    def _allocate_user(self) -> int:
         uid = self.uid_counter
         self.uid_counter += 1
         self.ack_map[uid] = []
         self.event_map[uid] = asyncio.Event()
         self.stats.on_new_user(uid)
         return uid
+
+    async def _wait_rebuild_and_allocate(self, timeout: float = 120.0) -> int:
+        try:
+            await asyncio.wait_for(self.rebuild_done.wait(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise AdmissionClosedError(
+                f"server unavailable: cache rebuild timed out after {timeout}s"
+            ) from exc
+        if self.maintenance_state in ("loading", "failed", "stopping"):
+            raise AdmissionClosedError(
+                f"server unavailable: engine is {self.maintenance_state}"
+            )
+        return self._allocate_user()
+
+    def new_user(self, timeout: float = 120.0):
+        if self.maintenance_state in ("loading", "failed", "stopping"):
+            raise AdmissionClosedError(
+                f"server unavailable: engine is {self.maintenance_state}"
+            )
+        if self.maintenance_state == "rebuilding":
+            return self._wait_rebuild_and_allocate(timeout=timeout)
+        return _AwaitableInt(self._allocate_user())
+
+    async def new_user_async(self, timeout: float = 120.0) -> int:
+        res = self.new_user(timeout=timeout)
+        if inspect.isawaitable(res):
+            return await res
+        return int(res)
 
     async def listen(self):
         while True:
@@ -278,6 +325,25 @@ class FrontendManager:
                 continue
             if isinstance(msg, CacheRebuildReply):
                 self._resolve_rebuild(msg)
+                continue
+            if isinstance(msg, CacheStepReply):
+                fut = self.rebuild_futures.pop(msg.request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result({"status": msg.status, "result": msg.result, "error": msg.error})
+                if self.fatal_error is not None:
+                    self.maintenance_state = "failed"
+                else:
+                    self.maintenance_state = "failed" if msg.status == "failed" else "serving"
+                if hasattr(self, "rebuild_done"):
+                    self.rebuild_done.set()
+                continue
+            if isinstance(msg, CacheResidencyReply):
+                fut = self.routing_futures.pop(msg.request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result({"status": msg.status, "report": msg.report, "error": msg.error})
+                if msg.status == "ok" and isinstance(msg.report, dict):
+                    self._residency_cache = msg.report
+                    self._residency_time = time.monotonic()
                 continue
             if isinstance(msg, RoutingStatsReply):
                 fut = self.routing_futures.pop(msg.request_id, None)
@@ -320,11 +386,18 @@ class FrontendManager:
         fut = self.rebuild_futures.pop(msg.request_id, None)
         if fut is not None and not fut.done():
             fut.set_result(self.last_rebuild)
+        if getattr(msg, "residency_report", None):
+            self._residency_cache = msg.residency_report
+            self._residency_time = time.monotonic()
         if self.fatal_error is not None:
             # A dead backend stays failed regardless of any (possibly stale/buffered) reply.
             self.maintenance_state = "failed"
+            if hasattr(self, "rebuild_done"):
+                self.rebuild_done.set()
             return
         self.maintenance_state = "failed" if msg.status == "failed" else "serving"
+        if hasattr(self, "rebuild_done"):
+            self.rebuild_done.set()
 
     def fail_pending_rebuilds(self, message: str) -> None:
         """Resolve every in-flight rebuild waiter as failed. Called from the supervisor thread
@@ -339,6 +412,8 @@ class FrontendManager:
         result = {"status": "failed", "error": message}
 
         def _resolve_all() -> None:
+            if hasattr(self, "rebuild_done"):
+                self.rebuild_done.set()
             for request_id in list(self.rebuild_futures):
                 fut = self.rebuild_futures.pop(request_id, None)
                 if fut is not None and not fut.done():
@@ -537,6 +612,7 @@ class CacheRebuildRequest(BaseModel):
     # is deferred (needs the drain-gate machinery); constraining the Literal makes an
     # unsupported value fail fast with a 422 at the API layer instead of a generic 503.
     mode: Literal["if_idle"] = "if_idle"
+    layer_moves: list[tuple[int, str]] | None = None
     timeout: float = 300.0
 
 
@@ -547,6 +623,7 @@ async def dispatch_rebuild(
     num_pages: int | None,
     num_mamba_slots: int | None = None,
     num_swa_pages: int | None = None,
+    layer_moves: list[tuple[int, str]] | None = None,
     mode: str = "if_idle",
     timeout: float = 300.0,
 ) -> Dict[str, Any]:
@@ -559,6 +636,8 @@ async def dispatch_rebuild(
     fut = asyncio.get_running_loop().create_future()
     state.rebuild_futures[request_id] = fut
     state.maintenance_state = "rebuilding"
+    if hasattr(state, "rebuild_done"):
+        state.rebuild_done.clear()
     try:
         await state.send_one(
             CacheRebuildMsg(
@@ -567,6 +646,7 @@ async def dispatch_rebuild(
                 num_pages=num_pages,
                 num_mamba_slots=num_mamba_slots,
                 num_swa_pages=num_swa_pages,
+                layer_moves=layer_moves,
                 mode=mode,
             )
         )
@@ -576,6 +656,8 @@ async def dispatch_rebuild(
         # maintenance forever with no reply ever arriving to clear it) and surface the error.
         state.rebuild_futures.pop(request_id, None)
         state.maintenance_state = "serving"
+        if hasattr(state, "rebuild_done"):
+            state.rebuild_done.set()
         return {"status": "failed", "error": f"failed to dispatch rebuild: {e!r}"}
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
@@ -650,12 +732,163 @@ async def cache_rebuild(req: CacheRebuildRequest):
         num_pages=req.num_pages,
         num_mamba_slots=req.num_mamba_slots,
         num_swa_pages=_resolve_num_swa_pages(state, req),
+        layer_moves=req.layer_moves,
         mode=req.mode,
         timeout=req.timeout,
     )
     if result["status"] == "timeout":
         return JSONResponse(result, status_code=504)
     return JSONResponse(result, status_code=200 if result["status"] == "ok" else 503)
+
+
+class CacheStepRequest(BaseModel):
+    axis: Literal["vram", "ram"]
+    direction: Literal["down", "up"]
+    ram_tight: bool = False
+    timeout: float = 60.0
+
+
+async def dispatch_step(
+    state: FrontendManager,
+    *,
+    axis: str,
+    direction: str,
+    ram_tight: bool = False,
+    timeout: float = 60.0,
+) -> Dict[str, Any]:
+    """Dispatch a memory-governor step (VRAM or RAM ladder) to the scheduler/engine."""
+    if getattr(state, "engine", None) is not None:
+        res = state.engine.step_memory(axis=axis, direction=direction, ram_tight=ram_tight)
+        state._residency_cache = state.engine.residency_report()
+        state._residency_time = time.monotonic()
+        out = {"status": "ok"}
+        if isinstance(res, dict):
+            out.update(res)
+            out["result"] = res
+        return out
+
+    request_id = str(uuid.uuid4())
+    fut = asyncio.get_running_loop().create_future()
+    state.rebuild_futures[request_id] = fut
+    state.maintenance_state = "rebuilding"
+    if hasattr(state, "rebuild_done"):
+        state.rebuild_done.clear()
+    try:
+        await state.send_one(
+            CacheStepMsg(
+                request_id=request_id,
+                axis=axis,
+                direction=direction,
+                ram_tight=ram_tight,
+            )
+        )
+    except Exception as e:  # noqa: BLE001
+        state.rebuild_futures.pop(request_id, None)
+        state.maintenance_state = "serving"
+        if hasattr(state, "rebuild_done"):
+            state.rebuild_done.set()
+        return {"status": "failed", "error": f"failed to dispatch cache step: {e!r}"}
+    try:
+        reply = await asyncio.wait_for(fut, timeout=timeout)
+        out = {"status": reply.get("status", "ok")}
+        if "result" in reply and isinstance(reply["result"], dict):
+            out.update(reply["result"])
+            out["result"] = reply["result"]
+        if "error" in reply and reply["error"]:
+            out["error"] = reply["error"]
+        return out
+    except asyncio.TimeoutError:
+        state.rebuild_futures.pop(request_id, None)
+        return {"status": "timeout", "request_id": request_id}
+
+
+@app.post("/v1/cache/step")
+async def cache_step(req: CacheStepRequest):
+    """Step cache memory footprint along the VRAM or RAM ladder."""
+    state = get_global_state()
+    if state.maintenance_state == "loading":
+        return JSONResponse(
+            {"status": "loading", "error": "model is still loading; cannot step cache yet"},
+            status_code=503,
+        )
+    if state.maintenance_state == "failed":
+        return JSONResponse(
+            {"status": "failed", "error": "server latched in maintenance; restart required"},
+            status_code=503,
+        )
+    if state.maintenance_state == "stopping":
+        return JSONResponse(
+            {"status": "busy", "error": "engine stop is in progress"},
+            status_code=409,
+        )
+    if state.maintenance_state == "rebuilding":
+        if hasattr(state, "rebuild_done"):
+            try:
+                await asyncio.wait_for(state.rebuild_done.wait(), timeout=req.timeout)
+            except asyncio.TimeoutError:
+                return JSONResponse(
+                    {"status": "timeout", "error": "timed out waiting for in-flight rebuild"},
+                    status_code=504,
+                )
+        if state.maintenance_state in ("loading", "failed", "stopping"):
+            return JSONResponse(
+                {"status": "failed", "error": f"engine is {state.maintenance_state}"},
+                status_code=503,
+            )
+
+    result = await dispatch_step(
+        state,
+        axis=req.axis,
+        direction=req.direction,
+        ram_tight=req.ram_tight,
+        timeout=req.timeout,
+    )
+    if result.get("status") == "timeout":
+        return JSONResponse(result, status_code=504)
+    return JSONResponse(result, status_code=200 if result.get("status") == "ok" else 503)
+
+
+@app.get("/v1/cache/residency")
+async def cache_residency(timeout: float = 10.0):
+    """Report current layer residency and cache sizes."""
+    state = get_global_state()
+    now = time.monotonic()
+    if state._residency_cache is not None and (now - state._residency_time) < 5.0:
+        return state._residency_cache
+
+    if getattr(state, "engine", None) is not None:
+        report = state.engine.residency_report()
+        state._residency_cache = report
+        state._residency_time = now
+        return report
+
+    if state.maintenance_state in ("loading", "failed", "stopping"):
+        return JSONResponse(
+            {"error": f"engine is {state.maintenance_state}, not available"},
+            status_code=503,
+        )
+    request_id = str(uuid.uuid4())
+    fut = asyncio.get_running_loop().create_future()
+    state.routing_futures[request_id] = fut
+    try:
+        await state.send_one(CacheResidencyMsg(request_id=request_id))
+    except Exception as e:  # noqa: BLE001
+        state.routing_futures.pop(request_id, None)
+        return JSONResponse(
+            {"error": f"failed to dispatch residency request: {e!r}"},
+            status_code=503,
+        )
+    try:
+        reply = await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        state.routing_futures.pop(request_id, None)
+        return JSONResponse({"error": "residency request timed out"}, status_code=504)
+    if reply.get("status") != "ok":
+        return JSONResponse({"error": reply.get("error", "unknown error")}, status_code=500)
+    report = reply.get("report") or {}
+    state._residency_cache = report
+    state._residency_time = time.monotonic()
+    return report
 
 
 def _cache_limits(geo: dict, unit_bytes: dict, pool_budget: int, floors: dict) -> dict:
@@ -950,12 +1183,15 @@ async def generate(req: GenerateRequest, request: Request):
     logger.debug("Received generate request %s", req)
     log_request("/generate", req, request)
     state = get_global_state()
-    if state.maintenance_state != "serving":
-        detail = "model is still loading" if state.maintenance_state == "loading" else "cache rebuild in progress"
+    if state.maintenance_state in ("loading", "failed", "stopping"):
+        detail = "model is still loading" if state.maintenance_state == "loading" else f"server {state.maintenance_state}"
         return JSONResponse({"error": f"server unavailable: {detail}"}, status_code=503)
     if req.max_tokens < 1:
         return JSONResponse({"error": f"max_tokens must be at least 1, got {req.max_tokens}"}, status_code=400)
-    uid = state.new_user()
+    try:
+        uid = await state.new_user_async()
+    except AdmissionClosedError as e:
+        return JSONResponse({"error": str(e)}, status_code=503)
     await state.send_one(
         TokenizeMsg(
             uid=uid,
