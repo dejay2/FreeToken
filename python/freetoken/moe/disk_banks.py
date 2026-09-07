@@ -179,7 +179,10 @@ class ExpertDiskCopy:
         if doc is None:
             doc = self.manifest
         tmp = self.manifest_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(doc, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
         tmp.replace(self.manifest_path)
 
     def layer_complete(self, layer_id: int) -> bool:
@@ -216,6 +219,10 @@ class ExpertDiskCopy:
                     chunk = chunk.contiguous()
                     u = chunk.view(torch.uint8).reshape(-1)
                     f.write(u.numpy().tobytes())
+                # the manifest's complete flag is the spill gate: it must never name a
+                # layer whose bytes are still in the page cache when the box loses power
+                f.flush()
+                os.fsync(f.fileno())
             tmp_path.replace(dst_path)
 
         self.manifest.setdefault("complete", {})[str(layer_id)] = True
@@ -227,7 +234,11 @@ class ExpertDiskCopy:
         with open(path, "rb") as f:
             u = dst_tensor.view(torch.uint8).reshape(-1)
             mv = memoryview(u.numpy())
-            f.readinto(mv)
+            got = f.readinto(mv)
+        if got != len(mv):
+            raise RuntimeError(
+                f"short read recalling layer {layer_id} bank {bank_name!r}: {got} of {len(mv)} bytes"
+            )
 
 
 class BackgroundWriter(threading.Thread):

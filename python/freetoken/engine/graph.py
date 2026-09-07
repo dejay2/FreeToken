@@ -130,10 +130,6 @@ class GraphRunner:
         self.stream = stream
         self.device = device
         self.model = model
-        if self.moe_offload_cache is not None and getattr(self.moe_offload_cache, "has_disk_layers", False):
-            logger.info_rank0("CUDA graphs deferred until no disk layers")
-            self.graph_map = {}
-            return
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _reset_moe_offload_cache(self) -> None:
@@ -204,6 +200,9 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
+        # A DISK layer's per-step disk gather needs a host sync (topk_ids D2H) that a captured
+        # graph cannot contain; the engine also rebuilds this runner with no graphs while any
+        # layer is DISK, so this is the belt to that suspender. One bool read per batch.
         cache = getattr(self, "moe_offload_cache", None)
         if cache is not None and getattr(cache, "has_disk_layers", False):
             return False

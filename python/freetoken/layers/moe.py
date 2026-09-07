@@ -879,18 +879,6 @@ class OffloadMoELayer(MoELayer):
                 device=hidden_states.device,
                 decode_target=getattr(cache, "decode_target", "gpu"),
             )
-        if cache.is_disk_layer(self.layer_id):
-            cache.disk_materialize_layer(self.layer_id)
-            return self._expert_gemm(
-                cache,
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                views=cache.bank_views(self.num_experts),
-                n=self.num_experts,
-                alphas=cache.alphas_for_layer(self.layer_id),
-                is_prefill=True,
-            )
         if cache.is_gpu_owned_layer(self.layer_id):
             # No overlap buffer, no materialize, no release: the layer is already resident.
             # Keep the double-buffer pipeline moving anyway -- the next streaming layer's
@@ -924,6 +912,9 @@ class OffloadMoELayer(MoELayer):
             )
             cache.release_prefill_layer(self.layer_id)
             return out
+        # A DISK layer lands here too (the engine turns prefill overlap off while any layer
+        # is DISK): materialize_layer does the slot bookkeeping and copy_missing's disk
+        # branch fills slots [0, E) from the disk copy through staging.
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
         return self._expert_gemm(

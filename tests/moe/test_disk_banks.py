@@ -66,6 +66,7 @@ class FakeDiskEngine:
         owned_layers: tuple[int, ...] = (0,),
         model_dir: Path | None = None,
         disk_dir: Path | None = None,
+        overlap: bool = False,
     ):
         _init_tp()
         self.device = torch.device("cpu")
@@ -81,7 +82,7 @@ class FakeDiskEngine:
             ),
             model_path=str(self.model_dir),
             moe_backend="offload",
-            moe_prefill_overlap=False,
+            moe_prefill_overlap=overlap,
             moe_cache_size=cache_size,
             cuda_graph_max_bs=1,
             max_running_req=4,
@@ -105,6 +106,7 @@ class FakeDiskEngine:
             num_experts=num_experts,
             cache_size=cache_size,
             device=self.device,
+            prefill_overlap=overlap,
         )
         self.bank_schema = ("gate_up", "down")
         self.shapes = {
@@ -617,3 +619,125 @@ def test_disk_materialize_layer(tmp_path: Path):
     for b_idx, (per_layer, slot_cache) in enumerate(cache.banks):
         name = schema[b_idx]
         assert torch.equal(slot_cache[:num_experts], orig_banks[name][0])
+
+
+# --------------------------------------------------------------------------------------
+# R2 fixes: overlap suspend/resume, materialize bookkeeping, incomplete-layer gating,
+# pre-teardown spill check, scratch geometry
+# --------------------------------------------------------------------------------------
+
+def _complete_layers(eng: FakeDiskEngine, layer_ids) -> None:
+    for lid in layer_ids:
+        banks = {n: eng.moe_offload_cache.bank_sources[n][lid] for n in eng.bank_schema}
+        eng.expert_disk_copy.write_layer(lid, banks)
+
+
+def test_spill_suspends_prefill_overlap_and_last_recall_resumes(tmp_path: Path):
+    """The daily boot runs with prefill overlap on; rebind_layer refuses a DISK layer while
+    it is on, so the engine must switch it off before the spill and back on after the last
+    recall (design note: off while any layer is DISK)."""
+    eng = FakeDiskEngine(
+        num_layers=3, num_experts=8, cache_size=32, owned_layers=(),
+        model_dir=tmp_path / "model", disk_dir=tmp_path / "disk", overlap=True,
+    )
+    cache = eng.moe_offload_cache
+    assert cache.prefill_overlap and len(cache.prefill_bank_buffers) == 2
+    _complete_layers(eng, (1, 2))
+
+    eng._move_layer(2, "disk")
+    assert not cache.prefill_overlap and cache.prefill_bank_buffers == []
+    eng._move_layer(1, "disk")
+    assert not cache.prefill_overlap
+
+    eng._move_layer(2, "pinned")
+    assert cache.has_disk_layers and not cache.prefill_overlap  # one DISK layer left
+    eng._move_layer(1, "gpu_owned")
+    assert not cache.has_disk_layers
+    assert cache.prefill_overlap and len(cache.prefill_bank_buffers) == 2
+
+
+def test_materialize_layer_runs_slot_bookkeeping_for_disk_layer(tmp_path: Path, monkeypatch):
+    """A whole-layer fill of slots [0, E) must invalidate the ids those slots held, or the
+    next decode of another pinned layer hits a stale slot holding disk-layer rows. The
+    bookkeeping is materialize_layer's kernel; copy_missing then fills the data."""
+    _init_tp()
+    num_experts = 16
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    _make_dummy_checkpoint(model_dir)
+    schema = ("gate_up", "down")
+    shapes = {"gate_up": (num_experts, 8, 4), "down": (num_experts, 4, 8)}
+    dtypes = {"gate_up": torch.bfloat16, "down": torch.bfloat16}
+    copy = ExpertDiskCopy(tmp_path / "disk", model_dir, schema, shapes, dtypes)
+    cache = OffloadMoeCache(num_layers=2, num_experts=num_experts, cache_size=num_experts, device=torch.device("cpu"))
+    cache.expert_disk_copy = copy
+    banks = {n: [torch.randn(shapes[n], dtype=torch.bfloat16) for _ in range(2)] for n in schema}
+    cache.set_bank_sources(banks, layer_residency=["pinned", "pinned"])
+    copy.write_layer(1, {n: banks[n][1] for n in schema})
+    cache.rebind_layer(1, "disk", None)
+
+    calls = []
+    monkeypatch.setattr(
+        "freetoken.moe.offload_kernels.materialize_layer",
+        lambda c, lid: calls.append(lid),
+    )
+    cache.materialize_layer(1)
+    assert calls == [1], "the LRU bookkeeping kernel must run for a DISK layer too"
+    assert cache._pending_whole_layer and cache._pending_src_layer == 1
+    cache.copy_missing()
+    for b_idx, (_, slot_cache) in enumerate(cache.banks):
+        assert torch.equal(slot_cache[:num_experts], banks[schema[b_idx]][1])
+
+
+def test_ram_axis_skips_layers_the_writer_has_not_finished(tmp_path: Path):
+    eng = FakeDiskEngine(num_layers=4, num_experts=8, cache_size=16, owned_layers=(0,),
+                         model_dir=tmp_path / "model", disk_dir=tmp_path / "disk")
+    _complete_layers(eng, (2,))  # layers 1 and 3 are still being written
+    r = eng.step_memory(axis="ram", direction="down")
+    assert r["applied"] == "pinned->disk" and r["layer"] == 2
+    r = eng.step_memory(axis="ram", direction="down")
+    assert r["applied"] is None and "incomplete" in r["reason"]
+    assert not r["at_floor"]
+    assert eng.moe_offload_cache.layer_residency[3] == "pinned"
+
+
+def test_rebuild_rejects_incomplete_spill_before_teardown(tmp_path: Path):
+    """The real pre-check in rebuild_runtime_cache must reject an incomplete spill while the
+    engine is still serving (before the point of no return)."""
+    from freetoken.kvcache.base import CacheRebuildRejected
+
+    eng = FakeDiskEngine(num_layers=3, num_experts=8, cache_size=16, owned_layers=(0,),
+                         model_dir=tmp_path / "model", disk_dir=tmp_path / "disk")
+    eng.rebuild_teardown_started = False
+    with pytest.raises(CacheRebuildRejected, match="incomplete"):
+        Engine.rebuild_runtime_cache(eng, layer_moves=[(1, "disk")])
+    assert eng.rebuild_teardown_started is False
+    assert eng.moe_offload_cache.layer_residency[1] == "pinned"
+
+
+def test_disk_gather_scratch_matches_routing_and_id_dtype(tmp_path: Path):
+    _init_tp()
+    num_experts = 16
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    _make_dummy_checkpoint(model_dir)
+    schema = ("gate_up", "down")
+    shapes = {"gate_up": (num_experts, 8, 4), "down": (num_experts, 4, 8)}
+    dtypes = {"gate_up": torch.bfloat16, "down": torch.bfloat16}
+    copy = ExpertDiskCopy(tmp_path / "disk", model_dir, schema, shapes, dtypes)
+    cache = OffloadMoeCache(num_layers=1, num_experts=num_experts, cache_size=num_experts, device=torch.device("cpu"))
+    cache.expert_disk_copy = copy
+    banks = {n: [torch.randn(shapes[n], dtype=torch.bfloat16)] for n in schema}
+    cache.set_bank_sources(banks, layer_residency=["pinned"])
+    copy.write_layer(0, {n: banks[n][0] for n in schema})
+    cache.rebind_layer(0, "disk", None)
+
+    topk_ids = torch.tensor([[3, 9, 3], [9, 1, 7]], dtype=torch.int32)  # 6 routes, 4 unique
+    views, ids = cache.disk_gather(0, topk_ids)
+    assert ids.dtype == topk_ids.dtype and ids.shape == topk_ids.shape
+    assert views[0].shape[0] == 4
+    # scratch sized top_k x bs on first use (design: 28 MB at the daily bs=1 boot), not 64 rows
+    assert cache._disk_device_scratch["gate_up"].shape[0] == topk_ids.numel()
+    for row in range(topk_ids.shape[0]):
+        for k in range(topk_ids.shape[1]):
+            assert torch.equal(views[0][ids[row, k]], banks["gate_up"][0][topk_ids[row, k]])

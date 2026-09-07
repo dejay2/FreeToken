@@ -363,6 +363,20 @@ class SpecForwardOutput(NamedTuple):
     hidden: torch.Tensor
 
 
+def _resume_prefill_overlap_if_clear(engine) -> None:
+    """Re-arm the prefill double buffer once no layer is DISK, if a spill suspended it.
+
+    A module function (not a method) because the step tests drive Engine._move_layer on a
+    lightweight fake; only attributes _move_layer itself set are assumed."""
+    cache = engine.moe_offload_cache
+    if not getattr(engine, "_prefill_overlap_suspended", False) or cache is None:
+        return
+    if cache.has_disk_layers:
+        return
+    cache.set_prefill_overlap(True)
+    engine._prefill_overlap_suspended = False
+
+
 class Engine:
     # MoE layer ids resolved from --moe-gpu-owned-layers. A CLASS default so the budget
     # helpers read a sane empty set on an Engine.__new__(Engine) stub (the unit tests build
@@ -1325,6 +1339,14 @@ class Engine:
                 raise RuntimeError(
                     f"cannot spill layer {layer_id} to disk: disk copy missing or layer incomplete"
                 )
+            # The prefill double buffer DMAs from registered host banks; a DISK layer has
+            # none, so rebind_layer refuses the move while overlap is on. Suspend it here
+            # (design note: off while any layer is DISK, as for LOCKED/PAGEABLE) and resume
+            # it below when the last DISK layer is recalled. Safe between forwards only,
+            # which is where rebuild_runtime_cache runs.
+            if self.moe_offload_cache.prefill_overlap:
+                self.moe_offload_cache.set_prefill_overlap(False)
+                self._prefill_overlap_suspended = True
 
             if layer_id in self._host_banks:
                 for b in self._host_banks[layer_id].values():
@@ -1386,6 +1408,7 @@ class Engine:
             self.moe_offload_cache.rebind_layer(layer_id, HostResidency.PINNED.value, new_banks)
             self._gpu_owned_layer_ids = self.moe_offload_cache.gpu_owned_layer_ids
             self._stash_vram_ledger_inputs(self.moe_offload_cache.bank_sources, self._gpu_owned_layer_ids)
+            _resume_prefill_overlap_if_clear(self)
 
         elif target == HostResidency.GPU_OWNED.value:
             new_banks = {}
@@ -1409,14 +1432,13 @@ class Engine:
                 try:
                     for start_row, chunk_size, chunk_tup in reader.iter_layer_chunks(rows=64):
                         for idx, name in enumerate(self.moe_offload_cache.bank_schema):
-                            new_banks[name][start_row : start_row + chunk_size].copy_(
-                                chunk_tup[idx], non_blocking=(self.device.type == "cuda")
-                            )
+                            # synchronous on purpose: the next iter_layer_chunks pread
+                            # overwrites the same staging rows, so an async H2D here would
+                            # race the read (chunk n+1's bytes landing before copy n drained)
+                            new_banks[name][start_row : start_row + chunk_size].copy_(chunk_tup[idx])
                 finally:
                     if own_reader:
                         reader.close()
-                if self.device.type == "cuda":
-                    torch.cuda.synchronize(self.device)
                 if layer_id in self._ram_spilled_layers:
                     self._ram_spilled_layers.remove(layer_id)
             else:
@@ -1437,6 +1459,7 @@ class Engine:
 
             self.moe_offload_cache.rebind_layer(layer_id, HostResidency.GPU_OWNED.value, new_banks)
             self._gpu_owned_layer_ids = self.moe_offload_cache.gpu_owned_layer_ids
+            _resume_prefill_overlap_if_clear(self)
             self._stash_vram_ledger_inputs(self.moe_offload_cache.bank_sources, self._gpu_owned_layer_ids)
             demoted = getattr(self, "_demoted_layers", None)
             if demoted and layer_id in demoted:
@@ -1528,10 +1551,22 @@ class Engine:
                     except Exception:
                         stats = None
 
+                # Only a layer the background writer has finished can be spilled; picking an
+                # incomplete one would raise inside the rebuild, after the graphs are gone.
+                spillable = [l for l in pinned_layers if disk_copy.layer_complete(l)]
+                if not spillable:
+                    return {
+                        "applied": None,
+                        "reason": "disk copy incomplete for every pinned layer",
+                        "layer": None,
+                        "moe_cache_size": current_slots,
+                        "at_floor": False,
+                        "vram_free_bytes": free_vram,
+                    }
                 if stats is not None and stats.freq:
-                    target_layer = min(pinned_layers, key=lambda l: (sum(stats.freq[l]), -l))
+                    target_layer = min(spillable, key=lambda l: (sum(stats.freq[l]), -l))
                 else:
-                    target_layer = max(pinned_layers)
+                    target_layer = max(spillable)
 
                 rebuild(layer_moves=[(target_layer, "disk")])
                 remaining_pinned = [l for l in pinned_layers if l != target_layer]
@@ -1780,6 +1815,16 @@ class Engine:
                     sim_owned.add(lid)
                 else:
                     sim_owned.discard(lid)
+                if tgt == "disk":
+                    # a spill is refused BEFORE teardown: _move_layer's own check would fire
+                    # after the graphs are gone and leave the engine unable to serve
+                    dc = getattr(self, "expert_disk_copy", None) or getattr(
+                        self.moe_offload_cache, "expert_disk_copy", None
+                    )
+                    if dc is None or not dc.layer_complete(lid):
+                        raise CacheRebuildRejected(
+                            f"layer {lid} cannot be spilled: no disk copy or layer incomplete"
+                        )
             if len(sim_owned) >= self.moe_offload_cache.num_layers:
                 raise CacheRebuildRejected(
                     "cannot move all layers to gpu_owned; at least one streaming layer required"
@@ -1878,9 +1923,15 @@ class Engine:
         # free << startup pre-load free), so re-deriving it here would silently drop large
         # batch sizes after the first rebuild. Reusing the already-resolved list keeps the
         # captured coverage identical (the fit-check above guarantees the graph headroom fits).
-        prior_graph_bs = self.graph_runner.graph_bs_list or getattr(self, "_deferred_graph_bs", None)
-        if self.graph_runner.graph_bs_list:
-            self._deferred_graph_bs = list(self.graph_runner.graph_bs_list)
+        # While DISK layers exist the live runner was built with no graphs (below), so the
+        # boot-resolved set is parked in _deferred_graph_bs and read back from there. Keyed on
+        # the deferral marker, not on list truthiness: a boot that disabled graphs has an
+        # empty list that must stay empty (None would re-derive the auto set).
+        if getattr(self, "_graphs_deferred", None):
+            prior_graph_bs = self._deferred_graph_bs
+        else:
+            prior_graph_bs = self.graph_runner.graph_bs_list
+            self._deferred_graph_bs = list(prior_graph_bs)
         # Point of no return for the scheduler's rollback logic: from here the live graphs and
         # pools start being freed. A failure BEFORE this flag flips leaves the engine serving
         # untouched (no rollback needed); after it, only a rebuild restores service.

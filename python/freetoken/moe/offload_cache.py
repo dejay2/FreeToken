@@ -249,6 +249,10 @@ class OffloadMoeCache:
         self.gate_up_alpha: torch.Tensor | None = None
         self.down_alpha: torch.Tensor | None = None
         self.disk_copy = None
+        # Read once per decode batch by GraphRunner.can_use_cuda_graph; kept as a plain bool
+        # (set in rebind_layer) so the feature-off decode path pays one attribute read, not a
+        # scan of layer_residency.
+        self._has_disk_layers = False
         self._disk_readers: dict[int, Any] = {}
         self._disk_staging: dict[str, torch.Tensor] | None = None
         self._disk_device_scratch: dict[str, torch.Tensor] | None = None
@@ -610,6 +614,7 @@ class OffloadMoeCache:
                 )
         self._unpinned_layers = unpinned
         self.layer_residency = list(residency)
+        self._has_disk_layers = HostResidency.DISK.value in self.layer_residency
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
@@ -749,14 +754,7 @@ class OffloadMoeCache:
         assert self.bank_sources, "set_bank_sources must run before rebuild"
         self.validate_rebuild(cache_size)
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
-        self.prefill_bank_buffers = []
-        self.prefill_copy_stream = None
-        self.prefill_begin_event = None
-        self.prefill_ready_events = []
-        self.prefill_release_events = []
-        self._prefill_buffer_layer = [None, None]
-        self._prefill_buffer_released = [True, True]
-        self._prefill_buffer_has_release_event = [False, False]
+        self._teardown_prefill_overlap()
         # 2. Drop old GPU tensors (free-before-alloc).
         self.banks = []
         self.bank_caches = {}
@@ -955,6 +953,7 @@ class OffloadMoeCache:
         self.layer_residency = new_residency
         self._unpinned_layers = new_unpinned
         self._first_streaming_layer = min(streaming_layers)
+        self._has_disk_layers = HostResidency.DISK.value in new_residency
 
         if banks is not None:
             for name in self.bank_schema:
@@ -964,7 +963,7 @@ class OffloadMoeCache:
         if residency == HostResidency.GPU_OWNED.value:
             assert banks is not None, "gpu_owned residency requires device tensor banks"
             self.resident_banks[layer_id] = tuple(self.bank_sources[n][layer_id] for n in self.bank_schema)
-            self._disk_readers.pop(layer_id, None)
+            self._close_disk_reader(layer_id)
         elif residency == HostResidency.DISK.value:
             self.resident_banks.pop(layer_id, None)
             copy = getattr(self, "expert_disk_copy", None) or self.disk_copy
@@ -988,9 +987,48 @@ class OffloadMoeCache:
                     self.bank_sources[name][layer_id] = torch.empty((1, *feat_shape), dtype=dtype)
         else:
             self.resident_banks.pop(layer_id, None)
-            self._disk_readers.pop(layer_id, None)
+            self._close_disk_reader(layer_id)
 
         self._build_copy_plan()
+
+    def _close_disk_reader(self, layer_id: int) -> None:
+        # a recalled layer's reader holds three fds and a thread pool; close them now rather
+        # than when the GC gets to it
+        reader = self._disk_readers.pop(layer_id, None)
+        if reader is not None:
+            reader.close()
+
+    def _teardown_prefill_overlap(self) -> None:
+        """Drop the prefill double-buffer views and events (they alias bank_caches)."""
+        self.prefill_bank_buffers = []
+        self.prefill_copy_stream = None
+        self.prefill_begin_event = None
+        self.prefill_ready_events = []
+        self.prefill_release_events = []
+        self._prefill_buffer_layer = [None, None]
+        self._prefill_buffer_released = [True, True]
+        self._prefill_buffer_has_release_event = [False, False]
+
+    def set_prefill_overlap(self, enabled: bool) -> None:
+        """Switch the prefill double buffer off (before a layer goes DISK: the overlap DMA
+        reads registered banks, and a DISK layer has none) or back on (after the last DISK
+        layer is recalled). Only between forwards: the buffers alias slots [0, 2E) and the
+        events are per-prefill state. Turning it on needs cache_size >= 2 * num_experts and
+        no LOCKED/PAGEABLE/DISK layer; otherwise it stays off."""
+        if enabled == self.prefill_overlap:
+            return
+        if not enabled:
+            self._teardown_prefill_overlap()
+            self.prefill_overlap = False
+            return
+        if self._unpinned_layers or self.cache_size < 2 * self.num_experts or not self.banks:
+            logger.warning(
+                f"MoE prefill overlap stays off: unpinned layers {sorted(self._unpinned_layers)}, "
+                f"cache_size {self.cache_size} (needs >= {2 * self.num_experts})"
+            )
+            return
+        self.prefill_overlap = True
+        self._init_prefill_overlap_buffers()
 
     _init_fused_copy = _build_fused_copy_plan
 
@@ -1000,9 +1038,7 @@ class OffloadMoeCache:
 
     @property
     def has_disk_layers(self) -> bool:
-        from freetoken.moe.host_banks import HostResidency
-
-        return any(r == HostResidency.DISK.value for r in self.layer_residency)
+        return self._has_disk_layers
 
     def is_disk_layer(self, layer_id: int) -> bool:
         from freetoken.moe.host_banks import HostResidency
@@ -1070,8 +1106,10 @@ class OffloadMoeCache:
                     if name in self.bank_caches
                     else self.bank_sources[name][0].dtype
                 )
+                # top_k x batch rows (28 MB for the daily bs=1 top-10 nvfp4 boot, the design
+                # note's figure); regrown below if a later, larger batch routes more rows
                 self._disk_device_scratch[name] = torch.empty(
-                    (max(64, k), *feat_shape), dtype=dtype, device=self.device
+                    (max(k, topk_ids.numel()), *feat_shape), dtype=dtype, device=self.device
                 )
 
         for b_idx, name in enumerate(self.bank_schema):
@@ -1084,7 +1122,8 @@ class OffloadMoeCache:
             scratch[:k].copy_(staging_views[b_idx], non_blocking=False)
 
         views = tuple(self._disk_device_scratch[name][:k] for name in self.bank_schema)
-        remapped_ids = inverse_indices.to(topk_ids.device, non_blocking=False)
+        # same dtype as the routing ids the kernels were built for (int32 in the decode path)
+        remapped_ids = inverse_indices.to(device=topk_ids.device, dtype=topk_ids.dtype)
 
         if self.gate_up_alpha is not None and self.down_alpha is not None:
             idx = layer_id * self.num_experts + unique_experts.to(self.gate_up_alpha.device)
@@ -1098,7 +1137,11 @@ class OffloadMoeCache:
         return getattr(self, "_disk_alphas", None)
 
     def disk_materialize_layer(self, layer_id: int) -> None:
-        """Fill slots [0, num_experts) position == expert id in 64-row chunks through staging."""
+        """Fill slots [0, num_experts) position == expert id in 64-row chunks through staging.
+
+        Data only: the slot bookkeeping for the whole-layer fill is materialize_layer's
+        kernel, so the prefill pairing is materialize_layer -> copy_missing (which lands
+        here for a DISK layer), exactly the pageable-layer path."""
         reader = self._disk_readers.get(layer_id)
         if reader is None:
             copy = getattr(self, "expert_disk_copy", None) or self.disk_copy
@@ -1402,13 +1445,16 @@ class OffloadMoeCache:
         )
 
     def materialize_layer(self, layer_id: int) -> None:
+        from freetoken.moe.offload_kernels import materialize_layer
+
         self._reject_gpu_owned(layer_id, "materialize_layer")
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
-        if self.is_disk_layer(layer_id):
-            return
-        from freetoken.moe.offload_kernels import materialize_layer
-
+        # The kernel is LRU bookkeeping only (slots [0, E) := (layer_id, position), the ids
+        # they held are invalidated); it touches no bank pointer, so a DISK layer runs it
+        # too -- skipping it would leave id_of_slot naming other layers' experts in slots
+        # that copy_missing's disk branch is about to overwrite, and the next decode of
+        # such a layer would hit a stale slot.
         materialize_layer(self, layer_id)
 
     def reset(self) -> None:
