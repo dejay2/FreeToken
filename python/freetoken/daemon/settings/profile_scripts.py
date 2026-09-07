@@ -85,6 +85,9 @@ def render_boot_script(
         dial = DIAL_BY_NAME.get(name)
         if dial is None:
             continue
+        if dial.source == "helper" and name not in settings:
+            # Older profiles omit helper-only knobs until a page Save supplies them.
+            continue
         value = _setting(settings, name)
         if dial.control == "toggle":
             if _enabled(value):

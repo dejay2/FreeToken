@@ -124,6 +124,10 @@ GROUP_INFO: dict[str, dict[str, str]] = {
         "plain": "Card memory",
         "info": "How the graphics card's 32 GB is split between ready-to-use expert pieces, chat memory and a safety cushion. The main speed dial lives here.",
     },
+    "Memory governor": {
+        "plain": "Memory governor",
+        "info": "Automatically move expert layers between the card, PC memory and disk as other programs use memory.",
+    },
     "Picture input": {
         "plain": "Pictures",
         "info": "Let chats include pictures, and choose where the picture weights wait.",
@@ -360,7 +364,7 @@ DIALS: tuple[Dial, ...] = (
     Dial(
         "MemoryGovernor", "toggle", True, "boolean",
         "Automatically step expert layers down the VRAM/RAM ladder and shrink pools when free memory drops below cushion, stepping back up when memory returns; the card cushion is also the boot's free-VRAM headroom (--moe-cache-headroom-bytes).",
-        "Expert slots and card memory",
+        "Memory governor",
         plain="Give memory back to games and other programs automatically",
         effects=("speed:down",),
         info=(
@@ -373,7 +377,7 @@ DIALS: tuple[Dial, ...] = (
     Dial(
         "GovernorVRAMFreeGB", "number", 1.5, "GB",
         "Free card memory cushion the governor maintains by stepping layers down or shrinking pools; at boot it is passed as --moe-cache-headroom-bytes (never as the post-cache reserve).",
-        "Expert slots and card memory", minimum=0.0, maximum=128.0, numeric_kind="float",
+        "Memory governor", minimum=0.0, maximum=128.0, numeric_kind="float",
         plain="Keep this much of the card free", slider=(0.0, 16.0, 0.25),
         effects=("vram:up", "speed:down"),
         info=(
@@ -385,12 +389,89 @@ DIALS: tuple[Dial, ...] = (
     Dial(
         "GovernorRAMFreeGB", "number", 4.0, "GB",
         "Free main memory cushion the governor maintains by spilling pinned expert layers to SSD disk storage.",
-        "Expert slots and card memory", minimum=0.0, maximum=1024.0, numeric_kind="float",
+        "Memory governor", minimum=0.0, maximum=1024.0, numeric_kind="float",
         plain="Keep this much main memory free", slider=(0.0, 64.0, 1.0),
         effects=("ram:up", "speed:down"),
         info=(
             "Host RAM that must stay free for other programs. Below this cushion, the governor spills pinned expert "
             "layers to SSD disk storage to free host memory."
+        ),
+    ),
+    Dial(
+        "GovernorUpMarginGB", "number", 0.5, "GB", "Extra headroom before stepping back up.",
+        "Memory governor", minimum=0.0, maximum=8.0, numeric_kind="float", source="helper",
+        plain="Extra headroom before stepping back up", slider=(0.0, 8.0, 0.25), advanced=True,
+        effects=("vram:up", "ram:up"),
+        info=(
+            "Extra free memory required before the governor recalls one more expert layer. "
+            "A larger cushion makes recalls safer after a busy game or another memory-hungry program, "
+            "but keeps more layers parked away from the card."
+        ),
+    ),
+    Dial(
+        "GovernorStepIntervalS", "number", 5.0, "s", "Check interval.",
+        "Memory governor", minimum=1.0, maximum=60.0, numeric_kind="float", source="helper",
+        plain="Check interval", slider=(1.0, 60.0, 1.0), advanced=True,
+        effects=("speed:mixed",),
+        info=(
+            "How often the helper checks card and PC memory. Shorter intervals react sooner when a game "
+            "starts using memory, while longer intervals make fewer checks. The default five-second check "
+            "is the measured balance for the serving box."
+        ),
+    ),
+    Dial(
+        "GovernorUpHoldS", "number", 60.0, "s", "Wait before the first step back up.",
+        "Memory governor", minimum=0.0, maximum=600.0, numeric_kind="float", source="helper",
+        plain="Wait before the first step back up", slider=(0.0, 600.0, 5.0), advanced=True,
+        effects=("speed:down",),
+        info=(
+            "How long memory must remain comfortably above its cushion before the first layer is recalled. "
+            "This wait prevents a brief burst of free memory from immediately bringing a layer back and "
+            "then forcing it out again."
+        ),
+    ),
+    Dial(
+        "GovernorMaxHoldS", "number", 600.0, "s", "Longest wait when recovery keeps tripping the cushion.",
+        "Memory governor", minimum=60.0, maximum=3600.0, numeric_kind="float", source="helper",
+        plain="Longest wait when recovery keeps tripping the cushion", slider=(60.0, 3600.0, 30.0), advanced=True,
+        effects=("speed:down",),
+        info=(
+            "The largest recovery wait the helper may use after free memory repeatedly falls back below "
+            "the cushion. Raising it makes repeated recalls less likely, but also delays recovery after "
+            "memory pressure has gone away."
+        ),
+    ),
+    Dial(
+        "GovernorPostUpGraceS", "number", 10.0, "s", "Grace after a recall before the memory side may step down.",
+        "Memory governor", minimum=0.0, maximum=120.0, numeric_kind="float", source="helper",
+        plain="Grace after a recall before stepping down", slider=(0.0, 120.0, 5.0), advanced=True,
+        effects=("speed:mixed",),
+        info=(
+            "After a layer is recalled, this grace period protects the memory side from reacting to the "
+            "temporary cost of that move. A longer grace reduces flap between rungs; a shorter one reacts "
+            "faster to a genuine new squeeze."
+        ),
+    ),
+    Dial(
+        "GovernorRAMRungsBeforeUp", "number", 2, "rungs", "Layers of room needed before a memory recall.",
+        "Memory governor", minimum=1, maximum=4, source="helper",
+        plain="Layers of room needed before a memory recall", slider=(1, 4, 1), advanced=True,
+        effects=("ram:up",),
+        info=(
+            "How many full expert-layer sizes of free PC memory are required before the helper moves one "
+            "layer back from disk. More room protects against the memory cost of a recall, at the cost of "
+            "keeping more layers on disk."
+        ),
+    ),
+    Dial(
+        "GovernorVRAMRungsBeforeUp", "number", 1, "rungs", "Layers of room needed before a card recall.",
+        "Memory governor", minimum=1, maximum=4, source="helper",
+        plain="Layers of room needed before a card recall", slider=(1, 4, 1), advanced=True,
+        effects=("vram:up",),
+        info=(
+            "How many full expert-layer sizes of free card memory are required before the helper moves one "
+            "layer back to the GPU. More room makes recalls safer, but delays using the card's recovered "
+            "memory for speed."
         ),
     ),
     Dial(

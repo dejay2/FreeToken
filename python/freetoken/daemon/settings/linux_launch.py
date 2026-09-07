@@ -358,6 +358,8 @@ def build_launch(
         argv += ["--moe-vram-reserve-bytes", str(reserve)]
     if facts.is_moe and headroom >= 0:
         argv += ["--moe-cache-headroom-bytes", str(headroom)]
+    # The governor's timing and rung controls are helper-only knobs. They are read by the
+    # torch-free settings watcher, not passed to the model server's launch command.
     graph_bs = _int(_get(settings, "CudaGraphMaxBS"), -1)
     if graph_bs >= 0:
         argv += ["--cuda-graph-max-bs", str(graph_bs)]

@@ -127,6 +127,13 @@ _LAUNCHER_ORDER = (
     "MemoryGovernor",
     "GovernorVRAMFreeGB",
     "GovernorRAMFreeGB",
+    "GovernorUpMarginGB",
+    "GovernorStepIntervalS",
+    "GovernorUpHoldS",
+    "GovernorMaxHoldS",
+    "GovernorPostUpGraceS",
+    "GovernorRAMRungsBeforeUp",
+    "GovernorVRAMRungsBeforeUp",
 )
 _ORDER_INDEX = {name: index for index, name in enumerate(_LAUNCHER_ORDER)}
 
@@ -385,6 +392,10 @@ class BootFile:
             arg = active.get(dial.name)
             if arg is not None:
                 values[dial.name] = _value_from_raw(arg.raw_value)
+            elif dial.source == "helper":
+                # Helper-only dials are absent from older profiles until the page saves them;
+                # keep those profiles' load snapshots stable while still reading explicit lines.
+                continue
             elif dial.control == "toggle":
                 values[dial.name] = False
             elif dial.name == "KVPark":
