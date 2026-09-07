@@ -443,11 +443,26 @@ class MemoryFitService:
             "argv": argv[4:],
             "machine": machine,
         }
+        child_env = dict(getattr(plan, "env", None) or environ)
+
+        def failure_message(message: str, stderr: Any = "") -> str:
+            redact = (
+                str(settings.get("ModelPath", "")),
+                str(child_env.get("FREETOKEN_MTP_PRIVATE_ROOT", "")),
+            )
+            summary = _diagnostic(message, redact=redact)
+            # The last nonblank line carries the exception, not the startup warning. Redact
+            # before truncating, using the effective launch env rather than only the parent.
+            last = next((line for line in reversed(str(stderr or "").splitlines()) if line.strip()), "")
+            if not last:
+                return summary
+            return f"{summary[:160]}; stderr: {_diagnostic(last, redact=redact)[:340]}"
+
         try:
             completed = self._runner(
-                [argv[0], "-m", "freetoken.engine.memory_plan"],
+                [argv[0], str(Path(__file__).resolve().parents[2] / "engine" / "memory_plan.py")],
                 input=json.dumps(child_request, separators=(",", ":")),
-                env=dict(getattr(plan, "env", None) or environ),
+                env=child_env,
                 text=True,
                 capture_output=True,
                 timeout=self.timeout,
@@ -458,10 +473,11 @@ class MemoryFitService:
             raise EstimateUnavailable("planner_timeout", "the metadata planner exceeded its time limit") from exc
         except (OSError, subprocess.SubprocessError) as exc:
             raise EstimateUnavailable("planner_failed", f"planner process failed: {type(exc).__name__}") from exc
+        stderr = getattr(completed, "stderr", "")
         if getattr(completed, "returncode", 0) not in (0, None):
             raise EstimateUnavailable(
                 "planner_failed",
-                _diagnostic(getattr(completed, "stderr", ""), redact=(str(settings.get("ModelPath", "")),)),
+                failure_message(f"planner exited with status {completed.returncode}", stderr),
             )
         stdout = str(getattr(completed, "stdout", "") or "").strip()
         if len(stdout.encode("utf-8", "replace")) > 4 * 1024 * 1024:
@@ -472,18 +488,14 @@ class MemoryFitService:
             if stdout[end:].strip() or not isinstance(value, dict):
                 raise ValueError("child stdout contains more than one JSON object")
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise EstimateUnavailable("planner_failed", "planner returned malformed JSON") from exc
+            raise EstimateUnavailable(
+                "planner_failed", failure_message("planner returned malformed JSON", stderr)
+            ) from exc
         if value.get("version") != PROTOCOL_VERSION or value.get("status") != "ok":
             error = value.get("error") if isinstance(value.get("error"), Mapping) else {}
             raise EstimateUnavailable(
                 str(error.get("code") or "planner_failed"),
-                _diagnostic(
-                    error.get("message") or "planner did not return an ok result",
-                    redact=(
-                        str(settings.get("ModelPath", "")),
-                        str(environ.get("FREETOKEN_MTP_PRIVATE_ROOT", "")),
-                    ),
-                ),
+                failure_message(error.get("message") or "planner did not return an ok result", stderr),
             )
         return value
 

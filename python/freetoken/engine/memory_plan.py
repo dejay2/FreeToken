@@ -1546,20 +1546,27 @@ def estimate_request(request: dict) -> dict:
 
 
 def main() -> int:
-    """Read one bounded request and write exactly one JSON object to stdout."""
-    raw = sys.stdin.buffer.read(4 * 1024 * 1024 + 1)
-    if len(raw) > 4 * 1024 * 1024:
-        output = _error("planner_failed", "planner request is too large")
-    else:
-        try:
-            request = json.loads(raw.decode("utf-8"))
-            with contextlib.redirect_stdout(sys.stderr):
-                output = estimate_request(request)
-        except Exception as exc:  # malformed input is still a one-object response
-            output = _error("planner_failed", f"malformed planner request: {type(exc).__name__}")
-    sys.stdout.write(json.dumps(output, separators=(",", ":")))
-    sys.stdout.write("\n")
+    """CLI-only entry: reserve stdout for JSON before importing any engine providers."""
+    # Run this file directly, not with -m: engine/__init__.py binds logger streams before
+    # -m reaches main(). J5 on WSL saw 964 log lines before the otherwise valid JSON.
+    # Redirect fd 1 too: redirect_stdout alone misses bound handlers and native writes.
+    # Leave it redirected through process shutdown so atexit/library flushes cannot append
+    # noise after the document. Only this private duplicate writes to the protocol pipe.
     sys.stdout.flush()
+    with os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8") as protocol:
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+        raw = sys.stdin.buffer.read(4 * 1024 * 1024 + 1)
+        if len(raw) > 4 * 1024 * 1024:
+            output = _error("planner_failed", "planner request is too large")
+        else:
+            try:
+                request = json.loads(raw.decode("utf-8"))
+                with contextlib.redirect_stdout(sys.stderr):
+                    output = estimate_request(request)
+            except Exception as exc:  # malformed input is still a one-object response
+                output = _error("planner_failed", f"malformed planner request: {type(exc).__name__}")
+        protocol.write(json.dumps(output, separators=(",", ":")) + "\n")
+        protocol.flush()
     return 0
 
 

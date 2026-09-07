@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
+import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -189,6 +191,90 @@ def test_fitting_estimate_merges_saved_extension_settings_without_writing(tmp_pa
     assert response["machine"]["ram_source"]
     assert json.loads(calls[0]["input"])["settings"]["FREETOKEN_MTP_SPEC_DEPTH"] == 3
     assert boot.read_bytes() == before
+
+
+def test_child_main_isolates_bound_logger_native_and_shutdown_stdout():
+    path = Path(__file__).parents[2] / "python/freetoken/engine/memory_plan.py"
+    script = f'''
+import atexit, importlib.util, logging, os, sys
+spec = importlib.util.spec_from_file_location("planner_test", {str(path)!r})
+planner = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = planner
+spec.loader.exec_module(planner)
+logger = logging.getLogger("bound-before-main")
+logger.addHandler(logging.StreamHandler(sys.stdout))
+def noisy(request):
+    logger.warning("bound logger noise")
+    print("Python print noise")
+    os.write(1, b"native stdout noise\\n")
+    atexit.register(lambda: os.write(1, b"shutdown noise\\n"))
+    return {{"version": 1, "status": "ok"}}
+planner.estimate_request = noisy
+raise SystemExit(planner.main())
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", script], input="{}", text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"version": 1, "status": "ok"}
+    for noise in ("bound logger noise", "Python print noise", "native stdout noise", "shutdown noise"):
+        assert noise in result.stderr
+
+
+def test_child_command_does_not_import_engine_before_protocol_setup(tmp_path):
+    # Shadow only the CUDA-heavy package initializer, keeping the real planner file. The
+    # old -m command executes this before main() can redirect the engine's bound loggers.
+    package = tmp_path / "freetoken"
+    engine = package / "engine"
+    engine.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (engine / "__init__.py").write_text(
+        "print('engine package import noise')\n"
+        f"__path__.append({str(Path(__file__).parents[2] / 'python/freetoken/engine')!r})\n"
+    )
+    captured = []
+
+    def runner(argv, **kwargs):
+        # Invalid protocol input requires no torch, but must still be a clean JSON document.
+        kwargs["input"] = '{"version":999}'
+        result = subprocess.run(argv, **kwargs)
+        captured.append(result)
+        return result
+
+    service = MemoryFitService(
+        runner=runner,
+        launch_builder=lambda *a, **kw: SimpleNamespace(
+            argv=[sys.executable, "-m", "freetoken.cli", "serve"],
+            env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        ),
+    )
+    from freetoken.daemon.settings.memory_fit import EstimateUnavailable
+
+    with pytest.raises(EstimateUnavailable):
+        service._run_child({}, {}, {})
+    assert captured[0].returncode == 0, captured[0].stderr
+    assert json.loads(captured[0].stdout)["status"] == "unavailable"
+
+
+@pytest.mark.parametrize("returncode,stdout", [(0, "not JSON"), (1, ""), (0, '{"version":1,"status":"unavailable","error":{"message":"provider failed"}}')])
+def test_child_failure_exposes_bounded_redacted_stderr(tmp_path, returncode, stdout):
+    from freetoken.daemon.settings.memory_fit import EstimateUnavailable, _unavailable
+
+    model, private = "/test/checkpoint", "/test/private-root"
+    stderr = f"startup warning\nTraceback: loading {model}\nValueError: missing tensor at {private}\n"
+    service = MemoryFitService(
+        runner=lambda *a, **kw: FakeCompleted(stdout, stderr, returncode),
+        launch_builder=lambda *a, **kw: SimpleNamespace(
+            argv=[sys.executable, "-m", "freetoken.cli", "serve"],
+            env={"FREETOKEN_MTP_PRIVATE_ROOT": private},
+        ),
+    )
+    with pytest.raises(EstimateUnavailable) as error:
+        service._run_child({"ModelPath": model}, {}, {})
+    message = _unavailable(error.value.code, error.value.message)["error"]["message"]
+    assert "ValueError: missing tensor" in message
+    assert model not in message and private not in message
+    assert len(message) <= 512
 
 
 def test_non_fitting_estimate_reports_shortfall_and_suggestion(tmp_path):
