@@ -59,6 +59,7 @@ class HostResidency(str, Enum):
     LOCKED = "locked"
     PAGEABLE = "pageable"
     GPU_OWNED = "gpu_owned"
+    DISK = "disk"
 
 
 _DEFAULT_CHUNK = 8 << 20
@@ -92,7 +93,7 @@ class HostBank:
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_backing", "_raw")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
                  *, backing: str | None = None):
@@ -102,6 +103,7 @@ class HostBank:
             born = _env_born_pinned() and (plan is None or not plan.has_unpinned)
             backing = "cuda" if born else "mmap"
         assert backing in ("mmap", "cuda"), backing
+        self._backing = backing
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
         asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
@@ -113,11 +115,13 @@ class HostBank:
             raw = alloc_pinned_tensor(asize + _BLK, dtype=torch.uint8)  # cudaMallocHost
             raw.zero_()  # keep the anonymous-mmap guarantee: unwritten regions stay zero
             off = (-raw.data_ptr()) % _BLK
+            self._raw = raw
             self._buf = raw.numpy()[off:off + asize]
             self.addr = raw.data_ptr() + off
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
         else:
+            self._raw = None
             self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
@@ -170,6 +174,22 @@ class HostBank:
         if self._pinned:
             return
         self._buf.madvise(mmap.MADV_DONTNEED)
+
+    def free(self) -> None:
+        """Drop references to the underlying buffer and tensors.
+
+        For born-pinned (cudaHostAlloc) banks, dropping tensor, _buf, and the raw
+        pinned tensor allows the PyTorch storage deleter to run cudaFreeHost.
+        mmap-backed banks keep release() semantics (MADV_DONTNEED).
+        """
+        if getattr(self, "_backing", None) == "cuda":
+            self.tensor = None
+            self._buf = None
+            self._raw = None
+            self.addr = 0
+            self._pinned = False
+        else:
+            self.release()
 
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
