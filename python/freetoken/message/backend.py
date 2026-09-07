@@ -61,6 +61,23 @@ class CacheRebuildBackendMsg(BaseBackendMsg):
     num_mamba_slots: int | None = None
     num_swa_pages: int | None = None
     mode: str = "if_idle"  # only "if_idle" is supported; "drain" is deferred (rejected)
+    layer_moves: list[tuple[int, str]] | None = None
+    step: tuple[str, str] | None = None
+
+
+@dataclass
+class CacheStepBackendMsg(BaseBackendMsg):
+    """API server -> scheduler: step memory ladder down or up along an axis."""
+    request_id: str
+    axis: str  # "vram" | "ram"
+    direction: str  # "down" | "up"
+    ram_tight: bool = False
+
+
+@dataclass
+class CacheResidencyBackendMsg(BaseBackendMsg):
+    """API server -> scheduler: query layer residency report."""
+    request_id: str
 
 
 @dataclass

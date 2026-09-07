@@ -108,6 +108,8 @@ class CacheRebuildMsg(BaseTokenizerMsg):
     num_mamba_slots: int | None = None
     num_swa_pages: int | None = None
     mode: str = "if_idle"
+    layer_moves: list[tuple[int, str]] | None = None
+    step: tuple[str, str] | None = None
 
 
 @dataclass
@@ -119,6 +121,43 @@ class CacheRebuildResultMsg(BaseTokenizerMsg):
     num_pages: int = 0
     mamba_slots: int = 0
     num_swa_pages: int = 0
+    error: str | None = None
+    applied: str | None = None
+    at_floor: bool = False
+    layers: dict | None = None
+    vram_free_bytes: int = 0
+
+
+@dataclass
+class CacheStepMsg(BaseTokenizerMsg):
+    request_id: str
+    axis: str  # "vram" | "ram"
+    direction: str  # "down" | "up"
+    ram_tight: bool = False
+
+
+@dataclass
+class CacheStepResultMsg(BaseTokenizerMsg):
+    request_id: str
+    status: str  # "ok" | "busy" | "failed" | "timeout"
+    applied: str | None = None
+    at_floor: bool = False
+    moe_cache_size: int = 0
+    layers: dict | None = None
+    vram_free_bytes: int = 0
+    error: str | None = None
+
+
+@dataclass
+class CacheResidencyMsg(BaseTokenizerMsg):
+    request_id: str
+
+
+@dataclass
+class CacheResidencyResultMsg(BaseTokenizerMsg):
+    request_id: str
+    status: str = "ok"
+    residency: dict | None = None
     error: str | None = None
 
 

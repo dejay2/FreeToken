@@ -75,6 +75,30 @@ class CacheRebuildReply(BaseFrontendMsg):
     mamba_slots: int = 0
     num_swa_pages: int = 0
     error: str | None = None
+    applied: str | None = None
+    at_floor: bool = False
+    layers: dict | None = None
+    vram_free_bytes: int = 0
+
+
+@dataclass
+class CacheStepReply(BaseFrontendMsg):
+    request_id: str
+    status: str  # "ok" | "busy" | "failed" | "timeout"
+    applied: str | None = None
+    at_floor: bool = False
+    moe_cache_size: int = 0
+    layers: dict | None = None
+    vram_free_bytes: int = 0
+    error: str | None = None
+
+
+@dataclass
+class CacheResidencyReply(BaseFrontendMsg):
+    request_id: str
+    status: str = "ok"
+    residency: dict | None = None
+    error: str | None = None
 
 
 @dataclass
