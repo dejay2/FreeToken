@@ -233,7 +233,7 @@
       <div>
         <p class="eyebrow">FreeToken</p>
         <h1>Server settings</h1>
-        <p class="subtitle">Change how the server starts. This page stays up even when the main server is stopped or fails to start. Changes take effect after a restart.</p>
+        <p class="subtitle">Change how the server starts. This page stays up even when the main server is stopped or fails to start. Most changes take effect after a restart; memory governor settings apply on Save.</p>
       </div>
       <div class="top-right">
         <div class="pill" id="server-pill"><span class="dot"></span> Main server: <strong>checking…</strong></div>
@@ -890,7 +890,7 @@
       const tone = model.supported ? '' : 'warn';
       card.className = `model-card ${tone}`;
       const facts = [];
-      if (model.maxContextTokens) facts.push(`<span>Longest chat <b>${fmt(model.maxContextTokens)}</b> tokens (about ${fmt(Math.round(model.maxContextTokens * 0.75))} words)</span>`);
+      if (model.maxContextTokens) facts.push(`<span>Max context <b>${fmt(model.maxContextTokens)}</b> tokens (about ${fmt(Math.round(model.maxContextTokens * 0.75))} words)</span>`);
       if (model.numLayers) facts.push(`<span><b>${fmt(model.numLayers)}</b> layers${model.isMoe ? `, <b>${fmt(model.numMoeLayers)}</b> with experts` : ''}</span>`);
       if (model.isMoe) facts.push(`<span><b>${fmt(model.numExperts)}</b> experts per layer${model.expertsPerToken ? `, <b>${fmt(model.expertsPerToken)}</b> used per word` : ''}</span>`);
       if (model.bytesPerExpert) facts.push(`<span><b>${(model.bytesPerExpert / 1e6).toFixed(2)} MB</b> per expert, <b>${escapeHtml(fmtGib(model.bytesPerLayer))}</b> per layer, <b>${escapeHtml(fmtGib(model.totalExpertBytes))}</b> all experts</span>`);
@@ -900,8 +900,8 @@
         model.supported ? '<span class="chip good">✓ Known to this engine</span>' : '<span class="chip bad">✕ Not a model type this engine lists</span>',
         model.isReference ? '<span class="chip good">Speeds on this page were measured on it</span>' : '<span class="chip">Sizes computed for it; speeds not measured</span>',
         model.hasVision ? '<span class="chip">Pictures</span>' : '',
-        model.hasPle ? '<span class="chip">Lookup table</span>' : '',
-        model.hasMtp ? '<span class="chip">Guess-ahead head</span>' : '',
+        model.hasPle ? '<span class="chip">PLE table</span>' : '',
+        model.hasMtp ? '<span class="chip">MTP draft head</span>' : '',
       ].filter(Boolean).join('');
       card.innerHTML = `<div class="model-head"><h2>${escapeHtml(model.name || 'Model')}</h2><span class="small">${escapeHtml(model.architecture || model.modelType || '')}</span></div><div class="badge-line">${badges}</div><div class="facts">${facts.join('')}</div><p class="small">The limits, slider tops and memory numbers on this page are sized for this model. Change the model folder and they follow it.</p>`;
     }
@@ -1115,13 +1115,13 @@
       const govLayers = governor.layers || {};
       const govText = governor.enabled === false ? 'Off' : (governor.last_action ? escapeHtml(governor.last_action) : 'Watching');
       $('status').innerHTML = [
-        `<div class="stat"><span class="small">Main server</span><strong><span class="dot ${escapeHtml(stateName)}"></span>${escapeHtml(pretty)}</strong><div class="sub">Door ${escapeHtml(server.port ?? '')}${server.uptimeS ? ` · up ${escapeHtml(fmtUptime(server.uptimeS))}` : ''}</div></div>`,
+        `<div class="stat"><span class="small">Main server</span><strong><span class="dot ${escapeHtml(stateName)}"></span>${escapeHtml(pretty)}</strong><div class="sub">Port ${escapeHtml(server.port ?? '')}${server.uptimeS ? ` · up ${escapeHtml(fmtUptime(server.uptimeS))}` : ''}</div></div>`,
         `<div class="stat"><span class="small">This settings page</span><strong><span class="dot serving"></span>${escapeHtml(body.helper?.status === 'up' ? 'Up' : (body.helper?.status || 'unknown'))}</strong><div class="sub">v${escapeHtml(body.helper?.version || '')} · up ${escapeHtml(fmtUptime(body.helper?.uptimeS))}</div></div>`,
-        `<div class="stat"><span class="small">Chats running now</span><strong>${escapeHtml(server.activeRequests ?? 0)}</strong><div class="sub">Card busy ${escapeHtml(gpu.gpuUtilPercent ?? 0)}%</div></div>`,
-        `<div class="stat"><span class="small">Card memory</span><strong>${escapeHtml(fmtMb(gpu.vramUsedMb))} <span class="muted">/ ${escapeHtml(fmtMb(gpu.vramTotalMb))}</span></strong><div class="bar" aria-label="Card memory used"><span style="width:${percent}%"></span></div></div>`,
-        `<div class="stat"><span class="small">Expert slots on the card</span><strong>${escapeHtml(geometry.moeCacheSize ? fmt(geometry.moeCacheSize) : '—')}</strong><div class="sub">${escapeHtml((geometry.gpuOwnedLayers || []).length)} layers kept whole</div></div>`,
-        `<div class="stat"><span class="small">Chat memory</span><strong>${escapeHtml(geometry.numPages ? fmt(geometry.numPages * (geometry.pageSize || 1)) : '—')}</strong><div class="sub">${geometry.numPages ? `${escapeHtml(fmt(geometry.numPages))} pages of ${escapeHtml(fmt(geometry.pageSize || 0))} tokens` : 'not running'}</div></div>`,
-        `<div class="stat"><span class="small">Idle chats kept</span><strong>${parkingText}</strong>${parking.lastError ? `<div class="error">${escapeHtml(parking.lastError)}</div>` : ''}</div>`,
+        `<div class="stat"><span class="small">Active requests</span><strong>${escapeHtml(server.activeRequests ?? 0)}</strong><div class="sub">GPU busy ${escapeHtml(gpu.gpuUtilPercent ?? 0)}%</div></div>`,
+        `<div class="stat"><span class="small">VRAM</span><strong>${escapeHtml(fmtMb(gpu.vramUsedMb))} <span class="muted">/ ${escapeHtml(fmtMb(gpu.vramTotalMb))}</span></strong><div class="bar" aria-label="VRAM used"><span style="width:${percent}%"></span></div></div>`,
+        `<div class="stat"><span class="small">MoE cache slots</span><strong>${escapeHtml(geometry.moeCacheSize ? fmt(geometry.moeCacheSize) : '—')}</strong><div class="sub">${escapeHtml((geometry.gpuOwnedLayers || []).length)} GPU-owned layers</div></div>`,
+        `<div class="stat"><span class="small">KV cache tokens</span><strong>${escapeHtml(geometry.numPages ? fmt(geometry.numPages * (geometry.pageSize || 1)) : '—')}</strong><div class="sub">${geometry.numPages ? `${escapeHtml(fmt(geometry.numPages))} pages of ${escapeHtml(fmt(geometry.pageSize || 0))} tokens` : 'not running'}</div></div>`,
+        `<div class="stat"><span class="small">KV parking</span><strong>${parkingText}</strong>${parking.lastError ? `<div class="error">${escapeHtml(parking.lastError)}</div>` : ''}</div>`,
         `<div class="stat"><span class="small">Memory governor</span><strong>${escapeHtml(govLayers.owned ?? 0)} owned · ${escapeHtml(govLayers.pinned ?? 0)} pinned · ${escapeHtml(govLayers.disk ?? 0)} disk</strong><div class="sub">${govText}</div></div>`,
       ].join('');
       $('status-updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
