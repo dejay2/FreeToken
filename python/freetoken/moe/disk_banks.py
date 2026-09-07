@@ -28,6 +28,19 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
+_IO_ALIGNMENT = 4096  # Linux O_DIRECT block size on the WSL serving box.
+
+
+def _drop_file_cache(fd: int, offset: int = 0, length: int = 0) -> None:
+    """Ask POSIX to evict a file range, while keeping non-POSIX imports usable."""
+    if not hasattr(os, "posix_fadvise"):
+        return
+    try:
+        os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
+    except OSError:
+        # DONTNEED is advisory and is absent or unsupported on some filesystems.
+        pass
+
 
 def _set_lowest_io_priority() -> None:
     """Demote current thread to idle scheduling priority for non-disruptive background writes.
@@ -223,21 +236,58 @@ class ExpertDiskCopy:
                 # layer whose bytes are still in the page cache when the box loses power
                 f.flush()
                 os.fsync(f.fileno())
+                _drop_file_cache(f.fileno())
             tmp_path.replace(dst_path)
 
         self.manifest.setdefault("complete", {})[str(layer_id)] = True
         self._save_manifest()
 
     def read_layer_into(self, layer_id: int, bank_name: str, dst_tensor: torch.Tensor) -> None:
-        """Recall a full expert bank from disk into a pre-allocated host bank tensor."""
+        """Recall a full expert bank from disk into a pre-allocated host bank tensor.
+
+        Born-pinned banks are page-aligned on the serving box, so an aligned whole-bank
+        read can use O_DIRECT. Small or misaligned test/host allocations use buffered I/O,
+        followed by DONTNEED so the recall cannot grow the VM page cache.
+        """
         path = self.bank_path(layer_id, bank_name)
-        with open(path, "rb") as f:
-            u = dst_tensor.view(torch.uint8).reshape(-1)
-            mv = memoryview(u.numpy())
-            got = f.readinto(mv)
-        if got != len(mv):
+        u = dst_tensor.view(torch.uint8).reshape(-1)
+        mv = memoryview(u.numpy())
+        length = len(mv)
+        offset = 0
+        aligned = (
+            hasattr(os, "O_DIRECT")
+            and hasattr(os, "preadv")
+            and dst_tensor.data_ptr() % _IO_ALIGNMENT == 0
+            and offset % _IO_ALIGNMENT == 0
+            and length % _IO_ALIGNMENT == 0
+        )
+
+        got = None
+        if aligned:
+            try:
+                fd = os.open(str(path), os.O_RDONLY | os.O_DIRECT)
+                try:
+                    got = 0
+                    while got < length:
+                        n = os.preadv(fd, [mv[got:]], offset + got)
+                        if n <= 0:
+                            raise OSError(f"short O_DIRECT read at {got} of {length} bytes")
+                        got += n
+                    _drop_file_cache(fd, offset, length)
+                finally:
+                    os.close(fd)
+            except OSError:
+                # Filesystems such as tmpfs may reject O_DIRECT; the buffered path is safe.
+                got = None
+
+        if got is None:
+            with open(path, "rb") as f:
+                got = f.readinto(mv)
+                _drop_file_cache(f.fileno(), offset, length)
+
+        if got != length:
             raise RuntimeError(
-                f"short read recalling layer {layer_id} bank {bank_name!r}: {got} of {len(mv)} bytes"
+                f"short read recalling layer {layer_id} bank {bank_name!r}: {got} of {length} bytes"
             )
 
 
@@ -352,6 +402,11 @@ class DiskLayerReader:
         else:
             list(self._executor.map(lambda t: _read_bank_expert(*t), tasks))
 
+        # The row offsets are intentionally arbitrary, so evict the whole bank once all
+        # workers have finished. This avoids leaving a 1.33 GiB recall-sized cache footprint.
+        for fd in self._fds.values():
+            _drop_file_cache(fd)
+
         return tuple(self.staging[name][:k] for name in self.copy.schema)
 
     def iter_layer_chunks(self, rows: int = 64):
@@ -364,7 +419,9 @@ class DiskLayerReader:
                 rbytes = self.row_bytes[name]
                 mv = self._staging_mvs[name]
                 total_bytes = chunk_size * rbytes
-                mv[:total_bytes] = os.pread(fd, total_bytes, start_row * rbytes)
+                offset = start_row * rbytes
+                mv[:total_bytes] = os.pread(fd, total_bytes, offset)
+                _drop_file_cache(fd, offset, total_bytes)
             yield start_row, chunk_size, tuple(self.staging[name][:chunk_size] for name in self.copy.schema)
 
     def close(self) -> None:

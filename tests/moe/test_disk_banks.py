@@ -247,6 +247,75 @@ def test_write_and_read_rows_byte_identical(tmp_path: Path):
     reader.close()
 
 
+@pytest.mark.skipif(not hasattr(os, "posix_fadvise"), reason="requires POSIX fadvise")
+def test_disk_copy_drops_pages_after_each_io_path(tmp_path: Path, monkeypatch):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    _make_dummy_checkpoint(model_dir)
+    schema = ("gate_up", "down")
+    shapes = {"gate_up": (16, 8, 4), "down": (16, 4, 8)}
+    dtypes = {"gate_up": torch.bfloat16, "down": torch.bfloat16}
+    copy = ExpertDiskCopy(tmp_path / "disk_cache", model_dir, schema, shapes, dtypes)
+    banks = {
+        name: torch.randn(shapes[name], dtype=dtypes[name])
+        for name in schema
+    }
+
+    calls = []
+
+    def record_fadvise(fd, offset, length, advice):
+        calls.append((fd, offset, length, advice))
+
+    monkeypatch.setattr(os, "posix_fadvise", record_fadvise)
+    copy.write_layer(0, banks)
+    assert len(calls) >= len(schema)
+    assert all(call[3] == os.POSIX_FADV_DONTNEED for call in calls)
+    after_write = len(calls)
+
+    recalled = torch.empty_like(banks["gate_up"])
+    copy.read_layer_into(0, "gate_up", recalled)
+    assert torch.equal(recalled, banks["gate_up"])
+    assert len(calls) > after_write
+    after_recall = len(calls)
+
+    staging = {
+        name: torch.empty((8, *shapes[name][1:]), dtype=dtypes[name])
+        for name in schema
+    }
+    reader = DiskLayerReader(copy, layer_id=0, staging=staging)
+    reader.read_rows([1, 7])
+    assert len(calls) >= after_recall + len(schema)
+    after_rows = len(calls)
+    list(reader.iter_layer_chunks(rows=8))
+    assert len(calls) >= after_rows + 2 * len(schema)
+    assert all(call[3] == os.POSIX_FADV_DONTNEED for call in calls)
+    reader.close()
+
+
+@pytest.mark.skipif(not hasattr(os, "posix_fadvise"), reason="requires POSIX fadvise")
+def test_read_layer_into_falls_back_for_misaligned_destination(tmp_path: Path, monkeypatch):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    _make_dummy_checkpoint(model_dir)
+    schema = ("gate_up",)
+    shapes = {"gate_up": (1, 2048)}  # 4096 bytes, so only the destination is misaligned.
+    dtypes = {"gate_up": torch.bfloat16}
+    copy = ExpertDiskCopy(tmp_path / "disk_cache", model_dir, schema, shapes, dtypes)
+    source = torch.arange(2048, dtype=torch.bfloat16).reshape(shapes["gate_up"])
+    copy.write_layer(0, {"gate_up": source})
+
+    raw = bytearray(4097)
+    destination = torch.frombuffer(raw, dtype=torch.bfloat16, count=2048, offset=1).reshape(shapes["gate_up"])
+    assert destination.data_ptr() % 4096 != 0
+    calls = []
+    monkeypatch.setattr(os, "posix_fadvise", lambda *args: calls.append(args))
+
+    copy.read_layer_into(0, "gate_up", destination)
+
+    assert torch.equal(destination, source)
+    assert calls and all(call[-1] == os.POSIX_FADV_DONTNEED for call in calls)
+
+
 # --------------------------------------------------------------------------------------
 # 3. Spill -> disk_gather -> GEMM output matches pinned path on CPU dummy
 # --------------------------------------------------------------------------------------
