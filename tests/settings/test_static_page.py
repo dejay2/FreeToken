@@ -3,6 +3,7 @@ from __future__ import annotations
 from html.parser import HTMLParser
 from pathlib import Path
 import json
+import re
 import shutil
 import subprocess
 
@@ -46,18 +47,18 @@ class _PageParser(HTMLParser):
 
 
 DIAL_FIXTURE = [
-    {"name": "ModelPath", "group": "Model and context", "control": "path"},
-    {"name": "ContextTokens", "group": "Model and context", "control": "number"},
-    {"name": "KVDtype", "group": "Model and context", "control": "choice"},
-    {"name": "MaxRunningRequests", "group": "Chats", "control": "number"},
-    {"name": "KVPark", "group": "KV notes and parking", "control": "choice"},
-    {"name": "MoECacheSize", "group": "Expert slots and card memory", "control": "number"},
-    {"name": "EmbedHost", "group": "Expert slots and card memory", "control": "toggle"},
-    {"name": "EnableVision", "group": "Picture input", "control": "toggle"},
-    {"name": "FREETOKEN_MTP_SPECULATE", "group": "Look-ahead speed trick (MTP)", "control": "toggle"},
-    {"name": "ExpertLoad", "group": "Loading and diagnostics", "control": "choice"},
-    {"name": "Port", "group": "Advanced", "control": "number"},
-    {"name": "DesktopPython", "group": "Advanced", "control": "path"},
+    {"name": "ModelPath", "group": "Model & chats", "control": "path"},
+    {"name": "ContextTokens", "group": "Model & chats", "control": "number"},
+    {"name": "KVDtype", "group": "Model & chats", "control": "choice"},
+    {"name": "MaxRunningRequests", "group": "Model & chats", "control": "number"},
+    {"name": "KVPark", "group": "Model & chats", "control": "choice"},
+    {"name": "MoECacheSize", "group": "Memory & experts", "control": "number"},
+    {"name": "EmbedHost", "group": "Memory & experts", "control": "toggle"},
+    {"name": "EnableVision", "group": "Pictures", "control": "toggle"},
+    {"name": "FREETOKEN_MTP_SPECULATE", "group": "MTP", "control": "toggle"},
+    {"name": "ExpertLoad", "group": "Server & advanced", "control": "choice"},
+    {"name": "Port", "group": "Server & advanced", "control": "number"},
+    {"name": "DesktopPython", "group": "Server & advanced", "control": "path"},
 ]
 
 
@@ -78,7 +79,7 @@ def test_static_page_renders_fixture_dials_from_metadata() -> None:
 
     assert "json('/api/settings')" in source
     assert "groups.map((group)" in source
-    assert "group.dials.map((dial) => renderDial(dial))" in source
+    assert "dials.map((dial) => renderDial(dial))" in source
     assert "groups.find((item) => item.name === dial.group)" in source
     assert "state.settings[dial.name]" in source or "state.settings[dial.name] ??" in source
     assert "valueFor(dial)" in source
@@ -146,8 +147,8 @@ def test_page_has_tabs_info_buttons_sliders_and_browse() -> None:
     source = _source()
 
     assert 'role="tablist"' in page
-    for tab in ("settings", "server", "profiles", "models"):
-        assert f'data-tab="{tab}"' in page
+    tabs = ("model-chats", "memory-experts", "memory-governor", "mtp", "pictures", "server-advanced")
+    assert [match.group(1) for match in re.finditer(r'<button[^>]+data-tab="([^"]+)"', page)] == list(tabs)
     # Plain-language help, effect chips, sliders and folder browsing are all driven by the
     # metadata the settings route sends; the page only needs the generic hooks.
     assert 'data-info="${name}"' in source
@@ -158,7 +159,9 @@ def test_page_has_tabs_info_buttons_sliders_and_browse() -> None:
     assert "/api/browse" in source
     assert "dial.autoValue" in source
     assert "dial.displayFactor" in source
-    assert "show-advanced" in page
+    assert "advanced-settings" in source
+    assert "dial.blurb" in source
+    assert "tabKeyForGroup" in source
     assert 'id="search"' in page
     # Restarting with unsaved changes asks in-page, never through a browser dialog.
     assert "restart-dialog" in page

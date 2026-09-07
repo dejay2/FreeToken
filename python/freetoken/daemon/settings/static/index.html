@@ -88,16 +88,6 @@
     .switch input::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left .15s; box-shadow: 0 1px 3px #0004; }
     .switch input:checked { background: var(--accent); }
     .switch input:checked::after { left: 21px; }
-    .settings-layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 18px; align-items: start; }
-    .group-nav { position: sticky; top: 14px; display: flex; flex-direction: column; gap: 2px; }
-    .group-nav a { text-decoration: none; color: var(--muted); padding: 7px 10px; border-radius: 8px; font-size: .9rem; font-weight: 550; }
-    .group-nav a:hover, .group-nav a.active { background: var(--accent-soft); color: var(--ink); }
-    .group-nav a[hidden] { display: none; }
-    .group { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 4px 18px 6px; margin-bottom: 16px; scroll-margin-top: 14px; }
-    .group[hidden] { display: none; }
-    .group-title { display: flex; flex-direction: column; gap: 2px; padding: 14px 0 10px; border-bottom: 1px solid var(--line); }
-    .group-title h3 { font-size: 1rem; display: flex; align-items: center; gap: 9px; }
-    .group-title h3::before { content: ""; width: 5px; height: 18px; border-radius: 3px; background: var(--accent); }
     .dial { display: grid; grid-template-columns: minmax(200px, .8fr) minmax(220px, 1.2fr); gap: 6px 20px; padding: 14px 0; border-bottom: 1px solid color-mix(in srgb, var(--line) 60%, transparent); align-items: start; }
     .dial:last-child { border-bottom: 0; }
     .dial[hidden] { display: none; }
@@ -135,6 +125,22 @@
     .info-panel .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 8px; font-size: .82rem; color: var(--muted); }
     .info-panel .tech { margin-top: 8px; font-size: .78rem; color: var(--muted); font-family: ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
     .empty { color: var(--muted); padding: 10px 0; }
+    .dial-blurb { color: var(--muted); font-size: .84rem; line-height: 1.35; max-width: 52ch; }
+    .settings-tab[hidden] { display: none; }
+    .settings-tab > .panel-head { margin-bottom: 10px; }
+    .dial-list { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 4px 18px 6px; }
+    .advanced-settings { margin-top: 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); box-shadow: var(--shadow); }
+    .advanced-settings summary { cursor: pointer; padding: 13px 18px; font-weight: 650; color: var(--muted); }
+    .advanced-settings summary::marker { color: var(--accent); }
+    .advanced-settings[hidden] { display: none; }
+    .advanced-settings .dial-list { border: 0; border-top: 1px solid var(--line); border-radius: 0 0 var(--radius) var(--radius); box-shadow: none; }
+    .tab-utility { margin-bottom: 14px; }
+    .profile-strip, .status-strip { margin-bottom: 14px; }
+    .profile-strip .profile-picker { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .profile-picker select { width: min(360px, 100%); }
+    .profile-manager { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+    .status-strip .panel-head { margin-bottom: 10px; }
+    .model-card[hidden], #models-tools[hidden] { display: none; }
 
     /* Server tab */
     .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
@@ -217,7 +223,7 @@
     .fit-detail-grid { display: grid; gap: 4px; margin-top: 7px; color: var(--muted); }
     .fit-detail-grid b { color: var(--ink); font-weight: 650; }
 
-    @media (max-width: 900px) { .settings-layout { grid-template-columns: 1fr; } .group-nav { display: none; } .top-right { align-items: flex-start; } }
+    @media (max-width: 900px) { .top-right { align-items: flex-start; } }
     @media (max-width: 600px) { .dial { grid-template-columns: 1fr; } .amount { grid-template-columns: 1fr; } .amount .number-wrap { justify-content: flex-end; } }
   </style>
 </head>
@@ -240,6 +246,47 @@
       </div>
     </header>
 
+    <section class="status-strip panel" id="status-strip" aria-live="polite">
+      <div class="panel-head"><h2>Server status</h2><span class="small" id="status-updated"></span></div>
+      <div id="status" class="status-grid"><p class="empty">Checking…</p></div>
+      <div id="job" class="job" aria-live="polite"></div>
+      <details class="tab-utility" id="log-details">
+        <summary class="small">Show boot log</summary>
+        <div class="panel-head"><h2>Boot log</h2><div class="actions"><label class="check"><input id="auto-follow" type="checkbox" checked> Keep following new lines</label><button class="button small" id="refresh-logs" type="button">Refresh</button></div></div>
+        <p class="small" id="log-meta"></p>
+        <pre id="logs" class="log">Loading log…</pre>
+      </details>
+    </section>
+
+    <section class="profile-strip panel" id="profile-strip">
+      <div class="panel-head">
+        <div><h2>Profile</h2><p class="small" id="active-profile">Choose the saved settings to use for the next start.</p></div>
+        <div class="profile-picker"><label class="small" for="profile-picker">Use profile</label><select id="profile-picker" aria-label="Use saved profile"><option value="">Custom settings</option></select></div>
+      </div>
+      <details class="profile-manager" id="profiles-manager">
+        <summary class="small">Manage profiles</summary>
+        <div class="panel-head"><div><h2>Saved profiles</h2><p class="small">Each saved profile is its own start-up file. Presets copy their values into the active file.</p></div><button class="button" id="new-profile" type="button">Save current settings as a profile</button></div>
+        <div id="profile-form" hidden>
+          <label class="small" for="profile-name">Profile name</label>
+          <div class="inline-form"><input id="profile-name" type="text" maxlength="100" placeholder="For example: Quiet evening mode"><button class="button primary" id="profile-save" type="button">Save profile</button><button class="button" id="profile-cancel" type="button">Cancel</button></div>
+        </div>
+        <div id="profiles"><p class="empty">Loading profiles…</p></div>
+      </details>
+    </section>
+
+    <div class="toolbar" id="settings-toolbar">
+      <div class="search"><input id="search" type="search" placeholder="Find a setting, for example memory, pictures, chats…" aria-label="Find a setting"></div>
+    </div>
+
+    <nav class="tabs" id="settings-tabs" role="tablist" aria-label="Settings sections">
+      <button class="tab-btn" role="tab" type="button" data-tab="model-chats" data-group="Model &amp; chats" aria-selected="true">Model &amp; chats</button>
+      <button class="tab-btn" role="tab" type="button" data-tab="memory-experts" data-group="Memory &amp; experts" aria-selected="false">Memory &amp; experts</button>
+      <button class="tab-btn" role="tab" type="button" data-tab="memory-governor" data-group="Memory governor" aria-selected="false">Memory governor</button>
+      <button class="tab-btn" role="tab" type="button" data-tab="mtp" data-group="MTP" aria-selected="false">MTP</button>
+      <button class="tab-btn" role="tab" type="button" data-tab="pictures" data-group="Pictures" aria-selected="false">Pictures</button>
+      <button class="tab-btn" role="tab" type="button" data-tab="server-advanced" data-group="Server &amp; advanced" aria-selected="false">Server &amp; advanced</button>
+    </nav>
+
     <section class="fit-panel" id="fit-panel" hidden aria-live="polite" aria-atomic="false">
       <div class="fit-head">
         <div><h2 id="fit-warning">Memory fit check</h2><p class="small" id="fit-error"></p></div>
@@ -249,65 +296,20 @@
       <div class="fit-suggestion" id="fit-suggestion" hidden><h3>Suggested values</h3><p class="small" id="fit-suggestion-note"></p><div class="fit-changes" id="fit-suggestion-changes"></div><button class="button small" id="fit-apply" type="button">Apply suggested values</button></div>
       <details class="fit-details" id="fit-details" hidden><summary>Estimated ready use and required boot capacity</summary><div class="fit-detail-grid" id="fit-detail-grid"></div></details>
     </section>
-
-    <nav class="tabs" role="tablist" aria-label="Sections">
-      <button class="tab-btn" role="tab" type="button" data-tab="settings" aria-selected="true">Settings</button>
-      <button class="tab-btn" role="tab" type="button" data-tab="server" aria-selected="false">Server <span class="count" id="server-tab-count" hidden></span></button>
-      <button class="tab-btn" role="tab" type="button" data-tab="profiles" aria-selected="false">Profiles <span class="count" id="profiles-tab-count" hidden></span></button>
-      <button class="tab-btn" role="tab" type="button" data-tab="models" aria-selected="false">Models</button>
-    </nav>
-
-    <section class="tab" id="tab-settings" role="tabpanel">
-      <div class="toolbar">
-        <div class="search"><input id="search" type="search" placeholder="Find a setting, for example memory, pictures, chats…" aria-label="Find a setting"></div>
-        <label class="switch"><input id="show-advanced" type="checkbox"> <span>Show expert settings</span></label>
-        <span class="small" id="active-profile"></span>
-      </div>
-      <div class="model-card" id="model-card" aria-live="polite"><p class="empty">Reading the model folder…</p></div>
-      <div class="settings-layout">
-        <nav class="group-nav" id="group-nav" aria-label="Setting groups"></nav>
-        <div id="settings" aria-live="polite"><p class="empty">Loading settings…</p></div>
-      </div>
-    </section>
-
-    <section class="tab" id="tab-server" role="tabpanel" hidden>
-      <div class="panel">
-        <div class="panel-head"><h2>Live status</h2><span class="small" id="status-updated"></span></div>
-        <div id="status" class="status-grid"><p class="empty">Checking…</p></div>
-        <div id="job" class="job" aria-live="polite"></div>
-      </div>
-      <div class="panel">
-        <div class="panel-head"><h2>Boot log</h2><div class="actions"><label class="check"><input id="auto-follow" type="checkbox" checked> Keep following new lines</label><button class="button small" id="refresh-logs" type="button">Refresh</button></div></div>
-        <p class="small" id="log-meta"></p>
-        <pre id="logs" class="log">Loading log…</pre>
-      </div>
-    </section>
-
-    <section class="tab" id="tab-profiles" role="tabpanel" hidden>
-      <div class="panel">
-        <div class="panel-head"><div><h2>Saved profiles</h2><p class="small">Each saved profile is its own start-up file. Use one to switch the file Start and Restart will run; presets still copy their values into the active file.</p></div><button class="button" id="new-profile" type="button">Save current settings as a profile</button></div>
-        <div id="profile-form" hidden>
-          <label class="small" for="profile-name">Profile name</label>
-          <div class="inline-form"><input id="profile-name" type="text" maxlength="100" placeholder="For example: Quiet evening mode"><button class="button primary" id="profile-save" type="button">Save profile</button><button class="button" id="profile-cancel" type="button">Cancel</button></div>
-        </div>
-        <div id="profiles"><p class="empty">Loading profiles…</p></div>
-      </div>
-    </section>
+    <div class="model-card" id="model-card" aria-live="polite"><p class="empty">Reading the model folder…</p></div>
 
     <!-- models-tab -->
-    <section class="tab" id="tab-models" role="tabpanel" hidden>
-      <div class="panel">
-        <div class="panel-head"><div><h2>Download a model</h2><p class="small">Paste a Hugging Face link or name. Preview checks the files, memory and drive space before anything is copied.</p></div></div>
-        <div class="inline-form"><input id="model-repo" type="text" placeholder="Paste a Hugging Face link or name" aria-label="Hugging Face model link or name"><button class="button primary" id="model-preview" type="button">Preview</button></div>
-        <div id="model-preview-card" class="model-card" hidden aria-live="polite"></div>
-        <div id="model-download-actions" class="actions" hidden><button class="button primary" id="model-download" type="button">Download model</button></div>
-        <div id="model-download-progress" class="job" hidden aria-live="polite"><div style="flex:1;min-width:220px"><strong id="model-download-stage">Waiting</strong><div class="bar"><span id="model-download-bar" style="width:0%"></span></div><span class="small" id="model-download-detail"></span></div><button class="button small" id="model-download-cancel" type="button">Cancel</button></div>
-      </div>
-      <div class="panel">
-        <div class="panel-head"><div><h2>Model folders on this drive</h2><p class="small">Use one of these folders as the model folder on the Settings tab.</p></div><button class="button small" id="model-folders-refresh" type="button">Refresh</button></div>
-        <div id="model-folders"><p class="empty">Looking for model folders…</p></div>
-      </div>
-    </section>
+    <details class="panel tab-utility" id="models-tools">
+      <summary>Model downloads and folders</summary>
+      <div class="panel-head"><div><h2>Download a model</h2><p class="small">Paste a Hugging Face link or name. Preview checks the files, memory and drive space before anything is copied.</p></div></div>
+      <div class="inline-form"><input id="model-repo" type="text" placeholder="Paste a Hugging Face link or name" aria-label="Hugging Face model link or name"><button class="button primary" id="model-preview" type="button">Preview</button></div>
+      <div id="model-preview-card" class="model-card" hidden aria-live="polite"></div>
+      <div id="model-download-actions" class="actions" hidden><button class="button primary" id="model-download" type="button">Download model</button></div>
+      <div id="model-download-progress" class="job" hidden aria-live="polite"><div style="flex:1;min-width:220px"><strong id="model-download-stage">Waiting</strong><div class="bar"><span id="model-download-bar" style="width:0%"></span></div><span class="small" id="model-download-detail"></span></div><button class="button small" id="model-download-cancel" type="button">Cancel</button></div>
+      <div class="panel-head"><div><h2>Model folders on this drive</h2><p class="small">Use one of these folders as the model folder on the Model &amp; chats tab.</p></div><button class="button small" id="model-folders-refresh" type="button">Refresh</button></div>
+      <div id="model-folders"><p class="empty">Looking for model folders…</p></div>
+    </details>
+    <div id="settings" aria-live="polite"><p class="empty">Loading settings…</p></div>
     <!-- /models-tab -->
     <script>
       window.addEventListener('DOMContentLoaded', () => {
@@ -423,7 +425,7 @@
           input.value = path;
           state.settings[dial.name] = path;
           markChanged(dial.name);
-          showTab('settings');
+          showTab('model-chats');
           refreshModel(path);
           setNotice('Model folder selected. Save the settings to keep it.', 'good');
         }
@@ -434,7 +436,7 @@
         $('model-folders-refresh').addEventListener('click', loadModelFolders);
         loadModelFolders();
         let tab = ''; try { tab = localStorage.getItem('ft-tab') || ''; } catch (_) {}
-        if (tab === 'models') showTab('models');
+        if (tab === 'model-chats') showTab('model-chats');
       });
     </script>
   </main>
@@ -463,7 +465,7 @@
 
   <script>
     'use strict';
-    const state = { settings: {}, saved: {}, dials: [], groups: [], model: null, modelTimer: null, modelPath: null, profiles: [], activeProfile: '', busy: false, stopping: false, actionToken: 0, formRevision: 0, jobId: null, jobToken: 0, jobTimer: null, logTimer: null, tab: 'settings', showAdvanced: false, query: '', browser: null, lastNonAuto: {}, fit: { result: null, checkedSettings: null, checkedAt: 0, action: null, save: true, bindToForm: true, formRevision: 0, allowOverride: false, override: false, estimating: false, requestId: 0 } };
+    const state = { settings: {}, saved: {}, dials: [], groups: [], model: null, modelTimer: null, modelPath: null, profiles: [], activeProfile: '', busy: false, stopping: false, actionToken: 0, formRevision: 0, jobId: null, jobToken: 0, jobTimer: null, logTimer: null, tab: 'model-chats', query: '', browser: null, lastNonAuto: {}, fit: { result: null, checkedSettings: null, checkedAt: 0, action: null, save: true, bindToForm: true, formRevision: 0, allowOverride: false, override: false, estimating: false, requestId: 0 } };
     const axisLabels = { speed: 'Speed', accuracy: 'Accuracy', vram: 'Card memory', ram: 'PC memory', ssd: 'Drive space', boot: 'Start-up time' };
     const costAxes = new Set(['vram', 'ram', 'ssd', 'boot']);
     const $ = (id) => document.getElementById(id);
@@ -583,12 +585,12 @@
       const panel = $('fit-panel');
       if (!panel) return;
       const fit = state.fit;
-      const visibleTab = state.tab === 'settings' || state.tab === 'server';
-      panel.hidden = !(visibleTab && (fit.estimating || fit.result));
-      if (panel.hidden) return;
       const warning = $('fit-warning'); const error = $('fit-error'); const now = $('fit-now'); const empty = $('fit-empty');
       $('fit-retry').hidden = true; $('fit-override').hidden = true; $('fit-suggestion').hidden = true; $('fit-details').hidden = true;
       $('fit-apply').disabled = state.busy; $('fit-retry').disabled = state.busy; $('fit-override').disabled = state.busy;
+      const visibleTab = state.tab === 'memory-experts' || document.querySelectorAll('.tab-btn').length === 0;
+      panel.hidden = !(visibleTab && (fit.estimating || fit.result));
+      if (panel.hidden) return;
       if (fit.estimating && !fit.result) {
         panel.className = 'fit-panel'; warning.textContent = 'Checking memory fit…'; error.textContent = ''; now.textContent = ''; empty.textContent = ''; return;
       }
@@ -653,8 +655,6 @@
       clearFitResult(); setNotice(`Suggested values filled in; press Start to check and start.${emptyOnly}`, 'good');
     }
 
-    try { state.showAdvanced = localStorage.getItem('ft-show-advanced') === '1'; } catch (_) {}
-
     /* ---------- notices ---------- */
     let noticeTimer = null;
     function setNotice(message, kind = '', extra) {
@@ -668,11 +668,22 @@
     }
 
     /* ---------- tabs ---------- */
+    function tabKeyForGroup(name) {
+      return String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    }
+    function syncTabExtras() {
+      const modelCard = $('model-card');
+      if (modelCard) modelCard.hidden = state.tab !== 'model-chats';
+      const modelTools = $('models-tools');
+      if (modelTools) modelTools.hidden = state.tab !== 'model-chats';
+    }
     function showTab(name) {
-      state.tab = name;
-      document.querySelectorAll('.tab-btn').forEach((button) => button.setAttribute('aria-selected', String(button.dataset.tab === name)));
-      document.querySelectorAll('.tab').forEach((panel) => { panel.hidden = panel.id !== `tab-${name}`; });
-      try { localStorage.setItem('ft-tab', name); } catch (_) {}
+      const available = Array.from(document.querySelectorAll('.tab-btn')).map((button) => button.dataset.tab);
+      state.tab = available.includes(name) ? name : 'model-chats';
+      document.querySelectorAll('.tab-btn').forEach((button) => button.setAttribute('aria-selected', String(button.dataset.tab === state.tab)));
+      document.querySelectorAll('.settings-tab').forEach((panel) => { panel.hidden = panel.id !== `tab-${state.tab}`; });
+      syncTabExtras();
+      try { localStorage.setItem('ft-tab', state.tab); } catch (_) {}
       renderFit();
     }
     document.querySelectorAll('.tab-btn').forEach((button) => button.addEventListener('click', () => showTab(button.dataset.tab)));
@@ -768,14 +779,29 @@
       const effects = (dial.effects || []).map(effectChip).join('');
       const searchText = `${dial.plain} ${dial.name} ${dial.info} ${dial.help} ${dial.group}`.toLowerCase();
       const floorHint = dial.expertsPerLayer && dial.ownedDial ? `<div class="small floor-hint" data-floor-hint="${name}" data-owned-dial="${escapeHtml(dial.ownedDial)}"></div>` : '';
-      return `<div class="dial" data-dial-row="${name}" data-advanced="${dial.advanced ? '1' : '0'}" data-search="${escapeHtml(searchText)}"><div class="dial-head"><div class="dial-label-row"><span class="dial-label">${escapeHtml(dial.plain || labelFor(dial.name))}</span><button class="info-btn" type="button" data-info="${name}" aria-expanded="false" aria-label="What does ${escapeHtml(dial.plain)} do?">i</button></div>${effects ? `<div class="effects">${effects}</div>` : ''}</div><div class="dial-control">${inputHtml(dial)}${floorHint}<div class="error" data-error="${escapeHtml(dial.name)}"></div></div><div class="info-panel" data-info-panel="${name}" hidden><p>${escapeHtml(dial.info || dial.help || '')}</p>${effects ? `<div class="legend"><span>▲ up when higher or on</span><span>▼ down when higher or on</span><span>◆ depends on the value</span></div>` : ''}<p class="tech">${escapeHtml(techLine(dial))}</p></div></div>`;
+      return `<div class="dial" data-dial-row="${name}" data-advanced="${dial.advanced ? '1' : '0'}" data-search="${escapeHtml(searchText)}"><div class="dial-head"><div class="dial-label-row"><span class="dial-label">${escapeHtml(dial.plain || labelFor(dial.name))}</span><button class="info-btn" type="button" data-info="${name}" aria-expanded="false" aria-label="What does ${escapeHtml(dial.plain)} do?">i</button></div><p class="dial-blurb">${escapeHtml(dial.blurb || '')}</p>${effects ? `<div class="effects">${effects}</div>` : ''}</div><div class="dial-control">${inputHtml(dial)}${floorHint}<div class="error" data-error="${escapeHtml(dial.name)}"></div></div><div class="info-panel" data-info-panel="${name}" hidden><p>${escapeHtml(dial.info || dial.help || '')}</p>${effects ? `<div class="legend"><span>▲ up when higher or on</span><span>▼ down when higher or on</span><span>◆ depends on the value</span></div>` : ''}<p class="tech">${escapeHtml(techLine(dial))}</p></div></div>`;
     }
 
     function renderSettings() {
       const groups = [];
-      state.dials.forEach((dial) => { let group = groups.find((item) => item.name === dial.group); if (!group) { const meta = state.groups.find((item) => item.name === dial.group) || {}; group = { name: dial.group, plain: meta.plain || labelFor(dial.group), info: meta.info || '', dials: [] }; groups.push(group); } group.dials.push(dial); });
-      $('settings').innerHTML = groups.length ? groups.map((group) => `<section class="group" id="group-${escapeHtml(group.name.replace(/\W+/g, '-'))}" data-group="${escapeHtml(group.name)}"><div class="group-title"><h3>${escapeHtml(group.plain)}</h3>${group.info ? `<p class="small">${escapeHtml(group.info)}</p>` : ''}</div>${group.dials.map((dial) => renderDial(dial)).join('')}</section>`).join('') : '<p class="empty">No settings were returned.</p>';
-      $('group-nav').innerHTML = groups.map((group) => `<a href="#group-${escapeHtml(group.name.replace(/\W+/g, '-'))}" data-nav="${escapeHtml(group.name)}">${escapeHtml(group.plain)}</a>`).join('');
+      state.groups.forEach((meta) => groups.push({ name: meta.name, plain: meta.plain || meta.name, info: meta.info || '', dials: [] }));
+      state.dials.forEach((dial) => {
+        let group = groups.find((item) => item.name === dial.group);
+        if (!group) { group = { name: dial.group, plain: labelFor(dial.group), info: '', dials: [] }; groups.push(group); }
+        group.dials.push(dial);
+      });
+      const renderList = (dials) => dials.length ? `<div class="dial-list">${dials.map((dial) => renderDial(dial)).join('')}</div>` : '<p class="empty">No settings were returned.</p>';
+      $('settings').innerHTML = groups.length ? groups.map((group) => {
+        const key = tabKeyForGroup(group.name);
+        const basic = group.dials.filter((dial) => !dial.advanced);
+        const advanced = group.dials.filter((dial) => dial.advanced);
+        const advancedMarkup = advanced.length ? `<details class="advanced-settings" data-tab-advanced="${escapeHtml(key)}"><summary>Advanced <span class="count">${advanced.length}</span></summary>${renderList(advanced)}</details>` : '';
+        return `<section class="settings-tab" id="tab-${escapeHtml(key)}" role="tabpanel" data-group="${escapeHtml(group.name)}"><div class="panel-head"><h2>${escapeHtml(group.plain)}</h2></div>${renderList(basic)}${advancedMarkup}</section>`;
+      }).join('') : '<p class="empty">No settings were returned.</p>';
+      document.querySelectorAll('.tab-btn').forEach((button) => {
+        const present = groups.some((group) => tabKeyForGroup(group.name) === button.dataset.tab);
+        button.hidden = !present;
+      });
       $('settings').querySelectorAll('[data-dial]').forEach((control) => { const update = () => updateDialValue(control); control.addEventListener('input', update); control.addEventListener('change', update); });
       $('settings').querySelectorAll('[data-slider]').forEach((slider) => slider.addEventListener('input', () => { const dial = dialByName(slider.dataset.slider); const number = document.querySelector(`[data-dial="${CSS.escape(dial.name)}"]`); number.value = slider.value; state.settings[dial.name] = toStored(dial, slider.value); markChanged(dial.name); }));
       $('settings').querySelectorAll('[data-auto]').forEach((box) => box.addEventListener('change', () => toggleAuto(box.dataset.auto, box.checked)));
@@ -784,6 +810,7 @@
       refreshFloorHints();
       applyFilters();
       refreshDirty();
+      showTab(state.tab);
     }
 
     function updateDialValue(control) {
@@ -817,11 +844,14 @@
 
     function applyFilters() {
       const query = state.query.trim().toLowerCase();
-      document.querySelectorAll('.group').forEach((group) => {
-        let visible = 0;
-        group.querySelectorAll('.dial').forEach((row) => { const show = (state.showAdvanced || row.dataset.advanced !== '1') && (!query || row.dataset.search.includes(query)); row.hidden = !show; if (show) visible += 1; });
-        group.hidden = visible === 0;
-        const nav = document.querySelector(`[data-nav="${CSS.escape(group.dataset.group)}"]`); if (nav) nav.hidden = visible === 0;
+      document.querySelectorAll('.settings-tab').forEach((tab) => {
+        tab.querySelectorAll('.dial').forEach((row) => { row.hidden = !!query && !row.dataset.search.includes(query); });
+        const advanced = tab.querySelector('.advanced-settings');
+        if (advanced) {
+          const matches = Array.from(advanced.querySelectorAll('.dial')).some((row) => !row.hidden);
+          advanced.hidden = !!query && !matches;
+          if (query && matches) advanced.open = true;
+        }
       });
     }
 
@@ -843,7 +873,7 @@
       fields.forEach((node) => { node.textContent = ''; });
       let first = null;
       (Array.isArray(errors) ? errors : []).forEach((error) => { const node = fields.find((candidate) => candidate.dataset.error === error.field); if (node) { node.textContent = error.message || 'This value is not allowed.'; first = first || node; } });
-      if (first) { const row = first.closest('.dial'); if (row) { row.hidden = false; row.closest('.group').hidden = false; showTab('settings'); row.scrollIntoView({ block: 'center' }); } }
+      if (first) { const row = first.closest('.dial'); if (row) { row.hidden = false; const tab = row.closest('.settings-tab'); const advanced = row.closest('.advanced-settings'); if (advanced) { advanced.hidden = false; advanced.open = true; } if (tab) { showTab(tab.id.replace(/^tab-/, '')); row.scrollIntoView({ block: 'center' }); } } }
     }
 
     /* ---------- the chosen model ---------- */
@@ -968,7 +998,7 @@
     async function launchLifecycle(action, snapshot, force, actionToken, fitToken) {
       if (state.actionToken !== actionToken || !fitSnapshotCurrent(snapshot, fitToken)) { if (state.actionToken === actionToken) setBusy(false); return false; }
       state.fit.override = !!force;
-      setNotice(`${labelFor(action)}ing the server…`); showTab('server');
+      setNotice(`${labelFor(action)}ing the server…`); showTab('server-advanced');
       try {
         const { response, body } = await json(`/api/server/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force: state.fit.override || force, settings: state.fit.checkedSettings }) });
         if (!response.ok) throw new Error(body.detail || 'The server action could not start.');
@@ -1018,7 +1048,7 @@
     }
     async function stopServer() {
       if (state.stopping) return;
-      ++state.actionToken; ++state.jobToken; invalidateFit(); setBusy(true, true); showTab('server'); setNotice('Stopping the server…');
+      ++state.actionToken; ++state.jobToken; invalidateFit(); setBusy(true, true); showTab('server-advanced'); setNotice('Stopping the server…');
       try {
         const { response, body } = await json('/api/server/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force: false }) });
         if (!response.ok) throw new Error(body.detail || 'The server action could not start.');
@@ -1095,7 +1125,6 @@
         `<div class="stat"><span class="small">Memory governor</span><strong>${escapeHtml(govLayers.owned ?? 0)} owned · ${escapeHtml(govLayers.pinned ?? 0)} pinned · ${escapeHtml(govLayers.disk ?? 0)} disk</strong><div class="sub">${govText}</div></div>`,
       ].join('');
       $('status-updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
-      $('server-tab-count').hidden = !server.activeRequests; $('server-tab-count').textContent = `${server.activeRequests || 0} busy`;
       if (body.currentJob && body.currentJob.jobId && !state.jobId && !['serving', 'stopped', 'failed'].includes(body.currentJob.stage)) { state.jobId = body.currentJob.jobId; const jobToken = ++state.jobToken; setBusy(true, body.currentJob.stage === 'stopping'); pollJob(jobToken); }
     }
 
@@ -1106,11 +1135,19 @@
     const fileName = (path) => { const parts = String(path || '').split(/[\\/]/); return parts[parts.length - 1] || '—'; };
     function renderActiveProfile() {
       const profile = state.profiles.find((item) => item.id === state.activeProfile || item.active);
-      $('active-profile').textContent = profile ? `Active profile: ${profile.name}` : (state.activeProfile ? `Active profile: ${state.activeProfile}` : '');
+      $('active-profile').textContent = profile ? `Active profile: ${profile.name}` : (state.activeProfile ? `Active profile: ${state.activeProfile}` : 'Custom settings');
+    }
+    function renderProfilePicker() {
+      const picker = $('profile-picker');
+      if (!picker) return;
+      const options = state.profiles.map((profile) => `<option value="${escapeHtml(profile.id)}">${escapeHtml(profile.name || profile.id)}${profile.isPreset ? ' (preset)' : ''}</option>`).join('');
+      picker.innerHTML = `<option value="">Custom settings</option>${options}`;
+      picker.value = state.profiles.some((profile) => profile.id === state.activeProfile) ? state.activeProfile : '';
     }
     function renderProfiles() {
       const active = state.profiles.find((item) => item.active);
       if (active) state.activeProfile = active.id;
+      renderProfilePicker();
       $('profiles').innerHTML = state.profiles.length ? state.profiles.map((profile) => {
         const values = Object.entries(profile.settings || {}).map(([key, value]) => { const dial = dialByName(key); return `<span><b>${escapeHtml(dial ? dial.plain : labelFor(key))}:</b> ${escapeHtml(value === '' ? 'off' : value)}</span>`; }).join('');
         const isActive = profile.id === state.activeProfile || profile.active;
@@ -1122,7 +1159,6 @@
           : `<button class="button small${isActive ? ' primary' : ''}" type="button" data-activate="${escapeHtml(profile.id)}" ${isActive ? 'disabled' : ''}>Use this profile</button>`;
         return `<article class="profile"><div class="profile-head"><div><h3>${escapeHtml(profile.name)}${isActive ? '<span class="tag">Active</span>' : ''}${kind}</h3><p class="small">${escapeHtml(profile.description || '')}</p></div><div class="actions">${use}${profile.isDefault || profile.isPreset ? '' : `<button class="button small danger" type="button" data-delete="${escapeHtml(profile.id)}">Delete</button>`}</div></div><div class="values"><span><b>Model:</b> ${escapeHtml(model)}</span><span><b>File:</b> ${escapeHtml(file)}</span>${values}</div><div class="confirm" data-confirm="${escapeHtml(profile.id)}" hidden>Delete this profile? <button type="button" data-confirm-delete="${escapeHtml(profile.id)}">Yes, delete</button> <button type="button" data-cancel-delete="${escapeHtml(profile.id)}">Keep it</button></div></article>`;
       }).join('') : '<p class="empty">No saved profiles yet.</p>';
-      $('profiles-tab-count').hidden = !state.profiles.length; $('profiles-tab-count').textContent = String(state.profiles.length);
       renderActiveProfile();
       document.querySelectorAll('[data-activate]').forEach((button) => button.addEventListener('click', () => activateProfile(button.dataset.activate)));
       document.querySelectorAll('[data-apply]').forEach((button) => button.addEventListener('click', () => applyProfile(button.dataset.apply)));
@@ -1204,20 +1240,23 @@
     $('fit-override').addEventListener('click', overrideFit);
     $('fit-retry').addEventListener('click', retryFit);
     $('search').addEventListener('input', () => { state.query = $('search').value; applyFilters(); });
-    $('show-advanced').checked = state.showAdvanced;
-    $('show-advanced').addEventListener('change', () => { state.showAdvanced = $('show-advanced').checked; try { localStorage.setItem('ft-show-advanced', state.showAdvanced ? '1' : '0'); } catch (_) {} applyFilters(); });
+    $('profile-picker').addEventListener('change', () => {
+      const id = $('profile-picker').value;
+      if (!id) return;
+      const profile = state.profiles.find((item) => item.id === id);
+      if (profile?.isPreset) applyProfile(id); else activateProfile(id);
+    });
     $('refresh-logs').addEventListener('click', async () => { await loadLogs(); startLogRefresh(); });
     $('auto-follow').addEventListener('change', startLogRefresh);
     $('new-profile').addEventListener('click', () => { $('profile-form').hidden = false; $('profile-name').focus(); });
     $('profile-cancel').addEventListener('click', () => { $('profile-form').hidden = true; $('profile-name').value = ''; });
     $('profile-save').addEventListener('click', saveProfile);
     $('profile-name').addEventListener('keydown', (event) => { if (event.key === 'Enter') saveProfile(); });
-    $('group-nav').addEventListener('click', (event) => { const link = event.target.closest('a'); if (link) { document.querySelectorAll('.group-nav a').forEach((item) => item.classList.toggle('active', item === link)); } });
 
     async function boot() {
       try {
-        let tab = 'settings'; try { tab = localStorage.getItem('ft-tab') || 'settings'; } catch (_) {}
-        showTab(['settings', 'server', 'profiles'].includes(tab) ? tab : 'settings');
+        let tab = 'model-chats'; try { tab = localStorage.getItem('ft-tab') || 'model-chats'; } catch (_) {}
+        showTab(['model-chats', 'memory-experts', 'memory-governor', 'mtp', 'pictures', 'server-advanced'].includes(tab) ? tab : 'model-chats');
         await Promise.all([loadSettings(), loadProfiles(), loadStatus(), loadLogs()]);
         startLogRefresh();
         setInterval(loadStatus, 3000);

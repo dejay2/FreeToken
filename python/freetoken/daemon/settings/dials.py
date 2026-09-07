@@ -44,6 +44,8 @@ class Dial:
     # (i) button, ``effects`` the chips shown beside it ("what turning this up or on does").
     plain: str = ""
     info: str = ""
+    # One-line text shown directly under the technical label on the settings page.
+    blurb: str = ""
     effects: tuple[str, ...] = ()
     # Slider range in display units: (low, high, step). Deliberately narrower than the
     # validation bounds, which are the launcher's technical limits, not sensible values.
@@ -82,6 +84,7 @@ class Dial:
             "min": over.get("min", self.minimum),
             "max": over.get("max", self.maximum),
             "plain": self.plain or self.name,
+            "blurb": self.blurb,
             "info": over.get("info", self.info),
             "effects": [
                 {"axis": axis, "direction": direction}
@@ -108,41 +111,29 @@ class Dial:
 
 
 GROUP_INFO: dict[str, dict[str, str]] = {
-    "Model and context": {
-        "plain": "Model and chat length",
-        "info": "Which model runs, how long one chat may get, and how its running memory is stored on the card.",
+    "Model & chats": {
+        "plain": "Model & chats",
+        "info": "Model choice, chat length, shared KV memory and parking for inactive chats.",
     },
-    "Chats": {
-        "plain": "Chats at once",
-        "info": "How many people or apps the server answers at the same time.",
-    },
-    "KV notes and parking": {
-        "plain": "Remembering idle chats",
-        "info": "Move an idle chat's memory off the card and bring it back when the chat continues, instead of re-reading the whole conversation.",
-    },
-    "Expert slots and card memory": {
-        "plain": "Card memory",
-        "info": "How the graphics card's 32 GB is split between ready-to-use expert pieces, chat memory and a safety cushion. The main speed dial lives here.",
+    "Memory & experts": {
+        "plain": "Memory & experts",
+        "info": "GPU expert slots, dense weights, embeddings and the memory fit check.",
     },
     "Memory governor": {
         "plain": "Memory governor",
-        "info": "Automatically move expert layers between the card, PC memory and disk as other programs use memory.",
+        "info": "Automatic movement of expert layers between GPU memory, RAM and SSD.",
     },
-    "Picture input": {
+    "MTP": {
+        "plain": "MTP",
+        "info": "Experimental multi-token prediction settings.",
+    },
+    "Pictures": {
         "plain": "Pictures",
-        "info": "Let chats include pictures, and choose where the picture weights wait.",
+        "info": "Picture input and the placement of vision weights.",
     },
-    "Look-ahead speed trick (MTP)": {
-        "plain": "Guess-ahead speed trick (experimental)",
-        "info": "A trial feature that drafts several words at once and checks them in one go. Needs the private MTP files on this PC.",
-    },
-    "Loading and diagnostics": {
-        "plain": "Start-up and health checks",
-        "info": "How the model is read from the drive at start-up and what gets written to the log.",
-    },
-    "Advanced": {
-        "plain": "Other settings",
-        "info": "Rarely changed. Wrong values here stop the server from starting.",
+    "Server & advanced": {
+        "plain": "Server & advanced",
+        "info": "Expert loading, diagnostics, server access and CUDA graph settings.",
     },
 }
 
@@ -152,8 +143,8 @@ GROUP_INFO: dict[str, dict[str, str]] = {
 DIALS: tuple[Dial, ...] = (
     Dial(
         "ModelPath", "path", "", "", "Filesystem directory containing the model weights and tokenizer config.",
-        "Model and context", engine_mapping="--model <path>",
-        plain="Model folder", browse="model",
+        "Model & chats", engine_mapping="--model <path>",
+        plain="Model path", blurb="Folder containing the model weights and tokenizer.", browse="model",
         info=(
             "The folder holding the model's files. A usable folder contains config.json and the weight "
             "files. Every other setting on this page was tuned for Qwen3.8-Flash-Next on this PC, so "
@@ -164,8 +155,8 @@ DIALS: tuple[Dial, ...] = (
         # maximum is a technical ceiling; the real limit is the chosen model's longest chat
         # (config.json max_position_embeddings), applied by adapt_dial / validate_settings.
         "ContextTokens", "number", 262144, "tokens", "Maximum sequence length per request reserved in the KV cache.",
-        "Model and context", minimum=64, maximum=4194304, engine_mapping="--kv-reserve-tokens <N>",
-        plain="Longest single chat", slider=(1024, 262144, 1024), effects=("vram:up",),
+        "Model & chats", minimum=64, maximum=4194304, engine_mapping="--kv-reserve-tokens <N>",
+        plain="Context tokens", blurb="Maximum tokens in one request's conversation.", slider=(1024, 262144, 1024), effects=("vram:up",),
         info=(
             "How long one conversation may grow, in tokens. A token is about three quarters of a "
             "word, so 262,144 tokens is roughly 200,000 words. The server sets this much room aside "
@@ -175,8 +166,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "KVCacheTokens", "number", 262144, "tokens", "Total capacity of the KV token cache pool (0 selects automatic sizing).",
-        "Model and context", minimum=0, maximum=4194304, engine_mapping="--num-tokens <N>",
-        plain="Chat memory pool", slider=(0, 524288, 8192), auto_value=0, auto_label="Automatic",
+        "Model & chats", minimum=0, maximum=4194304, engine_mapping="--num-tokens <N>",
+        plain="KV cache tokens", blurb="Total KV memory shared by all running conversations.", slider=(0, 524288, 8192), auto_value=0, auto_label="Automatic",
         effects=("vram:up", "speed:up"),
         info=(
             "The total chat memory the card keeps for all chats together. Bigger means more chats can "
@@ -190,8 +181,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "KVDtype", "choice", "bf16", "dtype", "Storage precision for QSA KV cache (bf16 is safe default; fp8 saves ~48% KV VRAM).",
-        "Model and context", options=("bf16", "fp8"), engine_mapping="--kv-dtype fp8 (if fp8)",
-        plain="Chat memory precision", option_labels=("Normal (bf16)", "Compact (fp8)"),
+        "Model & chats", options=("bf16", "fp8"), engine_mapping="--kv-dtype fp8 (if fp8)",
+        plain="KV cache dtype", blurb="Storage format for the QSA key-value cache.", option_labels=("Normal (bf16)", "Compact (fp8)"),
         effects=("vram:down", "speed:up", "accuracy:mixed"),
         info=(
             "Compact stores the chat memory in half the space: about 3 GiB back at 262,144 tokens. "
@@ -203,8 +194,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "MaxRunningRequests", "number", 4, "requests", "Maximum number of concurrent inference requests processed in parallel.",
-        "Chats", minimum=1, maximum=16, engine_mapping="--max-running-requests <N>",
-        plain="Chats answered at the same time", slider=(1, 16, 1), effects=("speed:mixed", "vram:up"),
+        "Model & chats", minimum=1, maximum=16, engine_mapping="--max-running-requests <N>",
+        plain="Max running requests", blurb="Maximum conversations processed at the same time.", slider=(1, 16, 1), effects=("speed:mixed", "vram:up"),
         info=(
             "How many chats the server works on together. Each one answers a little slower, but the "
             "total output goes up: measured 2026-09-03, four chats together produced 15.5 to 49.5 words "
@@ -214,8 +205,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "KVPark", "choice", "off", "backend", "Offload inactive KV cache prefixes to RAM or SSD between multi-turn chat interactions.",
-        "KV notes and parking", options=("off", "ram", "ssd"), engine_mapping="--kv-park <mode>",
-        plain="Where idle chats are kept", option_labels=("Off (re-read the chat)", "PC memory", "SSD"),
+        "Model & chats", options=("off", "ram", "ssd"), engine_mapping="--kv-park <mode>",
+        plain="KV parking", blurb="Where inactive conversation memory is kept.", option_labels=("Off (re-read the chat)", "PC memory", "SSD"),
         effects=("speed:up", "ram:up", "ssd:up"),
         info=(
             "When a chat goes quiet, its memory is moved off the card so other chats can use the space, "
@@ -228,8 +219,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "KVParkIdleMs", "number", 0, "ms", "Idle milliseconds before offloading inactive KV cache prefix to parking store.",
-        "KV notes and parking", minimum=0, maximum=86400000, engine_mapping="--kv-park-idle-ms <N>",
-        plain="Quiet time before a chat is parked", slider=(0, 600, 5), display_unit="s", display_factor=1000,
+        "Model & chats", minimum=0, maximum=86400000, engine_mapping="--kv-park-idle-ms <N>",
+        plain="KV parking idle time", blurb="Wait before moving an inactive conversation off the card.", slider=(0, 600, 5), display_unit="s", display_factor=1000,
         advanced=True, effects=("speed:mixed",),
         info=(
             "How long a chat must sit quiet before it is moved off the card. 0 parks it the moment its "
@@ -239,8 +230,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "KVParkMinTokens", "number", 8192, "tokens", "Minimum token prefix length required before eligible for KV cache parking.",
-        "KV notes and parking", minimum=64, maximum=4194304, engine_mapping="--kv-park-min-tokens <N>",
-        plain="Smallest chat worth parking", slider=(1024, 131072, 1024), advanced=True, effects=("speed:mixed",),
+        "Model & chats", minimum=64, maximum=4194304, engine_mapping="--kv-park-min-tokens <N>",
+        plain="KV parking minimum tokens", blurb="Shortest conversation prefix eligible for parking.", slider=(1024, 131072, 1024), advanced=True, effects=("speed:mixed",),
         info=(
             "Chats shorter than this are simply re-read, because that is nearly as fast as parking them. "
             "Measured 2026-09-03: an 8,192-token chat re-reads in 4.7 seconds and restores in 0.006 "
@@ -249,8 +240,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "KVParkRAMGiB", "number", 2.0, "GiB", "Maximum pinned host RAM budget allocated for parked KV cache prefixes.",
-        "KV notes and parking", minimum=0.125, maximum=128.0, numeric_kind="float", engine_mapping="--kv-park-ram-gib <N>",
-        plain="PC memory set aside for parked chats", slider=(0.5, 32, 0.5), effects=("ram:up", "speed:up"),
+        "Model & chats", minimum=0.125, maximum=128.0, numeric_kind="float", engine_mapping="--kv-park-ram-gib <N>",
+        plain="KV parking RAM", blurb="RAM budget for parked conversation memory.", slider=(0.5, 32, 0.5), effects=("ram:up", "speed:up"),
         info=(
             "Only used when idle chats are kept in PC memory. This memory is locked for the server and "
             "nothing else can use it while it runs. One 65,000-token chat needs 1.65 GiB; a full "
@@ -260,8 +251,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "KVParkSSDDir", "path", "~/.cache/freetoken/kv-park", "path", "Filesystem directory on high-speed SSD used for parked KV cache files.",
-        "KV notes and parking", engine_mapping="--kv-park-ssd-dir <dir>",
-        plain="Parking folder on the SSD", browse="folder", effects=("ssd:up",),
+        "Model & chats", engine_mapping="--kv-park-ssd-dir <dir>",
+        plain="KV parking SSD folder", blurb="SSD folder used for parked conversation files.", browse="folder", effects=("ssd:up",),
         info=(
             "Where parked chats are written when the SSD option is on. Pick a folder on a fast SSD; "
             "the files are read back at about 5.3 GiB per second on this PC's drive. They are deleted "
@@ -270,8 +261,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "KVParkSSDGiB", "number", 32.0, "GiB", "Maximum disk storage budget on SSD allocated for parked KV cache files.",
-        "KV notes and parking", minimum=0.125, maximum=8192.0, numeric_kind="float", engine_mapping="--kv-park-ssd-gib <N>",
-        plain="Drive space for parked chats", slider=(1, 256, 1), effects=("ssd:up", "speed:up"),
+        "Model & chats", minimum=0.125, maximum=8192.0, numeric_kind="float", engine_mapping="--kv-park-ssd-gib <N>",
+        plain="KV parking SSD size", blurb="SSD space reserved for parked conversation files.", slider=(1, 256, 1), effects=("ssd:up", "speed:up"),
         info=(
             "The most drive space parked chats may take. Each parked chat is 1.65 GiB per 65,000 "
             "tokens, so 32 GiB holds about 19 chats that long. When the space is full the oldest "
@@ -280,8 +271,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "KVParkWindowMiB", "number", 256, "MiB", "Staging window size in host RAM for overlapping SSD disk reads with GPU copies.",
-        "KV notes and parking", minimum=1, maximum=4096, engine_mapping="--kv-park-window-mib <N>",
-        plain="SSD transfer buffer", slider=(16, 2048, 16), advanced=True, effects=("ram:up",),
+        "Model & chats", minimum=1, maximum=4096, engine_mapping="--kv-park-window-mib <N>",
+        plain="KV parking transfer window", blurb="RAM transfer window for SSD parking reads and writes.", slider=(16, 2048, 16), advanced=True, effects=("ram:up",),
         info=(
             "Two buffers of this size sit in locked PC memory to move parked chats between the SSD and "
             "the card. 256 MiB was measured 2026-09-03 at 5.3 GiB per second reads and 1.6 GiB per "
@@ -290,8 +281,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "MoECacheSize", "number", 4188, "slots", "Total number of MoE expert slots allocated in GPU VRAM (0 selects automatic sizing).",
-        "Expert slots and card memory", minimum=0, maximum=1048576, engine_mapping="--moe-cache-size <N>",
-        plain="Expert slots on the card", slider=(1024, 8192, 64), auto_value=0, auto_label="Automatic",
+        "Memory & experts", minimum=0, maximum=1048576, engine_mapping="--moe-cache-size <N>",
+        plain="MoE cache size (slots)", blurb="Number of expert slots kept ready in GPU memory.", slider=(1024, 8192, 64), auto_value=0, auto_label="Automatic",
         effects=("speed:up", "vram:up"),
         info=(
             "The model is made of 24,576 expert pieces (63 GiB) that live in PC memory; the card keeps "
@@ -311,8 +302,8 @@ DIALS: tuple[Dial, ...] = (
         # "" = off. The engine accepts any N up to the model's MoE layer count; the slider top and
         # the storage form come from the chosen model (adapt_dial). Static maximum is a ceiling.
         "GpuOwnedLayers", "number", "auto", "layers", "MoE layers that remain permanently resident in GPU VRAM instead of streaming from host RAM.",
-        "Expert slots and card memory", minimum=0, maximum=4096, engine_mapping="--moe-gpu-owned-layers <val>",
-        plain="Layers kept whole on the card", slider=(0, 48, 1), stored_as="auto:{n}", stored_zero="",
+        "Memory & experts", minimum=0, maximum=4096, engine_mapping="--moe-gpu-owned-layers <val>",
+        plain="GPU-owned layers", blurb="Number of expert layers kept permanently on the GPU.", slider=(0, 48, 1), stored_as="auto:{n}", stored_zero="",
         effects=("ram:down", "vram:up", "speed:mixed"),
         info=(
             "Keeps every expert of the chosen layers on the card so those layers never need PC memory. "
@@ -327,8 +318,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "DenseQuant", "choice", "int8", "format", "Weight-only int8 quantization for dense non-MoE layers, saving ~3.9 GiB VRAM.",
-        "Expert slots and card memory", options=("", "int8"), engine_mapping="$env:FREETOKEN_DENSE_QUANT",
-        plain="Shrink the always-on weights", option_labels=("Off (full size)", "On (int8)"),
+        "Memory & experts", options=("", "int8"), engine_mapping="$env:FREETOKEN_DENSE_QUANT",
+        plain="Dense quant", blurb="Use int8 weights for dense, always-active layers.", option_labels=("Off (full size)", "On (int8)"),
         effects=("vram:down", "speed:up", "accuracy:mixed"),
         info=(
             "Stores the parts of the model that run on every word at 8 bits instead of 16. Gives 3.9 GiB "
@@ -339,8 +330,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "MoEVramReserveBytes", "number", -1, "bytes", "VRAM bytes reserved after expert cache sizing for CUDA graphs and draft heads (-1 = auto).",
-        "Expert slots and card memory", minimum=-1, maximum=34359738368, engine_mapping="--moe-vram-reserve-bytes <N>",
-        plain="Card memory held back for later", slider=(0, 8, 0.25), display_unit="GiB", display_factor=GIB,
+        "Memory & experts", minimum=-1, maximum=34359738368, engine_mapping="--moe-vram-reserve-bytes <N>",
+        plain="MoE VRAM reserve", blurb="GPU memory held back for graphs and draft heads.", slider=(0, 8, 0.25), display_unit="GiB", display_factor=GIB,
         auto_value=-1, auto_label="Automatic", advanced=True, effects=("vram:up",),
         info=(
             "Card memory the expert slots must not use because other things are loaded after them: "
@@ -351,8 +342,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "MoECacheHeadroomBytes", "number", -1, "bytes", "Free VRAM cushion that expert slot cache must leave untouched (-1 = default 1.5 GiB).",
-        "Expert slots and card memory", minimum=-1, maximum=34359738368, engine_mapping="--moe-cache-headroom-bytes <N>",
-        plain="Free card memory cushion", slider=(0, 8, 0.25), display_unit="GiB", display_factor=GIB,
+        "Memory & experts", minimum=-1, maximum=34359738368, engine_mapping="--moe-cache-headroom-bytes <N>",
+        plain="MoE cache headroom", blurb="GPU memory the expert cache must leave unused.", slider=(0, 8, 0.25), display_unit="GiB", display_factor=GIB,
         auto_value=-1, auto_label="Automatic (1.5 GiB)", advanced=True, effects=("vram:up", "speed:mixed"),
         info=(
             "Card memory that must stay free after everything is loaded. Automatic keeps 1.5 GiB, the "
@@ -365,7 +356,7 @@ DIALS: tuple[Dial, ...] = (
         "MemoryGovernor", "toggle", True, "boolean",
         "Automatically step expert layers down the VRAM/RAM ladder and shrink pools when free memory drops below cushion, stepping back up when memory returns; the card cushion is also the boot's free-VRAM headroom (--moe-cache-headroom-bytes).",
         "Memory governor",
-        plain="Give memory back to games and other programs automatically",
+        plain="Memory governor", blurb="Move expert layers between GPU, RAM, and SSD as memory changes.",
         effects=("speed:down",),
         info=(
             "Steps expert layers between GPU memory, host RAM, and SSD disk storage when other apps or games "
@@ -378,7 +369,7 @@ DIALS: tuple[Dial, ...] = (
         "GovernorVRAMFreeGB", "number", 1.5, "GB",
         "Free card memory cushion the governor maintains by stepping layers down or shrinking pools; at boot it is passed as --moe-cache-headroom-bytes (never as the post-cache reserve).",
         "Memory governor", minimum=0.0, maximum=128.0, numeric_kind="float",
-        plain="Keep this much of the card free", slider=(0.0, 16.0, 0.25),
+        plain="VRAM cushion", blurb="Free GPU memory cushion maintained by the governor.", slider=(0.0, 16.0, 0.25),
         effects=("vram:up", "speed:down"),
         info=(
             "Card memory that must stay free for other programs. Below this cushion, the governor steps expert layers "
@@ -390,7 +381,7 @@ DIALS: tuple[Dial, ...] = (
         "GovernorRAMFreeGB", "number", 4.0, "GB",
         "Free main memory cushion the governor maintains by spilling pinned expert layers to SSD disk storage.",
         "Memory governor", minimum=0.0, maximum=1024.0, numeric_kind="float",
-        plain="Keep this much main memory free", slider=(0.0, 64.0, 1.0),
+        plain="RAM cushion", blurb="Free host RAM cushion maintained by the governor.", slider=(0.0, 64.0, 1.0),
         effects=("ram:up", "speed:down"),
         info=(
             "Host RAM that must stay free for other programs. Below this cushion, the governor spills pinned expert "
@@ -400,7 +391,7 @@ DIALS: tuple[Dial, ...] = (
     Dial(
         "GovernorUpMarginGB", "number", 0.5, "GB", "Extra headroom before stepping back up.",
         "Memory governor", minimum=0.0, maximum=8.0, numeric_kind="float", source="helper",
-        plain="Extra headroom before stepping back up", slider=(0.0, 8.0, 0.25), advanced=True,
+        plain="Governor up margin", blurb="Extra free-memory margin required before moving layers up.", slider=(0.0, 8.0, 0.25), advanced=True,
         effects=("vram:up", "ram:up"),
         info=(
             "Extra free memory required before the governor recalls one more expert layer. "
@@ -411,7 +402,7 @@ DIALS: tuple[Dial, ...] = (
     Dial(
         "GovernorStepIntervalS", "number", 5.0, "s", "Check interval.",
         "Memory governor", minimum=1.0, maximum=60.0, numeric_kind="float", source="helper",
-        plain="Check interval", slider=(1.0, 60.0, 1.0), advanced=True,
+        plain="Governor check interval", blurb="How often the governor checks memory.", slider=(1.0, 60.0, 1.0), advanced=True,
         effects=("speed:mixed",),
         info=(
             "How often the helper checks card and PC memory. Shorter intervals react sooner when a game "
@@ -422,7 +413,7 @@ DIALS: tuple[Dial, ...] = (
     Dial(
         "GovernorUpHoldS", "number", 60.0, "s", "Wait before the first step back up.",
         "Memory governor", minimum=0.0, maximum=600.0, numeric_kind="float", source="helper",
-        plain="Wait before the first step back up", slider=(0.0, 600.0, 5.0), advanced=True,
+        plain="Governor up hold", blurb="Wait above the cushions before the first move up.", slider=(0.0, 600.0, 5.0), advanced=True,
         effects=("speed:down",),
         info=(
             "How long memory must remain comfortably above its cushion before the first layer is recalled. "
@@ -433,7 +424,7 @@ DIALS: tuple[Dial, ...] = (
     Dial(
         "GovernorMaxHoldS", "number", 600.0, "s", "Longest wait when recovery keeps tripping the cushion.",
         "Memory governor", minimum=60.0, maximum=3600.0, numeric_kind="float", source="helper",
-        plain="Longest wait when recovery keeps tripping the cushion", slider=(60.0, 3600.0, 30.0), advanced=True,
+        plain="Governor max hold", blurb="Longest wait after repeated memory pressure.", slider=(60.0, 3600.0, 30.0), advanced=True,
         effects=("speed:down",),
         info=(
             "The largest recovery wait the helper may use after free memory repeatedly falls back below "
@@ -444,7 +435,7 @@ DIALS: tuple[Dial, ...] = (
     Dial(
         "GovernorPostUpGraceS", "number", 10.0, "s", "Grace after a recall before the memory side may step down.",
         "Memory governor", minimum=0.0, maximum=120.0, numeric_kind="float", source="helper",
-        plain="Grace after a recall before stepping down", slider=(0.0, 120.0, 5.0), advanced=True,
+        plain="Governor post-up grace", blurb="Pause after a recall before reacting to its memory cost.", slider=(0.0, 120.0, 5.0), advanced=True,
         effects=("speed:mixed",),
         info=(
             "After a layer is recalled, this grace period protects the memory side from reacting to the "
@@ -455,7 +446,7 @@ DIALS: tuple[Dial, ...] = (
     Dial(
         "GovernorRAMRungsBeforeUp", "number", 2, "rungs", "Layers of room needed before a memory recall.",
         "Memory governor", minimum=1, maximum=4, source="helper",
-        plain="Layers of room needed before a memory recall", slider=(1, 4, 1), advanced=True,
+        plain="RAM rungs before up", blurb="Full layer sizes needed before recalling from SSD.", slider=(1, 4, 1), advanced=True,
         effects=("ram:up",),
         info=(
             "How many full expert-layer sizes of free PC memory are required before the helper moves one "
@@ -466,7 +457,7 @@ DIALS: tuple[Dial, ...] = (
     Dial(
         "GovernorVRAMRungsBeforeUp", "number", 1, "rungs", "Layers of room needed before a card recall.",
         "Memory governor", minimum=1, maximum=4, source="helper",
-        plain="Layers of room needed before a card recall", slider=(1, 4, 1), advanced=True,
+        plain="VRAM rungs before up", blurb="Full layer sizes needed before recalling to the GPU.", slider=(1, 4, 1), advanced=True,
         effects=("vram:up",),
         info=(
             "How many full expert-layer sizes of free card memory are required before the helper moves one "
@@ -476,8 +467,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "EmbedHost", "toggle", True, "boolean", "Pin the 1.27 GB token embedding table in host RAM to free GPU VRAM for expert slots.",
-        "Expert slots and card memory", engine_mapping="$env:FREETOKEN_EMBED_HOST='1'",
-        plain="Keep the word table in PC memory", effects=("vram:down", "ram:up"),
+        "Memory & experts", engine_mapping="$env:FREETOKEN_EMBED_HOST='1'",
+        plain="Embedding on host", blurb="Keep the token embedding table in host RAM.", effects=("vram:down", "ram:up"),
         info=(
             "The table that turns words into numbers is 1.27 GB. On, it lives in locked PC memory and "
             "the card fetches one row per word; that gives 1.27 GB of card memory back for expert slots "
@@ -486,8 +477,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "EnableVision", "toggle", True, "boolean", "Enable still-picture vision model weights and multimodal image input endpoints.",
-        "Picture input", engine_mapping="$env:FREETOKEN_LOAD_VISION='1'",
-        plain="Allow pictures in chats", effects=("ram:up", "boot:up"),
+        "Pictures", engine_mapping="$env:FREETOKEN_LOAD_VISION='1'",
+        plain="Vision (picture input)", blurb="Allow picture input and load the vision weights.", effects=("ram:up", "boot:up"),
         info=(
             "Loads the picture-reading part of the model (856 MiB) so chats can include images. Where "
             "it waits is set by the two choices below. Off, pictures are refused and that memory is saved."
@@ -495,8 +486,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "VisionPackagesPath", "path", "$visionPackages", "path", "Directory containing local Pillow and TorchVision dependencies for image processing.",
-        "Picture input", engine_mapping="Added to $env:PYTHONPATH",
-        plain="Picture software folder", browse="folder", advanced=True,
+        "Pictures", engine_mapping="Added to $env:PYTHONPATH",
+        plain="Vision packages path", blurb="Folder containing Pillow and TorchVision for pictures.", browse="folder", advanced=True,
         info=(
             "The folder holding the extra picture libraries the server needs (Pillow and TorchVision). "
             "Only change it if you installed them somewhere else."
@@ -504,8 +495,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "VisionExecution", "choice", "layer-stream", "mode", "Vision execution strategy: layer-stream stages bounded layers to GPU; gpu keeps all on GPU.",
-        "Picture input", options=("layer-stream", "gpu"), engine_mapping="$env:FREETOKEN_VISION_EXECUTION",
-        plain="Where pictures are processed", option_labels=("Piece by piece (saves card memory)", "All on the card"),
+        "Pictures", options=("layer-stream", "gpu"), engine_mapping="$env:FREETOKEN_VISION_EXECUTION",
+        plain="Vision execution", blurb="Process picture weights in pieces or all on the GPU.", option_labels=("Piece by piece (saves card memory)", "All on the card"),
         effects=("vram:down", "speed:mixed"),
         info=(
             "Piece by piece keeps the picture weights in PC memory and moves one block at a time onto "
@@ -516,8 +507,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "VisionWeights", "choice", "mmap", "mode", "Vision weight placement: mmap demand-pages weights only when an image arrives; ram holds them resident.",
-        "Picture input", options=("ram", "mmap"), engine_mapping="$env:FREETOKEN_VISION_WEIGHTS",
-        plain="When picture weights are read", option_labels=("At start-up, kept in PC memory", "Only when a picture arrives"),
+        "Pictures", options=("ram", "mmap"), engine_mapping="$env:FREETOKEN_VISION_WEIGHTS",
+        plain="Vision weights", blurb="Keep picture weights in RAM or read them on demand.", option_labels=("At start-up, kept in PC memory", "Only when a picture arrives"),
         effects=("ram:down", "speed:mixed"),
         info=(
             "Only when a picture arrives leaves the 856 MiB of picture weights on the drive until the "
@@ -528,8 +519,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "FREETOKEN_MTP_SPECULATE", "toggle", "0", "boolean", "Enable Multi-Token Prediction speculative decoding draft engine.",
-        "Look-ahead speed trick (MTP)", source="env", engine_mapping="$env:FREETOKEN_MTP_SPECULATE",
-        plain="Guess ahead", effects=("speed:mixed", "vram:up"),
+        "MTP", source="env", engine_mapping="$env:FREETOKEN_MTP_SPECULATE",
+        plain="MTP speculative decoding", blurb="Turn on draft-and-check speculative decoding.", effects=("speed:mixed", "vram:up"),
         info=(
             "Experimental. A small extra model drafts several words at once and the main model checks "
             "them in one step; when the guesses land, answers come faster. Needs the private MTP files "
@@ -539,8 +530,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "FREETOKEN_MTP_RESIDENT", "toggle", "0", "boolean", "Keep MTP draft head model weights permanently resident in GPU VRAM.",
-        "Look-ahead speed trick (MTP)", source="env", engine_mapping="$env:FREETOKEN_MTP_RESIDENT",
-        plain="Keep the guessing head on the card", advanced=True, effects=("speed:up", "vram:up"),
+        "MTP", source="env", engine_mapping="$env:FREETOKEN_MTP_RESIDENT",
+        plain="MTP resident draft head", blurb="Keep the MTP draft head loaded on the GPU.", advanced=True, effects=("speed:up", "vram:up"),
         info=(
             "Keeps the guess-ahead head on the card all the time (2.25 GiB) instead of loading it when "
             "needed. Faster guesses, less room for expert slots. Only matters when Guess ahead is on."
@@ -548,8 +539,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "FREETOKEN_MTP_SHADOW", "toggle", "0", "boolean", "Run MTP in passive shadow verification mode without returning draft tokens.",
-        "Look-ahead speed trick (MTP)", source="env", engine_mapping="$env:FREETOKEN_MTP_SHADOW",
-        plain="Measure guesses only", advanced=True, effects=("speed:down",),
+        "MTP", source="env", engine_mapping="$env:FREETOKEN_MTP_SHADOW",
+        plain="MTP shadow mode", blurb="Measure draft quality without returning draft tokens.", advanced=True, effects=("speed:down",),
         info=(
             "Runs the guessing head alongside normal answering and only records how often its guesses "
             "would have been right. Answers are unchanged and slightly slower. A testing aid."
@@ -557,8 +548,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "FREETOKEN_MTP_SPEC_DEPTH", "number", 5, "tokens", "Maximum draft chain length per speculation step (1-5).",
-        "Look-ahead speed trick (MTP)", minimum=1, maximum=5, source="env", engine_mapping="$env:FREETOKEN_MTP_SPEC_DEPTH",
-        plain="How many words to guess ahead", slider=(1, 5, 1), effects=("speed:mixed",),
+        "MTP", minimum=1, maximum=5, source="env", engine_mapping="$env:FREETOKEN_MTP_SPEC_DEPTH",
+        plain="MTP speculation depth", blurb="Maximum number of draft tokens per speculation step.", slider=(1, 5, 1), effects=("speed:mixed",),
         info=(
             "How many words the guessing head drafts before the main model checks them. Checking "
             "costs about the same whether it checks one guess or five, so fewer guesses rarely helps: "
@@ -568,8 +559,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "FREETOKEN_MTP_SPEC_GRAPH", "toggle", "1", "boolean", "Capture speculation verification cycles inside CUDA graphs for lower latency.",
-        "Look-ahead speed trick (MTP)", source="env", engine_mapping="$env:FREETOKEN_MTP_SPEC_GRAPH",
-        plain="Fast path for guess checking", effects=("speed:up", "boot:up", "vram:up"),
+        "MTP", source="env", engine_mapping="$env:FREETOKEN_MTP_SPEC_GRAPH",
+        plain="MTP verify graph", blurb="Use a captured graph for MTP verification.", effects=("speed:up", "boot:up", "vram:up"),
         info=(
             "Records the guess-checking step once at start-up so it replays with less overhead each "
             "time. Start-up takes about a second longer and the recordings use a little card memory. "
@@ -579,9 +570,9 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "FREETOKEN_MTP_SPEC_CONF_CUT", "number", 0.8, "probability", "Stop drafting before the first draft token whose top-1 probability is below this (0 disables).",
-        "Look-ahead speed trick (MTP)", minimum=0.0, maximum=1.0, numeric_kind="float", source="env",
+        "MTP", minimum=0.0, maximum=1.0, numeric_kind="float", source="env",
         engine_mapping="$env:FREETOKEN_MTP_SPEC_CONF_CUT",
-        plain="Stop guessing when unsure below", slider=(0, 1, 0.05), effects=("speed:up",),
+        plain="MTP confidence cut", blurb="Stop a draft chain when confidence falls below this value.", slider=(0, 1, 0.05), effects=("speed:up",),
         info=(
             "Before each guess the guessing head says how sure it is, 0 to 1. The chain stops at the "
             "first guess below this number, so a chain of 5 may end after 1 or 2 and the doomed "
@@ -592,8 +583,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "FREETOKEN_MTP_SPEC_COST_AWARE", "toggle", "1", "boolean", "Adapt the speculation bar to measured cycle and plain-step wall time.",
-        "Look-ahead speed trick (MTP)", source="env", engine_mapping="$env:FREETOKEN_MTP_SPEC_COST_AWARE",
-        plain="Set the bar from real timing", effects=("speed:up",),
+        "MTP", source="env", engine_mapping="$env:FREETOKEN_MTP_SPEC_COST_AWARE",
+        plain="MTP cost-aware", blurb="Adjust speculation to measured timing.", effects=("speed:up",),
         info=(
             "The server keeps timing how long a guessing round takes against a plain word and moves "
             "the worth-it bar to match, instead of holding the fixed bar below. Measured 2026-09-01: "
@@ -603,9 +594,9 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "FREETOKEN_MTP_SPEC_MIN_EMITTED", "number", 2.4, "tokens", "Minimum emitted tokens per speculative cycle before the request falls back to plain decode (0 never falls back).",
-        "Look-ahead speed trick (MTP)", minimum=0.0, maximum=6.0, numeric_kind="float", source="env",
+        "MTP", minimum=0.0, maximum=6.0, numeric_kind="float", source="env",
         engine_mapping="$env:FREETOKEN_MTP_SPEC_MIN_EMITTED",
-        plain="Words a guessing round must earn", slider=(0, 6, 0.1), advanced=True, effects=("speed:mixed",),
+        plain="MTP min emitted", blurb="Minimum tokens a speculative cycle must earn.", slider=(0, 6, 0.1), advanced=True, effects=("speed:mixed",),
         info=(
             "A guessing round costs about as much as 2.4 plain words when the sureness cut is on, "
             "3.6 when it is off. A chat whose rounds keep earning less than this bar is switched back "
@@ -617,8 +608,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "ExpertLoad", "choice", "parallel", "mode", "Strategy for loading expert banks into RAM (parallel uses unbuffered I/O on Windows).",
-        "Loading and diagnostics", options=("auto", "serial", "parallel"), engine_mapping="--expert-load <mode>",
-        plain="How the model is read at start-up", option_labels=("Automatic", "One file at a time", "Several files at once"),
+        "Server & advanced", options=("auto", "serial", "parallel"), engine_mapping="--expert-load <mode>",
+        plain="Expert load", blurb="Choose how expert weight files are read at startup.", option_labels=("Automatic", "One file at a time", "Several files at once"),
         advanced=True, effects=("boot:down", "ram:up"),
         info=(
             "Several files at once reads the 63 GiB of expert pieces with many threads straight from "
@@ -630,8 +621,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "EnableCacheReport", "toggle", True, "boolean", "Enable periodic logging and telemetry reports for KV cache and expert slot utilization.",
-        "Loading and diagnostics", engine_mapping="--enable-cache-report",
-        plain="Write memory reports to the log", advanced=True,
+        "Server & advanced", engine_mapping="--enable-cache-report",
+        plain="Cache report", blurb="Write periodic KV and expert-cache usage reports.", advanced=True,
         info=(
             "Adds a regular line to the boot log saying how full the chat memory and expert slots are. "
             "Handy when tuning; no measurable speed cost. Off keeps the log quieter."
@@ -639,8 +630,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "CollectRoutingStats", "toggle", True, "boolean", "Accumulate decode routing frequency histograms accessible via GET /v1/cache/routing.",
-        "Loading and diagnostics", engine_mapping="--moe-collect-decode-freq",
-        plain="Count which experts get used", advanced=True, effects=("speed:down",),
+        "Server & advanced", engine_mapping="--moe-collect-decode-freq",
+        plain="Routing stats", blurb="Count which experts are selected during decoding.", advanced=True, effects=("speed:down",),
         info=(
             "Keeps a tally of how often each expert piece is chosen, for research. Adds one small extra "
             "step per layer per word. The tally is what picked the six busiest layers for the card."
@@ -648,8 +639,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "Port", "number", 2020, "port", "TCP port the main FreeToken OpenAI-compatible HTTP server listens on.",
-        "Advanced", minimum=1, maximum=65529, engine_mapping="--port <port>",
-        plain="Door number apps connect to", advanced=True,
+        "Server & advanced", minimum=1, maximum=65529, engine_mapping="--port <port>",
+        plain="Port", blurb="TCP port used by the main FreeToken server.", advanced=True,
         info=(
             "The number apps use to reach the server on this PC, like a door number. The server also "
             "uses the nine numbers after it for its own helpers, and this settings page lives on 2031. "
@@ -658,8 +649,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "DesktopPython", "path", "(Join-Path $env:LOCALAPPDATA 'FreeToken\\venv\\Scripts\\python.exe')", "path", "Path to Python interpreter in the FreeToken Desktop virtual environment.",
-        "Advanced", engine_mapping="Launcher interpreter",
-        plain="Python program to run the server with", browse="file", advanced=True,
+        "Server & advanced", engine_mapping="Launcher interpreter",
+        plain="Desktop Python", blurb="Python program used to start the server.", browse="file", advanced=True,
         info=(
             "The Python program that runs the server. The default is the one the FreeToken Desktop app "
             "installed, which already has the graphics-card libraries. Leave it unless that install moves."
@@ -667,8 +658,8 @@ DIALS: tuple[Dial, ...] = (
     ),
     Dial(
         "CudaGraphMaxBS", "number", 4, "batch size", "Maximum batch size captured into CUDA graphs (-1 disables graph capture).",
-        "Advanced", minimum=-1, maximum=1024, engine_mapping="--cuda-graph-max-bs <N>",
-        plain="Fast path up to this many chats", slider=(1, 16, 1), auto_value=-1, auto_label="Off",
+        "Server & advanced", minimum=-1, maximum=1024, engine_mapping="--cuda-graph-max-bs <N>",
+        plain="CUDA graph max batch", blurb="Largest batch size included in CUDA graph capture.", slider=(1, 16, 1), auto_value=-1, auto_label="Off",
         advanced=True, effects=("speed:up", "vram:up", "boot:up"),
         info=(
             "The server records its per-word work once for each chat count up to this number and "
