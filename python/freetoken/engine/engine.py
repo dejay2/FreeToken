@@ -441,6 +441,7 @@ class Engine:
             self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
+            self._initial_moe_cache_size = getattr(config, "moe_cache_size", None)
         # After the host tables AND the offload cache: the block names the PLE backing one
         # decided and the GPU-owned / CPU / streaming split the other did.
         self._log_weight_placement_report(config)
@@ -454,6 +455,7 @@ class Engine:
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
+        self._initial_num_pages = self.num_pages
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
@@ -810,8 +812,9 @@ class Engine:
         """
         from freetoken.engine.cache_budget import expert_bytes_per_slot
 
+        sources = getattr(banks, "sources", banks)
         self._vram_ledger_inputs = {
-            "per_expert_bytes": expert_bytes_per_slot(banks.sources, gpu_owned_layer_ids),
+            "per_expert_bytes": expert_bytes_per_slot(sources, gpu_owned_layer_ids),
             "gpu_owned_layers": tuple(sorted(gpu_owned_layer_ids)),
         }
 
@@ -1244,6 +1247,233 @@ class Engine:
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)
         self.kv_cache.attach_page_table(self.page_table)
 
+    def _move_layer(self, layer_id: int, target: str) -> None:
+        """Move one MoE layer between gpu_owned and pinned residency.
+
+        Uses alloc_layer_banks semantics for a single layer (HostBank born-pinned path
+        and GpuOwnedBank device tensors). Uses torch.Tensor.copy_ for D2H / H2D copies.
+        Updates self._gpu_owned_layer_ids and _stash_vram_ledger_inputs.
+        """
+        assert self.moe_offload_cache is not None, "no MoE offload cache to move layer in"
+        from freetoken.moe.host_banks import GpuOwnedBank, HostBank, HostResidency
+
+        current_residency = self.moe_offload_cache.layer_residency[layer_id]
+        if current_residency == target:
+            return
+
+        if not hasattr(self, "_host_banks"):
+            self._host_banks = {}
+
+        if target == HostResidency.PINNED.value:
+            new_banks = {}
+            for name in self.moe_offload_cache.bank_schema:
+                old = self.moe_offload_cache.bank_sources[name][layer_id]
+                old_t = getattr(old, "tensor", old)
+                shape, dtype = old_t.shape, old_t.dtype
+                try:
+                    if self.device.type == "cuda":
+                        bank = HostBank(shape, dtype, backing="cuda")
+                    else:
+                        bank = HostBank(shape, dtype)
+                except Exception:
+                    bank = HostBank(shape, dtype)
+                bank.tensor.copy_(old_t)
+                if layer_id not in self._host_banks:
+                    self._host_banks[layer_id] = {}
+                self._host_banks[layer_id][name] = bank
+                new_banks[name] = bank.tensor
+
+            self.moe_offload_cache.rebind_layer(layer_id, HostResidency.PINNED.value, new_banks)
+            self._gpu_owned_layer_ids = self.moe_offload_cache.gpu_owned_layer_ids
+            self._stash_vram_ledger_inputs(self.moe_offload_cache.bank_sources, self._gpu_owned_layer_ids)
+
+        elif target == HostResidency.GPU_OWNED.value:
+            new_banks = {}
+            for name in self.moe_offload_cache.bank_schema:
+                old = self.moe_offload_cache.bank_sources[name][layer_id]
+                old_t = getattr(old, "tensor", old)
+                shape, dtype = old_t.shape, old_t.dtype
+                dev_t = torch.empty(shape, dtype=dtype, device=self.device)
+                dev_t.copy_(old_t)
+                new_banks[name] = dev_t
+
+            if layer_id in self._host_banks:
+                for b in self._host_banks[layer_id].values():
+                    if hasattr(b, "free"):
+                        b.free()
+                del self._host_banks[layer_id]
+
+            self.moe_offload_cache.rebind_layer(layer_id, HostResidency.GPU_OWNED.value, new_banks)
+            self._gpu_owned_layer_ids = self.moe_offload_cache.gpu_owned_layer_ids
+            self._stash_vram_ledger_inputs(self.moe_offload_cache.bank_sources, self._gpu_owned_layer_ids)
+        else:
+            raise NotImplementedError(f"unsupported target residency {target!r} in J1")
+
+    def step_memory(
+        self,
+        axis: str,
+        direction: str,
+        ram_tight: bool = False,
+        *,
+        is_idle: bool | None = None,
+    ) -> dict:
+        """Step memory usage up or down along the specified axis.
+
+        VRAM down ladder:
+          1. gpu_owned layer -> pinned (highest layer id)
+          2. slot cache -512 down to floor (1024 with overlap, 512 without)
+          3. KV pool -25% (idle-only; skipped if request active)
+          4. at floor
+        VRAM up: reverse order.
+        RAM axis: pinned -> disk (deferred to J2).
+        """
+        if axis == "ram":
+            return {"applied": None, "reason": "disk rung not built"}
+        if axis != "vram":
+            raise ValueError(f"unknown axis {axis!r} (expected 'vram' or 'ram')")
+        if direction not in ("down", "up"):
+            raise ValueError(f"unknown direction {direction!r} (expected 'down' or 'up')")
+
+        cache = self.moe_offload_cache
+        num_experts = (
+            getattr(self.config.model_config, "num_experts", 512)
+            if hasattr(self.config, "model_config")
+            else 512
+        )
+        overlap = getattr(self.config, "moe_prefill_overlap", False)
+        slot_floor = 2 * num_experts if overlap else num_experts
+        current_slots = cache.cache_size if cache is not None else 0
+
+        free_vram = 0
+        if self.device.type == "cuda" and hasattr(self, "_sync_get_memory"):
+            try:
+                free_vram = self._sync_get_memory()[0]
+            except Exception:
+                pass
+
+        if direction == "down":
+            # 1. gpu_owned -> pinned
+            if cache is not None and self._gpu_owned_layer_ids:
+                layer_id = max(self._gpu_owned_layer_ids)
+                self.rebuild_runtime_cache(layer_moves=[(layer_id, "pinned")])
+                return {
+                    "applied": "gpu_owned->pinned",
+                    "layer": layer_id,
+                    "moe_cache_size": cache.cache_size,
+                    "at_floor": False,
+                    "vram_free_bytes": free_vram,
+                }
+
+            # 2. slots -512
+            if cache is not None and current_slots > slot_floor:
+                new_slots = max(slot_floor, current_slots - 512)
+                self.rebuild_runtime_cache(moe_cache_size=new_slots)
+                idle = True if is_idle is None else is_idle
+                can_shrink_kv = idle and getattr(self, "num_pages", 0) > 1
+                at_floor = (new_slots == slot_floor and not can_shrink_kv)
+                return {
+                    "applied": "slots",
+                    "layer": None,
+                    "moe_cache_size": new_slots,
+                    "at_floor": at_floor,
+                    "vram_free_bytes": free_vram,
+                }
+
+            # 3. KV pool -25% (idle-only)
+            idle = True if is_idle is None else is_idle
+            init_pages = getattr(self, "_initial_num_pages", None) or getattr(self, "num_pages", 0)
+            kv_floor = max(1, int(init_pages * 0.75))
+            if idle and getattr(self, "num_pages", 0) > kv_floor:
+                self.rebuild_runtime_cache(num_pages=kv_floor)
+                return {
+                    "applied": "kv",
+                    "layer": None,
+                    "moe_cache_size": current_slots,
+                    "at_floor": True,
+                    "vram_free_bytes": free_vram,
+                }
+
+            # 4. at floor
+            return {
+                "applied": None,
+                "layer": None,
+                "moe_cache_size": current_slots,
+                "at_floor": True,
+                "vram_free_bytes": free_vram,
+            }
+
+        else:  # direction == "up"
+            idle = True if is_idle is None else is_idle
+            init_pages = getattr(self, "_initial_num_pages", None)
+            if idle and init_pages and self.num_pages < init_pages:
+                self.rebuild_runtime_cache(num_pages=init_pages)
+                return {
+                    "applied": "kv",
+                    "layer": None,
+                    "moe_cache_size": current_slots,
+                    "at_floor": False,
+                    "vram_free_bytes": free_vram,
+                }
+
+            init_slots = getattr(self, "_initial_moe_cache_size", None)
+            if init_slots and current_slots < init_slots:
+                new_slots = min(init_slots, current_slots + 512)
+                self.rebuild_runtime_cache(moe_cache_size=new_slots)
+                return {
+                    "applied": "slots",
+                    "layer": None,
+                    "moe_cache_size": new_slots,
+                    "at_floor": False,
+                    "vram_free_bytes": free_vram,
+                }
+
+            if cache is not None:
+                all_layers = set(range(cache.num_layers))
+                candidates = sorted(all_layers - self._gpu_owned_layer_ids)
+                if len(candidates) > 1:
+                    layer_id = candidates[0]
+                    try:
+                        self.rebuild_runtime_cache(layer_moves=[(layer_id, "gpu_owned")])
+                        return {
+                            "applied": "pinned->gpu_owned",
+                            "layer": layer_id,
+                            "moe_cache_size": cache.cache_size,
+                            "at_floor": False,
+                            "vram_free_bytes": free_vram,
+                        }
+                    except Exception:
+                        pass
+
+            return {
+                "applied": None,
+                "layer": None,
+                "moe_cache_size": current_slots,
+                "at_floor": False,
+                "vram_free_bytes": free_vram,
+            }
+
+    def residency_report(self) -> dict:
+        """Report layer residency and cache dimensions for GET /v1/cache/residency."""
+        if self.moe_offload_cache is None:
+            return {
+                "layers": {},
+                "moe_cache_size": 0,
+                "owned": 0,
+                "pinned": 0,
+                "disk": 0,
+            }
+        layers = {i: r for i, r in enumerate(self.moe_offload_cache.layer_residency)}
+        owned = sum(1 for r in layers.values() if r == "gpu_owned")
+        pinned = sum(1 for r in layers.values() if r == "pinned")
+        disk = sum(1 for r in layers.values() if r == "disk")
+        return {
+            "layers": layers,
+            "moe_cache_size": self.moe_offload_cache.cache_size,
+            "owned": owned,
+            "pinned": pinned,
+            "disk": disk,
+        }
+
     @torch.inference_mode()
     def rebuild_runtime_cache(
         self,
@@ -1252,6 +1482,7 @@ class Engine:
         num_pages: int | None = None,
         num_mamba_slots: int | None = None,
         num_swa_pages: int | None = None,
+        layer_moves: list[tuple[int, str]] | None = None,
     ) -> None:
         """Idle-only in-place resize of the MoE slot cache, KV page pool, GDN (mamba) state pool,
         and/or the window pool (num_swa_pages: an absolute pinned window), followed by CUDA-graph
@@ -1260,7 +1491,7 @@ class Engine:
         """
         config = self.config
         if (moe_cache_size is None and num_pages is None and num_mamba_slots is None
-                and num_swa_pages is None):
+                and num_swa_pages is None and not layer_moves):
             return
 
         # 0a. Geometry prevalidation BEFORE any destructive free. An invalid target (moe
@@ -1268,6 +1499,26 @@ class Engine:
         #     marlin cap, non-positive pages, or too few GDN slots to run) must reject
         #     recoverably with the old cache intact -- NOT after teardown, which would
         #     leave the server unable to serve. These checks are model-agnostic.
+        if layer_moves:
+            if self.moe_offload_cache is None:
+                raise CacheRebuildRejected(
+                    "layer_moves requested but this model has no MoE offload cache"
+                )
+            sim_owned = set(self._gpu_owned_layer_ids)
+            for lid, tgt in layer_moves:
+                if not (0 <= lid < self.moe_offload_cache.num_layers):
+                    raise CacheRebuildRejected(f"invalid layer_id {lid}")
+                if tgt not in ("gpu_owned", "pinned", "disk"):
+                    raise CacheRebuildRejected(f"invalid target residency {tgt}")
+                if tgt == "gpu_owned":
+                    sim_owned.add(lid)
+                else:
+                    sim_owned.discard(lid)
+            if len(sim_owned) >= self.moe_offload_cache.num_layers:
+                raise CacheRebuildRejected(
+                    "cannot move all layers to gpu_owned; at least one streaming layer required"
+                )
+
         if moe_cache_size is not None:
             if self.moe_offload_cache is None:
                 raise CacheRebuildRejected(
@@ -1284,9 +1535,6 @@ class Engine:
                 raise CacheRebuildRejected(
                     "num_mamba_slots requested but this model has no GDN state pool"
                 )
-            # num_mamba_slots is the USABLE slot count (what the user sets and the status bar
-            # shows); the pool also reserves a padding sink (slot 0), so the physical pool is
-            # num_mamba_slots + 1. _linear_pool_min_slots is the physical floor -> usable - 1.
             min_usable = _linear_pool_min_slots(config) - 1
             if num_mamba_slots < min_usable:
                 raise CacheRebuildRejected(
@@ -1295,8 +1543,6 @@ class Engine:
                     f"needed to run; admission would deadlock"
                 )
         if num_swa_pages is not None:
-            # An absolute window pin for the radix-SWA window pool (Gemma) or the DSV4 window tier;
-            # meaningless for dense/MHA models and the naive SWA path (concurrency x window).
             if not _supports_swa_ratio(config):
                 raise CacheRebuildRejected(
                     "num_swa_pages requested but this model has no window pool "
@@ -1307,13 +1553,8 @@ class Engine:
                     f"num_swa_pages must be positive, got {num_swa_pages}"
                 )
 
-        # 0b. Pool-family budget fit-check BEFORE any destructive free: an unfit geometry
-        #     must reject (recoverable) so the old caches stay intact and serving continues,
-        #     rather than freeing and then OOMing into permanent failure. The engine supplies
-        #     the memory account; the pool answers whether its target geometry fits.
+        # 0b. Pool-family budget fit-check BEFORE any destructive free
         target_moe, per_expert_bytes = self._target_moe_and_expert_bytes(moe_cache_size)
-        # Price the sibling GDN state pool at ITS target (physical slots = usable + padding
-        # sink) and hand the bytes in -- the KV pool only budgets its own tiers.
         target_mamba = (
             num_mamba_slots + 1
             if num_mamba_slots is not None
@@ -1333,19 +1574,9 @@ class Engine:
         )
 
         torch.cuda.synchronize(self.device)
-        # Preserve the CUDA-graph batch-size set resolved at startup. The auto heuristic keys
-        # off free memory, which is far smaller now that the caches are resident (post-cache
-        # free << startup pre-load free), so re-deriving it here would silently drop large
-        # batch sizes after the first rebuild. Reusing the already-resolved list keeps the
-        # captured coverage identical (the fit-check above guarantees the graph headroom fits).
         prior_graph_bs = self.graph_runner.graph_bs_list
-        # Point of no return for the scheduler's rollback logic: from here the live graphs and
-        # pools start being freed. A failure BEFORE this flag flips leaves the engine serving
-        # untouched (no rollback needed); after it, only a rebuild restores service.
         self.rebuild_teardown_started = True
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
-        # The speculative verify graphs go first: they bake KV-pool and page-table addresses,
-        # and reset_capture drops the QSA verify metadata they replay against.
         spec_graph_widths = ()
         if self.spec_graph_runner is not None:
             spec_graph_widths = self.spec_graph_runner.widths
@@ -1353,24 +1584,29 @@ class Engine:
             self.spec_graph_runner = None
         self.attn_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
-        # 2. Resize caches in place (each frees its old GPU tensors before allocating).
-        # Pin the new window first (validated above) so any KV-pool rebuild below sizes the window
-        # to it (_dsv4_pool_sizes / _swa_paged_num_tokens read config.swa_num_pages_override).
-        # frozen EngineConfig — mutate in place like the moe_cache_size path; `config.x = y` raises
-        # FrozenInstanceError, which here aborts the rebuild after the CUDA graphs are gone (→ 503).
+
+        # 2. Apply layer moves before moe_offload_cache.rebuild
+        if layer_moves:
+            for layer_id, target in layer_moves:
+                self._move_layer(layer_id, target)
+
+        # Resize caches in place (each frees its old GPU tensors before allocating).
         if num_swa_pages is not None:
             object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
         if moe_cache_size is not None:
             assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
             if self.moe_offload_cache.quant_format == "exl3":
-                # Packed pointer tables retain references to the old slot tensors. Drop them
-                # before rebuild so resizing can actually release that allocation; the next
-                # eager call rebuilds tables for the new bank addresses before graph capture.
                 scratch = getattr(self.moe_offload_cache, "exl3_scratch", None)
                 tables = getattr(scratch, "mgemm_tables", None)
                 if tables is not None:
                     tables.clear()
             self.moe_offload_cache.rebuild(moe_cache_size)
+            object.__setattr__(config, "moe_cache_size", moe_cache_size)
+        elif layer_moves:
+            if hasattr(config, "_moe_cache_size_requested"):
+                num_experts = getattr(config.model_config, "num_experts", 0)
+                new_total = config.moe_cache_size + len(self._gpu_owned_layer_ids) * num_experts
+                object.__setattr__(config, "_moe_cache_size_requested", new_total)
         if num_pages is not None:
             # sets self.num_pages (rebuilds KV + window)
             self._resize_kv_pool(config, num_pages, num_swa_pages)
