@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import math
 import os
@@ -378,6 +378,11 @@ class EngineConfig:
     # plus "auto" (the measured six hungriest layers) and "auto:N". None = off.
     # Each owned layer costs num_experts LRU slots of VRAM and returns one host bank of RAM.
     moe_gpu_owned_layers: str | None = None
+    # Write a contiguous on-disk expert copy in the background after banks load (--moe-disk-copy).
+    # None = auto: default on for --moe-backend offload on NVFP4 checkpoints.
+    moe_disk_copy: bool | None = None
+    # Directory to write the expert disk copy (--moe-disk-copy-dir; default <model>/freetoken-expert-cache).
+    moe_disk_copy_dir: str | None = None
     # VRAM the MoE cache must NOT spend because something allocated AFTER it was sized
     # already owns those bytes: the integrated MTP resident draft head (2.17 GiB measured),
     # the decode/spec/draft CUDA-graph pools, and the vision layer-stream workspace. Joins

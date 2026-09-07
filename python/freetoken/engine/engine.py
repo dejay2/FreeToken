@@ -433,6 +433,11 @@ class Engine:
         # below and by the cache build. Empty until _init_offload_moe_cache resolves it.
         self._gpu_owned_layer_ids: frozenset = frozenset()
         self.cpu_moe_executor = None
+        self.expert_disk_copy = None
+        self.expert_disk_writer = None
+        self._ram_spilled_layers: list[int] = []
+        self._deferred_graph_bs: list[int] | None = None
+        self._graphs_deferred: str | None = None
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
@@ -1117,6 +1122,43 @@ class Engine:
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
+
+        enable_disk_copy = getattr(config, "moe_disk_copy", None)
+        if enable_disk_copy is None:
+            enable_disk_copy = (
+                is_offload_moe_backend(config.moe_backend)
+                and getattr(cache, "quant_format", None) == "nvfp4"
+            )
+        if enable_disk_copy:
+            from pathlib import Path
+            from freetoken.moe.disk_banks import ExpertDiskCopy, BackgroundWriter
+
+            disk_copy_dir = getattr(config, "moe_disk_copy_dir", None)
+            if not disk_copy_dir:
+                disk_copy_dir = Path(config.model_path) / "freetoken-expert-cache"
+            else:
+                disk_copy_dir = Path(disk_copy_dir)
+
+            first_layer_banks = {
+                name: getattr(cache.bank_sources[name][0], "tensor", cache.bank_sources[name][0])
+                for name in cache.bank_schema
+            }
+            shapes = {name: first_layer_banks[name].shape for name in cache.bank_schema}
+            dtypes = {name: first_layer_banks[name].dtype for name in cache.bank_schema}
+
+            self.expert_disk_copy = ExpertDiskCopy(
+                root=disk_copy_dir,
+                model_path=Path(config.model_path),
+                schema=cache.bank_schema,
+                shapes=shapes,
+                dtypes=dtypes,
+            )
+            cache.expert_disk_copy = self.expert_disk_copy
+            if getattr(config.tp_info, "rank", 0) == 0:
+                writer = BackgroundWriter(self.expert_disk_copy, cache)
+                writer.start()
+                self.expert_disk_writer = writer
+
         return cache
 
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:
@@ -1248,11 +1290,18 @@ class Engine:
         self.kv_cache.attach_page_table(self.page_table)
 
     def _move_layer(self, layer_id: int, target: str) -> None:
-        """Move one MoE layer between gpu_owned and pinned residency.
+        """Move one MoE layer between gpu_owned, pinned, and disk residency.
 
-        Uses alloc_layer_banks semantics for a single layer (HostBank born-pinned path
-        and GpuOwnedBank device tensors). Uses torch.Tensor.copy_ for D2H / H2D copies.
-        Updates self._gpu_owned_layer_ids and _stash_vram_ledger_inputs.
+        Transitions:
+          gpu_owned -> pinned: D2H copy into newly allocated HostBank, free device tensors, rebind.
+          pinned -> gpu_owned: H2D copy into device tensors, free HostBank, rebind.
+          pinned -> disk: free HostBank, attach DiskLayerReader, rebind.
+          gpu_owned -> disk: free device tensors, attach DiskLayerReader, rebind.
+          disk -> pinned: alloc HostBank, read from disk copy, rebind.
+          disk -> gpu_owned: alloc device tensors, read from disk copy through staging chunks, rebind.
+
+        Spill transitions (-> disk) verify ExpertDiskCopy.layer_complete(layer_id) first.
+        Updates self._gpu_owned_layer_ids, self._ram_spilled_layers, and _stash_vram_ledger_inputs.
         """
         assert self.moe_offload_cache is not None, "no MoE offload cache to move layer in"
         from freetoken.moe.host_banks import GpuOwnedBank, HostBank, HostResidency
@@ -1263,52 +1312,128 @@ class Engine:
 
         if not hasattr(self, "_host_banks"):
             self._host_banks = {}
+        if not hasattr(self, "_ram_spilled_layers"):
+            self._ram_spilled_layers = []
 
-        if target == HostResidency.PINNED.value:
-            new_banks = {}
-            for name in self.moe_offload_cache.bank_schema:
-                old = self.moe_offload_cache.bank_sources[name][layer_id]
-                old_t = getattr(old, "tensor", old)
-                shape, dtype = old_t.shape, old_t.dtype
-                # Born-pinned (cudaHostAlloc) on a CUDA engine: the fused copy kernel needs a
-                # device alias for the new bank, and only a pinned+mapped bank has one. An
-                # mmap-backed fallback would build a pointer table the GPU cannot dereference,
-                # so a failed pinned allocation must raise (the scheduler reports the step
-                # failed) rather than degrade silently. CPU engines (tests) take the default.
-                if self.device.type == "cuda":
-                    bank = HostBank(shape, dtype, backing="cuda")
-                else:
-                    bank = HostBank(shape, dtype)
-                bank.tensor.copy_(old_t)
-                if layer_id not in self._host_banks:
-                    self._host_banks[layer_id] = {}
-                self._host_banks[layer_id][name] = bank
-                new_banks[name] = bank.tensor
+        disk_copy = getattr(self, "expert_disk_copy", None) or getattr(
+            self.moe_offload_cache, "expert_disk_copy", None
+        )
 
-            self.moe_offload_cache.rebind_layer(layer_id, HostResidency.PINNED.value, new_banks)
-            self._gpu_owned_layer_ids = self.moe_offload_cache.gpu_owned_layer_ids
-            self._stash_vram_ledger_inputs(self.moe_offload_cache.bank_sources, self._gpu_owned_layer_ids)
-            # step-up promotes in reverse demotion order (design note: "Up: reverse")
-            demoted = getattr(self, "_demoted_layers", None)
-            if demoted is None:
-                demoted = self._demoted_layers = []
-            demoted.append(layer_id)
-
-        elif target == HostResidency.GPU_OWNED.value:
-            new_banks = {}
-            for name in self.moe_offload_cache.bank_schema:
-                old = self.moe_offload_cache.bank_sources[name][layer_id]
-                old_t = getattr(old, "tensor", old)
-                shape, dtype = old_t.shape, old_t.dtype
-                dev_t = torch.empty(shape, dtype=dtype, device=self.device)
-                dev_t.copy_(old_t)
-                new_banks[name] = dev_t
+        if target == HostResidency.DISK.value:
+            # pinned -> disk or gpu_owned -> disk
+            if disk_copy is None or not disk_copy.layer_complete(layer_id):
+                raise RuntimeError(
+                    f"cannot spill layer {layer_id} to disk: disk copy missing or layer incomplete"
+                )
 
             if layer_id in self._host_banks:
                 for b in self._host_banks[layer_id].values():
                     if hasattr(b, "free"):
                         b.free()
                 del self._host_banks[layer_id]
+
+            self.moe_offload_cache.rebind_layer(layer_id, HostResidency.DISK.value, None)
+            self._gpu_owned_layer_ids = self.moe_offload_cache.gpu_owned_layer_ids
+            self._stash_vram_ledger_inputs(self.moe_offload_cache.bank_sources, self._gpu_owned_layer_ids)
+            if layer_id not in self._ram_spilled_layers:
+                self._ram_spilled_layers.append(layer_id)
+            demoted = getattr(self, "_demoted_layers", None)
+            if demoted and layer_id in demoted:
+                demoted.remove(layer_id)
+
+        elif target == HostResidency.PINNED.value:
+            new_banks = {}
+            if current_residency == HostResidency.DISK.value:
+                # disk -> pinned
+                if disk_copy is None:
+                    raise RuntimeError(f"cannot recall layer {layer_id} from disk: no disk copy configured")
+                for name in self.moe_offload_cache.bank_schema:
+                    shape = disk_copy.shapes[name]
+                    dtype = disk_copy.dtypes[name]
+                    if self.device.type == "cuda":
+                        bank = HostBank(shape, dtype, backing="cuda")
+                    else:
+                        bank = HostBank(shape, dtype)
+                    disk_copy.read_layer_into(layer_id, name, bank.tensor)
+                    if layer_id not in self._host_banks:
+                        self._host_banks[layer_id] = {}
+                    self._host_banks[layer_id][name] = bank
+                    new_banks[name] = bank.tensor
+                if layer_id in self._ram_spilled_layers:
+                    self._ram_spilled_layers.remove(layer_id)
+            else:
+                # gpu_owned -> pinned
+                for name in self.moe_offload_cache.bank_schema:
+                    old = self.moe_offload_cache.bank_sources[name][layer_id]
+                    old_t = getattr(old, "tensor", old)
+                    shape, dtype = old_t.shape, old_t.dtype
+                    if self.device.type == "cuda":
+                        bank = HostBank(shape, dtype, backing="cuda")
+                    else:
+                        bank = HostBank(shape, dtype)
+                    bank.tensor.copy_(old_t)
+                    if layer_id not in self._host_banks:
+                        self._host_banks[layer_id] = {}
+                    self._host_banks[layer_id][name] = bank
+                    new_banks[name] = bank.tensor
+
+                # step-up promotes in reverse demotion order (design note: "Up: reverse")
+                demoted = getattr(self, "_demoted_layers", None)
+                if demoted is None:
+                    demoted = self._demoted_layers = []
+                demoted.append(layer_id)
+
+            self.moe_offload_cache.rebind_layer(layer_id, HostResidency.PINNED.value, new_banks)
+            self._gpu_owned_layer_ids = self.moe_offload_cache.gpu_owned_layer_ids
+            self._stash_vram_ledger_inputs(self.moe_offload_cache.bank_sources, self._gpu_owned_layer_ids)
+
+        elif target == HostResidency.GPU_OWNED.value:
+            new_banks = {}
+            if current_residency == HostResidency.DISK.value:
+                # disk -> gpu_owned
+                if disk_copy is None:
+                    raise RuntimeError(f"cannot recall layer {layer_id} from disk: no disk copy configured")
+                for name in self.moe_offload_cache.bank_schema:
+                    shape = disk_copy.shapes[name]
+                    dtype = disk_copy.dtypes[name]
+                    new_banks[name] = torch.empty(shape, dtype=dtype, device=self.device)
+
+                reader = getattr(self.moe_offload_cache, "_disk_readers", {}).get(layer_id)
+                own_reader = False
+                if reader is None:
+                    from freetoken.moe.disk_banks import DiskLayerReader
+
+                    staging = self.moe_offload_cache._get_disk_staging()
+                    reader = DiskLayerReader(disk_copy, layer_id, staging)
+                    own_reader = True
+                try:
+                    for start_row, chunk_size, chunk_tup in reader.iter_layer_chunks(rows=64):
+                        for idx, name in enumerate(self.moe_offload_cache.bank_schema):
+                            new_banks[name][start_row : start_row + chunk_size].copy_(
+                                chunk_tup[idx], non_blocking=(self.device.type == "cuda")
+                            )
+                finally:
+                    if own_reader:
+                        reader.close()
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                if layer_id in self._ram_spilled_layers:
+                    self._ram_spilled_layers.remove(layer_id)
+            else:
+                # pinned -> gpu_owned
+                for name in self.moe_offload_cache.bank_schema:
+                    old = self.moe_offload_cache.bank_sources[name][layer_id]
+                    old_t = getattr(old, "tensor", old)
+                    shape, dtype = old_t.shape, old_t.dtype
+                    dev_t = torch.empty(shape, dtype=dtype, device=self.device)
+                    dev_t.copy_(old_t)
+                    new_banks[name] = dev_t
+
+                if layer_id in self._host_banks:
+                    for b in self._host_banks[layer_id].values():
+                        if hasattr(b, "free"):
+                            b.free()
+                    del self._host_banks[layer_id]
 
             self.moe_offload_cache.rebind_layer(layer_id, HostResidency.GPU_OWNED.value, new_banks)
             self._gpu_owned_layer_ids = self.moe_offload_cache.gpu_owned_layer_ids
@@ -1317,7 +1442,7 @@ class Engine:
             if demoted and layer_id in demoted:
                 demoted.remove(layer_id)
         else:
-            raise NotImplementedError(f"unsupported target residency {target!r} in J1")
+            raise NotImplementedError(f"unsupported target residency {target!r}")
 
     def step_memory(
         self,
@@ -1336,15 +1461,126 @@ class Engine:
         :meth:`rebuild_runtime_cache` for direct engine use.
 
         VRAM down ladder:
-          1. gpu_owned layer -> pinned (highest layer id)
+          1. gpu_owned layer -> disk (if ram_tight and complete on disk) else pinned (highest layer id)
           2. slot cache -512 down to floor (1024 with overlap, 512 without)
           3. KV pool -25% (idle-only; skipped if request active)
           4. at floor
         VRAM up: reverse order.
-        RAM axis: pinned -> disk (deferred to J2).
+        RAM axis:
+          down: pinned layer -> disk, picking fewest routes in learned routing or highest pinned id.
+          up: disk -> pinned, in reverse spill order.
         """
         if axis == "ram":
-            return {"applied": None, "reason": "disk rung not built"}
+            disk_copy = getattr(self, "expert_disk_copy", None) or (
+                getattr(self.moe_offload_cache, "expert_disk_copy", None)
+                if self.moe_offload_cache is not None
+                else None
+            )
+            if disk_copy is None:
+                return {"applied": None, "reason": "disk rung not built"}
+            if direction not in ("down", "up"):
+                raise ValueError(f"unknown direction {direction!r} (expected 'down' or 'up')")
+
+            cache = self.moe_offload_cache
+            rebuild = rebuild or self.rebuild_runtime_cache
+            current_slots = cache.cache_size if cache is not None else 0
+            free_vram = 0
+            if self.device.type == "cuda" and hasattr(self, "_sync_get_memory"):
+                try:
+                    free_vram = self._sync_get_memory()[0]
+                except Exception:
+                    pass
+
+            from freetoken.moe.host_banks import HostResidency
+
+            if direction == "down":
+                if cache is None:
+                    return {
+                        "applied": None,
+                        "layer": None,
+                        "moe_cache_size": 0,
+                        "at_floor": True,
+                        "vram_free_bytes": free_vram,
+                    }
+                pinned_layers = [
+                    l for l, r in enumerate(cache.layer_residency)
+                    if r == HostResidency.PINNED.value
+                ]
+                if not pinned_layers:
+                    return {
+                        "applied": None,
+                        "layer": None,
+                        "moe_cache_size": current_slots,
+                        "at_floor": True,
+                        "vram_free_bytes": free_vram,
+                    }
+
+                stats = None
+                if hasattr(self, "config") and hasattr(self.config, "model_path"):
+                    from freetoken.moe.learned_routing import load_routing_stats
+
+                    try:
+                        stats = load_routing_stats(
+                            self.config.model_path,
+                            num_layers=cache.num_layers,
+                            num_experts=cache.num_experts,
+                        )
+                    except Exception:
+                        stats = None
+
+                if stats is not None and stats.freq:
+                    target_layer = min(pinned_layers, key=lambda l: (sum(stats.freq[l]), -l))
+                else:
+                    target_layer = max(pinned_layers)
+
+                rebuild(layer_moves=[(target_layer, "disk")])
+                remaining_pinned = [l for l in pinned_layers if l != target_layer]
+                return {
+                    "applied": "pinned->disk",
+                    "layer": target_layer,
+                    "moe_cache_size": current_slots,
+                    "at_floor": len(remaining_pinned) == 0,
+                    "vram_free_bytes": free_vram,
+                }
+            else:  # direction == "up"
+                if cache is None:
+                    return {
+                        "applied": None,
+                        "layer": None,
+                        "moe_cache_size": 0,
+                        "at_floor": False,
+                        "vram_free_bytes": free_vram,
+                    }
+                from freetoken.moe.host_banks import HostResidency
+
+                spilled = getattr(self, "_ram_spilled_layers", [])
+                candidates = [
+                    l for l in reversed(spilled)
+                    if cache.layer_residency[l] == HostResidency.DISK.value
+                ]
+                if not candidates:
+                    candidates = [
+                        l for l, r in enumerate(cache.layer_residency)
+                        if r == HostResidency.DISK.value
+                    ]
+                if not candidates:
+                    return {
+                        "applied": None,
+                        "layer": None,
+                        "moe_cache_size": current_slots,
+                        "at_floor": False,
+                        "vram_free_bytes": free_vram,
+                    }
+                target_layer = candidates[0]
+                rebuild(layer_moves=[(target_layer, "pinned")])
+                return {
+                    "applied": "disk->pinned",
+                    "layer": target_layer,
+                    "moe_cache_size": current_slots,
+                    "at_floor": False,
+                    "vram_free_bytes": free_vram,
+                }
+
         if axis != "vram":
             raise ValueError(f"unknown axis {axis!r} (expected 'vram' or 'ram')")
         if direction not in ("down", "up"):
@@ -1369,12 +1605,21 @@ class Engine:
                 pass
 
         if direction == "down":
-            # 1. gpu_owned -> pinned
+            # 1. gpu_owned -> disk (if ram_tight and complete on disk) else gpu_owned -> pinned
             if cache is not None and self._gpu_owned_layer_ids:
                 layer_id = max(self._gpu_owned_layer_ids)
-                rebuild(layer_moves=[(layer_id, "pinned")])
+                disk_copy = getattr(self, "expert_disk_copy", None) or (
+                    getattr(cache, "expert_disk_copy", None) if cache is not None else None
+                )
+                can_disk = (
+                    ram_tight
+                    and disk_copy is not None
+                    and disk_copy.layer_complete(layer_id)
+                )
+                target = "disk" if can_disk else "pinned"
+                rebuild(layer_moves=[(layer_id, target)])
                 return {
-                    "applied": "gpu_owned->pinned",
+                    "applied": f"gpu_owned->{target}",
                     "layer": layer_id,
                     "moe_cache_size": cache.cache_size,
                     "at_floor": False,
@@ -1452,12 +1697,13 @@ class Engine:
                     # last); a never-owned layer falls back to the lowest streaming id.
                     demoted = [l for l in getattr(self, "_demoted_layers", []) if l in candidates]
                     layer_id = demoted[-1] if demoted else candidates[0]
+                    curr_res = cache.layer_residency[layer_id]
                     # No try/except here: a failure after teardown must reach the scheduler,
                     # which owns the failed/rollback reply; swallowing it would report
                     # "nothing applied" from an engine that can no longer serve.
                     rebuild(layer_moves=[(layer_id, "gpu_owned")])
                     return {
-                        "applied": "pinned->gpu_owned",
+                        "applied": f"{curr_res}->gpu_owned",
                         "layer": layer_id,
                         "moe_cache_size": cache.cache_size,
                         "at_floor": False,
@@ -1538,15 +1784,22 @@ class Engine:
                 raise CacheRebuildRejected(
                     "cannot move all layers to gpu_owned; at least one streaming layer required"
                 )
-            # A promotion allocates one full expert layer on the card AFTER the graphs are torn
-            # down; check it fits now so an OOM cannot strand the engine without graphs.
-            promote_bytes = sum(
-                sum(
-                    t.numel() * t.element_size()
-                    for t in (self.moe_offload_cache.bank_sources[n][lid] for n in self.moe_offload_cache.bank_schema)
-                )
-                for lid, tgt in layer_moves if tgt == "gpu_owned"
+            promote_bytes = 0
+            disk_copy = getattr(self, "expert_disk_copy", None) or getattr(
+                self.moe_offload_cache, "expert_disk_copy", None
             )
+            for lid, tgt in layer_moves:
+                if tgt == "gpu_owned" and lid not in self._gpu_owned_layer_ids:
+                    if self.moe_offload_cache.layer_residency[lid] == "disk" and disk_copy is not None:
+                        promote_bytes += sum(disk_copy.bank_bytes(n) for n in self.moe_offload_cache.bank_schema)
+                    else:
+                        promote_bytes += sum(
+                            t.numel() * t.element_size()
+                            for t in (
+                                getattr(self.moe_offload_cache.bank_sources[n][lid], "tensor", self.moe_offload_cache.bank_sources[n][lid])
+                                for n in self.moe_offload_cache.bank_schema
+                            )
+                        )
             if promote_bytes and self.device.type == "cuda":
                 free_now = self._sync_get_memory()[0]
                 if free_now < promote_bytes + (256 << 20):
@@ -1625,7 +1878,9 @@ class Engine:
         # free << startup pre-load free), so re-deriving it here would silently drop large
         # batch sizes after the first rebuild. Reusing the already-resolved list keeps the
         # captured coverage identical (the fit-check above guarantees the graph headroom fits).
-        prior_graph_bs = self.graph_runner.graph_bs_list
+        prior_graph_bs = self.graph_runner.graph_bs_list or getattr(self, "_deferred_graph_bs", None)
+        if self.graph_runner.graph_bs_list:
+            self._deferred_graph_bs = list(self.graph_runner.graph_bs_list)
         # Point of no return for the scheduler's rollback logic: from here the live graphs and
         # pools start being freed. A failure BEFORE this flag flips leaves the engine serving
         # untouched (no rollback needed); after it, only a rebuild restores service.
@@ -1697,32 +1952,51 @@ class Engine:
         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
         gc.collect()
         free_min = self._sync_get_memory()[0]
-        self.graph_runner = GraphRunner(
-            stream=self.stream,
-            device=self.device,
-            model=self.model,
-            attn_backend=self.attn_backend,
-            cuda_graph_bs=prior_graph_bs,  # reuse the startup-resolved set (see above)
-            cuda_graph_max_bs=config.cuda_graph_max_bs,
-            free_memory=free_min,
-            max_seq_len=aligned_max_seq_len,
-            vocab_size=config.model_config.vocab_size,
-            dummy_req=self.dummy_req,
-            moe_offload_cache=self.moe_offload_cache,
-        )
-        if spec_graph_widths:
-            # re-armed, not re-captured: the widths capture lazily on their next live step,
-            # against the tensors this rebuild just allocated
-            from .spec_graph import SpecVerifyGraphRunner
-
-            self.spec_graph_runner = SpecVerifyGraphRunner(
-                target_ctx=self.ctx,
-                target_model=self.model,
-                attn_backend=self.attn_backend,
+        has_disk = self.moe_offload_cache is not None and getattr(self.moe_offload_cache, "has_disk_layers", False)
+        if has_disk:
+            self.graph_runner = GraphRunner(
+                stream=self.stream,
                 device=self.device,
-                widths=spec_graph_widths,
-                guard_bytes=_SPEC_GRAPH_GUARD_BYTES,
+                model=self.model,
+                attn_backend=self.attn_backend,
+                cuda_graph_bs=[],
+                cuda_graph_max_bs=config.cuda_graph_max_bs,
+                free_memory=free_min,
+                max_seq_len=aligned_max_seq_len,
+                vocab_size=config.model_config.vocab_size,
+                dummy_req=self.dummy_req,
+                moe_offload_cache=self.moe_offload_cache,
             )
+            self._graphs_deferred = "deferred until no disk layers"
+            logger.info_rank0("CUDA graph capture deferred until no disk layers")
+        else:
+            self._graphs_deferred = None
+            self.graph_runner = GraphRunner(
+                stream=self.stream,
+                device=self.device,
+                model=self.model,
+                attn_backend=self.attn_backend,
+                cuda_graph_bs=prior_graph_bs,  # reuse the startup-resolved set (see above)
+                cuda_graph_max_bs=config.cuda_graph_max_bs,
+                free_memory=free_min,
+                max_seq_len=aligned_max_seq_len,
+                vocab_size=config.model_config.vocab_size,
+                dummy_req=self.dummy_req,
+                moe_offload_cache=self.moe_offload_cache,
+            )
+            if spec_graph_widths:
+                # re-armed, not re-captured: the widths capture lazily on their next live step,
+                # against the tensors this rebuild just allocated
+                from .spec_graph import SpecVerifyGraphRunner
+
+                self.spec_graph_runner = SpecVerifyGraphRunner(
+                    target_ctx=self.ctx,
+                    target_model=self.model,
+                    attn_backend=self.attn_backend,
+                    device=self.device,
+                    widths=spec_graph_widths,
+                    guard_bytes=_SPEC_GRAPH_GUARD_BYTES,
+                )
 
     def _capture_spec_graphs_at_boot(self) -> None:
         """Capture every armed speculative width NOW, while boot memory is still fresh.

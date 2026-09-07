@@ -674,6 +674,32 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-disk-copy",
+        action="store_true",
+        dest="moe_disk_copy",
+        default=ServerArgs.moe_disk_copy,
+        help=(
+            "Write a contiguous on-disk expert copy in the background after banks load "
+            "so the memory governor can spill MoE layers to disk. Default on for "
+            "--moe-backend offload on NVFP4 checkpoints."
+        ),
+    )
+
+    parser.add_argument(
+        "--disable-moe-disk-copy",
+        action="store_false",
+        dest="moe_disk_copy",
+        help="Disable background expert disk copy.",
+    )
+
+    parser.add_argument(
+        "--moe-disk-copy-dir",
+        type=str,
+        default=ServerArgs.moe_disk_copy_dir,
+        help="Directory to write the expert disk copy. Default <model>/freetoken-expert-cache.",
+    )
+
+    parser.add_argument(
         "--moe-vram-reserve-bytes",
         type=int,
         default=ServerArgs.moe_vram_reserve_bytes,
