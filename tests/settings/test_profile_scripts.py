@@ -42,6 +42,9 @@ def _qwen_settings() -> dict[str, object]:
         "KVParkWindowMiB": 256,
         "MoEVramReserveBytes": -1,
         "MoECacheHeadroomBytes": -1,
+        "MemoryGovernor": True,
+        "GovernorVRAMFreeGB": 1.5,
+        "GovernorRAMFreeGB": 4.0,
         "FREETOKEN_MTP_SPECULATE": "0",
         "FREETOKEN_MTP_RESIDENT": "0",
         "FREETOKEN_MTP_SHADOW": "0",
@@ -83,6 +86,9 @@ def _dense_settings() -> dict[str, object]:
         "KVParkWindowMiB": 256,
         "MoEVramReserveBytes": -1,
         "MoECacheHeadroomBytes": -1,
+        "MemoryGovernor": False,
+        "GovernorVRAMFreeGB": 1.5,
+        "GovernorRAMFreeGB": 4.0,
         "FREETOKEN_MTP_SPECULATE": "0",
         "FREETOKEN_MTP_RESIDENT": "0",
         "FREETOKEN_MTP_SHADOW": "0",
@@ -114,6 +120,7 @@ def test_dense_profile_script_round_trips_and_omits_false_switches(tmp_path: Pat
     assert "-EmbedHost" not in text
     assert "-EnableVision" not in text
     assert "-EnableCacheReport" not in text
+    assert "-MemoryGovernor" not in text
     assert "$launcher = Join-Path $PSScriptRoot '..\\scripts\\start-freetoken-windows.ps1'" in text
 
 
