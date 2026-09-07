@@ -33,6 +33,103 @@ def make_client(tmp_path):
     return TestClient(app), boot
 
 
+def test_lifecycle_route_freezes_full_snapshot_and_stop_rejects_settings(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        '{"architectures":["Qwen4ExpForConditionalGeneration"],'
+        '"model_type":"qwen4_exp","num_hidden_layers":48,"num_experts":512,'
+        '"max_position_embeddings":262144,"hidden_size":16,"moe_intermediate_size":32,'
+        '"quantization_config":{"quant_algo":"NVFP4"}}',
+        encoding="utf-8",
+    )
+    boot = tmp_path / "boot-2020.ps1"
+    boot.write_text(
+        f"& $launcher `\n    -ModelPath '{model}' `\n    -Port 2020\n",
+        encoding="utf-8",
+    )
+
+    class RecordingManager:
+        def __init__(self):
+            self.boot_file = boot
+            self.log_path = tmp_path / "server.log"
+            self.port = 2020
+            self.calls = []
+
+        def start(self, action="start", *, settings=None, force=False):
+            self.calls.append((action, settings, force))
+            return "job-recorded"
+
+        def job(self, job_id):
+            return {"jobId": job_id, "stage": "booting"}
+
+    manager = RecordingManager()
+    app = create_app(
+        boot_file=boot,
+        process_manager=manager,
+        profiles=ProfilesManager(tmp_path / "boot-profiles.json"),
+        static_path=tmp_path / "missing-index.html",
+    )
+    with TestClient(app) as client:
+        started = client.post(
+            "/api/server/start",
+            json={"force": True, "settings": {"MoECacheSize": 120}},
+        )
+        assert started.status_code == 202, started.text
+        assert manager.calls[0][0] == "start"
+        assert manager.calls[0][1]["ModelPath"] == str(model)
+        assert manager.calls[0][1]["MoECacheSize"] == 120
+        assert manager.calls[0][2] is True
+        rejected = client.post(
+            "/api/server/stop",
+            json={"settings": {"MoECacheSize": 120}},
+        )
+        assert rejected.status_code == 422
+
+
+def test_lifecycle_override_does_not_gain_an_estimator_metadata_gate(tmp_path):
+    missing_model = tmp_path / "model-does-not-exist"
+    boot = tmp_path / "boot-2020.ps1"
+    boot.write_text(
+        f"& $launcher `\n    -ModelPath '{missing_model}' `\n    -Port 2020\n",
+        encoding="utf-8",
+    )
+
+    class RecordingManager:
+        boot_file = boot
+        log_path = tmp_path / "server.log"
+        port = 2020
+
+        def __init__(self):
+            self.calls = []
+
+        def start(self, action="start", *, settings=None, force=False):
+            self.calls.append((action, settings, force))
+            return "job-override"
+
+        def job(self, job_id):
+            return {"jobId": job_id, "stage": "booting"}
+
+    manager = RecordingManager()
+    app = create_app(
+        boot_file=boot,
+        process_manager=manager,
+        profiles=ProfilesManager(tmp_path / "boot-profiles.json"),
+        static_path=tmp_path / "missing-index.html",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/server/start",
+            json={"force": True, "settings": {"MoECacheSize": 120}},
+        )
+
+    assert response.status_code == 202, response.text
+    assert manager.calls[0][0] == "start"
+    assert manager.calls[0][1]["MoECacheSize"] == 120
+    assert manager.calls[0][2] is True
+
+
 def test_settings_routes_return_metadata_and_save(tmp_path):
     client, boot = make_client(tmp_path)
     response = client.get("/api/settings")

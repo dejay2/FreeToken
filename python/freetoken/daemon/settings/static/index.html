@@ -194,6 +194,27 @@
     .model-card .facts b { color: var(--text); font-weight: 600; }
     .model-card .badge-line { display: flex; gap: 6px; flex-wrap: wrap; }
 
+    /* Memory fit check: the warning is global so it remains visible when Start opens Server. */
+    .fit-panel { border: 1px solid var(--warn); border-left: 4px solid var(--warn); border-radius: 12px; background: var(--warn-soft); padding: 13px 16px; margin-bottom: 14px; }
+    .fit-panel.good { border-color: var(--good); border-left-color: var(--good); background: var(--good-soft); }
+    .fit-panel.bad { border-color: var(--bad); border-left-color: var(--bad); background: var(--bad-soft); }
+    .fit-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+    .fit-head h2 { font-size: 1rem; }
+    .fit-head .small { margin-top: 3px; }
+    .fit-verdicts { display: grid; gap: 4px; margin-top: 10px; }
+    .fit-verdict { margin: 0; font-weight: 650; }
+    .fit-verdict.good { color: var(--good); }
+    .fit-verdict.bad { color: var(--bad); }
+    .fit-suggestion { margin-top: 12px; padding-top: 10px; border-top: 1px solid color-mix(in srgb, var(--warn) 30%, transparent); }
+    .fit-suggestion h3 { font-size: .92rem; }
+    .fit-suggestion p { margin-top: 3px; }
+    .fit-changes { display: flex; flex-wrap: wrap; gap: 5px 12px; margin: 7px 0 10px; color: var(--muted); font-size: .84rem; }
+    .fit-changes span { overflow-wrap: anywhere; }
+    .fit-details { margin-top: 10px; font-size: .82rem; }
+    .fit-details summary { cursor: pointer; color: var(--muted); }
+    .fit-detail-grid { display: grid; gap: 4px; margin-top: 7px; color: var(--muted); }
+    .fit-detail-grid b { color: var(--ink); font-weight: 650; }
+
     @media (max-width: 900px) { .settings-layout { grid-template-columns: 1fr; } .group-nav { display: none; } .top-right { align-items: flex-start; } }
     @media (max-width: 600px) { .dial { grid-template-columns: 1fr; } .amount { grid-template-columns: 1fr; } .amount .number-wrap { justify-content: flex-end; } }
   </style>
@@ -210,12 +231,22 @@
         <div class="pill" id="server-pill"><span class="dot"></span> Main server: <strong>checking…</strong></div>
         <div class="actions" aria-label="Server actions">
           <button class="button primary" id="save" type="button" disabled>Save <span class="badge" id="save-badge" hidden>0</span></button>
-          <button class="button" type="button" onclick="serverAction('restart')">Restart</button>
-          <button class="button" type="button" onclick="serverAction('start')">Start</button>
-          <button class="button danger" type="button" onclick="serverAction('stop')">Stop</button>
+          <button class="button" id="restart" type="button" onclick="serverAction('restart')">Restart</button>
+          <button class="button" id="start" type="button" onclick="serverAction('start')">Start</button>
+          <button class="button danger" id="stop" type="button" onclick="serverAction('stop')">Stop</button>
         </div>
       </div>
     </header>
+
+    <section class="fit-panel" id="fit-panel" hidden aria-live="polite" aria-atomic="false">
+      <div class="fit-head">
+        <div><h2 id="fit-warning">Memory fit check</h2><p class="small" id="fit-error"></p></div>
+        <div class="actions"><button class="button small" id="fit-retry" type="button" hidden>Retry</button><button class="button small primary" id="fit-override" type="button" hidden>Start anyway with my values.</button></div>
+      </div>
+      <div class="fit-verdicts"><p class="fit-verdict" id="fit-now"></p><p class="fit-verdict" id="fit-empty"></p></div>
+      <div class="fit-suggestion" id="fit-suggestion" hidden><h3>Suggested values</h3><p class="small" id="fit-suggestion-note"></p><div class="fit-changes" id="fit-suggestion-changes"></div><button class="button small" id="fit-apply" type="button">Apply suggested values</button></div>
+      <details class="fit-details" id="fit-details" hidden><summary>Estimated ready use and required boot capacity</summary><div class="fit-detail-grid" id="fit-detail-grid"></div></details>
+    </section>
 
     <nav class="tabs" role="tablist" aria-label="Sections">
       <button class="tab-btn" role="tab" type="button" data-tab="settings" aria-selected="true">Settings</button>
@@ -430,7 +461,7 @@
 
   <script>
     'use strict';
-    const state = { settings: {}, saved: {}, dials: [], groups: [], model: null, modelTimer: null, modelPath: null, profiles: [], activeProfile: '', busy: false, jobId: null, jobTimer: null, logTimer: null, tab: 'settings', showAdvanced: false, query: '', browser: null, lastNonAuto: {} };
+    const state = { settings: {}, saved: {}, dials: [], groups: [], model: null, modelTimer: null, modelPath: null, profiles: [], activeProfile: '', busy: false, stopping: false, actionToken: 0, formRevision: 0, jobId: null, jobToken: 0, jobTimer: null, logTimer: null, tab: 'settings', showAdvanced: false, query: '', browser: null, lastNonAuto: {}, fit: { result: null, checkedSettings: null, checkedAt: 0, action: null, save: true, bindToForm: true, formRevision: 0, allowOverride: false, override: false, estimating: false, requestId: 0 } };
     const axisLabels = { speed: 'Speed', accuracy: 'Accuracy', vram: 'Card memory', ram: 'PC memory', ssd: 'Drive space', boot: 'Start-up time' };
     const costAxes = new Set(['vram', 'ram', 'ssd', 'boot']);
     const $ = (id) => document.getElementById(id);
@@ -440,6 +471,185 @@
     const valueFor = (dial) => state.settings[dial.name] ?? dial.value ?? '';
     const dialByName = (name) => state.dials.find((dial) => dial.name === name);
     const fmt = (value) => Number(value).toLocaleString(undefined, { maximumFractionDigits: 3 });
+    const FIT_MAX_AGE_MS = 30 * 1000;
+    const fitClone = (value) => JSON.parse(JSON.stringify(value ?? {}));
+    const fitRecord = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+    const fitToggleValue = (value) => value === true || value === 1 || ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
+    const fitValueSame = (name, left, right) => { const dial = dialByName(name); return dial?.control === 'toggle' ? fitToggleValue(left) === fitToggleValue(right) : same(left, right); };
+    const fitSettingsSame = (left, right) => fitRecord(left) && fitRecord(right) && Object.keys(left).length === Object.keys(right).length && Object.keys(left).every((key) => Object.prototype.hasOwnProperty.call(right, key) && fitValueSame(key, left[key], right[key]));
+    const fitNumber = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+    const fitGiB = (bytes) => { const value = fitNumber(bytes); return value == null ? '—' : (value / 1024 ** 3).toFixed(2); };
+    const fitValue = (value) => typeof value === 'object' ? JSON.stringify(value) : String(value ?? '—');
+    function boundedFitText(value, fallback) { const text = String(value ?? '').replace(/\s+/g, ' ').trim(); return (text || fallback).slice(0, 240); }
+    function unavailableFit(code, message) { return { version: 1, status: 'unavailable', fits: null, fits_now: null, fits_empty: null, suggestion: null, error: { code, message: boundedFitText(message, 'The memory check could not be completed.') } }; }
+    const fitInteger = (value) => Number.isSafeInteger(value) && value >= 0;
+    const fitText = (value) => typeof value === 'string' && value.trim().length > 0;
+    const fitScalar = (value) => typeof value === 'string' || typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value));
+    const fitSettings = (value) => fitRecord(value) && Object.keys(value).length > 0 && Object.values(value).every(fitScalar);
+    const fitIndices = (value) => Array.isArray(value) && value.every(fitInteger);
+    const fitScope = (value) => ['now', 'empty', 'both'].includes(value);
+    const fitBooleans = (value) => ['fits', 'fits_now', 'fits_empty'].every((key) => typeof value[key] === 'boolean') && value.fits === value.fits_now;
+    function validFitResource(resource) {
+      if (!fitRecord(resource) || !fitInteger(resource.free_bytes) || !fitInteger(resource.total_bytes) || resource.total_bytes === 0 || resource.free_bytes > resource.total_bytes) return false;
+      return ['now', 'empty'].every((scenario) => {
+        const row = resource[scenario];
+        return fitRecord(row) && ['need_bytes', 'resident_bytes', 'boot_peak_bytes', 'shortfall_bytes'].every((key) => fitInteger(row[key]));
+      });
+    }
+    function validFitGeometry(row) {
+      return fitRecord(row) && ['total_slots', 'lru_slots', 'num_pages', 'page_size', 'usable_kv_tokens'].every((key) => fitInteger(row[key])) && row.num_pages > 1 && row.page_size > 0 && fitIndices(row.owned_layers) && typeof row.prefill_overlap === 'boolean';
+    }
+    function validFitSuggestion(suggestion) {
+      if (suggestion === null) return true;
+      if (!fitRecord(suggestion) || !fitSettings(suggestion.settings) || !fitBooleans(suggestion)) return false;
+      if (suggestion.target === 'now' ? !suggestion.fits_now : suggestion.target !== 'empty' || suggestion.fits_now || !suggestion.fits_empty) return false;
+      const changes = suggestion.changes;
+      if (!Array.isArray(changes) || changes.length !== Object.keys(suggestion.settings).length) return false;
+      const names = new Set();
+      return changes.every((change) => {
+        if (!fitRecord(change) || !fitText(change.name) || !fitText(change.reason) || !fitScalar(change.from) || !fitScalar(change.to) || names.has(change.name)) return false;
+        names.add(change.name);
+        return Object.prototype.hasOwnProperty.call(suggestion.settings, change.name) && fitValueSame(change.name, suggestion.settings[change.name], change.to) && !fitValueSame(change.name, change.from, change.to);
+      });
+    }
+    function validFitResponse(body) {
+      if (!fitRecord(body) || body.version !== 1) return false;
+      if (body.status === 'unavailable') return body.fits === null && body.fits_now === null && body.fits_empty === null && body.suggestion === null && fitRecord(body.error) && fitText(body.error.code) && fitText(body.error.message);
+      if (body.status !== 'ok' || !fitBooleans(body) || !fitText(body.sampled_at) || !Number.isFinite(Date.parse(body.sampled_at)) || !fitSettings(body.effective_settings)) return false;
+      if (!fitRecord(body.resources) || !validFitResource(body.resources.ram) || !validFitResource(body.resources.vram)) return false;
+      const effective = body.effective; const machine = body.machine; const pinning = body.pinning;
+      if (!fitRecord(effective) || !fitInteger(effective.page_size) || effective.page_size === 0 || !fitText(effective.attention_backend) || !fitText(effective.ple_backend) || !(effective.pin_budget_bytes === null || fitInteger(effective.pin_budget_bytes)) || typeof effective.bank_cuda_alloc !== 'boolean') return false;
+      if (!Object.values(effective).every((value) => value === null || fitScalar(value))) return false;
+      if (['cache_type', 'moe_backend'].some((key) => key in effective && !fitText(effective[key])) || ('prefill_overlap' in effective && typeof effective.prefill_overlap !== 'boolean') || ('memory_ratio' in effective && fitNumber(effective.memory_ratio) === null)) return false;
+      if (!fitRecord(machine) || !['ram_source', 'gpu_uuid', 'gpu_name', 'vram_source'].every((key) => fitText(machine[key])) || typeof machine.cgroup_limited !== 'boolean') return false;
+      if (!fitRecord(pinning) || !fitInteger(pinning.need_bytes) || !fitInteger(pinning.shortfall_bytes) || !(pinning.cap_bytes === null || fitInteger(pinning.cap_bytes)) || !fitIndices(pinning.cpu_layers)) return false;
+      if (!Array.isArray(body.issues) || !body.issues.every((issue) => fitRecord(issue) && fitText(issue.code) && fitScope(issue.scope) && fitText(issue.message))) return false;
+      if (!Array.isArray(body.components) || !body.components.every((row) => fitRecord(row) && ['name', 'phase', 'source'].every((key) => fitText(row[key])) && ['ram', 'vram'].includes(row.resource) && ['allocation', 'policy', 'reclaimable', 'allowance'].includes(row.kind) && fitScope(row.scenario) && fitInteger(row.bytes))) return false;
+      if (!Array.isArray(body.assumptions) || !body.assumptions.every((item) => typeof item === 'string') || !validFitSuggestion(body.suggestion) || !fitRecord(body.geometry)) return false;
+      // Null geometry is a reported planner failure, never permission to launch.
+      return ['now', 'empty'].every((scenario) => {
+        const fits = body[`fits_${scenario}`]; const row = body.geometry[scenario];
+        const hasIssue = body.issues.some((issue) => issue.scope === scenario || issue.scope === 'both');
+        if (row === null) return !fits && hasIssue;
+        return validFitGeometry(row) && (!fits || (!hasIssue && pinning.shortfall_bytes === 0 && ['ram', 'vram'].every((resource) => body.resources[resource][scenario].shortfall_bytes === 0)));
+      });
+    }
+    function fitIssues(result, scope) {
+      return (Array.isArray(result.issues) ? result.issues : []).filter((issue) => issue && (issue.scope === scope || issue.scope === 'both')).map((issue) => boundedFitText(issue.message, 'A planner constraint was reported.'));
+    }
+    function fitVerdict(result, label, scenario, fits) {
+      if (fits) return `${label}: fits.`;
+      const shortages = [];
+      [['vram', 'card memory'], ['ram', 'RAM']].forEach(([resource, name]) => {
+        const shortfall = fitNumber(result.resources?.[resource]?.[scenario]?.shortfall_bytes) || 0;
+        if (shortfall > 0) shortages.push(`${name} short by ${fitGiB(shortfall)} GiB`);
+      });
+      const reason = shortages.length ? shortages.join('; ') : fitIssues(result, scenario)[0];
+      return `${label}: does not fit${reason ? ` — ${reason}` : ''}.`;
+    }
+    function fitDetailMarkup(result) {
+      const details = [];
+      [['ram', 'RAM'], ['vram', 'VRAM']].forEach(([resource, label]) => {
+        [['now', 'free right now'], ['empty', 'empty machine']].forEach(([scenario, scenarioLabel]) => {
+          const row = result.resources?.[resource]?.[scenario];
+          if (!row) return;
+          const peak = fitGiB(row.boot_peak_bytes);
+          details.push(`<span><b>${escapeHtml(label)} · ${escapeHtml(scenarioLabel)}</b> Estimated ready use ${escapeHtml(fitGiB(row.resident_bytes))} GiB · Required for boot ${escapeHtml(fitGiB(row.need_bytes))} GiB (peak ${escapeHtml(peak)} GiB)</span>`);
+        });
+      });
+      const components = Array.isArray(result.components) ? result.components : [];
+      components.slice(0, 40).forEach((component) => {
+        if (!fitRecord(component)) return;
+        details.push(`<span><b>${escapeHtml(component.name || 'Component')}</b> · ${escapeHtml(component.resource || '')} · ${escapeHtml(component.phase || '')} · ${escapeHtml(fitGiB(component.bytes))} GiB · ${escapeHtml(component.kind || '')}</span>`);
+      });
+      return details.join('');
+    }
+    function renderFitSuggestion(result) {
+      const suggestion = result.suggestion;
+      const box = $('fit-suggestion');
+      if (!suggestion || !fitRecord(suggestion.settings)) { box.hidden = true; $('fit-suggestion-changes').innerHTML = ''; return; }
+      box.hidden = false;
+      $('fit-suggestion-note').textContent = suggestion.target === 'empty' ? 'These values fit an empty machine only; the server still needs an empty machine.' : 'These values are the closest settings the check found that fit now.';
+      const changes = Array.isArray(suggestion.changes) && suggestion.changes.length ? suggestion.changes : Object.entries(suggestion.settings).map(([name, to]) => ({ name, to }));
+      $('fit-suggestion-changes').innerHTML = changes.slice(0, 40).map((change) => {
+        const from = change.from === undefined ? '' : `: ${fitValue(change.from)} → ${fitValue(change.to)}`;
+        const reason = change.reason ? ` — ${change.reason}` : '';
+        return `<span><b>${escapeHtml(change.name || 'Setting')}</b>${escapeHtml(from + reason)}</span>`;
+      }).join('');
+    }
+    function renderFit() {
+      const panel = $('fit-panel');
+      if (!panel) return;
+      const fit = state.fit;
+      const visibleTab = state.tab === 'settings' || state.tab === 'server';
+      panel.hidden = !(visibleTab && (fit.estimating || fit.result));
+      if (panel.hidden) return;
+      const warning = $('fit-warning'); const error = $('fit-error'); const now = $('fit-now'); const empty = $('fit-empty');
+      $('fit-retry').hidden = true; $('fit-override').hidden = true; $('fit-suggestion').hidden = true; $('fit-details').hidden = true;
+      $('fit-apply').disabled = state.busy; $('fit-retry').disabled = state.busy; $('fit-override').disabled = state.busy;
+      if (fit.estimating && !fit.result) {
+        panel.className = 'fit-panel'; warning.textContent = 'Checking memory fit…'; error.textContent = ''; now.textContent = ''; empty.textContent = ''; return;
+      }
+      const result = fit.result;
+      if (!result) { panel.hidden = true; return; }
+      if (result.status === 'unavailable') {
+        panel.className = 'fit-panel bad'; warning.textContent = "Couldn't check memory. Nothing has started."; error.textContent = `Reason: ${boundedFitText(result.error?.message, 'The memory check could not be completed.')}`;
+        now.className = 'fit-verdict'; now.textContent = 'Free right now: not checked.'; empty.className = 'fit-verdict'; empty.textContent = 'Empty machine: not checked.';
+        $('fit-retry').hidden = false; $('fit-override').hidden = !fit.allowOverride; return;
+      }
+      panel.className = result.fits_now ? 'fit-panel good' : 'fit-panel bad';
+      warning.textContent = result.fits_now ? 'Memory check passed.' : 'These settings may not fit in memory.';
+      const issueText = [...fitIssues(result, 'now'), ...fitIssues(result, 'empty')].filter((value, index, values) => values.indexOf(value) === index).join(' ');
+      error.textContent = issueText;
+      now.className = `fit-verdict ${result.fits_now ? 'good' : 'bad'}`; now.textContent = fitVerdict(result, 'Free right now', 'now', result.fits_now);
+      empty.className = `fit-verdict ${result.fits_empty ? 'good' : 'bad'}`; empty.textContent = fitVerdict(result, 'Empty machine', 'empty', result.fits_empty);
+      renderFitSuggestion(result);
+      const detailMarkup = fitDetailMarkup(result); $('fit-detail-grid').innerHTML = detailMarkup; $('fit-details').hidden = !detailMarkup;
+      $('fit-override').hidden = !fit.allowOverride; $('fit-apply').disabled = state.busy;
+    }
+    function invalidateFit() {
+      state.formRevision += 1;
+      state.fit.requestId += 1; state.fit.result = null; state.fit.checkedSettings = null; state.fit.checkedAt = 0;
+      state.fit.action = null; state.fit.save = true; state.fit.bindToForm = true; state.fit.allowOverride = false; state.fit.override = false; state.fit.estimating = false;
+      renderFit();
+    }
+    function fitSnapshotCurrent(snapshot, token) {
+      const fit = state.fit;
+      return fit.requestId === token && fit.formRevision === state.formRevision && fitSettingsSame(fit.checkedSettings, snapshot) && (!fit.bindToForm || fitSettingsSame(state.settings, snapshot));
+    }
+    async function requestFit(snapshot, action, save, bindToForm = true) {
+      const token = ++state.fit.requestId;
+      state.fit.checkedSettings = fitClone(snapshot); state.fit.checkedAt = 0; state.fit.action = action; state.fit.save = save; state.fit.bindToForm = bindToForm; state.fit.formRevision = state.formRevision; state.fit.allowOverride = false; state.fit.override = false; state.fit.result = null; state.fit.estimating = true; renderFit();
+      let outcome;
+      try {
+        const { response, body } = await json('/api/settings/estimate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: fitClone(snapshot) }) });
+        if (token !== state.fit.requestId || (bindToForm && !fitSettingsSame(state.settings, snapshot))) return { stale: true, token };
+        if (response.status === 422) {
+          showFieldErrors(body.detail); state.fit.checkedAt = 0; state.fit.allowOverride = false; state.fit.result = null; renderFit(); return { validation: true, token };
+        }
+        outcome = response.ok && validFitResponse(body) ? body : (validFitResponse(body) && body.status === 'unavailable' ? body : unavailableFit(response.status === 503 ? 'planner_failed' : 'probe_failed', body.error?.message || body.detail || `The memory check returned HTTP ${response.status}.`));
+        if (!validFitResponse(outcome)) outcome = unavailableFit('planner_failed', 'The memory check returned an invalid response.');
+        if (outcome.status === 'ok' && !fitSettingsSame(outcome.effective_settings, snapshot)) outcome = unavailableFit('planner_failed', 'The memory check returned settings different from the checked values.');
+        state.fit.result = outcome; state.fit.checkedAt = Date.now(); state.fit.allowOverride = outcome.status === 'unavailable' || (outcome.status === 'ok' && !outcome.fits_now); setNotice(''); renderFit(); return { result: outcome, token };
+      } catch (error) {
+        if (token !== state.fit.requestId || (bindToForm && !fitSettingsSame(state.settings, snapshot))) return { stale: true, token };
+        outcome = unavailableFit('probe_failed', error.message || 'The memory check request failed.'); state.fit.result = outcome; state.fit.checkedAt = Date.now(); state.fit.allowOverride = true; setNotice(''); renderFit(); return { result: outcome, token };
+      } finally {
+        if (token === state.fit.requestId) { state.fit.estimating = false; renderFit(); }
+      }
+    }
+    function clearFitResult() {
+      state.fit.result = null; state.fit.checkedSettings = null; state.fit.checkedAt = 0; state.fit.allowOverride = false; state.fit.override = false; state.fit.action = null; state.fit.estimating = false; renderFit();
+    }
+    function applyFitSuggestion() {
+      const suggestion = state.fit.result?.suggestion;
+      if (!suggestion || !fitRecord(suggestion.settings)) return;
+      const changed = Object.entries(suggestion.settings);
+      changed.forEach(([name, value]) => { state.settings[name] = value; const dial = dialByName(name); if (dial && !isAuto(dial, value)) state.lastNonAuto[name] = value; });
+      renderSettings(); changed.forEach(([name]) => markChanged(name));
+      const emptyOnly = suggestion.target === 'empty' ? ' These values still need an empty machine.' : '';
+      clearFitResult(); setNotice(`Suggested values filled in; press Start to check and start.${emptyOnly}`, 'good');
+    }
 
     try { state.showAdvanced = localStorage.getItem('ft-show-advanced') === '1'; } catch (_) {}
 
@@ -461,6 +671,7 @@
       document.querySelectorAll('.tab-btn').forEach((button) => button.setAttribute('aria-selected', String(button.dataset.tab === name)));
       document.querySelectorAll('.tab').forEach((panel) => { panel.hidden = panel.id !== `tab-${name}`; });
       try { localStorage.setItem('ft-tab', name); } catch (_) {}
+      renderFit();
     }
     document.querySelectorAll('.tab-btn').forEach((button) => button.addEventListener('click', () => showTab(button.dataset.tab)));
 
@@ -595,7 +806,7 @@
     /* ---------- dirty tracking ---------- */
     const same = (a, b) => JSON.stringify(a ?? '') === JSON.stringify(b ?? '');
     function changedNames() { return Object.keys(state.settings).filter((name) => !same(state.settings[name], state.saved[name])); }
-    function markChanged(name) { const row = document.querySelector(`[data-dial-row="${CSS.escape(name)}"]`); if (row) row.classList.toggle('changed', !same(state.settings[name], state.saved[name])); refreshDirty(); }
+    function markChanged(name) { invalidateFit(); const row = document.querySelector(`[data-dial-row="${CSS.escape(name)}"]`); if (row) row.classList.toggle('changed', !same(state.settings[name], state.saved[name])); refreshDirty(); }
     function refreshDirty() {
       const changed = changedNames();
       document.querySelectorAll('[data-dial-row]').forEach((row) => row.classList.toggle('changed', changed.includes(row.dataset.dialRow)));
@@ -649,6 +860,7 @@
       const target = String(path ?? '');
       if (target === state.modelPath) return;
       state.modelPath = target;
+      invalidateFit();
       const { response, body } = await json(`/api/settings?model=${encodeURIComponent(target)}`);
       if (!response.ok || state.modelPath !== target) return;
       state.model = body.model || null;
@@ -677,6 +889,7 @@
     function scheduleModelRefresh(path) { clearTimeout(state.modelTimer); state.modelTimer = setTimeout(() => refreshModel(path), 500); }
 
     async function loadSettings() {
+      invalidateFit();
       const { response, body } = await json('/api/settings');
       if (!response.ok) throw new Error(body.detail || 'Could not load settings.');
       state.settings = { ...(body.settings || {}) };
@@ -693,13 +906,26 @@
       renderSettings();
     }
 
-    async function saveSettings() {
-      setBusy(true);
+    const normalSettingsBody = () => JSON.stringify({ settings: state.settings });
+    async function saveSettings(values = state.settings, options = {}) {
+      const forStart = options.forStart === true;
+      const submitted = fitClone(values);
+      if (!forStart) invalidateFit();
+      if (!forStart) setBusy(true);
       showFieldErrors([]);
       try {
-        const { response, body } = await json('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: state.settings }) });
-        if (response.status === 422) { showFieldErrors(body.detail); setNotice('Some values need attention. They are marked in red.', 'bad'); return false; }
-        if (!response.ok) { setNotice(body.detail || 'Could not save.', 'bad'); return false; }
+        const { response, body } = await json('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: forStart ? JSON.stringify({ settings: submitted }) : normalSettingsBody() });
+        if (response.status === 422) { showFieldErrors(body.detail); setNotice('Some values need attention. They are marked in red.', 'bad'); return forStart ? { ok: false, validation: true } : false; }
+        if (!response.ok) { setNotice(body.detail || 'Could not save.', 'bad'); return forStart ? { ok: false } : false; }
+        if (forStart) {
+          const canonical = body.settings;
+          if ((options.token !== undefined && !fitSnapshotCurrent(submitted, options.token)) || !fitRecord(canonical) || !fitSettingsSame(canonical, submitted)) {
+            setNotice('The saved settings differ from the checked values. Check again before starting.', 'bad');
+            return { ok: false, changed: true };
+          }
+          state.settings = fitClone(canonical); state.saved = fitClone(canonical); renderSettings();
+          return { ok: true, settings: canonical };
+        }
         state.settings = { ...state.settings, ...(body.settings || {}) };
         state.saved = JSON.parse(JSON.stringify(state.settings));
         renderSettings();
@@ -708,41 +934,98 @@
         return true;
       } catch (error) {
         setNotice(error.message || 'Could not save.', 'bad');
-        return false;
+        return forStart ? { ok: false } : false;
       } finally {
-        setBusy(false);
+        if (!forStart) setBusy(false);
       }
     }
 
-    function setBusy(value) { state.busy = value; document.querySelectorAll('header .button, #profiles .button, #new-profile, #profile-save').forEach((button) => { button.disabled = value; }); refreshDirty(); }
+    function setBusy(value, stopping = false) { state.busy = value; state.stopping = stopping; document.querySelectorAll('header .button:not(#stop), #profiles .button, #new-profile, #profile-save, #fit-override, #fit-apply, #fit-retry').forEach((button) => { button.disabled = value; }); const stop = $('stop'); if (stop) stop.disabled = stopping; refreshDirty(); renderFit(); }
 
     /* ---------- server actions ---------- */
-    async function serverAction(action, options = {}) {
-      if (state.busy) return;
-      if (action === 'restart' && changedNames().length && !options.confirmed) { $('restart-dialog').hidden = false; return; }
-      setBusy(true);
-      setNotice(`${labelFor(action)}ing the server…`);
-      showTab('server');
+    async function launchLifecycle(action, snapshot, force, actionToken, fitToken) {
+      if (state.actionToken !== actionToken || !fitSnapshotCurrent(snapshot, fitToken)) { if (state.actionToken === actionToken) setBusy(false); return false; }
+      state.fit.override = !!force;
+      setNotice(`${labelFor(action)}ing the server…`); showTab('server');
       try {
-        const { response, body } = await json(`/api/server/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force: false }) });
+        const { response, body } = await json(`/api/server/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force: state.fit.override || force, settings: state.fit.checkedSettings }) });
         if (!response.ok) throw new Error(body.detail || 'The server action could not start.');
         if (!body.jobId) throw new Error('The server did not return a progress job.');
-        state.jobId = body.jobId;
-        pollJob();
+        if (state.actionToken !== actionToken) return false;
+        clearFitResult(); state.jobId = body.jobId; const jobToken = ++state.jobToken; pollJob(jobToken); return true;
       } catch (error) {
-        state.jobId = null;
-        setNotice(error.message || 'The server action could not start.', 'bad');
-        setBusy(false);
+        if (state.actionToken !== actionToken) return false;
+        state.jobId = null; setNotice(error.message || 'The server action could not start.', 'bad'); setBusy(false); return false;
       }
     }
+    async function checkAndLaunch(action, snapshot, options, actionToken) {
+      setNotice('Checking memory fit…');
+      const checked = await requestFit(snapshot, action, options.save, options.bindToForm);
+      if (state.actionToken !== actionToken) return false;
+      if (checked.stale) { setBusy(false); return false; }
+      if (checked.validation) { setBusy(false); return false; }
+      const result = checked.result;
+      const fitsForAction = result?.fits_now;
+      if (!result || result.status !== 'ok' || !fitsForAction) { setBusy(false); return false; }
+      if (Date.now() - state.fit.checkedAt > FIT_MAX_AGE_MS) { setBusy(false); return false; }
+      if (options.save) {
+        const saved = await saveSettings(snapshot, { forStart: true, token: checked.token });
+        if (state.actionToken !== actionToken) return false;
+        if (!saved.ok) { setBusy(false); return false; }
+      }
+      return launchLifecycle(action, snapshot, false, actionToken, checked.token);
+    }
+    async function overrideFit() {
+      const fit = state.fit;
+      if (state.busy || !fit.allowOverride || !fit.checkedSettings || !fit.action) return;
+      const snapshot = fitClone(fit.checkedSettings); const action = fit.action; const save = fit.save; const bindToForm = fit.bindToForm; const fitToken = fit.requestId;
+      fit.allowOverride = false; fit.override = true; renderFit();
+      const actionToken = ++state.actionToken; setBusy(true);
+      if (!fitSnapshotCurrent(snapshot, fitToken)) { invalidateFit(); setBusy(false); return; }
+      if (save) {
+        const saved = await saveSettings(snapshot, { forStart: true, token: fitToken });
+        if (state.actionToken !== actionToken) return;
+        if (!saved.ok) { setBusy(false); return; }
+      }
+      await launchLifecycle(action, snapshot, true, actionToken, fitToken);
+    }
+    function retryFit() {
+      const fit = state.fit;
+      if (state.busy || !fit.checkedSettings || !fit.action) return;
+      serverAction(fit.action, { confirmed: true, settings: fitClone(fit.checkedSettings), save: fit.save, bindToForm: fit.bindToForm });
+    }
+    async function stopServer() {
+      if (state.stopping) return;
+      ++state.actionToken; ++state.jobToken; invalidateFit(); setBusy(true, true); showTab('server'); setNotice('Stopping the server…');
+      try {
+        const { response, body } = await json('/api/server/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force: false }) });
+        if (!response.ok) throw new Error(body.detail || 'The server action could not start.');
+        if (!body.jobId) throw new Error('The server did not return a progress job.');
+        state.jobId = body.jobId; const jobToken = ++state.jobToken; pollJob(jobToken);
+      } catch (error) {
+        state.jobId = null; setNotice(error.message || 'The server action could not start.', 'bad'); setBusy(false);
+      }
+    }
+    async function serverAction(action, options = {}) {
+      if (action === 'stop') return stopServer();
+      if (state.busy) return;
+      if (action === 'restart' && changedNames().length && !options.confirmed) { $('restart-dialog').hidden = false; return; }
+      const actionToken = ++state.actionToken;
+      const explicit = options.settings !== undefined;
+      const snapshot = fitClone(explicit ? options.settings : state.settings);
+      const save = options.save === undefined ? true : options.save;
+      const bindToForm = options.bindToForm === undefined ? (!explicit || save) : options.bindToForm;
+      setBusy(true); await checkAndLaunch(action, snapshot, { save, bindToForm }, actionToken);
+    }
     $('restart-cancel').addEventListener('click', () => { $('restart-dialog').hidden = true; });
-    $('restart-without').addEventListener('click', () => { $('restart-dialog').hidden = true; serverAction('restart', { confirmed: true }); });
-    $('restart-save').addEventListener('click', async () => { $('restart-dialog').hidden = true; if (await saveSettings()) serverAction('restart', { confirmed: true }); });
+    $('restart-without').addEventListener('click', () => { $('restart-dialog').hidden = true; serverAction('restart', { confirmed: true, settings: fitClone(state.saved), save: false, bindToForm: false }); });
+    $('restart-save').addEventListener('click', () => { $('restart-dialog').hidden = true; serverAction('restart', { confirmed: true, settings: fitClone(state.settings), save: true, bindToForm: true }); });
 
-    async function pollJob() {
-      if (!state.jobId) return;
+    async function pollJob(jobToken = state.jobToken) {
+      if (!state.jobId || jobToken !== state.jobToken) return;
       try {
         const { response, body } = await json(`/api/server/jobs/${encodeURIComponent(state.jobId)}`);
+        if (jobToken !== state.jobToken) return;
         if (!response.ok) throw new Error('Could not read server progress.');
         const stage = body.stage || 'working';
         $('job').innerHTML = `<span class="dot ${escapeHtml(stage)}"></span><strong>${escapeHtml(stage.replace(/_/g, ' '))}</strong> <span class="muted">${escapeHtml(body.progress || '')}</span>${body.error ? `<div class="error">${escapeHtml(body.error)}</div>` : ''}`;
@@ -755,8 +1038,9 @@
           loadStatus();
           return;
         }
-        state.jobTimer = setTimeout(pollJob, 1500);
+        state.jobTimer = setTimeout(() => pollJob(jobToken), 1500);
       } catch (error) {
+        if (jobToken !== state.jobToken) return;
         state.jobId = null;
         setNotice(error.message || 'Could not read server progress.', 'bad');
         setBusy(false);
@@ -786,7 +1070,7 @@
       ].join('');
       $('status-updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
       $('server-tab-count').hidden = !server.activeRequests; $('server-tab-count').textContent = `${server.activeRequests || 0} busy`;
-      if (body.currentJob && body.currentJob.jobId && !state.jobId && !['serving', 'stopped', 'failed'].includes(body.currentJob.stage)) { state.jobId = body.currentJob.jobId; setBusy(true); pollJob(); }
+      if (body.currentJob && body.currentJob.jobId && !state.jobId && !['serving', 'stopped', 'failed'].includes(body.currentJob.stage)) { state.jobId = body.currentJob.jobId; const jobToken = ++state.jobToken; setBusy(true, body.currentJob.stage === 'stopping'); pollJob(jobToken); }
     }
 
     async function loadLogs() { const { response, body } = await json('/api/logs?limit=200'); if (response.ok) { const box = $('logs'); const stick = $('auto-follow').checked; box.textContent = (body.lines || []).join('\n') || 'No log lines yet.'; $('log-meta').textContent = body.totalLines ? `Last ${Math.min(200, body.totalLines)} of ${fmt(body.totalLines)} lines · ${body.logPath || ''}` : (body.logPath || ''); if (stick) box.scrollTop = box.scrollHeight; } }
@@ -823,12 +1107,14 @@
     async function loadProfiles() { const { response, body } = await json('/api/profiles'); if (response.ok) { state.profiles = body.profiles || []; renderProfiles(); } }
     async function activateProfile(id) {
       if (changedNames().length) { setNotice('Save or discard the changes before switching profiles.', 'warn'); return; }
+      invalidateFit();
       const { response, body } = await json(`/api/profiles/${encodeURIComponent(id)}/activate`, { method: 'POST' });
       if (!response.ok) { setNotice(body.detail || 'Could not use the profile.', 'bad'); return; }
       await loadSettings(); await loadProfiles();
       setNotice('This profile is now active. Restart the server to use it.', 'good');
     }
     async function applyProfile(id) {
+      invalidateFit();
       const profile = state.profiles.find((item) => item.id === id);
       if (profile && !profile.isPreset) { await activateProfile(id); return; }
       const { response, body } = await json(`/api/profiles/${encodeURIComponent(id)}/apply`, { method: 'POST' });
@@ -887,7 +1173,10 @@
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape') { closeBrowser(); $('restart-dialog').hidden = true; } });
 
     /* ---------- wiring ---------- */
-    $('save').addEventListener('click', saveSettings);
+    $('save').addEventListener('click', () => saveSettings());
+    $('fit-apply').addEventListener('click', applyFitSuggestion);
+    $('fit-override').addEventListener('click', overrideFit);
+    $('fit-retry').addEventListener('click', retryFit);
     $('search').addEventListener('input', () => { state.query = $('search').value; applyFilters(); });
     $('show-advanced').checked = state.showAdvanced;
     $('show-advanced').addEventListener('change', () => { state.showAdvanced = $('show-advanced').checked; try { localStorage.setItem('ft-show-advanced', state.showAdvanced ? '1' : '0'); } catch (_) {} applyFilters(); });

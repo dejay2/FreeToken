@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import datetime as _datetime
+import inspect
 import json
 import os
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -28,6 +31,22 @@ FAILURE_SIGNATURES = (
 )
 
 
+def _supported_kwargs(function: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Drop optional test-seam kwargs without retrying a call after an internal TypeError.
+
+    The production subprocess callables accept the complete keyword set. Tiny injected fakes in
+    settings tests often expose only ``argv``/``stdout``; inspect their signature before invoking
+    them so a TypeError raised by the callable itself can never cause a duplicate spawn/stop.
+    """
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return dict(kwargs)
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return dict(kwargs)
+    return {name: value for name, value in kwargs.items() if name in parameters}
+
+
 # The helper boots servers through PowerShell on Windows and through linux_launch elsewhere
 # (WSL included). Tests pin the branch with ProcessManager(platform_windows=...).
 IS_WINDOWS = os.name == "nt"
@@ -35,6 +54,10 @@ IS_WINDOWS = os.name == "nt"
 
 class LifecycleError(RuntimeError):
     """A lifecycle operation could not be completed."""
+
+
+class _StartCancelled(LifecycleError):
+    """The page requested Stop while a start/restart job was in flight."""
 
 
 @dataclass
@@ -46,6 +69,11 @@ class LifecycleJob:
     started_at: str
     completed_at: str | None = None
     error: str | None = None
+    settings_snapshot: dict[str, Any] | None = field(default=None, repr=False)
+    launch_snapshot: Any = field(default=None, repr=False)
+    force: bool = field(default=False, repr=False)
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    cleanup_pending: bool = field(default=False, repr=False)
     _started_monotonic: float = field(default=0.0, repr=False)
 
     def as_dict(self) -> dict[str, Any]:
@@ -57,6 +85,7 @@ class LifecycleJob:
             "startedAt": self.started_at,
             "completedAt": self.completed_at,
             "error": self.error,
+            "force": self.force,
         }
 
 
@@ -88,6 +117,7 @@ class ProcessManager:
         failure_scan_interval: float = 2.0,
         owner_id: str | None = None,
         executor=None,
+        launch_builder: Callable[..., Any] | None = None,
     ) -> None:
         self.boot_file = Path(boot_file)
         self.stop_script = Path(stop_script)
@@ -111,6 +141,7 @@ class ProcessManager:
         self.failure_scan_interval = float(failure_scan_interval)
         self.owner_id = owner_id or os.environ.get("FREETOKEN_SETTINGS_JOB_ID")
         self._executor = executor
+        self._launch_builder = launch_builder
         self._owned_executor = executor is None
         if self._executor is None:
             from concurrent.futures import ThreadPoolExecutor
@@ -119,21 +150,48 @@ class ProcessManager:
         self._jobs: dict[str, LifecycleJob] = {}
         self._active_id: str | None = None
         self._process: Any = None
+        self._temporary_boot_files: set[Path] = set()
         self._lock = threading.RLock()
 
     # ---- job API ---------------------------------------------------------
 
-    def start(self, action: str = "start") -> str:
-        """Queue a lifecycle action and return its job id immediately."""
+    def start(
+        self,
+        action: str = "start",
+        *,
+        settings: dict[str, Any] | None = None,
+        force: bool = False,
+    ) -> str:
+        """Queue a lifecycle action and return its job id immediately.
+
+        Reserve the job atomically, then prepare its immutable launch outside the lifecycle lock.
+        Stop/status remain responsive during metadata/probe I/O. Stop during preparation or an
+        active start/restart cancels the same job rather than queueing a second job.
+        """
         if action not in {"start", "stop", "restart"}:
             raise ValueError("action must be start, stop, or restart")
         with self._lock:
             if self._active_id is not None:
                 active = self._jobs[self._active_id]
+                if action == "stop" and active.action in {"start", "restart"}:
+                    active.cancel_event.set()
+                    if active.cleanup_pending and active.stage == "failed":
+                        active.stage = "stopping"
+                        active.completed_at = None
+                        active.progress = "Retrying scoped Stop; GPU ownership is retained."
+                        self._executor.submit(self._retry_cancelled_stop, active.job_id)
+                    elif not active.cleanup_pending:
+                        active.progress = "Stopping the in-progress start..."
+                    return active.job_id
+                if action == "stop" and active.action == "stop":
+                    return active.job_id
                 raise LifecycleError(
                     f"Job {active.job_id} is currently active (stage: {active.stage}). "
                     "Cannot start another action."
                 )
+
+            settings_snapshot = copy.deepcopy(settings) if settings is not None else None
+            source_boot = self.boot_file
             initial = "stopping" if action in {"stop", "restart"} else "booting"
             now = self._monotonic()
             job = LifecycleJob(
@@ -142,11 +200,25 @@ class ProcessManager:
                 stage=initial,
                 progress=self._initial_progress(action),
                 started_at=self._iso_now(),
+                settings_snapshot=settings_snapshot,
+                force=bool(force),
                 _started_monotonic=now,
             )
             self._jobs[job.job_id] = job
             self._active_id = job.job_id
-        self._executor.submit(self._run_job, job.job_id)
+        try:
+            if settings_snapshot is not None:
+                job.launch_snapshot = (
+                    self._snapshot_windows_boot(settings_snapshot, source_boot)
+                    if self.platform_windows else self._build_launch_snapshot(settings_snapshot)
+                )
+            self._executor.submit(self._run_job, job.job_id)
+        except Exception as exc:
+            with self._lock:
+                self._finish(job.job_id, "failed", "Launch preparation failed.", error=str(exc))
+                if self._active_id == job.job_id:
+                    self._active_id = None
+            raise
         return job.job_id
 
     submit = start
@@ -167,9 +239,79 @@ class ProcessManager:
             return job.as_dict() if job is not None else None
 
     def close(self) -> None:
+        self._cleanup_temporary_boot_files()
         if self._owned_executor:
             self._executor.shutdown(wait=False, cancel_futures=False)
             self._owned_executor = False
+
+    def _build_launch_snapshot(self, settings: dict[str, Any]) -> Any:
+        builder = self._launch_builder
+        if builder is None:
+            from .linux_launch import build_launch
+
+            builder = build_launch
+        try:
+            return builder(settings, base_env=dict(os.environ))
+        except Exception as exc:  # noqa: BLE001 - surface launch normalization as lifecycle input error
+            raise LifecycleError(f"could not normalize accepted launch: {exc}") from exc
+
+    def _snapshot_windows_boot(self, settings: dict[str, Any], source_boot: Path) -> tuple[Path, str]:
+        from .boot_parser import BootFile
+
+        try:
+            source = BootFile(source_boot)
+            return source.path, source._serialize(source.read_document(), dict(settings))
+        except Exception as exc:
+            raise LifecycleError(f"could not snapshot accepted Windows launch: {exc}") from exc
+
+    def _stage_windows_boot(self, settings: dict[str, Any], *, launch: Any = None) -> Path:
+        """Materialize an accepted settings snapshot without rewriting the active boot file.
+
+        The Windows launcher accepts settings only through its PowerShell boot document. A unique
+        sibling script keeps an accepted start/restart immutable even if the active profile changes
+        before the worker reaches PowerShell. It is removed after the worker finishes (or by the
+        scoped stop path), while the original file remains byte-for-byte untouched.
+        """
+        try:
+            source_path, staged = launch if launch is not None else self._snapshot_windows_boot(settings, self.boot_file)
+            descriptor, path = tempfile.mkstemp(
+                prefix=f".{source_path.stem}.launch-",
+                suffix=source_path.suffix or ".ps1",
+                dir=source_path.parent,
+            )
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(staged)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+                raise
+            staged_path = Path(path)
+            with self._lock:
+                self._temporary_boot_files.add(staged_path)
+            return staged_path
+        except Exception as exc:  # noqa: BLE001 - surface accepted launch materialization
+            if isinstance(exc, LifecycleError):
+                raise
+            raise LifecycleError(f"could not materialize accepted Windows launch: {exc}") from exc
+
+    def _discard_temporary_boot(self, path: Path) -> None:
+        with self._lock:
+            self._temporary_boot_files.discard(path)
+        with contextlib.suppress(FileNotFoundError, OSError):
+            path.unlink()
+
+    def _cleanup_temporary_boot_files(self) -> None:
+        with self._lock:
+            paths = tuple(self._temporary_boot_files)
+            self._temporary_boot_files.clear()
+        for path in paths:
+            with contextlib.suppress(FileNotFoundError, OSError):
+                path.unlink()
 
     # ---- direct process operations (also useful to tests) ----------------
 
@@ -194,18 +336,24 @@ class ProcessManager:
         try:
             result = self._runner(
                 command,
-                capture_output=True,
-                text=True,
-                timeout=130.0,
-                check=False,
+                **_supported_kwargs(
+                    self._runner,
+                    {
+                        "capture_output": True,
+                        "text": True,
+                        "timeout": 130.0,
+                        "check": False,
+                    },
+                ),
             )
-        except TypeError:
-            # Keep the seam usable with tiny test doubles that only accept argv.
-            result = self._runner(command)
-        self._append_process_output(result)
-        if getattr(result, "returncode", 0) not in (0, None):
-            raise LifecycleError(f"stop script exited with code {result.returncode}")
-        return result
+            self._append_process_output(result)
+            if getattr(result, "returncode", 0) not in (0, None):
+                raise LifecycleError(f"stop script exited with code {result.returncode}")
+            return result
+        finally:
+            # A staged start script has served its purpose once the scoped stop path returns,
+            # including a reported stop failure; never leave accepted snapshots accumulating.
+            self._cleanup_temporary_boot_files()
 
     def _run_stop_linux(self) -> Any:
         """Stop through /proc instead of the PowerShell stop script (WSL and native Linux)."""
@@ -219,12 +367,65 @@ class ProcessManager:
             raise LifecycleError(f"server on port {self.port} did not stop cleanly: {text}")
         return report
 
-    def _run_start_linux(self, log: Any) -> Any:
-        """Map the boot file onto ``ft serve`` (linux_launch) and start it detached."""
-        from .boot_parser import BootFile
-        from .linux_launch import build_launch
+    def _confirm_cancelled_stop(self) -> None:
+        """Require an empty scoped process set, not just free ports or low VRAM."""
+        if not self.platform_windows:
+            from .linux_launch import find_server_pids
 
-        plan = build_launch(BootFile(self.boot_file).load())
+            remaining = find_server_pids(self.port)
+        else:
+            # Reuse the stop script's read-only selectors; do not invent a second kill scope.
+            script = str(self.stop_script).replace("'", "''")
+            command = [
+                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                f"$ErrorActionPreference = 'Stop'; . '{script}' -DotSourceOnly; "
+                f"$ids = @(Select-FreeTokenKillSet -Processes (Get-FreeTokenProcessSnapshot) -Port {self.port}); "
+                "ConvertTo-Json -InputObject @($ids) -Compress",
+            ]
+            result = self._runner(command, **_supported_kwargs(self._runner, {
+                "capture_output": True, "text": True, "timeout": 10.0, "check": False,
+            }))
+            if getattr(result, "returncode", None) != 0:
+                raise LifecycleError("could not confirm the stopped process set")
+            remaining = json.loads(result.stdout)
+            if not isinstance(remaining, list) or any(type(pid) is not int for pid in remaining):
+                raise LifecycleError("invalid stopped-process confirmation")
+        if remaining:
+            raise LifecycleError("scoped server processes remain after Stop")
+
+    def _retry_cancelled_stop(self, job_id: str) -> None:
+        job = self._get_job_object(job_id)
+        try:
+            self.run_stop()
+            self._confirm_cancelled_stop()
+        except Exception as exc:
+            self._finish(job_id, "failed", "Stop could not be confirmed; retry Stop.", error=str(exc))
+            return
+        with self._lock:
+            job.cleanup_pending = False
+            self._finish(job_id, "stopped", "Start cancelled; server stopped.")
+            self.release_gpu_lock(self.owner_id or job_id)
+            if self._active_id == job_id:
+                self._active_id = None
+
+    def _run_start_linux(
+        self,
+        log: Any,
+        *,
+        launch: Any = None,
+        settings: dict[str, Any] | None = None,
+    ) -> Any:
+        """Map the accepted snapshot onto ``ft serve`` and start it detached."""
+        from .boot_parser import BootFile
+
+        if launch is not None:
+            plan = launch
+        elif settings is not None:
+            plan = self._build_launch_snapshot(settings)
+        else:
+            from .linux_launch import build_launch
+
+            plan = build_launch(BootFile(self.boot_file).load())
         for note in plan.notes:
             log.write(f"  Note: {note}\n".encode())
         log.write(f"  {plan.command_line()}\n".encode())
@@ -235,30 +436,35 @@ class ProcessManager:
             "env": plan.env,
             "start_new_session": True,  # the helper may restart; the server must outlive it
         }
-        try:
-            return self._popen(plan.argv, **kwargs)
-        except TypeError:
-            kwargs.pop("start_new_session", None)
-            kwargs.pop("env", None)
-            return self._popen(plan.argv, **kwargs)
+        return self._popen(plan.argv, **_supported_kwargs(self._popen, kwargs))
 
-    def run_start(self) -> Any:
+    def run_start(
+        self,
+        *,
+        launch: Any = None,
+        settings: dict[str, Any] | None = None,
+    ) -> Any:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("ab", buffering=0) as log:
             separator = f"\n===== settings helper start {_datetime.datetime.now().isoformat()} =====\n".encode()
             log.write(separator)
             if not self.platform_windows:
-                process = self._run_start_linux(log)
+                process = self._run_start_linux(log, launch=launch, settings=settings)
                 with self._lock:
                     self._process = process
                 return process
+            temporary_boot = None
+            boot_path = self.boot_file
+            if launch is not None or settings is not None:
+                temporary_boot = self._stage_windows_boot(settings or {}, launch=launch)
+                boot_path = temporary_boot
             command = [
                 "powershell.exe",
                 "-NoProfile",
                 "-ExecutionPolicy",
                 "Bypass",
                 "-File",
-                str(self.boot_file),
+                str(boot_path),
             ]
             kwargs = {
                 "stdout": log,
@@ -269,28 +475,36 @@ class ProcessManager:
             if creationflags:
                 kwargs["creationflags"] = creationflags
             try:
-                process = self._popen(command, **kwargs)
-            except TypeError:
-                # Small test doubles and non-Windows launchers may only accept argv/stdout.
-                kwargs.pop("creationflags", None)
-                process = self._popen(command, **kwargs)
+                process = self._popen(command, **_supported_kwargs(self._popen, kwargs))
+            except Exception:
+                if temporary_boot is not None:
+                    self._discard_temporary_boot(temporary_boot)
+                raise
         with self._lock:
             self._process = process
         return process
 
     def wait_until_serving(
-        self, timeout: float | None = None, *, job_id: str | None = None
+        self,
+        timeout: float | None = None,
+        *,
+        job_id: str | None = None,
+        cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         timeout = self.readiness_timeout if timeout is None else float(timeout)
         started = self._monotonic()
         deadline = started + timeout
         last_scan = -float("inf")
         while True:
+            if cancel is not None and cancel():
+                raise _StartCancelled("start cancelled by Stop")
             try:
                 document = self._readiness()
             except Exception as exc:  # noqa: BLE001 — an unreachable server is still booting
                 document = {"state": "unreachable", "error": str(exc)}
             if isinstance(document, dict) and document.get("state") == "serving":
+                if cancel is not None and cancel():
+                    raise _StartCancelled("start cancelled by Stop")
                 return document
 
             if job_id is not None:
@@ -318,12 +532,20 @@ class ProcessManager:
             remaining = max(0.0, deadline - now)
             self._sleep(min(self.poll_interval, remaining))
 
-    def acquire_gpu_lock(self, owner_id: str, timeout: float | None = None) -> bool:
+    def acquire_gpu_lock(
+        self,
+        owner_id: str,
+        timeout: float | None = None,
+        *,
+        cancel: Callable[[], bool] | None = None,
+    ) -> bool:
         """Acquire our lock, or wait on a different owner's lock without deleting it."""
         timeout = self.lock_timeout if timeout is None else float(timeout)
         deadline = self._monotonic() + timeout
         owner_id = str(owner_id)
         while True:
+            if cancel is not None and cancel():
+                return False
             existing = self._read_lock()
             if existing and existing != owner_id:
                 if self._monotonic() >= deadline:
@@ -419,30 +641,70 @@ class ProcessManager:
     def _run_job(self, job_id: str) -> None:
         lock_owner = self.owner_id or job_id
         acquired = False
+        spawned = False
+        stop_attempted = False
         try:
             job = self._get_job_object(job_id)
+            cancelled = job.cancel_event.is_set
             if job.action in {"stop", "restart"}:
-                self._set_progress(job_id, "stopping", "Running the Windows stop script for port 2020...")
+                self._set_progress(job_id, "stopping", "Running the server stop path for port 2020...")
+                stop_attempted = True
                 self.run_stop()
             if job.action == "stop":
                 self._finish(job_id, "stopped", "Server stopped.")
                 return
+            if cancelled():
+                raise _StartCancelled("start cancelled by Stop")
             self._set_progress(job_id, "waiting_for_gpu_lock", "Waiting for the GPU lock before starting port 2020...")
-            acquired = self.acquire_gpu_lock(lock_owner)
+            acquired = self.acquire_gpu_lock(lock_owner, cancel=cancelled)
             if not acquired:
+                if cancelled():
+                    raise _StartCancelled("start cancelled while waiting for the GPU lock")
                 raise LifecycleError("timed out waiting for the GPU lock")
-            self._set_progress(job_id, "booting", "Starting boot-2020.ps1 and waiting for serving state...")
-            self.run_start()
-            self.wait_until_serving(job_id=job_id)
-            self._finish(job_id, "serving", "Server is serving on port 2020.")
+            if cancelled():
+                raise _StartCancelled("start cancelled before spawn")
+            self._set_progress(job_id, "booting", "Starting the accepted launch and waiting for serving state...")
+            self.run_start(launch=job.launch_snapshot, settings=job.settings_snapshot)
+            spawned = True
+            if cancelled():
+                raise _StartCancelled("start cancelled after spawn")
+            self.wait_until_serving(job_id=job_id, cancel=cancelled)
+            if cancelled():
+                raise _StartCancelled("start cancelled as serving state arrived")
+            self._finish_serving(job_id)
+        except _StartCancelled as exc:
+            # Stop the same accepted job. This is deliberately inside the worker so a late spawn
+            # cannot race a second queued stop and readiness can never overwrite ``stopped``.
+            if spawned or stop_attempted:
+                try:
+                    if spawned:
+                        self.run_stop()
+                    self._confirm_cancelled_stop()
+                except Exception as stop_exc:  # noqa: BLE001 - retain ownership until confirmed cleanup
+                    with self._lock:
+                        job.cleanup_pending = True
+                        self._finish(job_id, "failed", "Stop could not be confirmed; retry Stop.",
+                                     error=f"{exc}; stop path: {stop_exc}")
+                    return
+            self._finish(job_id, "stopped", "Start cancelled; server stopped.")
         except Exception as exc:  # noqa: BLE001 — a failed job must not kill the helper
-            self._finish(job_id, "failed", "Lifecycle action failed.", error=str(exc))
-        finally:
-            if acquired:
-                self.release_gpu_lock(lock_owner)
+            error = str(exc)
+            self._cleanup_temporary_boot_files()
             with self._lock:
-                if self._active_id == job_id:
-                    self._active_id = None
+                if stop_attempted and job.cancel_event.is_set():
+                    job.cleanup_pending = True
+                progress = "Stop could not be confirmed; retry Stop." if job.cleanup_pending else "Lifecycle action failed."
+                self._finish(job_id, "failed", progress, error=error)
+        finally:
+            # A staged Windows launch is needed only until the accepted worker has crossed its
+            # spawn/readiness boundary. Never retain profile snapshots after this job terminates.
+            self._cleanup_temporary_boot_files()
+            with self._lock:
+                if not job.cleanup_pending:
+                    if acquired:
+                        self.release_gpu_lock(lock_owner)
+                    if self._active_id == job_id:
+                        self._active_id = None
 
     # ---- internal helpers ------------------------------------------------
 
@@ -457,10 +719,35 @@ class ProcessManager:
                 job.stage = stage
                 job.progress = progress
 
+    def _finish_serving(self, job_id: str) -> None:
+        """Commit serving atomically with the last cancellation check.
+
+        Stop can arrive after readiness returns but before the worker publishes its terminal
+        state. Keep the check and the terminal transition under the same lock; if the transition
+        wins first, Stop queues a normal stop job instead of losing the request in the worker's
+        finalizer.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            if job.cancel_event.is_set():
+                raise _StartCancelled("start cancelled before serving state was committed")
+            if job.stage == "stopped":
+                return
+            job.stage = "serving"
+            job.progress = "Server is serving on port 2020."
+            job.error = None
+            job.completed_at = self._iso_now()
+            if self._active_id == job_id:
+                self._active_id = None
+
     def _finish(self, job_id: str, stage: str, progress: str, error: str | None = None) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
+                return
+            if job.stage == "stopped" and stage != "stopped":
                 return
             job.stage = stage
             job.progress = progress

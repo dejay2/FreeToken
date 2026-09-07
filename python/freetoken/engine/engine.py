@@ -2395,16 +2395,20 @@ def _pin_budget_bytes(reserved: int = 0) -> int | None:
 
 
 def _auto_cpu_layers(
-    config: EngineConfig, num_moe_layers: int, reserved: int = 0, gpu_owned: int = 0
+    config: EngineConfig, num_moe_layers: int, reserved: int = 0, gpu_owned: int = 0,
+    *, bank_bytes: int | None = None,
 ) -> frozenset[int]:
     """Pick CPU (locked) MoE layers automatically when the banks exceed the pin budget.
 
     Locks just enough head+tail layers: per-layer decode miss rates are U-shaped, so the ends are the cheapest to move off the slot cache."""
     from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
-    bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(
-        config.model_config, gpu_owned=gpu_owned
-    )
+    # The metadata-only estimator reuses this placement policy across candidates without
+    # rereading the same FTW headers. Ordinary boots retain the existing metadata lookup.
+    if bank_bytes is None:
+        bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(
+            config.model_config, gpu_owned=gpu_owned
+        )
     if not bank_bytes:
         return frozenset()
     budget = _pin_budget_bytes(reserved)

@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from .boot_parser import BootFile, BootParseError, BootValidationError
 from .browse import BROWSE_KINDS, list_directory
@@ -26,6 +27,7 @@ from .dials import (
 )
 from .download import DownloadManager, create_download_router
 from .model_info import ModelInfo, read_model
+from .memory_fit import EstimateUnavailable, MemoryFitService, SettingsValidationError, prepare_settings
 from .process_manager import LifecycleError, ProcessManager
 from .profiles_manager import ProfileError, ProfileValidationError, ProfilesManager
 
@@ -44,6 +46,7 @@ class ProfileBody(BaseModel):
 
 class ServerActionBody(BaseModel):
     force: bool = False
+    settings: dict[str, Any] | None = None
 
 
 def repository_root() -> Path:
@@ -146,6 +149,7 @@ def create_app(
     static_path: str | os.PathLike[str] | None = None,
     downloads_dir: str | os.PathLike[str] | None = None,
     models_dir: str | os.PathLike[str] | None = None,
+    estimate_service: MemoryFitService | Any | None = None,
     version: str = HELPER_VERSION,
     wall_now=time.time,
 ) -> FastAPI:
@@ -206,6 +210,7 @@ def create_app(
     app.state.models_dir = model_root
     app.state.downloads_dir = download_root
     app.state.download_manager = download_manager
+    app.state.estimate_service = estimate_service or MemoryFitService()
     app.state.started_monotonic = started
     app.include_router(create_download_router(models_dir=model_root, manager=download_manager))
 
@@ -250,6 +255,33 @@ def create_app(
     async def get_model(path: str = Query(default="")):
         """Describe a model folder from its config.json alone (no weight files are opened)."""
         return read_model(path).as_dict()
+
+    @app.post("/api/settings/estimate")
+    async def estimate_settings_route(body: SettingsBody):
+        """Estimate the submitted snapshot without saving it or starting a server."""
+        try:
+            # The service validates/canonicalizes once inside this offload, then passes that
+            # snapshot to the child. Header I/O must not hold up Stop or status on the event loop.
+            return await run_in_threadpool(
+                app.state.estimate_service.estimate_settings,
+                body.settings,
+                boot_file=boot,
+            )
+        except SettingsValidationError as exc:
+            return _validation_response(exc.errors)
+        except BootParseError as exc:
+            raise _boot_http_error(exc) from exc
+        except EstimateUnavailable as exc:
+            content = {
+                "version": 1,
+                "status": "unavailable",
+                "fits": None,
+                "fits_now": None,
+                "fits_empty": None,
+                "suggestion": None,
+                "error": {"code": exc.code, "message": exc.message[:512]},
+            }
+            return JSONResponse(status_code=503, content=content)
 
     @app.put("/api/settings")
     async def put_settings(body: SettingsBody):
@@ -428,8 +460,24 @@ def create_app(
     async def server_action(action: str, body: ServerActionBody | None = None):
         if action not in {"start", "stop", "restart"}:
             raise HTTPException(status_code=422, detail="action must be start, stop, or restart")
+        body = body or ServerActionBody()
+        if body.settings is not None and action == "stop":
+            raise HTTPException(status_code=422, detail="settings are accepted only for start or restart")
+        accepted = None
+        if body.settings is not None:
+            try:
+                accepted = await run_in_threadpool(
+                    prepare_settings,
+                    body.settings,
+                    boot_file=boot,
+                    require_model_metadata=False,
+                )
+            except SettingsValidationError as exc:
+                return _validation_response(exc.errors)
+            except BootParseError as exc:
+                raise _boot_http_error(exc) from exc
         try:
-            job_id = process_manager.start(action)
+            job_id = await run_in_threadpool(process_manager.start, action, settings=accepted, force=body.force)
         except LifecycleError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         job = process_manager.job(job_id) or {}
