@@ -869,7 +869,7 @@ async def cache_step(req: CacheStepRequest):
 
 @app.get("/v1/cache/residency")
 async def cache_residency(timeout: float = 10.0):
-    """Report current layer residency and cache sizes."""
+    """Report current layer residency, cache sizes, and model-derived ``layer_bytes``."""
     state = get_global_state()
     now = time.monotonic()
     if state._residency_cache is not None and (now - state._residency_time) < 5.0:

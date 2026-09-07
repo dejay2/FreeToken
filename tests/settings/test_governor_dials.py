@@ -45,7 +45,7 @@ def test_governor_dials_metadata_and_validation() -> None:
     gov = dials.DIAL_BY_NAME["MemoryGovernor"]
     assert gov.control == "toggle"
     assert gov.default is True
-    assert gov.group == "Expert slots and card memory"
+    assert gov.group == "Memory governor"
     assert list(gov.effects) == ["speed:down"]
 
     vram = dials.DIAL_BY_NAME["GovernorVRAMFreeGB"]
@@ -70,6 +70,24 @@ def test_governor_dials_metadata_and_validation() -> None:
     assert dials.canonical_value(vram, 2.0) == 2.0
     assert dials.canonical_value(ram, 8.0) == 8.0
 
+    expected = {
+        "GovernorUpMarginGB": (0.5, 0.0, 8.0),
+        "GovernorStepIntervalS": (5.0, 1.0, 60.0),
+        "GovernorUpHoldS": (60.0, 0.0, 600.0),
+        "GovernorMaxHoldS": (600.0, 60.0, 3600.0),
+        "GovernorPostUpGraceS": (10.0, 0.0, 120.0),
+        "GovernorRAMRungsBeforeUp": (2, 1, 4),
+        "GovernorVRAMRungsBeforeUp": (1, 1, 4),
+    }
+    for name, (default, minimum, maximum) in expected.items():
+        dial = dials.DIAL_BY_NAME[name]
+        assert dial.group == "Memory governor"
+        assert dial.default == default
+        assert dial.minimum == minimum and dial.maximum == maximum
+        assert dial.source == "helper"
+        assert dial.advanced is True
+        assert not dials.validate_settings({name: default})
+
 
 def test_governor_dials_save_and_load(tmp_path: Path) -> None:
     boot_path = _copy_boot(tmp_path)
@@ -80,21 +98,41 @@ def test_governor_dials_save_and_load(tmp_path: Path) -> None:
         "MemoryGovernor": True,
         "GovernorVRAMFreeGB": 2.5,
         "GovernorRAMFreeGB": 8.0,
+        "GovernorUpMarginGB": 0.75,
+        "GovernorStepIntervalS": 7.5,
+        "GovernorUpHoldS": 90.0,
+        "GovernorMaxHoldS": 900.0,
+        "GovernorPostUpGraceS": 15.0,
+        "GovernorRAMRungsBeforeUp": 3,
+        "GovernorVRAMRungsBeforeUp": 2,
     })
     assert saved["MemoryGovernor"] is True
     assert saved["GovernorVRAMFreeGB"] == 2.5
     assert saved["GovernorRAMFreeGB"] == 8.0
+    assert saved["GovernorUpMarginGB"] == 0.75
+    assert saved["GovernorRAMRungsBeforeUp"] == 3
 
     # Reload from disk to verify persistence
     reloaded = BootFile(boot_path).load()
     assert reloaded["MemoryGovernor"] is True
     assert reloaded["GovernorVRAMFreeGB"] == 2.5
     assert reloaded["GovernorRAMFreeGB"] == 8.0
+    assert reloaded["GovernorUpMarginGB"] == 0.75
+    assert reloaded["GovernorStepIntervalS"] == 7.5
+    assert reloaded["GovernorUpHoldS"] == 90.0
+    assert reloaded["GovernorMaxHoldS"] == 900.0
+    assert reloaded["GovernorPostUpGraceS"] == 15.0
+    assert reloaded["GovernorRAMRungsBeforeUp"] == 3
+    assert reloaded["GovernorVRAMRungsBeforeUp"] == 2
 
     content = boot_path.read_text(encoding="utf-8")
     assert "-MemoryGovernor" in content
     assert "-GovernorVRAMFreeGB 2.5" in content
     assert "-GovernorRAMFreeGB 8" in content
+    assert "-GovernorUpMarginGB 0.75" in content
+    assert "-GovernorStepIntervalS 7.5" in content
+    assert "-GovernorRAMRungsBeforeUp 3" in content
+    assert content.index("-GovernorRAMFreeGB") < content.index("-GovernorUpMarginGB")
 
     # Now turn MemoryGovernor off and save again
     saved_off = boot.save({"MemoryGovernor": False})
@@ -105,8 +143,47 @@ def test_governor_dials_save_and_load(tmp_path: Path) -> None:
     assert "-MemoryGovernor" not in content_off
 
 
+def test_governor_defaults_are_written_as_helper_lines(tmp_path: Path) -> None:
+    boot_path = _copy_boot(tmp_path)
+    defaults = {
+        name: dials.DIAL_BY_NAME[name].default
+        for name in (
+            "GovernorUpMarginGB", "GovernorStepIntervalS", "GovernorUpHoldS",
+            "GovernorMaxHoldS", "GovernorPostUpGraceS", "GovernorRAMRungsBeforeUp",
+            "GovernorVRAMRungsBeforeUp",
+        )
+    }
+    BootFile(boot_path).save(defaults)
+    text = boot_path.read_text(encoding="utf-8")
+    assert "-GovernorUpMarginGB 0.5" in text
+    assert "-GovernorStepIntervalS 5" in text
+    assert "-GovernorUpHoldS 60" in text
+    assert "-GovernorMaxHoldS 600" in text
+    assert "-GovernorPostUpGraceS 10" in text
+    assert "-GovernorRAMRungsBeforeUp 2" in text
+    assert "-GovernorVRAMRungsBeforeUp 1" in text
+    assert BootFile(boot_path).load()["GovernorVRAMRungsBeforeUp"] == 1
+
+
 def _plan(settings: dict) -> object:
     return build_launch({"ModelPath": "/models/demo", **settings}, python="py", base_env={}, facts=_facts(), wsl=False)
+
+
+def test_governor_helper_dials_do_not_enter_server_launch() -> None:
+    plan = _plan({
+        "GovernorUpMarginGB": 8.0,
+        "GovernorStepIntervalS": 60.0,
+        "GovernorUpHoldS": 600.0,
+        "GovernorMaxHoldS": 3600.0,
+        "GovernorPostUpGraceS": 120.0,
+        "GovernorRAMRungsBeforeUp": 4,
+        "GovernorVRAMRungsBeforeUp": 4,
+    })
+    assert not any(name in plan.argv for name in (
+        "GovernorUpMarginGB", "GovernorStepIntervalS", "GovernorUpHoldS",
+        "GovernorMaxHoldS", "GovernorPostUpGraceS", "GovernorRAMRungsBeforeUp",
+        "GovernorVRAMRungsBeforeUp",
+    ))
 
 
 def test_governor_cushion_maps_onto_headroom_never_the_reserve() -> None:

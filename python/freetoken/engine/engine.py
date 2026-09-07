@@ -1762,7 +1762,22 @@ class Engine:
                 "owned": 0,
                 "pinned": 0,
                 "disk": 0,
+                "layer_bytes": 0,
             }
+        layer_bytes = 0
+        try:
+            from freetoken.engine.cache_budget import expert_bytes_per_slot
+
+            model_config = getattr(self.config, "model_config", None)
+            num_experts = int(getattr(model_config, "num_experts", 0) or 0)
+            if num_experts and self.moe_offload_cache.bank_sources:
+                per_expert_bytes = expert_bytes_per_slot(
+                    self.moe_offload_cache.bank_sources,
+                    getattr(self, "_gpu_owned_layer_ids", frozenset()),
+                )
+                layer_bytes = num_experts * int(per_expert_bytes)
+        except Exception:  # noqa: BLE001 - unknown bank geometry reports zero to the helper
+            layer_bytes = 0
         # String keys on purpose: this dict rides inside CacheResidencyResultMsg through the
         # tokenizer/detokenizer workers, whose msgpack decoder runs with strict_map_key (int
         # keys raise "int is not allowed for map key"). Seen live 2026-09-07: the first
@@ -1777,6 +1792,7 @@ class Engine:
             "owned": owned,
             "pinned": pinned,
             "disk": disk,
+            "layer_bytes": layer_bytes,
         }
 
     @torch.inference_mode()
