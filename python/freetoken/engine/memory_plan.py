@@ -1412,12 +1412,26 @@ def _suggestion(
                 return result
         return None
 
+    base_pool_auto = _int(base_settings.get("KVCacheTokens")) <= 0
+
     for target in ("now", "empty"):
         if target == "empty" and fits(base_result, "empty"):
             return None
         result = tier_search(target)
+        current_context = _int(base_settings.get("ContextTokens"))
+        if result is None and base_pool_auto and current_context > 0:
+            # An automatic pool (KVCacheTokens = 0) grows to fill whatever the lower tiers just
+            # freed, so tier_search above can never reach a fit while it stays automatic; the
+            # search then fell through to halving the context, which is the wrong advice.
+            # Measured live on the RTX 5090 serving box 2026-09-07: with ContextTokens = 262,144
+            # and an automatic pool the engine allocated 617,856 tokens (7.62 GiB) and left about
+            # 2.3 GiB, then the 2.56 GiB MTP draft head overflowed and the first prompt killed the
+            # scheduler with "CUDA driver error: device not ready". KVCacheTokens = 262,208
+            # (context + one 64-token page) left 4.25 GiB free after init, captured every MTP graph
+            # and served a 247k-token prompt. So pin the pool at the user's own context before
+            # proposing a shorter chat.
+            result = tier_search(target, context=current_context)
         if result is None:
-            current_context = _int(base_settings.get("ContextTokens"))
             page = page_size
             if current_context > 64:
                 context = max(64, ((current_context // 2) // page) * page)
@@ -1451,6 +1465,12 @@ def _suggestion(
                 "ContextTokens": "Reserve less single-chat context memory.",
                 "KVCacheTokens": "Use an explicit KV pool sized for the smaller context.",
             }
+            if "ContextTokens" not in patch:
+                # The context is unchanged, so this is the pin-the-pool fix, not a smaller chat.
+                reasons["KVCacheTokens"] = (
+                    "Pin the KV pool to the chosen context; 0 lets it fill the card and leaves "
+                    "no room for the rest of the boot."
+                )
             for name in control_names:
                 if name in patch:
                     changes.append(

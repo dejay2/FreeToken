@@ -15,24 +15,41 @@ from .dials import validate_settings
 from .profile_scripts import render_boot_script
 
 
+# Both presets pin KVCacheTokens rather than leaving it automatic. Measured live on the RTX 5090
+# serving box 2026-09-07: at ContextTokens = 262,144 an automatic pool sized itself to 617,856
+# tokens (7.62 GiB) to fill the card, left about 2.3 GiB, and the 2.56 GiB MTP draft head then
+# overflowed VRAM and the first prompt killed the scheduler. 262,208 = 262,144 + one 64-token page
+# (--num-tokens must be page-aligned) left 4.25 GiB free and served a 247k-token prompt.
 PRESET_PROFILES: tuple[dict[str, Any], ...] = (
     {
         "id": "profile-a",
         "name": "Profile A (BF16 Default)",
-        "description": "262K context, 4,188 slots, BF16 KV cache, parking off",
+        "description": "262K context, 262K KV pool, 4,188 slots, BF16 KV cache, parking off",
         "isPreset": True,
         "label": "preset",
         "kind": "preset",
-        "settings": {"KVDtype": "bf16", "MoECacheSize": 4188, "KVPark": "off"},
+        "settings": {
+            "ContextTokens": 262144,
+            "KVCacheTokens": 262208,
+            "KVDtype": "bf16",
+            "MoECacheSize": 4188,
+            "KVPark": "off",
+        },
     },
     {
         "id": "profile-b",
         "name": "Profile B (FP8)",
-        "description": "262K context, 5,332 slots, FP8 KV cache, parking off",
+        "description": "262K context, 262K KV pool, 5,332 slots, FP8 KV cache, parking off",
         "isPreset": True,
         "label": "preset",
         "kind": "preset",
-        "settings": {"KVDtype": "fp8", "MoECacheSize": 5332, "KVPark": "off"},
+        "settings": {
+            "ContextTokens": 262144,
+            "KVCacheTokens": 262208,
+            "KVDtype": "fp8",
+            "MoECacheSize": 5332,
+            "KVPark": "off",
+        },
     },
 )
 

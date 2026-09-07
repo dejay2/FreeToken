@@ -667,7 +667,9 @@ def test_suggestion_revalidates_the_winning_full_snapshot(monkeypatch):
     )
 
     assert suggestion is not None and suggestion["settings"]["ContextTokens"] == 512
-    assert sum(1 for item in calls if item[0] == "render") == 3
+    # base context, the pinned-pool retry at the base context, the halved context, and the
+    # fresh re-evaluation of the winner.
+    assert sum(1 for item in calls if item[0] == "render") == 4
     candidates = [item[1] for item in calls if item[0] == "candidate"]
     assert candidates[-2] == candidates[-1]
 
@@ -789,3 +791,99 @@ def test_context_fallback_uses_resolved_page_size_without_geometry(monkeypatch):
     assert suggestion["settings"]["ContextTokens"] == 64
     assert suggestion["settings"]["KVCacheTokens"] == 128
     assert all(candidate["KVCacheTokens"] % 64 == 0 for candidate in candidates)
+
+
+def _pin_pool_suggestion(monkeypatch, *, context: int, fits_for):
+    """Run _suggestion over a fake planner whose fit rule is ``fits_for(settings)``."""
+    memory_plan = _memory_plan_module()
+    candidates: list[dict] = []
+    base_config = SimpleNamespace(
+        model_config=SimpleNamespace(num_moe_layers=0, num_experts=0),
+        page_size=64,
+    )
+    base_settings = {
+        "MoECacheSize": 0,
+        "GpuOwnedLayers": "",
+        "ContextTokens": context,
+        "KVCacheTokens": 0,
+    }
+    base_result = {
+        "fits_now": False,
+        "fits_empty": False,
+        "geometry": {"now": {"page_size": 64, "total_slots": 0}},
+    }
+
+    monkeypatch.setattr(memory_plan, "_owned_layers", lambda _config: frozenset())
+    monkeypatch.setattr(memory_plan, "_ceil_div", lambda value, divisor: (value + divisor - 1) // divisor)
+    monkeypatch.setattr(
+        memory_plan,
+        "_candidate_config",
+        lambda _base, settings, **_kwargs: candidates.append(dict(settings)) or SimpleNamespace(),
+    )
+    monkeypatch.setattr(memory_plan, "_evaluate_scenarios", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        memory_plan,
+        "_render_plan",
+        lambda request, *_args: {
+            "fits_now": fits_for(request["settings"]),
+            "fits_empty": fits_for(request["settings"]),
+        },
+    )
+
+    suggestion = memory_plan._suggestion(
+        base_settings=base_settings,
+        base_result=base_result,
+        base_config=base_config,
+        machine={},
+        environment={},
+        model_bytes={},
+        host_tables=0,
+        vision_workspace=0,
+        table_components=[],
+        per_expert=0,
+        source_format="none",
+        runtime_format="none",
+    )
+    return suggestion, candidates
+
+
+def test_auto_pool_is_pinned_at_the_same_context_before_the_chat_is_shortened(monkeypatch):
+    # The live failure this guards: an automatic pool grows into whatever the lower tiers free,
+    # so only an explicit pool can fit, and the old search shortened the chat instead.
+    suggestion, candidates = _pin_pool_suggestion(
+        monkeypatch,
+        context=262144,
+        fits_for=lambda settings: settings.get("KVCacheTokens", 0) > 0,
+    )
+
+    assert suggestion is not None
+    assert "ContextTokens" not in suggestion["settings"]
+    assert suggestion["settings"]["KVCacheTokens"] == 262208
+    reasons = {item["name"]: item["reason"] for item in suggestion["changes"]}
+    assert reasons["KVCacheTokens"] == (
+        "Pin the KV pool to the chosen context; 0 lets it fill the card and leaves "
+        "no room for the rest of the boot."
+    )
+    # The chat length was never halved on the way there.
+    assert all(candidate["ContextTokens"] == 262144 for candidate in candidates)
+
+
+def test_context_is_still_halved_when_a_pinned_pool_at_full_context_does_not_fit(monkeypatch):
+    suggestion, candidates = _pin_pool_suggestion(
+        monkeypatch,
+        context=262144,
+        fits_for=lambda settings: (
+            settings.get("KVCacheTokens", 0) > 0 and settings.get("ContextTokens", 0) <= 65536
+        ),
+    )
+
+    assert suggestion is not None
+    assert suggestion["settings"]["ContextTokens"] == 65536
+    assert suggestion["settings"]["KVCacheTokens"] == 65600
+    reasons = {item["name"]: item["reason"] for item in suggestion["changes"]}
+    assert reasons["KVCacheTokens"] == "Use an explicit KV pool sized for the smaller context."
+    # The pinned pool at the untouched context was tried before any shorter chat, and lost.
+    tried = [(item["ContextTokens"], item["KVCacheTokens"]) for item in candidates]
+    assert tried.index((262144, 262208)) < min(
+        index for index, item in enumerate(tried) if item[0] < 262144
+    )

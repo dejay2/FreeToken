@@ -171,8 +171,11 @@ DIALS: tuple[Dial, ...] = (
         info=(
             "The total chat memory the card keeps for all chats together. Bigger means more chats can "
             "run at once with long histories before the server has to re-read them. Each 65,536 tokens "
-            "costs about 1.55 GiB of card memory (measured 2026-09-02). Automatic lets the engine fit "
-            "it to whatever card memory is left after the expert slots."
+            "costs about 1.55 GiB of card memory (measured 2026-09-02). Automatic (0) does not match "
+            "the longest single chat: it grows the pool until the free card memory is used up, which "
+            "can leave nothing for the look-ahead trick or the recordings. With the look-ahead trick "
+            "on, or a long chat, set this to the longest single chat plus one page of 64 tokens - "
+            "262,208 for 262,144."
         ),
     ),
     Dial(
@@ -657,7 +660,13 @@ def adapt_dial(dial: Dial, model: ModelInfo | None) -> dict[str, Any]:
             text += "Each 65,536 tokens costs about 1.55 GiB of card memory (measured 2026-09-02). "
         else:
             text += f"The slider runs to twice {label}'s longest chat; the cost per token is not measured for this model. "
-        text += "Automatic lets the engine fit it to whatever card memory is left after the expert slots."
+        text += (
+            "Automatic (0) does not match the longest single chat: it grows the pool until the free "
+            "card memory is used up, which can leave nothing for the look-ahead trick or the "
+            "recordings. With the look-ahead trick on, or a long chat, set this to the longest "
+            f"single chat plus one page of 64 tokens - {model.max_context_tokens + 64:,} for "
+            f"{model.max_context_tokens:,}."
+        )
         over["info"] = text
 
     elif name == "MoECacheSize" and model.is_moe:
