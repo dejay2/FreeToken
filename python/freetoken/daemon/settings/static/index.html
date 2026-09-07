@@ -127,6 +127,8 @@
     .path-row { display: flex; gap: 8px; }
     .path-row input { flex: 1; font-family: ui-monospace, Consolas, monospace; font-size: .88rem; }
     .error { color: var(--bad); font-size: .83rem; margin-top: 4px; }
+    .floor-hint { margin-top: 4px; }
+    .floor-hint:empty { display: none; }
     .error:empty { display: none; }
     .info-panel { grid-column: 1 / -1; background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; font-size: .92rem; }
     .info-panel[hidden] { display: none; }
@@ -743,11 +745,30 @@
       return parts.join(' · ');
     }
 
+    // Every layer kept whole on the card is charged to the expert-slot total, and the layers
+    // that still stream need a floor left over: minimum = layers x expertsPerLayer +
+    // streamingFloor. Both numbers arrive as dial metadata (adapt_dial), so no model geometry
+    // is written here. Saved 4288 slots with 8 layers on the card and the boot died at once
+    // (2026-09-07 11:22 BST): the line below is that arithmetic, shown while it is still a draft.
+    function floorHintText(dial, ownedValue) {
+      const layers = storedCount(ownedValue);
+      const minimum = layers * Number(dial.expertsPerLayer || 0) + Number(dial.streamingFloor || 0);
+      return `Minimum for ${fmt(layers)} layer${layers === 1 ? '' : 's'} on the card: ${fmt(minimum)}`;
+    }
+    function refreshFloorHints() {
+      document.querySelectorAll('[data-floor-hint]').forEach((node) => {
+        const dial = dialByName(node.dataset.floorHint);
+        if (!dial) return;
+        node.textContent = floorHintText(dial, state.settings[node.dataset.ownedDial]);
+      });
+    }
+
     function renderDial(dial) {
       const name = escapeHtml(dial.name);
       const effects = (dial.effects || []).map(effectChip).join('');
       const searchText = `${dial.plain} ${dial.name} ${dial.info} ${dial.help} ${dial.group}`.toLowerCase();
-      return `<div class="dial" data-dial-row="${name}" data-advanced="${dial.advanced ? '1' : '0'}" data-search="${escapeHtml(searchText)}"><div class="dial-head"><div class="dial-label-row"><span class="dial-label">${escapeHtml(dial.plain || labelFor(dial.name))}</span><button class="info-btn" type="button" data-info="${name}" aria-expanded="false" aria-label="What does ${escapeHtml(dial.plain)} do?">i</button></div>${effects ? `<div class="effects">${effects}</div>` : ''}</div><div class="dial-control">${inputHtml(dial)}<div class="error" data-error="${escapeHtml(dial.name)}"></div></div><div class="info-panel" data-info-panel="${name}" hidden><p>${escapeHtml(dial.info || dial.help || '')}</p>${effects ? `<div class="legend"><span>▲ up when higher or on</span><span>▼ down when higher or on</span><span>◆ depends on the value</span></div>` : ''}<p class="tech">${escapeHtml(techLine(dial))}</p></div></div>`;
+      const floorHint = dial.expertsPerLayer && dial.ownedDial ? `<div class="small floor-hint" data-floor-hint="${name}" data-owned-dial="${escapeHtml(dial.ownedDial)}"></div>` : '';
+      return `<div class="dial" data-dial-row="${name}" data-advanced="${dial.advanced ? '1' : '0'}" data-search="${escapeHtml(searchText)}"><div class="dial-head"><div class="dial-label-row"><span class="dial-label">${escapeHtml(dial.plain || labelFor(dial.name))}</span><button class="info-btn" type="button" data-info="${name}" aria-expanded="false" aria-label="What does ${escapeHtml(dial.plain)} do?">i</button></div>${effects ? `<div class="effects">${effects}</div>` : ''}</div><div class="dial-control">${inputHtml(dial)}${floorHint}<div class="error" data-error="${escapeHtml(dial.name)}"></div></div><div class="info-panel" data-info-panel="${name}" hidden><p>${escapeHtml(dial.info || dial.help || '')}</p>${effects ? `<div class="legend"><span>▲ up when higher or on</span><span>▼ down when higher or on</span><span>◆ depends on the value</span></div>` : ''}<p class="tech">${escapeHtml(techLine(dial))}</p></div></div>`;
     }
 
     function renderSettings() {
@@ -760,6 +781,7 @@
       $('settings').querySelectorAll('[data-auto]').forEach((box) => box.addEventListener('change', () => toggleAuto(box.dataset.auto, box.checked)));
       $('settings').querySelectorAll('[data-info]').forEach((button) => button.addEventListener('click', () => { const panel = document.querySelector(`[data-info-panel="${CSS.escape(button.dataset.info)}"]`); const open = panel.hidden; panel.hidden = !open; button.setAttribute('aria-expanded', String(open)); }));
       $('settings').querySelectorAll('[data-browse]').forEach((button) => button.addEventListener('click', () => openBrowser(button.dataset.browse, button.dataset.kind)));
+      refreshFloorHints();
       applyFilters();
       refreshDirty();
     }
@@ -806,7 +828,7 @@
     /* ---------- dirty tracking ---------- */
     const same = (a, b) => JSON.stringify(a ?? '') === JSON.stringify(b ?? '');
     function changedNames() { return Object.keys(state.settings).filter((name) => !same(state.settings[name], state.saved[name])); }
-    function markChanged(name) { invalidateFit(); const row = document.querySelector(`[data-dial-row="${CSS.escape(name)}"]`); if (row) row.classList.toggle('changed', !same(state.settings[name], state.saved[name])); refreshDirty(); }
+    function markChanged(name) { invalidateFit(); const row = document.querySelector(`[data-dial-row="${CSS.escape(name)}"]`); if (row) row.classList.toggle('changed', !same(state.settings[name], state.saved[name])); refreshFloorHints(); refreshDirty(); }
     function refreshDirty() {
       const changed = changedNames();
       document.querySelectorAll('[data-dial-row]').forEach((row) => row.classList.toggle('changed', changed.includes(row.dataset.dialRow)));

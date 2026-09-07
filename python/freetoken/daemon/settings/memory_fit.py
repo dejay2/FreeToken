@@ -358,7 +358,7 @@ def prepare_settings(
     # inherited values are allowed to come from the active boot. When the request changes the
     # model, the complete merged snapshot is checked as well so an old context/slot value cannot
     # be carried into a model with a smaller ceiling.
-    errors = validate_settings(requested, model)
+    errors = validate_settings(requested, model, context=saved)
     if not errors and isinstance(requested.get("ModelPath"), str) and requested["ModelPath"] != saved.get("ModelPath", ""):
         errors = validate_settings(effective, model)
     if errors:

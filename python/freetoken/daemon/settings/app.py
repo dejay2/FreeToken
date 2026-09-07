@@ -291,7 +291,9 @@ def create_app(
             raise _boot_http_error(exc) from exc
         model_path = body.settings.get("ModelPath")
         model = _model_for(saved_settings, model_path if isinstance(model_path, str) else None)
-        errors = validate_settings(body.settings, model)
+        # ``context`` is what the boot file already holds: a patch that moves only the slot
+        # total or only the layers-on-card count is still checked against the other half.
+        errors = validate_settings(body.settings, model, context=saved_settings)
         if not errors and isinstance(model_path, str) and model_path != saved_settings.get("ModelPath", ""):
             # A new model must also fit what the file already holds: a 32k model saved next to
             # a 262,144-token chat would reserve memory for a length it cannot produce.

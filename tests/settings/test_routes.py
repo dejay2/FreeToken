@@ -44,8 +44,11 @@ def test_lifecycle_route_freezes_full_snapshot_and_stop_rejects_settings(tmp_pat
         encoding="utf-8",
     )
     boot = tmp_path / "boot-2020.ps1"
+    # -GpuOwnedLayers 0: this test starts with a toy 120-slot cache, and the catalogue default
+    # ("auto" = 6 layers) would charge 6 x 512 slots against it -- the pair the validator now
+    # refuses (dials._expert_slot_charge_errors).
     boot.write_text(
-        f"& $launcher `\n    -ModelPath '{model}' `\n    -Port 2020\n",
+        f"& $launcher `\n    -ModelPath '{model}' `\n    -GpuOwnedLayers 0 `\n    -Port 2020\n",
         encoding="utf-8",
     )
 
@@ -224,3 +227,73 @@ def test_model_catalog_follows_the_active_profile_model_path(tmp_path):
         assert app.state.download_manager.models_dir == alternate_root
         listed = client.get("/api/models").json()["models"]
         assert [item["path"] for item in listed] == [str(alternate)]
+
+
+def test_saving_or_starting_an_under_floor_slot_pair_is_refused(tmp_path):
+    """The 2026-09-07 11:22 BST live failure, as the page would have seen it: 4288 expert
+    slots with 8 layers on the card leaves 192 for the streaming layers against a floor of
+    1024, and the boot died immediately. Both the save and the start now refuse it first."""
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        '{"architectures":["Qwen4ExpForConditionalGeneration"],'
+        '"model_type":"qwen4_exp","num_hidden_layers":48,"num_experts":512,'
+        '"max_position_embeddings":262144,"hidden_size":2560,"moe_intermediate_size":640,'
+        '"quantization_config":{"quant_algo":"NVFP4"}}',
+        encoding="utf-8",
+    )
+    boot = tmp_path / "boot-2020.ps1"
+    boot.write_text(
+        f"& $launcher `\n    -ModelPath '{model}' `\n    -MoECacheSize 6750 `\n"
+        f"    -GpuOwnedLayers auto:6 `\n    -Port 2020\n",
+        encoding="utf-8",
+    )
+    proc = ProcessManager(
+        boot_file=boot,
+        stop_script=tmp_path / "stop.ps1",
+        log_path=tmp_path / "server.log",
+        lock_path=tmp_path / "gpu.lock",
+        runner=lambda *a, **k: None,
+        readiness=lambda: {"state": "serving"},
+        sleep=lambda _: None,
+        poll_interval=0,
+    )
+    app = create_app(
+        boot_file=boot,
+        process_manager=proc,
+        profiles=ProfilesManager(tmp_path / "boot-profiles.json"),
+        log_path=tmp_path / "server.log",
+        static_path=tmp_path / "missing-index.html",
+    )
+    client = TestClient(app)
+
+    refused = client.put(
+        "/api/settings",
+        json={"settings": {"MoECacheSize": 4288, "GpuOwnedLayers": "auto:8"}},
+    )
+    assert refused.status_code == 422
+    detail = refused.json()["detail"][0]
+    assert detail["field"] == "MoECacheSize" and detail["minimum"] == 5120
+    assert "leaving 192" in detail["message"] and "5,120 or more" in detail["message"]
+    assert "-MoECacheSize 6750" in boot.read_text(encoding="utf-8"), "nothing was written"
+
+    # a patch that raises only the layer count is checked against the saved slot total
+    layers_only = client.put("/api/settings", json={"settings": {"GpuOwnedLayers": "auto:12"}})
+    assert layers_only.status_code == 422
+    assert layers_only.json()["detail"][0]["minimum"] == 7168
+
+    # and the same pair cannot be smuggled past the lifecycle route either
+    started = client.post(
+        "/api/server/start",
+        json={"force": True, "settings": {"MoECacheSize": 4288, "GpuOwnedLayers": "auto:8"}},
+    )
+    assert started.status_code == 422
+    assert started.json()["detail"][0]["minimum"] == 5120
+
+    # the pair the engine accepts saves normally
+    saved = client.put(
+        "/api/settings",
+        json={"settings": {"MoECacheSize": 5120, "GpuOwnedLayers": "auto:8"}},
+    )
+    assert saved.status_code == 200, saved.text
+    assert "-MoECacheSize 5120" in boot.read_text(encoding="utf-8")

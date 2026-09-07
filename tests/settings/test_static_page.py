@@ -393,3 +393,31 @@ def test_complete_fit_contract_preserves_launch_and_nonfit_states() -> None:
 })().catch(error=>{console.error(error); process.exitCode=1});
 """.replace("FIXTURE", json.dumps(_fit_response()))
     _run_fit_script(script)
+
+
+def test_the_slot_field_prints_the_minimum_for_the_layers_on_the_card() -> None:
+    """Every layer kept whole on the card is charged to the expert-slot total, so the page
+    shows minimum = layers x expertsPerLayer + streamingFloor while the value is still a
+    draft. Both numbers come from the dial metadata; the page knows no model geometry.
+    Live failure behind it: 4288 slots with 8 layers on the card (2026-09-07 11:22 BST)."""
+    source = _source()
+    assert "data-floor-hint=" in source and "data-owned-dial=" in source
+    assert "dial.expertsPerLayer && dial.ownedDial" in source, "hint only where the metadata says so"
+    assert "refreshFloorHints()" in source
+
+    script = r"""
+(() => {
+  const dial = {name:'Slots', expertsPerLayer:512, streamingFloor:1024, ownedDial:'Owned'};
+  assert.equal(floorHintText(dial, 'auto:8'), 'Minimum for 8 layers on the card: 5,120');
+  assert.equal(floorHintText(dial, '8'), 'Minimum for 8 layers on the card: 5,120');
+  assert.equal(floorHintText(dial, 8), 'Minimum for 8 layers on the card: 5,120');
+  assert.equal(floorHintText(dial, '0,7'), 'Minimum for 2 layers on the card: 2,048');
+  assert.equal(floorHintText(dial, 'auto'), 'Minimum for 6 layers on the card: 4,096');
+  assert.equal(floorHintText(dial, ''), 'Minimum for 0 layers on the card: 1,024');
+  assert.equal(floorHintText(dial, 1), 'Minimum for 1 layer on the card: 1,536');
+  const small = {name:'Slots', expertsPerLayer:64, streamingFloor:128, ownedDial:'Owned'};
+  assert.equal(floorHintText(small, 'auto:3'), 'Minimum for 3 layers on the card: 320');
+  console.log('floor hint: minimum = layers x expertsPerLayer + streamingFloor');
+})();
+"""
+    _run_fit_script(script)

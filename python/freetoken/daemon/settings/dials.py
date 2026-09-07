@@ -98,6 +98,12 @@ class Dial:
             "storedAs": over.get("storedAs", self.stored_as),
             "storedZero": self.stored_zero,
             "modelAware": bool(over) or self.name in MODEL_AWARE_DIALS,
+            # The GPU-owned-layer charge, for the live minimum the page prints under the
+            # slot field. Present only on the slot dial of a readable MoE model; the page
+            # keys off these instead of hard-coding this model's 512 and 1,024.
+            "expertsPerLayer": over.get("expertsPerLayer"),
+            "streamingFloor": over.get("streamingFloor"),
+            "ownedDial": over.get("ownedDial", ""),
         }
 
 
@@ -289,7 +295,10 @@ DIALS: tuple[Dial, ...] = (
             "on this PC: every 1,000 slots costs 2.58 GiB of card memory and is worth about 5.8 words "
             "per second on an 8,000-token chat (73 words per second at 6,750 slots). Below about 4,750 "
             "the slowdown gets steep. Slots and chat memory share the same card memory, so raising one "
-            "leaves less for the other. Automatic lets the engine pick the largest count that fits."
+            "leaves less for the other. Every layer kept whole on the card takes all of its experts "
+            "out of this same total - 512 slots each on this model - and the layers that still stream "
+            "need at least 1,024 slots left over, so the total must be at least 512 x layers on the "
+            "card + 1,024. Automatic lets the engine pick the largest count that fits."
         ),
     ),
     Dial(
@@ -306,7 +315,10 @@ DIALS: tuple[Dial, ...] = (
             "Each layer hands back 1.32 GiB of PC memory and takes 1.32 GiB of card memory, which is "
             "charged against the expert slots above (about 512 slots per layer). The layers are taken "
             "from a busiest-first ranking measured on this PC; six was the measured sweet spot with "
-            "4,188 slots, and every extra layer removes about 512 streaming slots. 0 turns this off."
+            "4,188 slots, and every extra layer removes about 512 streaming slots. Because the "
+            "expert slots above are the total, the layers that still stream need at least 1,024 "
+            "slots left over: keep the slot total at or above 512 x layers on the card + 1,024, or "
+            "the server refuses to start. 0 turns this off."
         ),
     ),
     Dial(
@@ -578,6 +590,90 @@ REFERENCE_LIMITS: dict[str, dict[str, Any]] = {
 # chat memory reserve and the headroom on the measured build (memory audit, 2026-09-02).
 SLOT_SLIDER_BUDGET_BYTES = 24 * _GIB
 
+# ---------------------------------------------------------------------------------------
+# The GPU-owned-layer charge against the expert-slot total.
+#
+# ``--moe-cache-size`` is the TOTAL expert-slot budget: each GPU-owned MoE layer holds one
+# full expert layer and is CHARGED to it, and what is left must still clear the streaming
+# floor. Mirrors the engine exactly -- ``engine/cache_budget.py``
+# ``lru_slots_after_owned_charge`` (the ``if lru < floor`` refusal, line 69) with the floor
+# its callers pass: ``2 * num_experts`` while MoE prefill overlap is on (the engine default,
+# ``engine.py:2269`` and ``engine/memory_plan.py:811``; the overlap borrows two full
+# expert-layer buffers) and ``num_experts`` without it. ``memory_plan._suggestion.slot_search``
+# searches from the same two floors (``num_experts + charge``, ``2 * num_experts + charge``).
+# The page cannot turn the overlap off, so it mirrors the on case: the stricter of the two,
+# and the one every boot from this page actually gets.
+#
+# Live failure this guards, 2026-09-07 11:22 BST on the RTX 5090 serving box: the page saved
+# MoECacheSize 4288 with GpuOwnedLayers auto:8 and the boot died immediately -- 8 x 512 = 4096
+# slots charged, 192 left for the LRU against a floor of 1024. The page had accepted it
+# silently, so the arithmetic below now runs before Save/Start instead of 100 s into a boot.
+STREAMING_FLOOR_LAYERS = 2
+#: The dial whose value is charged against the expert-slot total.
+OWNED_LAYERS_DIAL = "GpuOwnedLayers"
+#: The dial holding the total.
+SLOT_TOTAL_DIAL = "MoECacheSize"
+
+
+def streaming_floor_slots(experts_per_layer: int) -> int:
+    """Slots the still-streaming layers need left over (engine floor, prefill overlap on)."""
+    return STREAMING_FLOOR_LAYERS * max(0, int(experts_per_layer))
+
+
+def minimum_slot_total(owned_layers: int, experts_per_layer: int) -> int:
+    """Smallest ``MoECacheSize`` that can carry ``owned_layers`` and still feed the rest."""
+    experts = max(0, int(experts_per_layer))
+    return max(0, int(owned_layers)) * experts + streaming_floor_slots(experts)
+
+
+def slot_floor_sentence(experts_per_layer: int) -> str:
+    """One plain-language sentence stating the rule with a model's real numbers."""
+    experts = max(0, int(experts_per_layer))
+    if not experts:
+        return ""
+    floor = streaming_floor_slots(experts)
+    return (
+        f"Every layer kept whole on the card takes all of its experts out of this same total "
+        f"({experts:,} slots each), and the layers that still stream need at least {floor:,} "
+        f"slots left over, so the total must be at least {experts:,} x layers on the card "
+        f"+ {floor:,}."
+    )
+
+
+def owned_layer_count(value: Any, num_moe_layers: int | None = None) -> int | None:
+    """How many MoE layers a ``GpuOwnedLayers`` value makes the engine own, or None if unknown.
+
+    Mirrors ``engine._parse_gpu_owned_layers_spec`` for every spelling this page accepts:
+    ``""`` (off) -> 0, ``"auto"`` -> 6 (the launcher's old spelling of the six-layer default),
+    ``"auto:N"`` -> N, a bare count ``"8"``/``8`` -> 8, an explicit id list ``"0,7"`` -> the
+    number of DISTINCT ids (the engine parses a list into a set), and the fraction form
+    ``"0.125"`` -> ``round(fraction * num_moe_layers)``, which needs the model's layer count
+    and is None without it.
+    """
+    if isinstance(value, str) and "." in value.strip():
+        try:
+            fraction = float(value.strip())
+        except ValueError:
+            return None
+        if not 0.0 <= fraction <= 1.0 or not num_moe_layers:
+            return None
+        return round(fraction * int(num_moe_layers))
+    if isinstance(value, str) and "," in value:
+        ids = set()
+        for part in value.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                ids.add(int(part))
+            except ValueError:
+                return None
+        return len(ids)
+    try:
+        return stored_count(DIAL_BY_NAME[OWNED_LAYERS_DIAL], value)
+    except (KeyError, TypeError, ValueError):
+        return None
+
 
 def _words(tokens: int) -> str:
     return f"{int(tokens * 0.75):,}"
@@ -695,8 +791,15 @@ def adapt_dial(dial: Dial, model: ModelInfo | None) -> dict[str, Any]:
             )
         else:
             text += " More slots means fewer experts fetched from PC memory per word; the speed per slot has not been measured for this model."
-        text += " Slots and chat memory share the same card memory. Automatic lets the engine pick the largest count that fits."
+        text += " Slots and chat memory share the same card memory."
+        text += " " + slot_floor_sentence(model.num_experts or 0)
+        text += " Automatic lets the engine pick the largest count that fits."
         over["info"] = text
+        # What the page needs to print the live minimum under this field. Sent as metadata so
+        # the page never hard-codes this model's 512 experts or its 1,024-slot streaming floor.
+        over["expertsPerLayer"] = int(model.num_experts or 0)
+        over["streamingFloor"] = streaming_floor_slots(model.num_experts or 0)
+        over["ownedDial"] = OWNED_LAYERS_DIAL
 
     elif name == "GpuOwnedLayers" and model.is_moe:
         layers = model.num_moe_layers
@@ -724,6 +827,7 @@ def adapt_dial(dial: Dial, model: ModelInfo | None) -> dict[str, Any]:
                 "The busiest-first ranking was measured for Qwen3.8 only, so on this model the chosen "
                 "number of layers is spread evenly through the model. 0 turns this off."
             )
+        text += " " + slot_floor_sentence(model.num_experts or 0)
         over["info"] = text
 
     elif name == "EnableVision" and not model.has_vision:
@@ -857,15 +961,20 @@ def validate_settings(
     model: ModelInfo | None = None,
     *,
     ceilings_only: bool = False,
-) -> list[dict[str, str]]:
+    context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Return the contract's field/message list without importing any engine package.
 
     ``model`` (a ModelInfo) applies that model's limits: longest chat, expert-layer count.
     Without one, or with a folder that could not be read, the limits the catalogue was
     measured with apply (REFERENCE_LIMITS). ``ceilings_only`` checks just the technical
     ceilings: the boot-file writer and the profile store use it, since the app has already
-    applied the model limits and a stored profile may belong to a different model."""
-    errors: list[dict[str, str]] = []
+    applied the model limits and a stored profile may belong to a different model.
+
+    ``context`` is the settings already saved in the boot file. Only the cross-field check
+    below reads it, so a patch that touches one half of a pair is still checked against the
+    other half the boot will actually use."""
+    errors: list[dict[str, Any]] = []
     for name, value in settings.items():
         dial = DIAL_BY_NAME.get(name)
         if dial is None:
@@ -890,7 +999,79 @@ def validate_settings(
             errors.append({"field": name, "message": f"Value {compared} exceeds maximum {maximum}{limit_note}"})
         if dial.control == "path" and "\x00" in parsed:
             errors.append({"field": name, "message": f"Value for {name} contains a NUL character"})
+    if not ceilings_only:
+        errors.extend(
+            _expert_slot_charge_errors(
+                settings, model, context, failed={error["field"] for error in errors}
+            )
+        )
     return errors
+
+
+def _expert_slot_charge_errors(
+    settings: dict[str, Any],
+    model: ModelInfo | None,
+    context: dict[str, Any] | None,
+    *,
+    failed: set,
+) -> list[dict[str, Any]]:
+    """Refuse an expert-slot total the GPU-owned layers would eat (see STREAMING_FLOOR_LAYERS).
+
+    Runs only when the caller touched one of the two dials: the pair is a property of the
+    boot as a whole, but a save that changes neither must not be refused for a total the
+    boot file already holds. The message quotes the same arithmetic the engine's refusal
+    does, in the page's words, and carries ``minimum`` so the page can offer that value.
+    """
+    if not settings.keys() & {SLOT_TOTAL_DIAL, OWNED_LAYERS_DIAL}:
+        return []
+    if failed & {SLOT_TOTAL_DIAL, OWNED_LAYERS_DIAL}:
+        # the value is already refused on its own terms; a second message about the pair
+        # would only bury the first
+        return []
+    if model is None or not model.is_moe or not model.num_experts:
+        # no readable MoE geometry: the charge per layer is unknown, so there is nothing to
+        # check (the engine will still refuse, with the numbers it can see)
+        return []
+    inherited = context or {}
+    raw_total = settings.get(SLOT_TOTAL_DIAL, inherited.get(SLOT_TOTAL_DIAL))
+    raw_owned = settings.get(OWNED_LAYERS_DIAL, inherited.get(OWNED_LAYERS_DIAL))
+    if raw_total is None or raw_owned is None:
+        return []
+    try:
+        total = int(canonical_value(DIAL_BY_NAME[SLOT_TOTAL_DIAL], raw_total))
+    except (TypeError, ValueError, OverflowError):
+        return []
+    if total <= 0:
+        # 0 is "Automatic": --moe-cache-auto charges the owned layers through the budget
+        # before the split, so there is no total to run short (cache_budget.py:64-65)
+        return []
+    layers = owned_layer_count(raw_owned, model.num_moe_layers)
+    if not layers or layers < 0:
+        # unparsable, or nothing owned: with no charge the engine applies no LRU floor to an
+        # explicit total either (lru_slots_after_owned_charge only runs for a non-empty owned
+        # set), so a page floor here would refuse boots the engine accepts
+        return []
+    experts = int(model.num_experts)
+    charge = layers * experts
+    minimum = minimum_slot_total(layers, experts)
+    if total >= minimum:
+        return []
+    left = total - charge
+    floor = streaming_floor_slots(experts)
+    layer_word = "layer" if layers == 1 else "layers"
+    takes = "takes" if layers == 1 else "take"
+    return [
+        {
+            "field": SLOT_TOTAL_DIAL,
+            "message": (
+                f"{layers} {layer_word} on the card {takes} {charge:,} of the {total:,} expert "
+                f"slots, leaving {left:,}; the layers that still stream need at least "
+                f"{floor:,}. Set expert slots to {minimum:,} or more, or keep fewer layers "
+                f"on the card."
+            ),
+            "minimum": minimum,
+        }
+    ]
 
 
 def normalise_settings(settings: dict[str, Any]) -> dict[str, Any]:
@@ -919,9 +1100,16 @@ __all__ = [
     "ENV_DIALS",
     "EXTENSION_DIALS",
     "MODEL_AWARE_DIALS",
+    "OWNED_LAYERS_DIAL",
+    "SLOT_TOTAL_DIAL",
+    "STREAMING_FLOOR_LAYERS",
     "Dial",
     "adapt_dial",
     "canonical_value",
+    "minimum_slot_total",
+    "owned_layer_count",
+    "slot_floor_sentence",
+    "streaming_floor_slots",
     "stored_count",
     "stored_text",
     "dial_value_for_display",

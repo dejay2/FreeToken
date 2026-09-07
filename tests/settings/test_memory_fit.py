@@ -53,10 +53,13 @@ def _model(tmp_path: Path) -> Path:
 
 
 def _boot(tmp_path: Path, model: Path) -> Path:
+    # -GpuOwnedLayers 0: the estimates below use toy slot counts (120, 64) that no real boot
+    # would use, and the catalogue default ("auto" = 6 layers) would charge 6 x 512 slots
+    # against them -- the pair the validator now refuses (dials._expert_slot_charge_errors).
     boot = tmp_path / "boot-2020.ps1"
     boot.write_text(
         f"$env:FREETOKEN_MTP_SPEC_DEPTH = '3'\n"
-        f"& $launcher `\n    -ModelPath '{model}' `\n    -Port 2020\n",
+        f"& $launcher `\n    -ModelPath '{model}' `\n    -GpuOwnedLayers 0 `\n    -Port 2020\n",
         encoding="utf-8",
     )
     return boot
