@@ -27,6 +27,10 @@ from freetoken.message import (
     CacheParkStatusMsg,
     CacheRebuildBackendMsg,
     CacheRebuildResultMsg,
+    CacheResidencyBackendMsg,
+    CacheResidencyResultMsg,
+    CacheStepBackendMsg,
+    CacheStepResultMsg,
     DetokenizeMsg,
     ErrorReplyMsg,
     ExitMsg,
@@ -226,6 +230,7 @@ class Scheduler(SchedulerIOMixin):
         num_pages: int | None = None,
         num_mamba_slots: int | None = None,
         num_swa_pages: int | None = None,
+        layer_moves: list[tuple[int, str]] | None = None,
     ) -> None:
         """Idle-only runtime cache rebuild: resize the MoE slot cache, KV pages, GDN (mamba) state
         pool, and/or the window pool (num_swa_pages), re-capture CUDA graphs, and re-thread the
@@ -233,8 +238,12 @@ class Scheduler(SchedulerIOMixin):
         guarantee the scheduler is idle — no pending prefill, no running decode, no in-flight
         finished requests. All TP ranks must call this with identical arguments.
         """
+        is_moe_only = (
+            num_pages is None and num_mamba_slots is None and num_swa_pages is None
+        )
         assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
-        assert not self.decode_manager.runnable, "rebuild requires no running decode"
+        if not is_moe_only:
+            assert not self.decode_manager.runnable, "rebuild requires no running decode"
         torch.cuda.synchronize(self.device)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
@@ -246,8 +255,11 @@ class Scheduler(SchedulerIOMixin):
         ):
             self.cache_manager.prepare_rebuild()
         self.engine.rebuild_runtime_cache(
-            moe_cache_size=moe_cache_size, num_pages=num_pages, num_mamba_slots=num_mamba_slots,
+            moe_cache_size=moe_cache_size,
+            num_pages=num_pages,
+            num_mamba_slots=num_mamba_slots,
             num_swa_pages=num_swa_pages,
+            layer_moves=layer_moves,
         )
         if num_pages is not None or num_mamba_slots is not None or num_swa_pages is not None:
             # Any of these resizes invalidates the prefix cache: a KV resize leaves stale page
@@ -301,10 +313,20 @@ class Scheduler(SchedulerIOMixin):
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
         # NOT a gate — those requests are already freed (no live GPU/page resources).
-        if self._pending_rebuild is not None and last_data is None and not (
-            self.prefill_manager.runnable or self.decode_manager.runnable
-        ):
-            self._execute_pending_rebuild()
+        # MoE-only rebuild may execute when last_data is None even if decode_manager.runnable.
+        if self._pending_rebuild is not None and last_data is None:
+            is_moe_only = (
+                getattr(self._pending_rebuild, "num_pages", None) is None
+                and getattr(self._pending_rebuild, "num_mamba_slots", None) is None
+                and getattr(self._pending_rebuild, "num_swa_pages", None) is None
+            )
+            can_rebuild = (
+                not self.prefill_manager.runnable
+                if is_moe_only
+                else not (self.prefill_manager.runnable or self.decode_manager.runnable)
+            )
+            if can_rebuild:
+                self._execute_pending_rebuild()
 
         # Order this iteration's host->device token_pool copies (issued on ``self.stream``
         # during scheduling) after the previous batch's sampled-token writes (issued on the
@@ -373,10 +395,20 @@ class Scheduler(SchedulerIOMixin):
         # Non-overlap mode has no last_data to drain; execute a queued rebuild as soon as
         # the scheduler is idle (no pending prefill / running decode). Without this, a
         # rebuild in DISABLE_OVERLAP_SCHEDULING mode stays pending until the HTTP timeout.
-        if self._pending_rebuild is not None and not (
-            self.prefill_manager.runnable or self.decode_manager.runnable
-        ):
-            self._execute_pending_rebuild()
+        # MoE-only rebuild may execute even if decode_manager.runnable.
+        if self._pending_rebuild is not None:
+            is_moe_only = (
+                getattr(self._pending_rebuild, "num_pages", None) is None
+                and getattr(self._pending_rebuild, "num_mamba_slots", None) is None
+                and getattr(self._pending_rebuild, "num_swa_pages", None) is None
+            )
+            can_rebuild = (
+                not self.prefill_manager.runnable
+                if is_moe_only
+                else not (self.prefill_manager.runnable or self.decode_manager.runnable)
+            )
+            if can_rebuild:
+                self._execute_pending_rebuild()
 
         # Non-overlap mode already drains what it launches, so the speculative step needs no
         # early drain here -- only the same dispatch.
@@ -849,6 +881,14 @@ class Scheduler(SchedulerIOMixin):
             # v1 scope: only if_idle, single-rank, non-owned-KV. drain mode and TP rebuild
             # need the drain-gate / all-rank failure-agreement machinery (deferred), so we
             # reject them cleanly rather than ship hang-prone half-wired paths.
+            is_moe_only = (
+                msg.num_pages is None and msg.num_mamba_slots is None and msg.num_swa_pages is None
+            )
+            is_busy = (
+                self.prefill_manager.runnable
+                if is_moe_only
+                else (self.prefill_manager.runnable or self.decode_manager.runnable)
+            )
             if not self.cache_manager.supports_runtime_rebuild:
                 self._reply_rebuild(
                     msg.request_id, "unsupported", "this model's cache does not support runtime rebuild"
@@ -861,12 +901,35 @@ class Scheduler(SchedulerIOMixin):
                 self._reply_rebuild(
                     msg.request_id, "unsupported", "runtime rebuild unsupported under TP > 1"
                 )
-            elif self.prefill_manager.runnable or self.decode_manager.runnable:
+            elif is_busy:
                 # if_idle: refuse rather than wait. (finished_reqs hold no resources — they
                 # are already freed — so they do not block a rebuild.)
                 self._reply_rebuild(msg.request_id, "busy")
             else:
                 self._pending_rebuild = msg
+        elif isinstance(msg, CacheStepBackendMsg):
+            if self.config.tp_info.size > 1:
+                self._reply_step(msg.request_id, "unsupported", error="step unsupported under TP > 1")
+            else:
+                is_idle = not (self.prefill_manager.runnable or self.decode_manager.runnable)
+                try:
+                    res = self.engine.step_memory(
+                        axis=msg.axis,
+                        direction=msg.direction,
+                        ram_tight=msg.ram_tight,
+                        is_idle=is_idle,
+                    )
+                    self._reply_step(msg.request_id, "ok", res)
+                except Exception as e:
+                    logger.error(f"step_memory failed: {e!r}")
+                    self._reply_step(msg.request_id, "failed", error=str(e))
+        elif isinstance(msg, CacheResidencyBackendMsg):
+            try:
+                rep = self.engine.residency_report()
+                self._reply_residency(msg.request_id, "ok", rep)
+            except Exception as e:
+                logger.error(f"residency_report failed: {e!r}")
+                self._reply_residency(msg.request_id, "failed", error=str(e))
         elif isinstance(msg, RoutingStatsBackendMsg):
             # A read of counters the decode path already maintains: answer inline, whether or
             # not the scheduler is idle. Only rank 0 owns the reply link.
@@ -915,6 +978,42 @@ class Scheduler(SchedulerIOMixin):
                     num_pages=geo["num_pages"],
                     mamba_slots=geo["num_mamba_slots"] or 0,
                     num_swa_pages=geo["num_swa_pages"] or 0,
+                    error=error,
+                )
+            ]
+        )
+
+    def _reply_step(
+        self,
+        request_id: str,
+        status: str,
+        result: dict | None = None,
+        error: str | None = None,
+    ) -> None:
+        self.send_result(
+            [
+                CacheStepResultMsg(
+                    request_id=request_id,
+                    status=status,
+                    result=result or {},
+                    error=error,
+                )
+            ]
+        )
+
+    def _reply_residency(
+        self,
+        request_id: str,
+        status: str,
+        report: dict | None = None,
+        error: str | None = None,
+    ) -> None:
+        self.send_result(
+            [
+                CacheResidencyResultMsg(
+                    request_id=request_id,
+                    status=status,
+                    report=report or {},
                     error=error,
                 )
             ]
@@ -994,12 +1093,13 @@ class Scheduler(SchedulerIOMixin):
             "num_pages": msg.num_pages,
             "num_mamba_slots": msg.num_mamba_slots,
             "num_swa_pages": msg.num_swa_pages,
+            "layer_moves": getattr(msg, "layer_moves", None),
         }
         # Rollback target: the CURRENT (serving) sizes of ONLY the pools this request touches.
         # Passing the untouched pools too would trip rebuild_cache's KV/mamba/SWA gate and wipe
         # the prefix cache that a successful resize of just the requested pool preserves.
         snapshot = self._current_cache_geometry()
-        prior = {k: snapshot[k] for k, v in requested.items() if v is not None}
+        prior = {k: snapshot[k] for k, v in requested.items() if v is not None and k in snapshot}
         # Cleared here, set by engine.rebuild_runtime_cache at its point of no return — lets the
         # except below tell a pre-teardown failure (engine untouched) from a mid-teardown one.
         self.engine.rebuild_teardown_started = False
