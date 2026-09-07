@@ -335,6 +335,9 @@ def build_launch(
         argv += ["--moe-gpu-owned-layers", owned]
     reserve = _int(_get(settings, "MoEVramReserveBytes"), -1)
     headroom = _int(_get(settings, "MoECacheHeadroomBytes"), -1)
+    if _truthy(settings.get("MemoryGovernor")) and reserve == 0:
+        gov_vram_gb = float(_get(settings, "GovernorVRAMFreeGB") if _get(settings, "GovernorVRAMFreeGB") is not None else 1.5)
+        reserve = int(round(gov_vram_gb * (1024 ** 3)))
     if facts.is_moe and reserve >= 0:
         argv += ["--moe-vram-reserve-bytes", str(reserve)]
     if facts.is_moe and headroom >= 0:

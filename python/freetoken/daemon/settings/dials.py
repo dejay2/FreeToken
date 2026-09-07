@@ -358,6 +358,39 @@ DIALS: tuple[Dial, ...] = (
         ),
     ),
     Dial(
+        "MemoryGovernor", "toggle", True, "boolean",
+        "Automatically step expert layers down the VRAM/RAM ladder and shrink pools when free memory drops below cushion, stepping back up when memory returns; the card cushion is also left free at boot.",
+        "Expert slots and card memory",
+        plain="Give memory back to games and other programs automatically",
+        effects=("speed:down",),
+        info=(
+            "Steps expert layers between GPU memory, host RAM, and SSD disk storage when other apps or games "
+            "use memory, keeping the server alive; the card cushion is also left free at boot."
+        ),
+    ),
+    Dial(
+        "GovernorVRAMFreeGB", "number", 1.5, "GB",
+        "Free card memory cushion the governor maintains by stepping layers down or shrinking pools (also left free at boot).",
+        "Expert slots and card memory", minimum=0.0, maximum=128.0, numeric_kind="float",
+        plain="Keep this much of the card free", slider=(0.0, 16.0, 0.25),
+        effects=("vram:up", "speed:down"),
+        info=(
+            "Card memory that must stay free for other programs. Below this cushion, the governor steps expert layers "
+            "down or shrinks pools to free VRAM; this cushion is also reserved at boot."
+        ),
+    ),
+    Dial(
+        "GovernorRAMFreeGB", "number", 4.0, "GB",
+        "Free main memory cushion the governor maintains by spilling pinned expert layers to SSD disk storage.",
+        "Expert slots and card memory", minimum=0.0, maximum=1024.0, numeric_kind="float",
+        plain="Keep this much main memory free", slider=(0.0, 64.0, 1.0),
+        effects=("ram:up", "speed:down"),
+        info=(
+            "Host RAM that must stay free for other programs. Below this cushion, the governor spills pinned expert "
+            "layers to SSD disk storage to free host memory."
+        ),
+    ),
+    Dial(
         "EmbedHost", "toggle", True, "boolean", "Pin the 1.27 GB token embedding table in host RAM to free GPU VRAM for expert slots.",
         "Expert slots and card memory", engine_mapping="$env:FREETOKEN_EMBED_HOST='1'",
         plain="Keep the word table in PC memory", effects=("vram:down", "ram:up"),

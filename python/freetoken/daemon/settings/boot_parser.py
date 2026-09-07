@@ -124,6 +124,9 @@ _LAUNCHER_ORDER = (
     "KVParkWindowMiB",
     "MoEVramReserveBytes",
     "MoECacheHeadroomBytes",
+    "MemoryGovernor",
+    "GovernorVRAMFreeGB",
+    "GovernorRAMFreeGB",
 )
 _ORDER_INDEX = {name: index for index, name in enumerate(_LAUNCHER_ORDER)}
 
