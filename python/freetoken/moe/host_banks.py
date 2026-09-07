@@ -53,6 +53,8 @@ class HostResidency(str, Enum):
     The non-pinned classes exist for hosts that cap CUDA pin quota (WSL/WDDM: ~half of RAM).
     GPU_OWNED is the odd one out: there is no host bank at all -- the layer's experts live in
     VRAM for the process lifetime, so it neither spends pin quota nor holds host pages.
+    DISK has neither host nor device banks permanently allocated; weights live in an on-disk copy
+    and rows are gathered into staging during decode or materialized for prefill.
     """
 
     PINNED = "pinned"
@@ -417,6 +419,10 @@ def _settle(bank, residency: str) -> None:
             "a GPU-owned MoE layer reached the host settle path: this checkpoint's bank "
             "loader has no per-layer completion sink, so its device banks would never be "
             "filled; drop --moe-gpu-owned-layers for this model"
+        )
+    if residency == HostResidency.DISK.value:
+        raise RuntimeError(
+            "a DISK MoE layer reached the host settle path: disk layers have no host banks"
         )
     if residency == HostResidency.PINNED.value:
         bank.pin()

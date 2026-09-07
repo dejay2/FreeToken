@@ -726,6 +726,19 @@ class OffloadMoELayer(MoELayer):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
+        if cache.is_disk_layer(self.layer_id):
+            cache._note_decode_routing(self.layer_id, topk_ids)
+            views, ids = cache.disk_gather(self.layer_id, topk_ids)
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                ids,
+                views=views,
+                n=None,
+                alphas=cache.alphas_for_disk(self.layer_id),
+                is_prefill=False,
+            )
         if cache.is_gpu_owned_layer(self.layer_id):
             # Every expert of this layer is already in VRAM at position == expert id, so
             # there is nothing to predict, fetch, evict or remap: hand the kernel the RAW
@@ -865,6 +878,18 @@ class OffloadMoELayer(MoELayer):
             require_exl3_gpu_only(
                 device=hidden_states.device,
                 decode_target=getattr(cache, "decode_target", "gpu"),
+            )
+        if cache.is_disk_layer(self.layer_id):
+            cache.disk_materialize_layer(self.layer_id)
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.bank_views(self.num_experts),
+                n=self.num_experts,
+                alphas=cache.alphas_for_layer(self.layer_id),
+                is_prefill=True,
             )
         if cache.is_gpu_owned_layer(self.layer_id):
             # No overlap buffer, no materialize, no release: the layer is already resident.

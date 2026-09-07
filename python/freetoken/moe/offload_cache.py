@@ -248,6 +248,11 @@ class OffloadMoeCache:
         # marlin/b12x per-expert global scales ([L*E], GPU resident, see set_alphas).
         self.gate_up_alpha: torch.Tensor | None = None
         self.down_alpha: torch.Tensor | None = None
+        self.disk_copy = None
+        self._disk_readers: dict[int, Any] = {}
+        self._disk_staging: dict[str, torch.Tensor] | None = None
+        self._disk_device_scratch: dict[str, torch.Tensor] | None = None
+        self._disk_alphas: tuple[torch.Tensor, torch.Tensor] | None = None
         # Opt-in decode miss-rate instrumentation. Accumulated on-device (no per-step host
         # sync); read via ``decode_miss_stats``. Graph-safe: the ``+=`` is captured into the
         # decode graph and re-executes with each replay's REAL routing (record_decode_stats
@@ -959,8 +964,31 @@ class OffloadMoeCache:
         if residency == HostResidency.GPU_OWNED.value:
             assert banks is not None, "gpu_owned residency requires device tensor banks"
             self.resident_banks[layer_id] = tuple(self.bank_sources[n][layer_id] for n in self.bank_schema)
+            self._disk_readers.pop(layer_id, None)
+        elif residency == HostResidency.DISK.value:
+            self.resident_banks.pop(layer_id, None)
+            copy = getattr(self, "expert_disk_copy", None) or self.disk_copy
+            if copy is not None:
+                staging = self._get_disk_staging()
+                from freetoken.moe.disk_banks import DiskLayerReader
+
+                self._disk_readers[layer_id] = DiskLayerReader(copy, layer_id, staging)
+            if self.bank_sources:
+                for name in self.bank_schema:
+                    feat_shape = (
+                        self.bank_caches[name].shape[1:]
+                        if name in self.bank_caches
+                        else self.bank_sources[name][layer_id].shape[1:]
+                    )
+                    dtype = (
+                        self.bank_caches[name].dtype
+                        if name in self.bank_caches
+                        else self.bank_sources[name][layer_id].dtype
+                    )
+                    self.bank_sources[name][layer_id] = torch.empty((1, *feat_shape), dtype=dtype)
         else:
             self.resident_banks.pop(layer_id, None)
+            self._disk_readers.pop(layer_id, None)
 
         self._build_copy_plan()
 
@@ -983,6 +1011,110 @@ class OffloadMoeCache:
             0 <= layer_id < len(self.layer_residency)
             and self.layer_residency[layer_id] == HostResidency.DISK.value
         )
+
+    def _get_disk_staging(self) -> dict[str, torch.Tensor]:
+        if self._disk_staging is None:
+            self._disk_staging = {}
+            for name in self.bank_schema:
+                if name in self.bank_caches:
+                    feat_shape = self.bank_caches[name].shape[1:]
+                    dtype = self.bank_caches[name].dtype
+                elif self.disk_copy is not None:
+                    feat_shape = self.disk_copy.shapes[name][1:]
+                    dtype = self.disk_copy.dtypes[name]
+                else:
+                    feat_shape = self.bank_sources[name][0].shape[1:]
+                    dtype = self.bank_sources[name][0].dtype
+
+                if self.device.type == "cuda":
+                    from freetoken.moe.host_banks import HostBank
+
+                    bank = HostBank((64, *feat_shape), dtype, backing="cuda")
+                    self._disk_staging[name] = bank.tensor
+                else:
+                    self._disk_staging[name] = torch.empty((64, *feat_shape), dtype=dtype)
+        return self._disk_staging
+
+    def disk_gather(
+        self, layer_id: int, topk_ids: torch.Tensor
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        """Gather routed expert rows from disk into device scratch for decode."""
+        reader = self._disk_readers.get(layer_id)
+        if reader is None:
+            copy = getattr(self, "expert_disk_copy", None) or self.disk_copy
+            if copy is not None:
+                staging = self._get_disk_staging()
+                from freetoken.moe.disk_banks import DiskLayerReader
+
+                reader = self._disk_readers[layer_id] = DiskLayerReader(copy, layer_id, staging)
+            else:
+                raise RuntimeError(f"no DiskLayerReader attached for layer {layer_id}")
+
+        topk_ids_cpu = topk_ids.cpu()
+        unique_experts, inverse_indices = torch.unique(topk_ids_cpu, return_inverse=True)
+        expert_list = unique_experts.tolist()
+        k = len(expert_list)
+
+        staging_views = reader.read_rows(expert_list)
+
+        if self._disk_device_scratch is None:
+            self._disk_device_scratch = {}
+            for name in self.bank_schema:
+                feat_shape = (
+                    self.bank_caches[name].shape[1:]
+                    if name in self.bank_caches
+                    else self.bank_sources[name][0].shape[1:]
+                )
+                dtype = (
+                    self.bank_caches[name].dtype
+                    if name in self.bank_caches
+                    else self.bank_sources[name][0].dtype
+                )
+                self._disk_device_scratch[name] = torch.empty(
+                    (max(64, k), *feat_shape), dtype=dtype, device=self.device
+                )
+
+        for b_idx, name in enumerate(self.bank_schema):
+            scratch = self._disk_device_scratch[name]
+            if scratch.size(0) < k:
+                scratch = torch.empty(
+                    (k, *scratch.shape[1:]), dtype=scratch.dtype, device=self.device
+                )
+                self._disk_device_scratch[name] = scratch
+            scratch[:k].copy_(staging_views[b_idx], non_blocking=False)
+
+        views = tuple(self._disk_device_scratch[name][:k] for name in self.bank_schema)
+        remapped_ids = inverse_indices.to(topk_ids.device, non_blocking=False)
+
+        if self.gate_up_alpha is not None and self.down_alpha is not None:
+            idx = layer_id * self.num_experts + unique_experts.to(self.gate_up_alpha.device)
+            self._disk_alphas = (self.gate_up_alpha[idx], self.down_alpha[idx])
+        else:
+            self._disk_alphas = None
+
+        return views, remapped_ids
+
+    def alphas_for_disk(self, layer_id: int | None = None) -> tuple[torch.Tensor, torch.Tensor] | None:
+        return getattr(self, "_disk_alphas", None)
+
+    def disk_materialize_layer(self, layer_id: int) -> None:
+        """Fill slots [0, num_experts) position == expert id in 64-row chunks through staging."""
+        reader = self._disk_readers.get(layer_id)
+        if reader is None:
+            copy = getattr(self, "expert_disk_copy", None) or self.disk_copy
+            if copy is not None:
+                staging = self._get_disk_staging()
+                from freetoken.moe.disk_banks import DiskLayerReader
+
+                reader = self._disk_readers[layer_id] = DiskLayerReader(copy, layer_id, staging)
+            else:
+                raise RuntimeError(f"no DiskLayerReader attached for layer {layer_id}")
+
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = True
+        for start_row, chunk_size, staging_views in reader.iter_layer_chunks(rows=64):
+            for b_idx, (per_layer, cache) in enumerate(self.banks):
+                cache[start_row : start_row + chunk_size].copy_(staging_views[b_idx])
 
     def _init_prefill_overlap_buffers(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
@@ -1270,11 +1402,13 @@ class OffloadMoeCache:
         )
 
     def materialize_layer(self, layer_id: int) -> None:
-        from freetoken.moe.offload_kernels import materialize_layer
-
         self._reject_gpu_owned(layer_id, "materialize_layer")
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
+        if self.is_disk_layer(layer_id):
+            return
+        from freetoken.moe.offload_kernels import materialize_layer
+
         materialize_layer(self, layer_id)
 
     def reset(self) -> None:
@@ -1466,6 +1600,9 @@ class OffloadMoeCache:
                     f"pageable materialize (position == expert id); ensure_experts's "
                     f"LRU slot remap cannot be honored without a device alias"
                 )
+            if self.is_disk_layer(layer_id):
+                self.disk_materialize_layer(layer_id)
+                return
             # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into slots [0, num_experts) with position == expert id -- a plain synchronous pageable H2D copy
             # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
             for per_layer, cache in self.banks:
