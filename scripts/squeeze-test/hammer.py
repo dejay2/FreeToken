@@ -49,12 +49,15 @@ def run_one_request(
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             http_status = resp.status
-            t_first = time.perf_counter()
-            first_token_wait = t_first - t_start
+            # Non-streaming: the server sends headers with the finished body, so this is the
+            # whole wait. Streaming: headers arrive at once, so the first content chunk below
+            # overrides it (that is the delayed first token the wait queue produces).
+            first_token_wait = time.perf_counter() - t_start
 
             if stream:
                 # Parse server-sent events
                 tokens_counted = 0
+                first_content_seen = False
                 for raw_line in resp:
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line.startswith("data: "):
@@ -71,6 +74,9 @@ def run_one_request(
                         if choices:
                             delta = choices[0].get("delta", {})
                             if delta.get("content"):
+                                if not first_content_seen:
+                                    first_content_seen = True
+                                    first_token_wait = time.perf_counter() - t_start
                                 tokens_counted += 1
                     except Exception:
                         pass
@@ -109,6 +115,8 @@ def run_one_request(
         error = str(exc)
 
     tok_s = (completion_tokens / wall_s) if wall_s > 0 else 0.0
+    # Keep the CSV one field per column: urllib reasons can carry commas.
+    error = error.replace(",", ";").replace("\n", " ")
     return (t_wall_clock, http_status, wall_s, completion_tokens, tok_s, first_token_wait, error)
 
 
@@ -124,6 +132,7 @@ def main() -> None:
     parser.add_argument("--stream", action="store_true", help="Use streaming SSE chat completions")
     parser.add_argument("--log", default=None, help="Optional CSV file to write logs")
     parser.add_argument("--quiet", action="store_true", help="Do not print individual request lines to stdout")
+    parser.add_argument("--fail-pause", type=float, default=0.5, help="Seconds to wait after a failed request before the next one (default: 0.5)")
 
     args = parser.parse_args()
 
@@ -162,6 +171,7 @@ def main() -> None:
                 timeout=args.timeout,
                 stream=args.stream,
             )
+            failed = not (200 <= res[1] < 300) or bool(res[6])
             with results_lock:
                 all_results.append(res)
                 t_w, status, wall, toks, speed, wait, err = res
@@ -172,6 +182,10 @@ def main() -> None:
                 if log_file:
                     log_file.write(line + "\n")
                     log_file.flush()
+            if failed and not stop_event.is_set():
+                # A refused connection returns in well under a millisecond; without this pause a
+                # dead server produced ~10,000 CSV rows per second on the devbox stub check.
+                time.sleep(args.fail_pause)
 
     try:
         if args.parallel <= 1:

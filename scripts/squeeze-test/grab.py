@@ -256,11 +256,15 @@ def main() -> None:
         if args.dry_run:
             current_vram_gb = target_gb
             return
-        import torch
 
         target_bytes = int(target_gb * (1024**3))
         current_bytes = int(current_vram_gb * (1024**3))
         diff = target_bytes - current_bytes
+        if diff == 0:
+            return
+        # Import lazily so a RAM-only run (--vram-steps 0) needs no torch at all.
+        import torch
+
         if diff > 0:
             t = torch.empty((diff,), dtype=torch.uint8, device="cuda")
             t.fill_(1)

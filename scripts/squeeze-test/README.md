@@ -50,28 +50,42 @@ Keep this running in the foreground or in a dedicated pane.
 
 ### 2. Monitor Server and Governor Logs
 
-In a second WSL terminal, tail the settings supervisor logs and query cache residency:
+In a second WSL terminal, tail the settings helper journal (governor decisions) and the model
+server's own log (rebuilds, moves, errors). The helper writes the server log to
+`logs/server-2020.log` under the checkout:
 
 ```bash
 # Watch governor step actions and cushion triggers
 journalctl --user -u freetoken-settings -f
+# In a third terminal: the model server log (rebuild_runtime_cache, layer moves, OOMs)
+tail -f ~/FreeToken/logs/server-2020.log
 ```
 
 To inspect layer residency on demand (owned, pinned, disk):
 ```bash
-curl -s http://127.0.0.1:2020/v1/cache/residency | jq .
+curl -s http://127.0.0.1:2020/v1/cache/residency | python3 -m json.tool
 ```
 
 ---
 
 ### 3. Apply Memory Pressure from Windows (Items 1 & 2: VRAM and RAM Squeeze)
 
-From the devbox (or Windows terminal), launch `grab.py` using the Windows FreeToken Python venv.
+From the devbox, launch `grab.py` on Windows through `ssh 5090` (that host's login shell is
+PowerShell) using the Windows FreeToken Desktop venv Python. The checkout lives inside the WSL
+distro, so Windows reads the script through the `\\wsl.localhost\vllm` share; the CSV is written
+on the Windows side and read back from WSL as `/mnt/c/Users/jay/grab.csv`.
 
 ```bash
-# Via SSH from devbox:
-ssh 5090 'C:\Users\jay\AppData\Local\FreeToken\venv\Scripts\python.exe C:\Users\jay\FreeToken\scripts\squeeze-test\grab.py --vram-steps 2,4,8,12 --ram-steps 4,8,16 --hold 60 --step-interval 30 --log grab.csv'
+# Via SSH from devbox. Keep the outer single quotes (bash passes the line untouched) and the
+# inner double quotes: PowerShell splits a bare 2,4,8,12 into four separate arguments.
+# -t gives the remote a console so Ctrl-C reaches grab.py and it releases what it holds.
+ssh -t 5090 'C:\Users\jay\AppData\Local\FreeToken\venv\Scripts\python.exe \\wsl.localhost\vllm\home\jay\FreeToken\scripts\squeeze-test\grab.py --vram-steps "2,4,8,12" --ram-steps "4,8,16" --hold 60 --step-interval 30 --log C:\Users\jay\grab.csv'
 ```
+
+`grab.py` refuses to start when `nvidia-smi` shows under 1 GB free on the card (the daily boot
+with `MoECacheSize 0` leaves about 600 MiB; boot with the governor's reserve first). If the ssh
+session drops mid-run the timetable still finishes on its own and releases everything; confirm
+with `ssh 5090 'Get-Process python -ErrorAction SilentlyContinue'` (no output = nothing left).
 
 What occurs during this run:
 - **Card squeeze (Item 1)**: As VRAM allocations step up (2 -> 4 -> 8 -> 12 GB), the governor detects card cushion violations (< 1.5 GB free), issuing `POST /v1/cache/step` to move `gpu_owned` layers to `pinned`, then shrink slot cache. Free card memory stays above the cushion, and hammer requests continue without 503 errors.
@@ -105,7 +119,7 @@ Once `grab.py` completes its peak hold, it releases RAM and VRAM in reverse orde
 
 ## How to Read the CSVs Side by Side
 
-Both `grab.py` and `hammer.py` log rows stamped with `t` representing the Unix epoch seconds (`time.time()`). Because WSL2 and Windows host share the exact system hardware clock, rows can be directly correlated by `t`.
+Both `grab.py` and `hammer.py` log rows stamped with `t` representing the Unix epoch seconds (`time.time()`). Because WSL2 and Windows host share the exact system hardware clock, rows can be directly correlated by `t`. Copy the Windows CSV next to the WSL one first: `cp /mnt/c/Users/jay/grab.csv .`
 
 ### `grab.csv` Schema
 ```csv
@@ -117,7 +131,7 @@ t,phase,vram_free_mb,win_free_mb,grabbed_vram_gb,grabbed_ram_gb
 - `t`: Wall-clock Unix timestamp (seconds).
 - `phase`: Current timetable phase (`step_up`, `hold`, `step_down`).
 - `vram_free_mb`: Free VRAM reported by `nvidia-smi`.
-- `win_free_mb`: Free physical RAM reported by Windows `Win32_OperatingSystem`.
+- `win_free_mb`: Free physical RAM on Windows (`GlobalMemoryStatusEx` available-physical, the same counter `Win32_OperatingSystem.FreePhysicalMemory` reports; PowerShell CIM is the fallback). On Linux dry-runs: `MemAvailable`.
 - `grabbed_vram_gb`: Active CUDA memory allocated by the grabber.
 - `grabbed_ram_gb`: Active host RAM allocated by the grabber.
 
@@ -128,12 +142,14 @@ t,http_status,wall_s,completion_tokens,tok_s,error
 1757255741.12,200,0.670,64,95.5,
 ```
 
-- `t`: Completion wall-clock Unix timestamp.
+- `t`: Wall-clock Unix timestamp at which the request was sent (the row is written when it finishes).
 - `http_status`: HTTP response status code (200, 503, 0 for timeout).
 - `wall_s`: Elapsed request wall time in seconds.
 - `completion_tokens`: Generated token count.
 - `tok_s`: Request decode throughput (`completion_tokens / wall_s`).
-- `error`: Error description if failed (empty on success).
+- `error`: Error description if failed (empty on success; commas are replaced by `;`). After a
+  failure the hammer pauses `--fail-pause` seconds (default 0.5) so a dead server does not fill
+  the CSV with thousands of rows per second.
 
 ### Side-by-Side Analysis
 
