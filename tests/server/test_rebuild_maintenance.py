@@ -226,19 +226,47 @@ def test_crash_during_rebuild_latches_failed_via_watchdog():
 
 
 def test_openai_gate_message_is_loading_aware():
+    import asyncio
+
     from freetoken.server.openai_api import _maintenance_gate
 
-    assert _maintenance_gate(SimpleNamespace(maintenance_state="serving")) is None
-    loading = _maintenance_gate(SimpleNamespace(maintenance_state="loading"))
+    run = asyncio.run
+    assert run(_maintenance_gate(SimpleNamespace(maintenance_state="serving"))) is None
+    loading = run(_maintenance_gate(SimpleNamespace(maintenance_state="loading")))
     assert loading is not None and loading.status_code == 503
     assert b"loading" in loading.body.lower()
-    rebuild = _maintenance_gate(SimpleNamespace(maintenance_state="rebuilding"))
-    assert rebuild is not None and rebuild.status_code == 503
-    assert b"rebuild" in rebuild.body.lower()
-    failed = _maintenance_gate(SimpleNamespace(maintenance_state="failed"))
+    failed = run(_maintenance_gate(SimpleNamespace(maintenance_state="failed")))
     assert failed is not None and failed.status_code == 503
     # A state object without the attribute defaults to serving (defensive, never blocks).
-    assert _maintenance_gate(SimpleNamespace()) is None
+    assert run(_maintenance_gate(SimpleNamespace())) is None
+
+
+def test_openai_gate_waits_out_a_rebuild_via_the_frontend_manager():
+    """A runtime rebuild is waited out (memory governor steps), never answered 503 up front:
+    10 of 55 hammer requests failed on the serving box 2026-09-07 before this."""
+    import asyncio
+
+    from freetoken.server.openai_api import _maintenance_gate
+
+    class State:
+        def __init__(self):
+            self.maintenance_state = "rebuilding"
+            self.calls = 0
+
+        async def wait_until_serving(self, timeout=120.0):
+            self.calls += 1
+            self.maintenance_state = "serving"
+            return None
+
+    st = State()
+    assert asyncio.run(_maintenance_gate(st)) is None and st.calls == 1
+
+    class Down(State):
+        async def wait_until_serving(self, timeout=120.0):
+            return "server unavailable: cache rebuild timed out after 120.0s"
+
+    resp = asyncio.run(_maintenance_gate(Down()))
+    assert resp is not None and resp.status_code == 503 and b"timed out" in resp.body
 
 
 def test_cache_rebuild_guarded_during_loading():

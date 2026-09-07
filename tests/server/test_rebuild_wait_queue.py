@@ -300,3 +300,29 @@ async def test_cache_step_reply_timeout_leaves_gate_closed_until_the_late_reply(
         assert manager.maintenance_state == "serving" and manager.rebuild_done.is_set()
     finally:
         api._GLOBAL_STATE = prev
+
+
+@pytest.mark.anyio
+async def test_wait_until_serving_waits_out_rebuild_and_refuses_terminal_states():
+    manager = _make_manager()
+    manager.maintenance_state = "serving"
+    manager.rebuild_done.set()
+    assert await manager.wait_until_serving() is None
+    manager.maintenance_state = "rebuilding"
+    manager.rebuild_done.clear()
+
+    async def finish():
+        await asyncio.sleep(0.05)
+        manager.maintenance_state = "serving"
+        manager.rebuild_done.set()
+
+    asyncio.get_running_loop().create_task(finish())
+    assert await manager.wait_until_serving(timeout=2.0) is None
+    manager.maintenance_state = "rebuilding"
+    manager.rebuild_done.clear()
+    msg = await manager.wait_until_serving(timeout=0.05)
+    assert msg is not None and "timed out" in msg
+    for terminal in ("loading", "failed", "stopping"):
+        manager.maintenance_state = terminal
+        manager.rebuild_done.set()
+        assert await manager.wait_until_serving() is not None

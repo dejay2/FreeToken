@@ -117,9 +117,13 @@ def register_responses_routes(
     async def v1_responses(req: ResponsesRequest, request: Request):
         log_request("/v1/responses", req, request)
         state = get_state()
-        mstate = getattr(state, "maintenance_state", "serving")
-        if mstate != "serving":
-            detail = "model is still loading" if mstate == "loading" else "cache rebuild in progress"
+        # A runtime cache rebuild (memory governor step) is waited out, not refused.
+        wait = getattr(state, "wait_until_serving", None)
+        detail = await wait() if wait is not None else (
+            None if getattr(state, "maintenance_state", "serving") == "serving"
+            else "model is still loading"
+        )
+        if detail is not None:
             return _error_response(503, detail)
         if req.background:
             return _error_response(400, "background mode is not supported")

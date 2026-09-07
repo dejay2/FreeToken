@@ -83,9 +83,14 @@ def register_anthropic_routes(
     async def v1_messages(req: AnthropicMessagesRequest, request: Request):
         log_request("/v1/messages", req, request)
         state = get_state()
-        mstate = getattr(state, "maintenance_state", "serving")
-        if mstate != "serving":
-            detail = "model is still loading" if mstate == "loading" else "cache rebuild in progress"
+        # A runtime cache rebuild (memory governor step) is waited out, not refused: callers
+        # must only ever see slowness. loading / failed / stopping still answer 503 at once.
+        wait = getattr(state, "wait_until_serving", None)
+        detail = await wait() if wait is not None else (
+            None if getattr(state, "maintenance_state", "serving") == "serving"
+            else "model is still loading"
+        )
+        if detail is not None:
             return _anthropic_error_response(503, "overloaded_error", detail)
         return await handle_anthropic_messages(req, request, state, get_model_sampling())
 

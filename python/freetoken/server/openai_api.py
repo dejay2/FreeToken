@@ -88,19 +88,20 @@ def _all_tool_dicts(tools) -> list[dict[str, Any]]:
     return [t.model_dump(exclude_none=True) for t in (tools or [])]
 
 
-def _maintenance_gate(state: Any) -> JSONResponse | None:
-    """503 while the engine is not serving. Distinguishes the startup "loading" phase from a
-    runtime cache "rebuild"/"failed" so clients (and the desktop) get an actionable message.
-    None when serving."""
-    mstate = getattr(state, "maintenance_state", "serving")
-    if mstate == "serving":
+async def _maintenance_gate(state: Any) -> JSONResponse | None:
+    """503 while the engine is not serving; a runtime cache rebuild is WAITED OUT (memory
+    governor steps take a few seconds and callers must only see slowness), while loading /
+    failed / stopping answer at once. None when serving."""
+    wait = getattr(state, "wait_until_serving", None)
+    if wait is None:  # a bare state object in tests
+        mstate = getattr(state, "maintenance_state", "serving")
+        if mstate == "serving":
+            return None
+        msg = "model is still loading" if mstate == "loading" else f"server unavailable: engine is {mstate}"
+        return JSONResponse({"error": msg}, status_code=503)
+    msg = await wait()
+    if msg is None:
         return None
-    if mstate == "loading":
-        msg = "model is still loading"
-    elif mstate == "failed":
-        msg = "server unavailable: maintenance failed (restart required)"
-    else:
-        msg = "server unavailable: cache rebuild in progress"
     return JSONResponse({"error": msg}, status_code=503)
 
 
@@ -117,7 +118,7 @@ def register_openai_routes(
     async def v1_chat_completions(req: ChatCompletionRequest, request: Request):
         log_request("/v1/chat/completions", req, request)
         state = get_state()
-        if (gate := _maintenance_gate(state)) is not None:
+        if (gate := await _maintenance_gate(state)) is not None:
             return gate
         return await handle_chat_completion(req, request, state, get_model_sampling())
 
@@ -125,7 +126,7 @@ def register_openai_routes(
     async def v1_completions(req: CompletionRequest, request: Request):
         log_request("/v1/completions", req, request)
         state = get_state()
-        if (gate := _maintenance_gate(state)) is not None:
+        if (gate := await _maintenance_gate(state)) is not None:
             return gate
         return await handle_completion(req, request, state, get_model_sampling())
 

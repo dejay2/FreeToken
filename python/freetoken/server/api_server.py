@@ -302,6 +302,27 @@ class FrontendManager:
             )
         return self._allocate_user()
 
+    async def wait_until_serving(self, timeout: float = 120.0) -> str | None:
+        """The adapters' front-door gate. ``None`` when the engine is serving (after waiting out
+        a runtime rebuild, up to ``timeout``); otherwise the 503 reason.
+
+        The chat adapters used to answer 503 the moment ``maintenance_state`` was
+        "rebuilding", before ``new_user`` and its wait queue were ever reached: on the serving
+        box (2026-09-07 18:15) 10 of 55 hammer requests failed during the RAM-axis spills. Only
+        loading / failed / stopping (and a wait that outlives ``timeout``) are refusals."""
+        if self.maintenance_state == "rebuilding":
+            try:
+                await asyncio.wait_for(self.rebuild_done.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                return f"server unavailable: cache rebuild timed out after {timeout}s"
+        if self.maintenance_state == "loading":
+            return "model is still loading"
+        if self.maintenance_state == "failed":
+            return "server unavailable: maintenance failed (restart required)"
+        if self.maintenance_state == "stopping":
+            return "server unavailable: engine is stopping"
+        return None
+
     def new_user(self, timeout: float = 120.0):
         if self.maintenance_state in ("loading", "failed", "stopping"):
             raise AdmissionClosedError(
