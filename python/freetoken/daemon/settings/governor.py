@@ -183,6 +183,7 @@ class GovernorPolicy:
         free_vram: int,
         free_ram: int,
         last_actions: Any = None,
+        allow_down: bool = True,
     ) -> list[Action]:
         """Decide next action(s) based on current free memory and timing."""
         state = last_actions if isinstance(last_actions, dict) else self._state
@@ -242,7 +243,9 @@ class GovernorPolicy:
                 # A real second squeeze (more than one rung below the cushion) overrides the
                 # grace; the ordinary post-recall dip must wait until the grace expires.
                 hard_squeeze = free < cushion - self.rung_bytes
-                if since_last >= self.step_interval and (not in_post_up_grace or hard_squeeze):
+                # allow_down=False (the loop's boot settle window) must leave no trace: a dropped
+                # step must not stamp last_step_time, or the next tick waits a full interval.
+                if allow_down and since_last >= self.step_interval and (not in_post_up_grace or hard_squeeze):
                     actions.append(Action(axis=axis, direction="down", ram_tight=ram_tight))
                     axis_state["last_step_time"] = now
                     axis_state["last_step_direction"] = "down"
@@ -346,9 +349,7 @@ class GovernorLoop(threading.Thread):
             # Do not charge the residency HTTP round trip to the policy's step interval.
             now = time.monotonic()
 
-        actions = self.policy.decide(now, free_vram, free_ram)
-        if settling:
-            actions = [a for a in actions if a.direction != "down"]
+        actions = self.policy.decide(now, free_vram, free_ram, allow_down=not settling)
         for action in actions:
             self._execute_action(action, free_vram, free_ram)
             # The POST blocks for the whole rebuild; the interval and the flap window count
