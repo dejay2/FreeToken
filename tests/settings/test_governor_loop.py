@@ -167,6 +167,7 @@ def test_tick_restamps_the_axis_when_the_post_returns(monkeypatch):
     loop = GovernorLoop(pm, GovernorPolicy(vram_cushion=2 * GIB, ram_cushion=4 * GIB))
     loop.last_moe_cache_size = 6144
     loop._last_residency_query = clock["t"]  # this test isolates POST timing from the minute refresh
+    loop._serving_since = clock["t"] - governor.BOOT_SETTLE_SECONDS - 1  # past the boot settle window
     loop._tick()
     assert len(server.requests) == 1
     assert loop.policy._state["vram"]["last_step_time"] == 108.0
@@ -304,3 +305,40 @@ def test_apply_governor_settings_swaps_running_policy_without_server_call(tmp_pa
     assert loop.policy.vram_rungs_before_up == 3
     assert calls == []
     assert "governor settings applied" in caplog.text
+
+
+def test_boot_settle_window_drops_down_steps_but_not_up_steps(monkeypatch):
+    """Right after the server starts serving, Windows free memory sags for about a minute
+    (2026-09-07 21:01:57: seven spills with nothing else running). Down steps wait out the
+    settle window; up steps and a squeeze that persists past the window still act."""
+    server = _FakeServer([])
+    loop = _loop(monkeypatch, server)
+    monkeypatch.setattr(governor, "read_free_vram_bytes", lambda: int(2.5 * GIB))  # card: no step either way
+    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda: 1 * GIB)  # below the 4 GiB cushion
+    executed: list[Action] = []
+    monkeypatch.setattr(loop, "_execute_action", lambda a, fv, fr: executed.append(a))
+    monkeypatch.setattr(loop, "_query_residency", lambda: None)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(governor.time, "monotonic", lambda: clock["t"])
+
+    loop._tick()  # first serving tick starts the window; the RAM axis wants "down" but must wait
+    assert executed == []
+    clock["t"] += governor.BOOT_SETTLE_SECONDS - 1
+    loop._tick()
+    assert executed == []
+    clock["t"] += 2
+    loop._tick()  # past the window the persisting squeeze is acted on
+    assert [a.direction for a in executed] == ["down"]
+
+    # up steps are never delayed by the window: fresh loop, memory comfortably free
+    executed.clear()
+    loop2 = _loop(monkeypatch, server)
+    monkeypatch.setattr(loop2, "_execute_action", lambda a, fv, fr: executed.append(a))
+    monkeypatch.setattr(loop2, "_query_residency", lambda: None)
+    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda: 40 * GIB)
+    monkeypatch.setattr(governor, "read_free_vram_bytes", lambda: 12 * GIB)
+    clock["t"] = 5000.0
+    loop2._tick()
+    clock["t"] += loop2.policy.up_hold + 1  # the policy's own hold, well inside the settle window
+    loop2._tick()
+    assert executed and all(a.direction == "up" for a in executed)

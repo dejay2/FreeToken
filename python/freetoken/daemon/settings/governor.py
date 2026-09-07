@@ -31,6 +31,7 @@ DEFAULT_STEP_INTERVAL = 5.0  # 5 s
 DEFAULT_POST_UP_GRACE_MULTIPLIER = 2.0  # two intervals after a recall before ordinary down
 DEFAULT_UP_HOLD = 60.0  # 60 s
 DEFAULT_MAX_HOLD = 600.0  # 600 s (10 min)
+BOOT_SETTLE_SECONDS = 120.0  # no down steps this long after the server starts serving (boot dip)
 
 
 @dataclass(frozen=True)
@@ -285,6 +286,7 @@ class GovernorLoop(threading.Thread):
         self.last_layers: dict[str, int] = {"owned": 0, "pinned": 0, "disk": 0}
         self.last_free_vram: int | None = None
         self.last_free_ram: int | None = None
+        self._serving_since: float | None = None
         self.last_moe_cache_size: int | None = None
         self._last_residency_query = -float("inf")
         self._floor_logged: dict[str, bool] = {}
@@ -306,7 +308,18 @@ class GovernorLoop(threading.Thread):
             return
         status = self.process_manager.server_status()
         if not status.get("reachable") or status.get("state") != "serving":
+            self._serving_since = None
             return
+        now_mono = time.monotonic()
+        if self._serving_since is None:
+            self._serving_since = now_mono
+        # Boot dip: Windows free memory sags for about a minute right after the model server
+        # starts serving, while WSL hands the weight-loading cache back. On 2026-09-07 21:01:53
+        # the API came up and the RAM axis spilled seven layers between 21:01:57 and 21:02:32
+        # with no other program running, then recalled them all once Windows read 13 GB free.
+        # Down steps wait out this settle window; a real squeeze that persists past it is
+        # still acted on, and up steps are never delayed by it.
+        settling = now_mono - self._serving_since < BOOT_SETTLE_SECONDS
 
         try:
             free_vram = read_free_vram_bytes()
@@ -334,6 +347,8 @@ class GovernorLoop(threading.Thread):
             now = time.monotonic()
 
         actions = self.policy.decide(now, free_vram, free_ram)
+        if settling:
+            actions = [a for a in actions if a.direction != "down"]
         for action in actions:
             self._execute_action(action, free_vram, free_ram)
             # The POST blocks for the whole rebuild; the interval and the flap window count
