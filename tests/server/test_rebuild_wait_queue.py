@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -9,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import freetoken.server.api_server as api
+from freetoken.message import CacheResidencyReply, CacheStepMsg, CacheStepReply
 from freetoken.server.api_server import (
     AdmissionClosedError,
     CacheStepRequest,
@@ -181,65 +183,67 @@ def test_cache_step_preflight_checks():
         api._GLOBAL_STATE = prev
 
 
-class _FakeEngine:
-    def __init__(self):
-        self.step_calls = []
+class _FakeBackend:
+    """Stands in for the tokenizer/scheduler side of the wire: records what the API server sent
+    and answers through the same reply handlers listen() runs (_resolve_step / _resolve_residency),
+    so the test covers the real message path rather than a shortcut."""
+
+    def __init__(self, manager: FrontendManager, *, answer: bool = True):
+        self.manager = manager
+        self.sent: list = []
+        self.answer = answer
         self.owned = 4
-        self.slots = 6144
 
-    def step_memory(self, axis: str, direction: str, ram_tight: bool = False):
-        self.step_calls.append((axis, direction, ram_tight))
-        if axis == "vram" and direction == "down":
-            self.owned = 3
-            return {
-                "applied": "gpu_owned->pinned",
-                "layer": 3,
-                "moe_cache_size": self.slots,
-                "at_floor": False,
-                "vram_free_bytes": 1024**3,
-            }
-        return {"applied": None, "reason": "noop"}
-
-    def residency_report(self):
-        return {
-            "layers": {0: "gpu_owned", 1: "gpu_owned", 2: "gpu_owned", 3: "pinned"},
-            "moe_cache_size": self.slots,
-            "owned": self.owned,
-            "pinned": 45,
-            "disk": 0,
-        }
+    async def send_one(self, msg):
+        self.sent.append(msg)
+        if not self.answer:
+            return
+        if isinstance(msg, CacheStepMsg):
+            self.owned -= 1
+            reply = CacheStepReply(
+                request_id=msg.request_id, status="ok", applied="gpu_owned->pinned", layer=3,
+                at_floor=False, moe_cache_size=6144,
+                layers={"owned": self.owned, "pinned": 48 - self.owned, "disk": 0},
+                vram_free_bytes=1024**3,
+            )
+            asyncio.get_running_loop().call_soon(self.manager._resolve_step, reply)
+        else:  # CacheResidencyMsg
+            reply = CacheResidencyReply(
+                request_id=msg.request_id, status="ok",
+                residency={"layers": {3: "pinned"}, "moe_cache_size": 6144,
+                           "owned": self.owned, "pinned": 48 - self.owned, "disk": 0},
+            )
+            asyncio.get_running_loop().call_soon(self.manager._resolve_residency, reply)
 
 
-def test_cache_step_and_residency_with_engine():
-    client = TestClient(api.app)
+@pytest.mark.anyio
+async def test_cache_step_and_residency_round_trip():
     prev = api._GLOBAL_STATE
-    fake_engine = _FakeEngine()
     manager = _make_manager("serving")
-    manager.engine = fake_engine
+    backend = _FakeBackend(manager)
+    manager.send_one = backend.send_one
     api._GLOBAL_STATE = manager
-
     try:
-        # Step VRAM down
-        r = client.post("/v1/cache/step", json={"axis": "vram", "direction": "down", "ram_tight": True})
-        assert r.status_code == 200
-        data = r.json()
+        resp = await cache_step(CacheStepRequest(axis="vram", direction="down", ram_tight=True, timeout=2.0))
+        assert resp.status_code == 200
+        data = json.loads(resp.body)
         assert data["status"] == "ok"
         assert data["applied"] == "gpu_owned->pinned"
         assert data["layer"] == 3
-        assert fake_engine.step_calls == [("vram", "down", True)]
+        assert data["layers"] == {"owned": 3, "pinned": 45, "disk": 0}
+        sent = backend.sent[0]
+        assert isinstance(sent, CacheStepMsg) and (sent.axis, sent.direction, sent.ram_tight) == ("vram", "down", True)
+        # the step reopened the maintenance gate
+        assert manager.maintenance_state == "serving" and manager.rebuild_done.is_set()
 
-        # GET /v1/cache/residency
-        r_res = client.get("/v1/cache/residency")
-        assert r_res.status_code == 200
-        res_data = r_res.json()
-        assert res_data["owned"] == 3
-        assert res_data["pinned"] == 45
-        assert res_data["layers"]["3"] == "pinned"
-
-        # Check caching (<5s returns cached)
-        fake_engine.owned = 99
-        r_cached = client.get("/v1/cache/residency")
-        assert r_cached.json()["owned"] == 3  # still cached value
+        res = await cache_residency()
+        assert res["owned"] == 3 and res["pinned"] == 45
+        assert res["layers"][3] == "pinned"  # int key here; "3" once JSON-encoded over HTTP
+        assert len(backend.sent) == 2
+        # <5 s old: served from the cache, no second wire round trip
+        backend.owned = 99
+        res_cached = await cache_residency()
+        assert res_cached["owned"] == 3 and len(backend.sent) == 2
     finally:
         api._GLOBAL_STATE = prev
 
@@ -247,25 +251,20 @@ def test_cache_step_and_residency_with_engine():
 @pytest.mark.anyio
 async def test_cache_step_waits_during_rebuild_and_proceeds():
     prev = api._GLOBAL_STATE
-    fake_engine = _FakeEngine()
     manager = _make_manager("rebuilding")
-    manager.engine = fake_engine
+    backend = _FakeBackend(manager)
+    manager.send_one = backend.send_one
     api._GLOBAL_STATE = manager
-
     try:
-        from fastapi import Request
-        req = CacheStepRequest(axis="vram", direction="down", timeout=2.0)
-        task = asyncio.create_task(cache_step(req))
+        task = asyncio.create_task(cache_step(CacheStepRequest(axis="vram", direction="down", timeout=2.0)))
         await asyncio.sleep(0.01)
-        assert not task.done()
-
-        # Rebuild finishes
+        assert not task.done() and backend.sent == []
+        # the in-flight rebuild finishes
         manager.maintenance_state = "serving"
         manager.rebuild_done.set()
-
         resp = await task
         assert resp.status_code == 200
-        assert fake_engine.step_calls == [("vram", "down", False)]
+        assert [type(m) for m in backend.sent] == [CacheStepMsg]
     finally:
         api._GLOBAL_STATE = prev
 
@@ -273,15 +272,31 @@ async def test_cache_step_waits_during_rebuild_and_proceeds():
 @pytest.mark.anyio
 async def test_cache_step_times_out_when_rebuild_never_finishes():
     prev = api._GLOBAL_STATE
-    fake_engine = _FakeEngine()
     manager = _make_manager("rebuilding")
-    manager.engine = fake_engine
     api._GLOBAL_STATE = manager
-
     try:
-        req = CacheStepRequest(axis="vram", direction="down", timeout=0.02)
-        resp = await cache_step(req)
+        resp = await cache_step(CacheStepRequest(axis="vram", direction="down", timeout=0.02))
         assert resp.status_code == 504
         assert "timed out" in resp.body.decode()
+    finally:
+        api._GLOBAL_STATE = prev
+
+
+@pytest.mark.anyio
+async def test_cache_step_reply_timeout_leaves_gate_closed_until_the_late_reply():
+    """A step whose reply outlives the HTTP timeout keeps the gate shut (the engine is still
+    rebuilding); the late reply reopens it, exactly like a rebuild."""
+    prev = api._GLOBAL_STATE
+    manager = _make_manager("serving")
+    backend = _FakeBackend(manager, answer=False)
+    manager.send_one = backend.send_one
+    api._GLOBAL_STATE = manager
+    try:
+        resp = await cache_step(CacheStepRequest(axis="vram", direction="up", timeout=0.02))
+        assert resp.status_code == 504
+        assert manager.maintenance_state == "rebuilding" and not manager.rebuild_done.is_set()
+        late = CacheStepReply(request_id=backend.sent[0].request_id, status="ok", applied=None)
+        manager._resolve_step(late)
+        assert manager.maintenance_state == "serving" and manager.rebuild_done.is_set()
     finally:
         api._GLOBAL_STATE = prev

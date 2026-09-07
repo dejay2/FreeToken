@@ -327,34 +327,10 @@ class FrontendManager:
                 self._resolve_rebuild(msg)
                 continue
             if isinstance(msg, CacheStepReply):
-                fut = self.rebuild_futures.pop(msg.request_id, None)
-                if fut is not None and not fut.done():
-                    fut.set_result(
-                        {
-                            "status": msg.status,
-                            "applied": msg.applied,
-                            "layer": msg.layer,
-                            "at_floor": msg.at_floor,
-                            "moe_cache_size": msg.moe_cache_size,
-                            "layers": msg.layers,
-                            "vram_free_bytes": msg.vram_free_bytes,
-                            "error": msg.error,
-                        }
-                    )
-                if self.fatal_error is not None:
-                    self.maintenance_state = "failed"
-                else:
-                    self.maintenance_state = "failed" if msg.status == "failed" else "serving"
-                if hasattr(self, "rebuild_done"):
-                    self.rebuild_done.set()
+                self._resolve_step(msg)
                 continue
             if isinstance(msg, CacheResidencyReply):
-                fut = self.routing_futures.pop(msg.request_id, None)
-                if fut is not None and not fut.done():
-                    fut.set_result({"status": msg.status, "report": msg.residency, "error": msg.error})
-                if msg.status == "ok" and isinstance(msg.residency, dict):
-                    self._residency_cache = msg.residency
-                    self._residency_time = time.monotonic()
+                self._resolve_residency(msg)
                 continue
             if isinstance(msg, RoutingStatsReply):
                 fut = self.routing_futures.pop(msg.request_id, None)
@@ -406,6 +382,36 @@ class FrontendManager:
         self.maintenance_state = "failed" if msg.status == "failed" else "serving"
         if hasattr(self, "rebuild_done"):
             self.rebuild_done.set()
+
+    def _resolve_step(self, msg: CacheStepReply) -> None:
+        """A /v1/cache/step reply: same maintenance transition as _resolve_rebuild."""
+        fut = self.rebuild_futures.pop(msg.request_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(
+                {
+                    "status": msg.status,
+                    "applied": msg.applied,
+                    "layer": msg.layer,
+                    "at_floor": msg.at_floor,
+                    "moe_cache_size": msg.moe_cache_size,
+                    "layers": msg.layers,
+                    "vram_free_bytes": msg.vram_free_bytes,
+                    "error": msg.error,
+                }
+            )
+        if self.fatal_error is not None:
+            self.maintenance_state = "failed"
+        else:
+            self.maintenance_state = "failed" if msg.status == "failed" else "serving"
+        self.rebuild_done.set()
+
+    def _resolve_residency(self, msg: CacheResidencyReply) -> None:
+        fut = self.routing_futures.pop(msg.request_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result({"status": msg.status, "report": msg.residency, "error": msg.error})
+        if msg.status == "ok" and isinstance(msg.residency, dict):
+            self._residency_cache = msg.residency
+            self._residency_time = time.monotonic()
 
     def fail_pending_rebuilds(self, message: str) -> None:
         """Resolve every in-flight rebuild waiter as failed. Called from the supervisor thread
@@ -765,15 +771,6 @@ async def dispatch_step(
     timeout: float = 60.0,
 ) -> Dict[str, Any]:
     """Dispatch a memory-governor step (VRAM or RAM ladder) to the scheduler/engine."""
-    if getattr(state, "engine", None) is not None:
-        res = state.engine.step_memory(axis=axis, direction=direction, ram_tight=ram_tight)
-        state._residency_cache = state.engine.residency_report()
-        state._residency_time = time.monotonic()
-        out = {"status": "ok"}
-        if isinstance(res, dict):
-            out.update(res)
-        return out
-
     request_id = str(uuid.uuid4())
     fut = asyncio.get_running_loop().create_future()
     state.rebuild_futures[request_id] = fut
@@ -856,12 +853,6 @@ async def cache_residency(timeout: float = 10.0):
     now = time.monotonic()
     if state._residency_cache is not None and (now - state._residency_time) < 5.0:
         return state._residency_cache
-
-    if getattr(state, "engine", None) is not None:
-        report = state.engine.residency_report()
-        state._residency_cache = report
-        state._residency_time = now
-        return report
 
     if state.maintenance_state in ("loading", "failed", "stopping"):
         return JSONResponse(
