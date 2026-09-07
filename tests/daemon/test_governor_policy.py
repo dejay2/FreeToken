@@ -80,6 +80,26 @@ def test_decide_up_only_after_hold():
     assert actions[0] == Action(axis="vram", direction="up", ram_tight=False)
 
 
+def test_configured_rung_counts_control_each_up_threshold():
+    policy = GovernorPolicy(
+        vram_cushion=4 * GIB,
+        ram_cushion=8 * GIB,
+        rung_bytes=GIB,
+        margin=0,
+        step_interval=1.0,
+        up_hold=1.0,
+        ram_rungs_before_up=3,
+        vram_rungs_before_up=2,
+    )
+    high_vram = 4 * GIB + 2 * GIB + 1
+    high_ram = 8 * GIB + 3 * GIB + 1
+    assert policy.decide(now=0.0, free_vram=high_vram, free_ram=high_ram) == []
+    assert policy.decide(now=1.0, free_vram=high_vram, free_ram=high_ram) == [
+        Action(axis="vram", direction="up", ram_tight=False),
+        Action(axis="ram", direction="up", ram_tight=False),
+    ]
+
+
 def test_ram_up_threshold_requires_two_rungs_while_vram_keeps_one():
     vram_cushion = 4 * GIB
     ram_cushion = 8 * GIB

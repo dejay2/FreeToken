@@ -104,6 +104,37 @@ def test_floor_is_logged_once_per_episode(monkeypatch, caplog):
     ]
 
 
+def test_residency_layer_bytes_updates_rung_and_zero_uses_qwen_fallback(monkeypatch):
+    class _ResidencyResponse:
+        def __init__(self, body):
+            self.payload = json.dumps(body).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return self.payload
+
+    replies = iter((
+        {"layers": {}, "moe_cache_size": 6144, "layer_bytes": 987654321},
+        {"layers": {}, "moe_cache_size": 6144, "layer_bytes": 0},
+    ))
+
+    def residency(url_request, timeout=None):
+        return _ResidencyResponse(next(replies))
+
+    monkeypatch.setattr(governor.urllib.request, "urlopen", residency)
+    pm = SimpleNamespace(server_status=lambda: {"reachable": True, "state": "serving"})
+    loop = GovernorLoop(pm, GovernorPolicy(vram_cushion=2 * GIB, ram_cushion=4 * GIB), http_port=2020)
+    loop._query_residency()
+    assert loop.policy.rung_bytes == 987654321
+    loop._query_residency()
+    assert loop.policy.rung_bytes == governor.DEFAULT_RUNG_BYTES
+
+
 def test_server_down_or_timeout_never_raises(monkeypatch):
     def boom(req, timeout=None):
         raise urllib.error.URLError("connection refused")
@@ -135,6 +166,7 @@ def test_tick_restamps_the_axis_when_the_post_returns(monkeypatch):
     pm = SimpleNamespace(server_status=lambda: {"reachable": True, "state": "serving"})
     loop = GovernorLoop(pm, GovernorPolicy(vram_cushion=2 * GIB, ram_cushion=4 * GIB))
     loop.last_moe_cache_size = 6144
+    loop._last_residency_query = clock["t"]  # this test isolates POST timing from the minute refresh
     loop._tick()
     assert len(server.requests) == 1
     assert loop.policy._state["vram"]["last_step_time"] == 108.0
@@ -178,6 +210,8 @@ def test_start_governor_without_settings_reads_the_boot_file(tmp_path, monkeypat
     class FakeLoop:
         def __init__(self, pm, policy, http_port=2020):
             started["policy"] = policy
+            started["loop"] = self
+            self.policy = policy
             self.enabled = None
 
         def start(self):
@@ -197,12 +231,76 @@ def test_start_governor_without_settings_reads_the_boot_file(tmp_path, monkeypat
 
     boot = tmp_path / "boot-2020.ps1"
     shutil.copy2(Path(__file__).parents[2] / "boot-2020.ps1", boot)
-    BootFile(boot).save({"MemoryGovernor": True, "GovernorVRAMFreeGB": 2.5, "GovernorRAMFreeGB": 6})
+    BootFile(boot).save({
+        "MemoryGovernor": True,
+        "GovernorVRAMFreeGB": 2.5,
+        "GovernorRAMFreeGB": 6,
+        "GovernorUpMarginGB": 0.75,
+        "GovernorStepIntervalS": 7,
+        "GovernorUpHoldS": 90,
+        "GovernorMaxHoldS": 900,
+        "GovernorPostUpGraceS": 15,
+        "GovernorRAMRungsBeforeUp": 3,
+        "GovernorVRAMRungsBeforeUp": 2,
+    })
     pm = ProcessManager(boot_file=boot, stop_script=tmp_path / "stop.ps1", log_path=tmp_path / "log", lock_path=tmp_path / "lock", port=2020)
     pm.start_governor()
     try:
         assert started.get("running") is True
-        assert started["policy"].vram_cushion == int(round(2.5 * gov.GIB))
-        assert started["policy"].ram_cushion == int(round(6 * gov.GIB))
+        policy = started["policy"]
+        assert policy.vram_cushion == int(round(2.5 * gov.GIB))
+        assert policy.ram_cushion == int(round(6 * gov.GIB))
+        assert policy.margin == int(round(0.75 * gov.GIB))
+        assert policy.step_interval == 7.0
+        assert policy.up_hold == 90.0
+        assert policy.max_hold == 900.0
+        assert policy.post_up_grace == 15.0
+        assert policy.ram_rungs_before_up == 3
+        assert policy.vram_rungs_before_up == 2
     finally:
         pm.stop_governor()
+
+
+def test_apply_governor_settings_swaps_running_policy_without_server_call(tmp_path, caplog):
+    calls = []
+    pm = ProcessManager(
+        boot_file=tmp_path / "boot.ps1",
+        stop_script=tmp_path / "stop.ps1",
+        log_path=tmp_path / "server.log",
+        lock_path=tmp_path / "gpu.lock",
+        readiness=lambda: calls.append("readiness") or {"state": "serving"},
+        stats=lambda: calls.append("stats") or {},
+        gpu_probe=lambda: calls.append("gpu") or {},
+        platform_windows=False,
+    )
+    old_policy = GovernorPolicy(vram_cushion=2 * GIB, ram_cushion=4 * GIB)
+    loop = GovernorLoop(pm, old_policy)
+    loop.enabled = True
+    pm._governor = loop
+
+    with caplog.at_level(logging.INFO, logger="freetoken.daemon.settings.process_manager"):
+        pm.apply_governor_settings({
+            "MemoryGovernor": True,
+            "GovernorVRAMFreeGB": 3.0,
+            "GovernorRAMFreeGB": 7.0,
+            "GovernorUpMarginGB": 1.25,
+            "GovernorStepIntervalS": 9.0,
+            "GovernorUpHoldS": 12.0,
+            "GovernorMaxHoldS": 120.0,
+            "GovernorPostUpGraceS": 18.0,
+            "GovernorRAMRungsBeforeUp": 4,
+            "GovernorVRAMRungsBeforeUp": 3,
+        })
+
+    assert loop.policy is not old_policy
+    assert loop.policy.vram_cushion == int(3 * GIB)
+    assert loop.policy.ram_cushion == int(7 * GIB)
+    assert loop.policy.margin == int(1.25 * GIB)
+    assert loop.policy.step_interval == 9.0
+    assert loop.policy.up_hold == 12.0
+    assert loop.policy.max_hold == 120.0
+    assert loop.policy.post_up_grace == 18.0
+    assert loop.policy.ram_rungs_before_up == 4
+    assert loop.policy.vram_rungs_before_up == 3
+    assert calls == []
+    assert "governor settings applied" in caplog.text

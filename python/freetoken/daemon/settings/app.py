@@ -312,6 +312,9 @@ def create_app(
             saved = boot.save(changes)
             profiles.sync_active(saved)
             refresh_model_roots()
+            apply_governor = getattr(process_manager, "apply_governor_settings", None)
+            if callable(apply_governor):
+                apply_governor(saved)
         except BootValidationError as exc:
             return _validation_response(exc.errors)
         except BootParseError as exc:

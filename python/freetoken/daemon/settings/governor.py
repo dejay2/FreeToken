@@ -23,9 +23,9 @@ from .memory_fit import _read_vram_snapshot
 logger = logging.getLogger("freetoken.daemon.settings.governor")
 
 GIB = 1024 ** 3
-# On 2026-09-07 each 1.33 GiB recall grew the page cache by another 1.33 GiB, dropping
-# Windows free memory by about 2.7 GiB and trapping the governor at its 4.7-4.9 GiB cushion.
-DEFAULT_RUNG_BYTES = int(1.33 * GIB)  # 1.33 GiB per Qwen MoE layer
+# Fallback only when /v1/cache/residency cannot report the live model size. The 1.33 GiB
+# value is the measured Qwen3.8 MoE-layer number (2026-09-07), not a universal rung size.
+DEFAULT_RUNG_BYTES = int(1.33 * GIB)
 DEFAULT_MARGIN_BYTES = int(0.5 * GIB)  # 0.5 GiB step-up margin
 DEFAULT_STEP_INTERVAL = 5.0  # 5 s
 DEFAULT_POST_UP_GRACE_MULTIPLIER = 2.0  # two intervals after a recall before ordinary down
@@ -129,11 +129,10 @@ def read_free_windows_ram_bytes() -> int:
 
 
 class GovernorPolicy:
-    """Decide cache steps while shielding RAM recalls from their own memory cost.
+    """Decide cache steps while shielding recalls from their own memory cost.
 
-    The RAM axis needs two free rungs before recalling another layer, and every up step
-    gets a two-interval grace window so the 1.33 GiB recall cannot immediately cause a
-    compensating spill; the measured reason is recorded with the constants above.
+    The default RAM and VRAM rung counts preserve the measured Qwen behaviour, while the
+    live model report can replace ``rung_bytes`` for other expert-bank layouts.
     """
 
     def __init__(
@@ -146,6 +145,8 @@ class GovernorPolicy:
         up_hold: float = DEFAULT_UP_HOLD,
         max_hold: float = DEFAULT_MAX_HOLD,
         post_up_grace: float | None = None,
+        ram_rungs_before_up: int = 2,
+        vram_rungs_before_up: int = 1,
     ) -> None:
         self.vram_cushion = int(vram_cushion)
         self.ram_cushion = int(ram_cushion)
@@ -159,6 +160,8 @@ class GovernorPolicy:
         )
         self.up_hold = float(up_hold)
         self.max_hold = float(max_hold)
+        self.ram_rungs_before_up = int(ram_rungs_before_up)
+        self.vram_rungs_before_up = int(vram_rungs_before_up)
         self._state: dict[str, Any] = {}
 
     def note_step_done(self, axis: str, now: float) -> None:
@@ -188,9 +191,9 @@ class GovernorPolicy:
         for axis in ("vram", "ram"):
             free = free_vram if axis == "vram" else free_ram
             cushion = self.vram_cushion if axis == "vram" else self.ram_cushion
-            # RAM recalls immediately consume a full rung and the live flap showed that
-            # one-rung headroom was not enough; VRAM keeps the original one-rung threshold.
-            rungs_before_up = 2 if axis == "ram" else 1
+            rungs_before_up = (
+                self.ram_rungs_before_up if axis == "ram" else self.vram_rungs_before_up
+            )
             up_threshold = cushion + rungs_before_up * self.rung_bytes + self.margin
 
             axis_state = state.setdefault(
@@ -283,6 +286,7 @@ class GovernorLoop(threading.Thread):
         self.last_free_vram: int | None = None
         self.last_free_ram: int | None = None
         self.last_moe_cache_size: int | None = None
+        self._last_residency_query = -float("inf")
         self._floor_logged: dict[str, bool] = {}
 
     def stop(self) -> None:
@@ -319,10 +323,16 @@ class GovernorLoop(threading.Thread):
         self.last_free_vram = free_vram
         self.last_free_ram = free_ram
 
-        if self.last_moe_cache_size is None:
-            self._query_residency()
-
         now = time.monotonic()
+        # The model's expert-bank size is stable for a boot, but query it periodically so a
+        # late-starting server (or a transiently unavailable first reply) can correct the
+        # Qwen fallback without adding a request on every 2 s governor tick.
+        if now - self._last_residency_query >= 60.0:
+            self._last_residency_query = now
+            self._query_residency()
+            # Do not charge the residency HTTP round trip to the policy's step interval.
+            now = time.monotonic()
+
         actions = self.policy.decide(now, free_vram, free_ram)
         for action in actions:
             self._execute_action(action, free_vram, free_ram)
@@ -427,6 +437,11 @@ class GovernorLoop(threading.Thread):
                     }
                     if "moe_cache_size" in rep:
                         self.last_moe_cache_size = rep["moe_cache_size"]
+                    try:
+                        layer_bytes = int(rep.get("layer_bytes", 0) or 0)
+                    except (TypeError, ValueError, OverflowError):
+                        layer_bytes = 0
+                    self.policy.rung_bytes = layer_bytes if layer_bytes > 0 else DEFAULT_RUNG_BYTES
         except Exception:  # noqa: BLE001
             pass
 

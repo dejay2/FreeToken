@@ -7,6 +7,7 @@ import copy
 import datetime as _datetime
 import inspect
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -19,6 +20,9 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
+
+
+logger = logging.getLogger("freetoken.daemon.settings.process_manager")
 
 
 FAILURE_SIGNATURES = (
@@ -868,9 +872,40 @@ class ProcessManager:
         }
         return result
 
+    def _governor_policy(self, settings: dict[str, Any]) -> tuple[Any, bool]:
+        """Build the helper policy and enabled flag without importing torch or the engine."""
+        from .governor import GIB, GovernorPolicy
+
+        enabled_val = settings.get("MemoryGovernor", True)
+        enabled = (
+            str(enabled_val).strip().lower() in {"1", "true", "yes", "on"}
+            if not isinstance(enabled_val, bool)
+            else enabled_val
+        )
+
+        def _number(name: str, default: float) -> float:
+            value = settings.get(name)
+            return float(default if value is None else value)
+
+        vram_gb = _number("GovernorVRAMFreeGB", 1.5)
+        ram_gb = _number("GovernorRAMFreeGB", 4.0)
+        margin_gb = _number("GovernorUpMarginGB", 0.5)
+        policy = GovernorPolicy(
+            vram_cushion=int(round(vram_gb * GIB)),
+            ram_cushion=int(round(ram_gb * GIB)),
+            margin=int(round(margin_gb * GIB)),
+            step_interval=_number("GovernorStepIntervalS", 5.0),
+            up_hold=_number("GovernorUpHoldS", 60.0),
+            max_hold=_number("GovernorMaxHoldS", 600.0),
+            post_up_grace=_number("GovernorPostUpGraceS", 10.0),
+            ram_rungs_before_up=int(round(_number("GovernorRAMRungsBeforeUp", 2))),
+            vram_rungs_before_up=int(round(_number("GovernorVRAMRungsBeforeUp", 1))),
+        )
+        return policy, enabled
+
     def start_governor(self, settings: dict[str, Any] | None = None) -> None:
         try:
-            from .governor import GIB, GovernorLoop, GovernorPolicy
+            from .governor import GovernorLoop
         except ImportError:
             return
         if settings is None:
@@ -880,18 +915,37 @@ class ProcessManager:
                 settings = BootFile(self.boot_file).load()
             except Exception:
                 settings = {}
-        enabled_val = settings.get("MemoryGovernor", True)
-        enabled = str(enabled_val).strip().lower() in {"1", "true", "yes", "on"} if not isinstance(enabled_val, bool) else enabled_val
-        vram_gb = float(settings.get("GovernorVRAMFreeGB") if settings.get("GovernorVRAMFreeGB") is not None else 1.5)
-        ram_gb = float(settings.get("GovernorRAMFreeGB") if settings.get("GovernorRAMFreeGB") is not None else 4.0)
-        policy = GovernorPolicy(
-            vram_cushion=int(round(vram_gb * GIB)),
-            ram_cushion=int(round(ram_gb * GIB)),
-        )
+        policy, enabled = self._governor_policy(settings)
         self.stop_governor()
         self._governor = GovernorLoop(self, policy, http_port=self.port)
         self._governor.enabled = enabled
         self._governor.start()
+
+    def apply_governor_settings(self, settings: dict[str, Any]) -> None:
+        """Swap policy values in the running watcher without restarting the model server."""
+        from .governor import GIB
+
+        policy, enabled = self._governor_policy(settings)
+        with self._lock:
+            loop = self._governor
+            if loop is not None:
+                loop.policy = policy
+                loop.enabled = enabled
+        logger.info(
+            "governor settings applied: enabled=%s vram_cushion=%.2fGiB ram_cushion=%.2fGiB "
+            "margin=%.2fGiB interval=%.1fs up_hold=%.1fs max_hold=%.1fs grace=%.1fs "
+            "ram_rungs=%d vram_rungs=%d",
+            enabled,
+            policy.vram_cushion / GIB,
+            policy.ram_cushion / GIB,
+            policy.margin / GIB,
+            policy.step_interval,
+            policy.up_hold,
+            policy.max_hold,
+            policy.post_up_grace,
+            policy.ram_rungs_before_up,
+            policy.vram_rungs_before_up,
+        )
 
     def stop_governor(self) -> None:
         if self._governor is not None:
