@@ -229,3 +229,17 @@ def test_note_step_done_counts_interval_and_flap_window_from_completion():
 
     # An axis the policy has not seen yet is a no-op, not a KeyError.
     policy.note_step_done("ram", 73.0)
+
+
+def test_powershell_candidates_include_absolute_path_when_not_on_path(monkeypatch):
+    """A systemd --user service has no /mnt/c on PATH; the absolute path must still be tried."""
+    from freetoken.daemon.settings import governor
+
+    monkeypatch.setattr(governor.shutil, "which", lambda name: None)
+    monkeypatch.setattr(governor.os.path, "exists", lambda p: p == governor._POWERSHELL_ABS)
+    assert governor._powershell_candidates() == [governor._POWERSHELL_ABS]
+    monkeypatch.setattr(governor.os.path, "exists", lambda p: False)
+    assert governor._powershell_candidates() == []
+    monkeypatch.setattr(governor.shutil, "which", lambda name: "/usr/bin/powershell.exe")
+    monkeypatch.setattr(governor.os.path, "exists", lambda p: True)
+    assert governor._powershell_candidates() == ["/usr/bin/powershell.exe", governor._POWERSHELL_ABS]

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -60,6 +61,22 @@ def _read_proc_meminfo_available() -> int:
     raise RuntimeError("MemAvailable not found in /proc/meminfo")
 
 
+# The helper runs as a systemd --user service whose PATH has no /mnt/c/Windows entries, so a
+# bare "powershell.exe" fails with "No such file" and the reader silently fell back to the VM's
+# MemAvailable (seen live 2026-09-07 18:00: governor said 16.5 GiB free while Windows had 2.8 GB,
+# so the RAM axis never stepped). The absolute path works from a service without any interop
+# env; measured with systemd-run on the serving box.
+_POWERSHELL_ABS = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+
+
+def _powershell_candidates() -> list[str]:
+    found = shutil.which("powershell.exe")
+    out = [found] if found else []
+    if os.path.exists(_POWERSHELL_ABS) and _POWERSHELL_ABS not in out:
+        out.append(_POWERSHELL_ABS)
+    return out
+
+
 def read_free_windows_ram_bytes() -> int:
     """Read free physical RAM in bytes.
 
@@ -72,27 +89,28 @@ def read_free_windows_ram_bytes() -> int:
         if _last_win_ram is not None and (now - _last_win_ram[0]) < 2.0:
             return _last_win_ram[1]
 
-    try:
-        proc = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-Command",
-                "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=3.0,
-            check=False,
-        )
+    for exe in _powershell_candidates():
+        try:
+            proc = subprocess.run(
+                [
+                    exe,
+                    "-NoProfile",
+                    "-Command",
+                    "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                check=False,
+            )
+        except Exception:  # noqa: BLE001
+            continue
         if proc.returncode == 0 and proc.stdout.strip():
             kb = int(proc.stdout.strip())
             free_bytes = kb * 1024
             with _last_win_ram_lock:
                 _last_win_ram = (now, free_bytes)
             return free_bytes
-    except Exception:  # noqa: BLE001
-        pass
 
     if not _fallback_logged:
         logger.info("Windows RAM interop unavailable, falling back to /proc/meminfo MemAvailable")
