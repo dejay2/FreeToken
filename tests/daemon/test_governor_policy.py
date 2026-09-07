@@ -80,6 +80,98 @@ def test_decide_up_only_after_hold():
     assert actions[0] == Action(axis="vram", direction="up", ram_tight=False)
 
 
+def test_ram_up_threshold_requires_two_rungs_while_vram_keeps_one():
+    vram_cushion = 4 * GIB
+    ram_cushion = 8 * GIB
+    rung = int(1.33 * GIB)
+    margin = int(0.5 * GIB)
+    policy = GovernorPolicy(
+        vram_cushion=vram_cushion,
+        ram_cushion=ram_cushion,
+        rung_bytes=rung,
+        margin=margin,
+        step_interval=5.0,
+        up_hold=0.0,
+    )
+
+    # One-rung RAM headroom is deliberately not enough for a recall.
+    assert policy.decide(
+        now=0.0,
+        free_vram=vram_cushion,
+        free_ram=ram_cushion + rung + margin + 1,
+    ) == []
+
+    # Two rungs plus the margin are enough; VRAM remains in its neutral zone here.
+    actions = policy.decide(
+        now=1.0,
+        free_vram=vram_cushion,
+        free_ram=ram_cushion + 2 * rung + margin + 1,
+    )
+    assert actions == [Action(axis="ram", direction="up", ram_tight=False)]
+
+
+def test_post_up_grace_blocks_recall_dip_but_allows_hard_squeeze():
+    vram_cushion = 4 * GIB
+    ram_cushion = 8 * GIB
+    rung = int(1.33 * GIB)
+    margin = int(0.5 * GIB)
+    policy = GovernorPolicy(
+        vram_cushion=vram_cushion,
+        ram_cushion=ram_cushion,
+        rung_bytes=rung,
+        margin=margin,
+        step_interval=5.0,
+        up_hold=0.0,
+    )
+    high_ram = ram_cushion + 2 * rung + margin + GIB
+    assert policy.decide(now=0.0, free_vram=vram_cushion, free_ram=high_ram) == [
+        Action(axis="ram", direction="up", ram_tight=False)
+    ]
+
+    # A recall's cushion dip two seconds after the up is protected by the 10 s grace.
+    assert policy.decide(
+        now=2.0,
+        free_vram=vram_cushion,
+        free_ram=ram_cushion - 1,
+    ) == []
+
+    # A new squeeze more than one rung below the cushion overrides that grace.
+    actions = policy.decide(
+        now=5.0,
+        free_vram=vram_cushion,
+        free_ram=ram_cushion - rung - 1,
+    )
+    assert actions == [Action(axis="ram", direction="down", ram_tight=True)]
+
+
+def test_high_memory_bursts_after_first_hold():
+    vram_cushion = 4 * GIB
+    ram_cushion = 8 * GIB
+    rung = int(1.33 * GIB)
+    margin = int(0.5 * GIB)
+    policy = GovernorPolicy(
+        vram_cushion=vram_cushion,
+        ram_cushion=ram_cushion,
+        rung_bytes=rung,
+        margin=margin,
+        step_interval=5.0,
+        up_hold=60.0,
+    )
+    high_ram = ram_cushion + 2 * rung + margin + GIB
+
+    assert policy.decide(now=0.0, free_vram=vram_cushion, free_ram=high_ram) == []
+    assert policy.decide(now=60.0, free_vram=vram_cushion, free_ram=high_ram) == [
+        Action(axis="ram", direction="up", ram_tight=False)
+    ]
+    assert policy.decide(now=64.0, free_vram=vram_cushion, free_ram=high_ram) == []
+    assert policy.decide(now=65.0, free_vram=vram_cushion, free_ram=high_ram) == [
+        Action(axis="ram", direction="up", ram_tight=False)
+    ]
+    assert policy.decide(now=70.0, free_vram=vram_cushion, free_ram=high_ram) == [
+        Action(axis="ram", direction="up", ram_tight=False)
+    ]
+
+
 def test_decide_up_hold_resets_if_memory_drops():
     vram_cushion = 4 * GIB
     rung = int(1.33 * GIB)
@@ -222,9 +314,10 @@ def test_note_step_done_counts_interval_and_flap_window_from_completion():
     assert actions == []
     assert policy._state["vram"]["up_hold"] == 120.0
 
-    # One step per interval, counted from completion: 68 + 5 = 73.
-    assert policy.decide(now=72.0, free_vram=vram_cushion - GIB, free_ram=9 * GIB) == []
-    actions = policy.decide(now=73.0, free_vram=vram_cushion - GIB, free_ram=9 * GIB)
+    # The two-interval grace ends at 78; the next step is allowed after that grace.
+    assert policy.decide(now=73.0, free_vram=vram_cushion - GIB, free_ram=9 * GIB) == []
+    assert policy.decide(now=77.0, free_vram=vram_cushion - GIB, free_ram=9 * GIB) == []
+    actions = policy.decide(now=79.0, free_vram=vram_cushion - GIB, free_ram=9 * GIB)
     assert [a.direction for a in actions] == ["down"]
 
     # An axis the policy has not seen yet is a no-op, not a KeyError.

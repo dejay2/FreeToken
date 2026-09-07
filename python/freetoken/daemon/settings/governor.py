@@ -23,9 +23,12 @@ from .memory_fit import _read_vram_snapshot
 logger = logging.getLogger("freetoken.daemon.settings.governor")
 
 GIB = 1024 ** 3
+# On 2026-09-07 each 1.33 GiB recall grew the page cache by another 1.33 GiB, dropping
+# Windows free memory by about 2.7 GiB and trapping the governor at its 4.7-4.9 GiB cushion.
 DEFAULT_RUNG_BYTES = int(1.33 * GIB)  # 1.33 GiB per Qwen MoE layer
 DEFAULT_MARGIN_BYTES = int(0.5 * GIB)  # 0.5 GiB step-up margin
 DEFAULT_STEP_INTERVAL = 5.0  # 5 s
+DEFAULT_POST_UP_GRACE_MULTIPLIER = 2.0  # two intervals after a recall before ordinary down
 DEFAULT_UP_HOLD = 60.0  # 60 s
 DEFAULT_MAX_HOLD = 600.0  # 600 s (10 min)
 
@@ -126,7 +129,12 @@ def read_free_windows_ram_bytes() -> int:
 
 
 class GovernorPolicy:
-    """Pure decision function governing cache steps on the VRAM and RAM ladders."""
+    """Decide cache steps while shielding RAM recalls from their own memory cost.
+
+    The RAM axis needs two free rungs before recalling another layer, and every up step
+    gets a two-interval grace window so the 1.33 GiB recall cannot immediately cause a
+    compensating spill; the measured reason is recorded with the constants above.
+    """
 
     def __init__(
         self,
@@ -137,12 +145,18 @@ class GovernorPolicy:
         step_interval: float = DEFAULT_STEP_INTERVAL,
         up_hold: float = DEFAULT_UP_HOLD,
         max_hold: float = DEFAULT_MAX_HOLD,
+        post_up_grace: float | None = None,
     ) -> None:
         self.vram_cushion = int(vram_cushion)
         self.ram_cushion = int(ram_cushion)
         self.rung_bytes = int(rung_bytes)
         self.margin = int(margin)
         self.step_interval = float(step_interval)
+        self.post_up_grace = (
+            float(post_up_grace)
+            if post_up_grace is not None
+            else DEFAULT_POST_UP_GRACE_MULTIPLIER * self.step_interval
+        )
         self.up_hold = float(up_hold)
         self.max_hold = float(max_hold)
         self._state: dict[str, Any] = {}
@@ -174,7 +188,10 @@ class GovernorPolicy:
         for axis in ("vram", "ram"):
             free = free_vram if axis == "vram" else free_ram
             cushion = self.vram_cushion if axis == "vram" else self.ram_cushion
-            up_threshold = cushion + self.rung_bytes + self.margin
+            # RAM recalls immediately consume a full rung and the live flap showed that
+            # one-rung headroom was not enough; VRAM keeps the original one-rung threshold.
+            rungs_before_up = 2 if axis == "ram" else 1
+            up_threshold = cushion + rungs_before_up * self.rung_bytes + self.margin
 
             axis_state = state.setdefault(
                 axis,
@@ -206,16 +223,22 @@ class GovernorPolicy:
             cur_hold = axis_state["up_hold"]
             high_since = axis_state["high_since"]
             doubled = axis_state.get("doubled", False)
+            since_last = now - last_time
+            in_post_up_grace = last_dir == "up" and since_last <= self.post_up_grace
 
             if free < cushion:
                 axis_state["high_since"] = None
-                # Check for step-up tripping cushion within step_interval -> double hold-off
-                if last_dir == "up" and (now - last_time <= self.step_interval) and not doubled:
+                # The measured recall cost can trip the cushion during this window. Keep the
+                # old tripped-cushion hold doubling, but key it to the longer grace window.
+                if in_post_up_grace and not doubled:
                     cur_hold = min(self.max_hold, cur_hold * 2.0)
                     axis_state["up_hold"] = cur_hold
                     axis_state["doubled"] = True
 
-                if now - last_time >= self.step_interval:
+                # A real second squeeze (more than one rung below the cushion) overrides the
+                # grace; the ordinary post-recall dip must wait until the grace expires.
+                hard_squeeze = free < cushion - self.rung_bytes
+                if since_last >= self.step_interval and (not in_post_up_grace or hard_squeeze):
                     actions.append(Action(axis=axis, direction="down", ram_tight=ram_tight))
                     axis_state["last_step_time"] = now
                     axis_state["last_step_direction"] = "down"
@@ -226,13 +249,15 @@ class GovernorPolicy:
                     high_since = now
                     axis_state["high_since"] = now
 
-                if (now - high_since >= cur_hold) and (now - last_time >= self.step_interval):
+                if (now - high_since >= cur_hold) and (since_last >= self.step_interval):
                     actions.append(Action(axis=axis, direction="up", ram_tight=ram_tight))
                     axis_state["last_step_time"] = now
                     axis_state["last_step_direction"] = "up"
-                    axis_state["high_since"] = now
+                    # Keep high_since: once the first 60 s hold is served, high memory allows
+                    # burst recalls every step interval instead of another full hold each time.
                     axis_state["doubled"] = False
             else:
+                # Any dip below the generous-zone threshold starts a fresh hold next time.
                 axis_state["high_since"] = None
 
         return actions
