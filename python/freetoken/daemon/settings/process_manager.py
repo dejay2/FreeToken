@@ -995,31 +995,28 @@ class ProcessManager:
     # ---- what a restart frees --------------------------------------------
 
     def running_server_release(self) -> dict[str, int]:
-        """The running server's own RAM (its processes' RSS) and VRAM (its /v1/stats figure).
+        """The running server's own RAM and VRAM, as the fit check should add back for a restart.
 
-        Zero when nothing is serving or the figure cannot be read; the fit check adds these back
-        before judging a restart (see MemoryFitService._release_for).
+        RAM is the engine's own account, pinned layers x bytes per layer from /v1/cache/residency,
+        not the processes' RSS: on the WSL box the scheduler's pinned banks (63 GB) showed as a
+        24 MiB RSS on 2026-09-08 (the dxg-backed pinned pages are not counted there), while an
+        earlier boot had reported 71 GB. VRAM is the server's /v1/stats figure. Zero when nothing
+        is serving or a figure cannot be read (see MemoryFitService._release_for).
         """
         ram = 0
         vram = 0
-        if not self.platform_windows:
-            try:
-                from .linux_launch import find_server_pids
-
-                page = os.sysconf("SC_PAGE_SIZE")
-                for pid in find_server_pids(self.port):
-                    try:
-                        with open(f"/proc/{pid}/statm", encoding="ascii") as fh:
-                            ram += int(fh.read().split()[1]) * page
-                    except (OSError, ValueError, IndexError):
-                        continue
-            except Exception:  # noqa: BLE001 - /proc is best effort
-                ram = 0
+        try:
+            residency = self._get_json(f"http://127.0.0.1:{self.port}/v1/cache/residency", timeout=3.0)
+            if isinstance(residency, dict):
+                layers = int(residency.get("pinned", 0) or 0)
+                ram = layers * int(residency.get("layer_bytes", 0) or 0)
+        except Exception:  # noqa: BLE001 - an unreachable server frees nothing
+            ram = 0
         try:
             stats = self._stats()
             value = stats.get("vram_bytes", stats.get("vramBytes", 0)) if isinstance(stats, dict) else 0
             vram = int(value or 0)
-        except Exception:  # noqa: BLE001 - an unreachable server frees nothing
+        except Exception:  # noqa: BLE001
             vram = 0
         return {"ram_bytes": max(0, ram), "vram_bytes": max(0, vram)}
 

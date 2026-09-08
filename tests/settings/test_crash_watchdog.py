@@ -287,3 +287,14 @@ def test_diagnostic_mode_maps_to_blocking_launches_and_graphs_off():
     plain = ll.build_launch({"ModelPath": "/models/demo", "CudaGraphMaxBS": 4}, python="py", base_env={}, facts=_facts(), wsl=False)
     assert plain.argv[plain.argv.index("--cuda-graph-max-bs") + 1] == "4"
     assert "CUDA_LAUNCH_BLOCKING" not in plain.env and plain.env["FREETOKEN_DIAGNOSTIC_MODE"] == "0"
+
+
+def test_running_server_release_uses_the_engines_own_layer_account(tmp_path, monkeypatch):
+    manager = _manager(tmp_path, lambda: {"state": "serving"})
+    manager._stats = lambda: {"vram_bytes": 30 << 30}
+    monkeypatch.setattr(ProcessManager, "_get_json", staticmethod(lambda url, *, timeout: {"pinned": 47, "layer_bytes": 1419509760} if "residency" in url else {}))
+    release = manager.running_server_release()
+    assert release == {"ram_bytes": 47 * 1419509760, "vram_bytes": 30 << 30}
+    monkeypatch.setattr(ProcessManager, "_get_json", staticmethod(lambda url, *, timeout: (_ for _ in ()).throw(OSError("down"))))
+    manager._stats = lambda: (_ for _ in ()).throw(OSError("down"))
+    assert manager.running_server_release() == {"ram_bytes": 0, "vram_bytes": 0}
