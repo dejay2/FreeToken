@@ -149,3 +149,22 @@ the SSD-first ladder saw 6-11 disk layers and 2.6-4.6 tok/s at the worst point. 
 not move per park (it went up: Windows trims its own standby pages under the grab), so the proof
 that a park frees host RAM is the recovery direction: each unpark cost ~1.3 GB of Windows free.
 After release one layer stayed parked at Windows free 4.8 GB (recall bar 6.25 GB); ~3 tok/s.
+
+## Guess-ahead (MTP) cost, isolated from the PLE reader (07:10-07:27)
+
+Jay turned `FREETOKEN_MTP_SPECULATE` on at 21:54 on 2026-09-07 through the new MTP tab. Same
+daily 262k profile, `bench.py` (three 200-token completions, median decode tok/s), all 48 layers
+pinned, nothing parked, server quiet:
+
+| PLE reader | MTP | slots | decode tok/s |
+|---|---|---|---|
+| disk (io_uring) | off | 6429 | 55.8 (2026-09-07 19:48) |
+| mmap | on (depth 5, cost-aware, min emitted 2.4) | 5917 | 19.5-20.6 (three runs) |
+| mmap | off | 6429 | 50.3 |
+
+So the guessing itself costs ~2.5x on this build and the memory-mapped reader it forces costs
+~10%; the mmap reader took zero major page faults during a 600-token run (scheduler `majflt`
+unchanged), so it is not stalling on disk. The cost-aware / min-emitted catches did not stop the
+speculation from losing. MTP also holds 2.56 GiB of the card for its draft head (512 fewer slots).
+Left: MTP off, `PleBackend` back to auto (disk at the next start). A dynamic on/off worth its name
+means fixing the cost-aware gate inside the spike (`engine/spec_*.py`), a separate job.
