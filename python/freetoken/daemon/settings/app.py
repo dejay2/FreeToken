@@ -36,6 +36,8 @@ HELPER_VERSION = "1.4.0"
 
 class SettingsBody(BaseModel):
     settings: dict[str, Any] = Field(default_factory=dict)
+    # "restart" lets the memory check add back what the running server will free first.
+    action: str | None = None
 
 
 class ProfileBody(BaseModel):
@@ -210,7 +212,10 @@ def create_app(
     app.state.models_dir = model_root
     app.state.downloads_dir = download_root
     app.state.download_manager = download_manager
-    app.state.estimate_service = estimate_service or MemoryFitService()
+    release_probe = getattr(process_manager, "running_server_release", None)
+    app.state.estimate_service = estimate_service or MemoryFitService(
+        release_probe=release_probe if callable(release_probe) else None
+    )
     app.state.started_monotonic = started
     app.include_router(create_download_router(models_dir=model_root, manager=download_manager))
 
@@ -266,6 +271,7 @@ def create_app(
                 app.state.estimate_service.estimate_settings,
                 body.settings,
                 boot_file=boot,
+                action=body.action if body.action in ("start", "restart") else None,
             )
         except SettingsValidationError as exc:
             return _validation_response(exc.errors)

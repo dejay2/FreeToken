@@ -215,7 +215,7 @@ def test_page_has_memory_fit_panel_and_checked_lifecycle_snapshot() -> None:
     for control in ("fit-now", "fit-empty", "fit-suggestion", "fit-apply", "fit-override", "fit-error"):
         assert f'id="{control}"' in page
     assert "json('/api/settings/estimate'" in source
-    assert "body: JSON.stringify({ settings: fitClone(snapshot) })" in source
+    assert "body: JSON.stringify({ settings: fitClone(snapshot), action: action || null })" in source
     assert "Start anyway with my values." in page
     assert "state.fit" in source
     assert "checkedSettings" in source

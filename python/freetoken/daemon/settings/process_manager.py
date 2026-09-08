@@ -992,6 +992,37 @@ class ProcessManager:
             "free_ram_gb": 0.0,
         }
 
+    # ---- what a restart frees --------------------------------------------
+
+    def running_server_release(self) -> dict[str, int]:
+        """The running server's own RAM (its processes' RSS) and VRAM (its /v1/stats figure).
+
+        Zero when nothing is serving or the figure cannot be read; the fit check adds these back
+        before judging a restart (see MemoryFitService._release_for).
+        """
+        ram = 0
+        vram = 0
+        if not self.platform_windows:
+            try:
+                from .linux_launch import find_server_pids
+
+                page = os.sysconf("SC_PAGE_SIZE")
+                for pid in find_server_pids(self.port):
+                    try:
+                        with open(f"/proc/{pid}/statm", encoding="ascii") as fh:
+                            ram += int(fh.read().split()[1]) * page
+                    except (OSError, ValueError, IndexError):
+                        continue
+            except Exception:  # noqa: BLE001 - /proc is best effort
+                ram = 0
+        try:
+            stats = self._stats()
+            value = stats.get("vram_bytes", stats.get("vramBytes", 0)) if isinstance(stats, dict) else 0
+            vram = int(value or 0)
+        except Exception:  # noqa: BLE001 - an unreachable server frees nothing
+            vram = 0
+        return {"ram_bytes": max(0, ram), "vram_bytes": max(0, vram)}
+
     # ---- crash watchdog --------------------------------------------------
 
     @staticmethod

@@ -394,8 +394,10 @@ class MemoryFitService:
         launch_builder: Callable[..., Any] | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         root: str | os.PathLike[str] | None = None,
+        release_probe: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self._snapshot = snapshot
+        self._release_probe = release_probe
         self._runner = runner or subprocess.run
         self._launch_builder = launch_builder
         self.timeout = float(timeout)
@@ -757,22 +759,57 @@ class MemoryFitService:
             output["suggestion"] = None
         return output
 
+    def _release_for(self, action: str | None) -> dict[str, int] | None:
+        """What a restart frees before its boot: the running server's own RAM and VRAM.
+
+        A restart stops the old server first, so judging it against the machine as it is now
+        (the old server still holding ~70 GB of pinned banks and most of the card) says
+        "does not fit" for every restart, and the planner then burns its whole time budget
+        searching a thousand candidates that fit "right now" (measured 2026-09-08: 32-82 s, past
+        the 45 s limit, so the page's Restart never started anything). Only a restart adds the
+        release back; Start and a plain estimate keep the honest "now".
+        """
+        if action != "restart" or self._release_probe is None:
+            return None
+        try:
+            raw = self._release_probe() or {}
+        except Exception:  # noqa: BLE001 - an unreadable release is just no release
+            return None
+        release = {
+            "ram_bytes": max(0, _as_int(raw.get("ram_bytes"))),
+            "vram_bytes": max(0, _as_int(raw.get("vram_bytes"))),
+        }
+        return release if release["ram_bytes"] or release["vram_bytes"] else None
+
+    @staticmethod
+    def _with_release(snapshot: Mapping[str, Any], release: Mapping[str, int] | None) -> dict[str, Any]:
+        if not release:
+            return dict(snapshot)
+        adjusted = dict(snapshot)
+        for resource in ("ram", "vram"):
+            total = _as_int(snapshot.get(f"{resource}_total_bytes"))
+            free = _as_int(snapshot.get(f"{resource}_free_bytes")) + _as_int(release.get(f"{resource}_bytes"))
+            adjusted[f"{resource}_free_bytes"] = min(total, free) if total > 0 else free
+        return adjusted
+
     def estimate_settings(
         self,
         settings: Mapping[str, Any],
         *,
         boot_file: BootFile,
         environ: Mapping[str, str] | None = None,
+        action: str | None = None,
     ) -> dict[str, Any]:
         if not self._busy.acquire(blocking=False):
             raise EstimateUnavailable("estimate_busy", "another memory estimate is already running")
         try:
             canonical = prepare_settings(settings, boot_file=boot_file)
             env = dict(os.environ if environ is None else environ)
-            before = self._take_snapshot(env)
+            release = self._release_for(action)
+            before = self._with_release(self._take_snapshot(env), release)
             for attempt in range(2):
                 planner = self._run_child(canonical, before, env)
-                after = self._take_snapshot(env)
+                after = self._with_release(self._take_snapshot(env), release)
                 if _resource_changed(before, after):
                     if attempt == 0:
                         before = after
@@ -783,7 +820,9 @@ class MemoryFitService:
                 now = _datetime.datetime.now(_datetime.timezone.utc).isoformat(timespec="seconds").replace(
                     "+00:00", "Z"
                 )
-                return self._assemble(planner, canonical, before, now)
+                output = self._assemble(planner, canonical, before, now)
+                output["release"] = dict(release) if release else None
+                return output
             raise EstimateUnavailable("stale_resources", "resource probes remained unstable")
         finally:
             self._busy.release()
@@ -794,9 +833,10 @@ def estimate_settings(
     *,
     boot_file: BootFile,
     environ: dict[str, str] | None = None,
+    action: str | None = None,
 ) -> dict:
     """Estimate one canonical launch through the serving-v Python subprocess."""
-    return MemoryFitService().estimate_settings(settings, boot_file=boot_file, environ=environ)
+    return MemoryFitService().estimate_settings(settings, boot_file=boot_file, environ=environ, action=action)
 
 
 __all__ = [

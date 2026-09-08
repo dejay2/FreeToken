@@ -605,7 +605,8 @@
       warning.textContent = result.fits_now ? 'Memory check passed.' : 'These settings may not fit in memory.';
       const issueText = [...fitIssues(result, 'now'), ...fitIssues(result, 'empty')].filter((value, index, values) => values.indexOf(value) === index).join(' ');
       error.textContent = issueText;
-      now.className = `fit-verdict ${result.fits_now ? 'good' : 'bad'}`; now.textContent = fitVerdict(result, 'Free right now', 'now', result.fits_now);
+      const nowLabel = result.release && (result.release.ram_bytes || result.release.vram_bytes) ? 'Free once the running server has stopped' : 'Free right now';
+      now.className = `fit-verdict ${result.fits_now ? 'good' : 'bad'}`; now.textContent = fitVerdict(result, nowLabel, 'now', result.fits_now);
       empty.className = `fit-verdict ${result.fits_empty ? 'good' : 'bad'}`; empty.textContent = fitVerdict(result, 'Empty machine', 'empty', result.fits_empty);
       renderFitSuggestion(result);
       const detailMarkup = fitDetailMarkup(result); $('fit-detail-grid').innerHTML = detailMarkup; $('fit-details').hidden = !detailMarkup;
@@ -626,7 +627,7 @@
       state.fit.checkedSettings = fitClone(snapshot); state.fit.checkedAt = 0; state.fit.action = action; state.fit.save = save; state.fit.bindToForm = bindToForm; state.fit.formRevision = state.formRevision; state.fit.allowOverride = false; state.fit.override = false; state.fit.result = null; state.fit.estimating = true; renderFit();
       let outcome;
       try {
-        const { response, body } = await json('/api/settings/estimate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: fitClone(snapshot) }) });
+        const { response, body } = await json('/api/settings/estimate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: fitClone(snapshot), action: action || null }) });
         if (token !== state.fit.requestId || (bindToForm && !fitSettingsSame(state.settings, snapshot))) return { stale: true, token };
         if (response.status === 422) {
           showFieldErrors(body.detail); state.fit.checkedAt = 0; state.fit.allowOverride = false; state.fit.result = null; renderFit(); return { validation: true, token };

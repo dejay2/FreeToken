@@ -890,3 +890,39 @@ def test_context_is_still_halved_when_a_pinned_pool_at_full_context_does_not_fit
     assert tried.index((262144, 262208)) < min(
         index for index, item in enumerate(tried) if item[0] < 262144
     )
+
+
+def test_a_restart_estimate_adds_back_what_the_running_server_will_free(tmp_path):
+    """Judging a restart against the machine with the old server still in it says 'does not
+    fit' every time and sends the planner on a 30-80 s candidate hunt (2026-09-08)."""
+    model = _model(tmp_path)
+    boot = _boot(tmp_path, model)
+    result = _planner_result(50)
+    tight = {"ram_free_bytes": 10, "ram_total_bytes": 200, "vram_free_bytes": 5, "vram_total_bytes": 100}
+    service, calls = _service(tmp_path, result, [dict(tight), dict(tight), dict(tight), dict(tight)])
+    service._release_probe = lambda: {"ram_bytes": 150, "vram_bytes": 500}
+    response = service.estimate_settings({"MoECacheSize": 120}, boot_file=BootFile(boot), environ={"PATH": "/bin"}, action="restart")
+    machine = json.loads(calls[0]["input"])["machine"]
+    assert machine["ram_free_bytes"] == 160 and machine["vram_free_bytes"] == 100, "added back, capped at the total"
+    assert response["status"] == "ok" and response["release"] == {"ram_bytes": 150, "vram_bytes": 500}
+    # a plain Start or estimate keeps the honest 'now'
+    response = service.estimate_settings({"MoECacheSize": 120}, boot_file=BootFile(boot), environ={"PATH": "/bin"}, action="start")
+    machine = json.loads(calls[1]["input"])["machine"]
+    assert machine["ram_free_bytes"] == 10 and machine["vram_free_bytes"] == 5 and response["release"] is None
+
+
+def test_a_restart_estimate_without_a_probe_or_with_a_failing_probe_is_unchanged(tmp_path):
+    model = _model(tmp_path)
+    boot = _boot(tmp_path, model)
+    result = _planner_result(50)
+    tight = {"ram_free_bytes": 10, "ram_total_bytes": 200, "vram_free_bytes": 5, "vram_total_bytes": 100}
+    service, calls = _service(tmp_path, result, [dict(tight), dict(tight), dict(tight), dict(tight)])
+    service.estimate_settings({"MoECacheSize": 120}, boot_file=BootFile(boot), environ={"PATH": "/bin"}, action="restart")
+    assert json.loads(calls[0]["input"])["machine"]["ram_free_bytes"] == 10
+
+    def boom():
+        raise RuntimeError("no /proc here")
+
+    service._release_probe = boom
+    response = service.estimate_settings({"MoECacheSize": 120}, boot_file=BootFile(boot), environ={"PATH": "/bin"}, action="restart")
+    assert json.loads(calls[1]["input"])["machine"]["ram_free_bytes"] == 10 and response["release"] is None
