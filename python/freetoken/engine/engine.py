@@ -396,6 +396,7 @@ class Engine:
         self.spec_sampler = None
         self.spec_state_ladder = None
         self.spec_graph_runner = None
+        self._spec_graph_widths: tuple[int, ...] = ()  # armed at boot; a rebuild re-arms from here
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
@@ -601,6 +602,7 @@ class Engine:
                 widths=config.spec_decode.graph_widths,
                 guard_bytes=_SPEC_GRAPH_GUARD_BYTES,
             )
+            self._spec_graph_widths = tuple(config.spec_decode.graph_widths)
             logger.info_rank0(
                 "Integrated MTP graphs armed for widths "
                 f"{config.spec_decode.graph_widths} (1 = the capture-decode step)"
@@ -2061,9 +2063,7 @@ class Engine:
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
         # The speculative verify graphs go first: they bake KV-pool and page-table addresses,
         # and reset_capture drops the QSA verify metadata they replay against.
-        spec_graph_widths = ()
         if self.spec_graph_runner is not None:
-            spec_graph_widths = self.spec_graph_runner.widths
             self.spec_graph_runner.destroy()
             self.spec_graph_runner = None
         self.attn_backend.reset_capture()
@@ -2157,19 +2157,32 @@ class Engine:
                 dummy_req=self.dummy_req,
                 moe_offload_cache=self.moe_offload_cache,
             )
-            if spec_graph_widths:
-                # re-armed, not re-captured: the widths capture lazily on their next live step,
-                # against the tensors this rebuild just allocated
-                from .spec_graph import SpecVerifyGraphRunner
+        # Re-arm the speculative widths on BOTH branches. Until 2026-09-08 this sat inside the
+        # capture branch only, so the spill that deferred the graphs dropped the runner and the
+        # recall found nothing to re-arm: with MTP on, every later decode step ran eager
+        # (measured 20 tok/s against 50 before the spill, RTX 5090, depth 3). Arming while the
+        # graphs are deferred is harmless: _capture_decode_graph checks can_use_cuda_graph first.
+        self._rearm_spec_graphs()
 
-                self.spec_graph_runner = SpecVerifyGraphRunner(
-                    target_ctx=self.ctx,
-                    target_model=self.model,
-                    attn_backend=self.attn_backend,
-                    device=self.device,
-                    widths=spec_graph_widths,
-                    guard_bytes=_SPEC_GRAPH_GUARD_BYTES,
-                )
+    def _rearm_spec_graphs(self) -> None:
+        """Re-arm (not re-capture) the speculative verify widths armed at boot.
+
+        The widths capture lazily on their next live step, against the tensors the rebuild just
+        allocated. A no-op when boot armed nothing.
+        """
+        widths = tuple(getattr(self, "_spec_graph_widths", ()) or ())
+        if not widths or self.spec_graph_runner is not None:
+            return
+        from .spec_graph import SpecVerifyGraphRunner
+
+        self.spec_graph_runner = SpecVerifyGraphRunner(
+            target_ctx=self.ctx,
+            target_model=self.model,
+            attn_backend=self.attn_backend,
+            device=self.device,
+            widths=widths,
+            guard_bytes=_SPEC_GRAPH_GUARD_BYTES,
+        )
 
     def _capture_spec_graphs_at_boot(self) -> None:
         """Capture every armed speculative width NOW, while boot memory is still fresh.
@@ -2565,7 +2578,10 @@ class Engine:
         if not batch.mtp_verify or batch.size != 1:
             raise RuntimeError("a speculative step forwards one mtp_verify batch")
         captured = None
-        graph_runner = self.spec_graph_runner
+        # While the graphs are deferred (a layer on the SSD) the verify batch takes the decode
+        # movement path, whose disk gather does a host sync that no capture can contain: run
+        # eager rather than spend a doomed in-capture attempt per width on every spill.
+        graph_runner = None if getattr(self, "_graphs_deferred", None) else self.spec_graph_runner
         armed = probe is not None and graph_runner is not None
         with diag.region("diag.spec_verify_replay"):
             if graph_runner is not None:
