@@ -68,8 +68,20 @@ class CacheManager:
             raise ValueError("KV parking is supported only by the hybrid radix cache")
         self.park_store = park_store
         self.park_consensus = park_consensus
+        self._park_generation = int(getattr(park_store, "generation", 0))
         self._pending_parks = []
         self._temporary_lease_depth = 0
+        if park_store is not None:
+            bind_change_callback = getattr(park_store, "bind_change_callback", None)
+            if bind_change_callback is not None:
+                bind_change_callback(self._bump_park_generation)
+
+    @property
+    def park_generation(self) -> int:
+        return self._park_generation
+
+    def _bump_park_generation(self) -> None:
+        self._park_generation += 1
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
@@ -99,9 +111,16 @@ class CacheManager:
             return SWARadixCache(device, page_size, self.sliding_window_size)
         return create_prefix_cache(device=device, type=type, page_size=page_size)
 
-    def _lookup_parked(self, input_ids: torch.Tensor, live_match):
+    def _lookup_parked(self, input_ids: torch.Tensor, live_match, pending_req=None):
         if self.park_store is None or len(input_ids) < self.park_store.min_tokens:
             return None
+        generation = self.park_generation
+        if (
+            pending_req is not None
+            and getattr(pending_req, "park_probe_generation", None) == generation
+        ):
+            return getattr(pending_req, "park_entry", None)
+
         live_cached_len = live_match.cached_len
         # Restoring must buy enough extra prefill to repay the measured transfer: 4,096 tokens
         # from SSD, one page from pinned RAM. This also prevents an on-card match from being
@@ -110,11 +129,39 @@ class CacheManager:
         # Keep one page for the current turn's uncached tail and ask the store for the longest
         # entry that can fit. A too-large parked prefix must not hide a shorter usable one.
         max_len = max(live_cached_len, self.available_size - self.page_size)
-        return self.park_store.lookup(
-            input_ids,
-            min_len=live_cached_len + margin,
-            max_len=max_len,
-        )
+        keys = None
+        if pending_req is not None:
+            keys = getattr(pending_req, "park_keys", None)
+            if keys is None:
+                from freetoken.kvcache.park_store import rolling_page_keys
+
+                keys = rolling_page_keys(
+                    input_ids,
+                    self.page_size,
+                    getattr(self.park_store, "fingerprint", ""),
+                )
+                pending_req.park_keys = keys
+        try:
+            entry = self.park_store.lookup(
+                input_ids,
+                min_len=live_cached_len + margin,
+                max_len=max_len,
+                **({"keys": keys} if keys is not None else {}),
+            )
+        except TypeError as exc:
+            # Keep small test/dummy stores compatible while production ParkStore supports the
+            # precomputed-key fast path. A real store's TypeError must not be hidden.
+            if keys is None or "keys" not in str(exc):
+                raise
+            entry = self.park_store.lookup(
+                input_ids,
+                min_len=live_cached_len + margin,
+                max_len=max_len,
+            )
+        if pending_req is not None:
+            pending_req.park_entry = entry
+            pending_req.park_probe_generation = self.park_generation
+        return entry
 
     def _restore_parked(self, input_ids: torch.Tensor, live_match, entry):
         needs_restore = entry is not None
@@ -200,7 +247,7 @@ class CacheManager:
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
             m = self.prefix_cache.match_prefix(ids)
-            entry = self._lookup_parked(ids, m)
+            entry = self._lookup_parked(ids, m, req)
             target_len = entry.token_count if entry is not None else m.cached_len
             target_agreed = True
             if self.park_consensus is not None:
@@ -234,8 +281,26 @@ class CacheManager:
         """Hybrid only: free GDN state slots + evictable (unlocked) tree snapshots."""
         return self.linear_state_pool.num_free_slots + self.prefix_cache.mamba_evictable_size
 
+    def _park_candidates(self):
+        """Return only snapshots from a completed turn, never an intermediate prefill leaf.
+
+        The 2026-09-08 live 190k run produced 42 SSD entries while ``kv_park_idle_ms=0`` because
+        allocation pressure treated every snapshot-bearing leaf as parkable. A finish marker lets
+        the idle path keep one store entry per turn while short-pool pressure still falls through
+        to ordinary eviction for unfinished intermediate state.
+        """
+        return [
+            candidate
+            for candidate in self.prefix_cache.park_candidates()
+            # Direct cache fixtures predate the finish marker; preserve their old park behavior.
+            # Scheduler-created intermediate snapshots are explicitly marked False below.
+            if getattr(candidate.node, "park_finished", True)
+        ]
+
     def _park_candidate(self, candidate, *, synchronous: bool = False) -> bool:
         if self.park_store is None or self._temporary_lease_depth:
+            return False
+        if not getattr(candidate.node, "park_finished", True):
             return False
         page_bases = candidate.kv_indices[:: self.page_size]
         if synchronous:
@@ -253,6 +318,7 @@ class CacheManager:
         evicted = self.prefix_cache.detach_parked(candidate)
         if not evicted.mamba_slots:
             return False
+        self._bump_park_generation()
         if pending is None:
             if evicted.lock_node is not None:
                 self.prefix_cache.dec_lock(evicted.lock_node)
@@ -288,13 +354,13 @@ class CacheManager:
     def _park_lru(self, *, synchronous: bool = False) -> bool:
         if self.park_store is None or self._temporary_lease_depth:
             return False
-        for candidate in self.prefix_cache.park_candidates():
+        for candidate in self._park_candidates():
             if self._park_candidate(candidate, synchronous=synchronous):
                 return True
         return False
 
     def park_idle(self, *, now_ns: int | None = None) -> int:
-        """Park every eligible leaf older than the configured delay; idle scheduler only."""
+        """Park completed-turn leaves older than the configured delay; idle scheduler only."""
         if self.park_store is None or self._temporary_lease_depth:
             return 0
         if now_ns is None:
@@ -303,7 +369,7 @@ class CacheManager:
             now_ns = time.monotonic_ns()
         threshold = self.park_store.idle_ms * 1_000_000
         parked = 0
-        for candidate in self.prefix_cache.park_candidates():
+        for candidate in self._park_candidates():
             if now_ns - candidate.timestamp < threshold:
                 continue
             if self._park_candidate(candidate):
@@ -316,7 +382,8 @@ class CacheManager:
             return None
         if self._pending_parks:
             return 10
-        timestamp = self.prefix_cache.oldest_park_timestamp()
+        candidates = self._park_candidates()
+        timestamp = min((candidate.timestamp for candidate in candidates), default=None)
         if timestamp is None:
             return None
         if now_ns is None:
@@ -583,6 +650,27 @@ class CacheManager:
             req.cache_handle = new_handle
             self.lock(new_handle)
 
+    def _mark_finished_park_node(self, input_ids: torch.Tensor) -> None:
+        # Parking off pays nothing: the marker only steers park candidates, and the walk below
+        # needs the C++ radix compare (absent on the GPU-less devbox, where these paths must
+        # still run in tests). With parking on it is one fast_compare_key over the prefix per
+        # commit, well under a millisecond at 190k tokens (R1 follow-up: have insert() return
+        # the node and drop the walk).
+        if self.park_store is None or len(input_ids) == 0:
+            return
+        match = self.prefix_cache.match_prefix(input_ids)
+        if match.mamba_value is not None:
+            # ``park_candidates`` can contain snapshots from chunked prefill. Mark only the final
+            # completed-turn boundary; intermediate snapshots remain ordinary eviction victims.
+            match.node.park_finished = True
+
+    def _mark_unfinished_park_node(self, input_ids: torch.Tensor) -> None:
+        if self.park_store is None or len(input_ids) == 0:
+            return
+        match = self.prefix_cache.match_prefix(input_ids)
+        if match.mamba_value is not None:
+            match.node.park_finished = False
+
     def _cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
         """Hybrid (GDN) cache_req: commit KV like radix AND manage the GDN state snapshot.
         Prefill chunk commit: DONATE the frozen ping-pong slot (the snapshot the forward wrote
@@ -623,6 +711,9 @@ class CacheManager:
                 frozen = req.mamba_ping_pong[frozen_idx]
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:L], page_indices[:L], frozen)
+                self._bump_park_generation()
+                if not mamba_exist:
+                    self._mark_unfinished_park_node(req.input_ids[:L])
                 pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
                 req.mamba_ping_pong = None
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
@@ -637,6 +728,8 @@ class CacheManager:
             if insert_len == req.cached_len and insert_len > 0:
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
+                self._bump_park_generation()
+                self._mark_finished_park_node(req.input_ids[:insert_len])
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                 keep_live = not mamba_exist           # tree now owns linear_slot_idx
@@ -660,12 +753,15 @@ class CacheManager:
         frozen = req.mamba_ping_pong[frozen_idx]
         prefix_len, mamba_exist = self.prefix_cache.insert(
             req.input_ids[:L], page_indices[:L], frozen)
+        self._bump_park_generation()
         self.unlock(old_handle)
         self._free(page_indices[old_handle.cached_len : prefix_len])
         # Lock the committed snapshot node FIRST: the replacement-slot alloc below can trigger
         # evict_mamba (via ensure_mamba_slots), which would otherwise reclaim this still-unlocked
         # just-donated node -- freeing its KV pages under the still-decoding request.
         m = self.prefix_cache.match_prefix(req.input_ids[:L])
+        if not mamba_exist:
+            m.node.park_finished = False
         # Same re-point as the generic path: the dedup free above returned this request's own
         # pages for [old_handle.cached_len, prefix_len) while its row still named them.
         if prefix_len > old_handle.cached_len:
@@ -863,6 +959,7 @@ class CacheManager:
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
         if self.is_hybrid:
             self.linear_state_pool.reclaim_all_slots()
+        self._bump_park_generation()
 
     @contextmanager
     def lazy_free_region(self):
@@ -879,7 +976,9 @@ class CacheManager:
             yield
         finally:
             del self._free
-            self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
+            if lazy_free_list:
+                self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
+                self._bump_park_generation()
 
     @contextmanager
     def temporary_page_lease(
@@ -974,6 +1073,7 @@ class CacheManager:
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:
             self.free_slots = torch.cat([self.free_slots, indices[:: self.page_size]])
+            self._bump_park_generation()
 
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
         if self.page_size == 1:

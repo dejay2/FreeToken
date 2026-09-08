@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Full, Queue
 from threading import Event, Lock, RLock, Thread
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 
@@ -153,6 +153,19 @@ def _byte_view(tensor: torch.Tensor) -> torch.Tensor:
     if not tensor.is_contiguous():
         raise ValueError(f"park view must be contiguous, got shape={tuple(tensor.shape)}")
     return tensor.view(torch.uint8).reshape(-1)
+
+
+def _release_file_cache(handle) -> None:
+    # On 2026-09-08 a 19 GB park took about one minute and Windows free RAM fell 1.1 -> 0.4
+    # GB; after drop_caches it rose 2.5 -> 9.4 GB within a minute with the server untouched.
+    # Release each completed file window instead of crediting WSL's cache in the memory governor.
+    if not hasattr(os, "posix_fadvise"):
+        return
+    try:
+        os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    except (AttributeError, OSError):
+        # Some filesystems expose the call but refuse the advice; retaining the cache is safe.
+        return
 
 
 @dataclass(frozen=True)
@@ -426,6 +439,8 @@ class ParkStore:
         self.disk_budget_bytes = int(disk_budget_bytes)
         self.pinned_window_bytes = int(pinned_window_bytes)
         self._entries: dict[str, ParkedEntry] = {}
+        self._generation = 0
+        self._on_change: Callable[[], None] | None = None
         self._hits = 0
         self._misses = 0
         self._last_restore_ms = 0.0
@@ -490,6 +505,18 @@ class ParkStore:
             logger.warning(
                 f"KV parking disabled during {mode} store setup: {exc!r}"
             )
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    def bind_change_callback(self, callback: Callable[[], None] | None) -> None:
+        self._on_change = callback
+
+    def _notify_change(self) -> None:
+        self._generation += 1
+        if self._on_change is not None:
+            self._on_change()
 
     @classmethod
     def from_config(cls, config, kv_pool, state_pool) -> "ParkStore":
@@ -767,6 +794,9 @@ class ParkStore:
                         raw = memoryview(window[:length].numpy()).cast("B")
                         payload_digest.update(raw)
                         handle.write(raw)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                        _release_file_cache(handle)
                 checksum = payload_digest.hexdigest()
                 handle.seek(0)
                 handle.write(
@@ -973,6 +1003,7 @@ class ParkStore:
             with self._lock:
                 self._evict_to_fit(needed)
                 self._entries[key] = entry
+                self._notify_change()
                 if self.mode == "ssd":
                     self._write_manifest()
             return True
@@ -996,10 +1027,18 @@ class ParkStore:
         input_ids: torch.Tensor,
         min_len: int = 0,
         max_len: int | None = None,
+        *,
+        keys: list[str] | None = None,
     ) -> ParkedEntry | None:
         with self._lock:
             tokens = _tokens_cpu(input_ids)
-            keys = rolling_page_keys(tokens, self.page_size, self.fingerprint)
+            if keys is None:
+                keys = rolling_page_keys(tokens, self.page_size, self.fingerprint)
+            elif len(keys) != len(tokens) // self.page_size:
+                raise ValueError(
+                    f"precomputed KV park keys cover {len(keys)} pages, "
+                    f"expected {len(tokens) // self.page_size}"
+                )
             for page_number in range(len(keys), 0, -1):
                 token_count = page_number * self.page_size
                 if token_count < max(self.min_tokens, min_len):
@@ -1081,6 +1120,7 @@ class ParkStore:
                         raise ParkEntryRejected(
                             f"short KV park payload read: {entry.path}"
                         )
+                    _release_file_cache(handle)
                     mark = time.perf_counter()
                     digest.update(raw)
                     if timing is not None:
@@ -1153,6 +1193,8 @@ class ParkStore:
                         raise ParkEntryRejected(
                             f"short KV park payload read: {entry.path}"
                         )
+                    if handle is not None:
+                        _release_file_cache(handle)
                     mark = time.perf_counter()
                     digest.update(raw)
                     if timing is not None:
@@ -1287,8 +1329,10 @@ class ParkStore:
 
     def _drop_entry(self, key: str, *, write_manifest: bool = True) -> None:
         entry = self._entries.pop(key, None)
-        if entry is not None and entry.path is not None:
-            entry.path.unlink(missing_ok=True)
+        if entry is not None:
+            if entry.path is not None:
+                entry.path.unlink(missing_ok=True)
+            self._notify_change()
         if write_manifest and self.mode == "ssd":
             self._write_manifest()
 

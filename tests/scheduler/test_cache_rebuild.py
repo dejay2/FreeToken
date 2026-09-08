@@ -98,6 +98,22 @@ def test_normal_loop_executes_pending_rebuild_when_idle():
     assert sched._pending_rebuild is None
 
 
+def test_pending_rebuild_runs_ahead_of_unadmitted_request():
+    # A pending request that owns no pages or state must not block a queued full rebuild. The live
+    # 190k run spun here because _rebuild_can_run treated every pending request as in-flight.
+    from types import SimpleNamespace
+
+    from freetoken.scheduler.scheduler import Scheduler
+
+    sched, calls = _stub_scheduler(prefill_runnable=True, decode_runnable=False, pending=object())
+    sched.prefill_manager.pending_list = [SimpleNamespace(chunked_req=None)]
+
+    Scheduler.normal_loop(sched)
+
+    assert calls == [True]
+    assert sched._pending_rebuild is None
+
+
 def test_normal_loop_defers_pending_rebuild_while_busy():
     # A queued rebuild must NOT run while prefill/decode is still in flight.
     from freetoken.scheduler.scheduler import Scheduler

@@ -241,7 +241,7 @@ class Scheduler(SchedulerIOMixin):
         is_moe_only = (
             num_pages is None and num_mamba_slots is None and num_swa_pages is None
         )
-        assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
+        assert not self._prefill_has_chunked_continuation(), "rebuild requires no in-flight prefill"
         if not is_moe_only:
             assert not self.decode_manager.runnable, "rebuild requires no running decode"
         torch.cuda.synchronize(self.device)
@@ -877,9 +877,9 @@ class Scheduler(SchedulerIOMixin):
                 msg.num_pages is None and msg.num_mamba_slots is None and msg.num_swa_pages is None
             )
             is_busy = (
-                self.prefill_manager.runnable
+                False
                 if is_moe_only
-                else (self.prefill_manager.runnable or self.decode_manager.runnable)
+                else (self._prefill_has_chunked_continuation() or self.decode_manager.runnable)
             )
             if not self.cache_manager.supports_runtime_rebuild:
                 self._reply_rebuild(
@@ -1091,9 +1091,19 @@ class Scheduler(SchedulerIOMixin):
             return False  # unknown work waits for idle, as every rebuild did before J1
         return msg.num_pages is None and msg.num_mamba_slots is None and msg.num_swa_pages is None
 
+    def _prefill_has_chunked_continuation(self) -> bool:
+        pending = getattr(self.prefill_manager, "pending_list", None)
+        if pending is None:
+            # Keep lightweight scheduler shells used by maintenance tests on the old boolean seam.
+            return bool(getattr(self.prefill_manager, "runnable", False))
+        return any(getattr(req, "chunked_req", None) is not None for req in pending)
+
     def _rebuild_can_run(self) -> bool:
-        if self.prefill_manager.runnable:
-            return False  # never mid prefill chunk
+        # A never-admitted PendingReq owns no pages or GDN slots, so it is harmless. Only a
+        # chunked continuation is in-flight on the prefill side; the 190k live run deadlocked
+        # because this gate treated every pending request as a live chunk.
+        if self._prefill_has_chunked_continuation():
+            return False
         if self._is_moe_only_rebuild(self._pending_rebuild):
             return True
         return not self.decode_manager.runnable
@@ -1815,6 +1825,20 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
             or self.decode_manager.schedule_next_batch()
         )
+        pop_rejections = getattr(self.prefill_manager, "pop_rejections", None)
+        if pop_rejections is not None:
+            rejections = pop_rejections()
+            if rejections:
+                self.send_result(
+                    [
+                        ErrorReplyMsg(
+                            uid=uid,
+                            error=reason,
+                            code="context_length_exceeded",
+                        )
+                        for uid, reason in rejections
+                    ]
+                )
         if batch is None:
             return None
         with diag.region("diag.prefill_batch" if batch.is_prefill else None):

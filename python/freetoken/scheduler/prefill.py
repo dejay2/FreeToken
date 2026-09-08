@@ -53,6 +53,23 @@ class PrefillAdder:
         if self.table_manager.available_size == 0:
             return None
 
+        # Retry gate (R1, 2026-09-08): a never-admitted request is re-probed only when something
+        # that can change the outcome moved -- the parking generation (pages freed/inserted/
+        # parked/rebuilt) or the free KV / GDN-slot counts. Without this, the 190k live run
+        # re-hashed 2,970 pages and re-probed the park store on EVERY scheduler iteration while a
+        # governor rebuild waited. Continuation chunks of an already-admitted request bypass it:
+        # their pages are held by the prior chunk and nothing needs to change for them to run.
+        generation = (
+            self.cache_manager.park_generation,
+            self.cache_manager.available_size,
+            self.cache_manager.linear_state_pool.num_free_slots
+            if self.cache_manager.is_hybrid else 0,
+        )
+        if req.chunked_req is None and getattr(req, "admission_generation", None) == generation:
+            return None
+        req.admission_generation = generation
+        req.admission_error = None
+
         # TODO: consider host cache match case
         mr = self.cache_manager.match_req(req)
         handle = mr.cuda_handle
@@ -60,6 +77,19 @@ class PrefillAdder:
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
         estimated_len = extend_len + req.output_len
+        # Reject only what can NEVER fit, even with an empty cache and no other request running.
+        # reserved_size (other requests' in-flight decode) is deliberately not subtracted: that
+        # shrinks as they finish, so a request blocked by it must wait, not be refused (R1).
+        empty_cache_limit = self.cache_manager.num_pages * self.cache_manager.page_size
+        if estimated_len > empty_cache_limit:
+            reason = (
+                f"KV admission gate rejected request {req.uid}: needs {estimated_len} tokens "
+                f"(prompt {extend_len} + output budget {req.output_len}), but the KV pool holds "
+                f"{empty_cache_limit} tokens even when empty"
+            )
+            req.admission_error = reason
+            logger.warning_rank0(reason)
+            return None
 
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
             return None
@@ -225,7 +255,9 @@ class PrefillAdder:
             )
             if req is None:
                 # no aligned chunk this pass: undo the admission (a continuation keeps its
-                # resources -- they belong to the prior chunk's Req)
+                # resources -- they belong to the prior chunk's Req). The match did not fail, so
+                # permit another sizing attempt in this same park generation without re-probing.
+                pending_req.admission_generation = None
                 self.cache_manager.unlock(cache_handle)
                 self.table_manager.free(table_idx)
                 if linear_slot_idx is not None:
@@ -241,24 +273,28 @@ class PrefillManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
+    rejected: List[Tuple[int, str]] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
-        self.pending_list.append(
-            PendingReq(
-                req.uid,
-                req.input_ids,
-                req.sampling_params,
-                mm_embeds=req.mm_embeds,
-                cache_private=(
-                    req.mm_embeds is not None
-                    or req.mm_pixel_values is not None
-                    or req.mm_image_grid_thw is not None
-                    or req.mm_token_type_ids is not None
-                ),
-                mrope_position_ids=req.mrope_position_ids,
-                mrope_position_delta=getattr(req, "mrope_position_delta", 0),
-            )
+        pending = PendingReq(
+            req.uid,
+            req.input_ids,
+            req.sampling_params,
+            mm_embeds=req.mm_embeds,
+            cache_private=(
+                req.mm_embeds is not None
+                or req.mm_pixel_values is not None
+                or req.mm_image_grid_thw is not None
+                or req.mm_token_type_ids is not None
+            ),
+            mrope_position_ids=req.mrope_position_ids,
+            mrope_position_delta=getattr(req, "mrope_position_delta", 0),
         )
+        # Keep the parked-probe state on the request without widening PendingReq's shared wire
+        # shape; the ids never change while a request waits for a cache-generation change.
+        pending.park_keys = None
+        pending.park_probe_generation = None
+        self.pending_list.append(pending)
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:
@@ -283,7 +319,8 @@ class PrefillManager:
         # once at admission, so continuation chunks (already-chunked reqs) contribute 0.
         log_new_tokens = 0
         log_cached_tokens = 0
-        for pending_req in self.pending_list:
+        remaining: List[PendingReq] = []
+        for index, pending_req in enumerate(self.pending_list):
             is_continuation = pending_req.chunked_req is not None
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
@@ -302,15 +339,24 @@ class PrefillManager:
                 if not is_continuation:
                     log_cached_tokens += req.cache_handle.cached_len
             else:
+                reason = getattr(pending_req, "admission_error", None)
+                if reason is not None:
+                    self.rejected.append((pending_req.uid, reason))
+                    continue
+                remaining = self.pending_list[index:]
                 break  # We cannot add more requests
+        self.pending_list = chunked_list + remaining
         if len(reqs) == 0:
             return None
-        self.pending_list = chunked_list + self.pending_list[len(reqs) :]
         batch = Batch(reqs=reqs, phase="prefill")
         batch.log_new_tokens = log_new_tokens
         batch.log_cached_tokens = log_cached_tokens
         batch.prompt_admissions = prompt_admissions
         return batch
+
+    def pop_rejections(self) -> List[Tuple[int, str]]:
+        rejected, self.rejected = self.rejected, []
+        return rejected
 
     def abort_req(self, uid: int) -> Req | None:
         for i, req in enumerate(self.pending_list):

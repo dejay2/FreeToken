@@ -1084,3 +1084,78 @@ def test_ram_and_ssd_budgets_evict_the_oldest_entry(tmp_path: Path):
         assert store.lookup(first) is None
         assert store.lookup(second) is not None
         assert store.status()["parked_count"] == 1
+
+
+def test_lookup_uses_precomputed_page_keys(tmp_path: Path, monkeypatch):
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    pages = torch.tensor([0, 4], dtype=torch.int32)
+    slot = state_pool.alloc(1)[0]
+    tokens = torch.arange(8, dtype=torch.int32)
+    store = _store("ram", tmp_path, kv_pool, state_pool)
+    assert store.save(tokens, pages, slot)
+    keys = rolling_page_keys(tokens, 4, "model-A")
+
+    monkeypatch.setattr(
+        park_module,
+        "rolling_page_keys",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("lookup recomputed parked page keys")
+        ),
+    )
+
+    assert store.lookup(tokens, keys=keys) is not None
+    store.close()
+
+
+def test_ssd_writer_releases_page_cache(tmp_path: Path, monkeypatch):
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    source_pages = torch.tensor([0, 4], dtype=torch.int32)
+    source_slot, target_slot = state_pool.alloc(2)
+    _fill_entry(kv_pool, state_pool, source_pages, source_slot)
+    tokens = torch.arange(8, dtype=torch.int32)
+    store = _store("ssd", tmp_path, kv_pool, state_pool, pinned_window_bytes=4096)
+    calls = []
+    events = []
+
+    def spy_fsync(fd):
+        events.append(("fsync", fd))
+        return real_fsync(fd)
+
+    def spy_fadvise(fd, offset, length, advice):
+        stat = park_module.os.fstat(fd)
+        calls.append((fd, offset, length, advice, stat.st_size))
+        events.append(("fadvise", fd))
+
+    real_fsync = park_module.os.fsync
+    monkeypatch.setattr(park_module.os, "fsync", spy_fsync)
+    monkeypatch.setattr(park_module.os, "posix_fadvise", spy_fadvise, raising=False)
+    try:
+        assert store.save(tokens, source_pages, source_slot)
+        save_calls = list(calls)
+        assert save_calls
+        expected_windows = (store.payload_bytes(len(tokens)) + 4095) // 4096
+        assert len(save_calls) == expected_windows
+        assert all(
+            offset == 0
+            and length == 0
+            and advice == park_module.os.POSIX_FADV_DONTNEED
+            and fd >= 0
+            and file_size > 0
+            for fd, offset, length, advice, file_size in save_calls
+        )
+        assert any(
+            events[index][0] == "fsync" and events[index + 1][0] == "fadvise"
+            for index in range(len(events) - 1)
+        )
+
+        entry = store.lookup(tokens)
+        assert entry is not None
+        store.restore(entry, torch.tensor([8, 12], dtype=torch.int32), target_slot)
+        restore_calls = calls[len(save_calls) :]
+        assert restore_calls
+        assert all(call[0] >= 0 and call[4] > 0 for call in restore_calls)
+
+        monkeypatch.delattr(park_module.os, "posix_fadvise", raising=False)
+        store.restore(entry, torch.tensor([8, 12], dtype=torch.int32), target_slot)
+    finally:
+        store.close()
