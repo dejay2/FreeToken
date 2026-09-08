@@ -76,3 +76,27 @@ device time (expert fetch for the union of the rows' experts), which is structur
   fetch, and slots are the only dial (docs/research/memory-audit-qwen38-rtx5090.md).
 
 Boot file left at depth 5 (the 09-02 default; measured no worse than 3 here), MTP on.
+
+## Addendum: the operator's own harness (pi, 6.8k-token system prompt, 4.6-5.2k-token replies)
+
+Same prompt, same pi build, run from a Herdr pane on the devbox through the ssh tunnel, speed
+as pi's own footer reports it; slot count from `/v1/cache/residency` at the time:
+
+| server | slots | pi tok/s |
+|---|---|---|
+| MTP on, depth 5, mmap reader | 6429 | 71.7 |
+| MTP off, mmap reader | 6429 | 71.9 |
+| MTP off, disk reader (io_uring) | 6429 | 76.0 |
+| MTP off, disk reader, after the governor parked 2 layers | 5405 | 71.2 |
+
+During the MTP-on run the per-cycle log grew by 800 cycles at 3.98 emitted/cycle (61 % of
+the reply came out of guess cycles) and the result was still no faster than plain: at this
+context a cycle costs about what four plain steps cost, so accepted drafts only break even.
+The reader is worth ~5 %; a thousand slots is worth ~6 %; MTP on vs off is inside the noise.
+The operator's "85-95 off vs 75 on" is the reader plus whatever slot count the memory governor
+had in force at the time (Windows: 95.6 GB, vmmemWSL 64 GB, Memory Compression 7 GB, free
+5.7 GB, so the governor parks and unparks layers through the day: 5405-6429 slots).
+
+Server left on the operator's usual "off" shape: MTP off, PleBackend auto (= disk reader).
+The only MTP-side lever left is making the disk reader stage the verify rows (hooks:
+`prepare_cuda_graph_replay` / `forward_host_ctx`, ple_disk.py), worth ~5 % to an MTP-on boot.
