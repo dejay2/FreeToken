@@ -134,6 +134,7 @@ _LAUNCHER_ORDER = (
     "GovernorPostUpGraceS",
     "GovernorRAMRungsBeforeUp",
     "GovernorVRAMRungsBeforeUp",
+    "PleBackend",
 )
 _ORDER_INDEX = {name: index for index, name in enumerate(_LAUNCHER_ORDER)}
 

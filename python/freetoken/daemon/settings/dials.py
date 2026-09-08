@@ -687,6 +687,20 @@ DIALS: tuple[Dial, ...] = (
         ),
     ),
     Dial(
+        "PleBackend", "choice", "auto", "reader",
+        "How the PLE n-gram table is read: auto (disk on Linux, mmap when MTP is on), disk (io_uring row store, Linux only, not with MTP), mmap (demand-paged table), pinned (whole table in pinned RAM).",
+        "Server & advanced", options=("auto", "disk", "mmap", "pinned"), source="helper", engine_mapping="--ple-backend <reader>",
+        plain="PLE table reader", blurb="How the 48 GB n-gram table is read each word.", advanced=True,
+        option_labels=("Automatic", "Direct disk reads (Linux, not with MTP)", "Memory-mapped file", "Whole table in PC memory"),
+        effects=("speed:mixed", "ram:mixed"),
+        info=(
+            "Automatic picks the direct disk reader on Linux, or the memory-mapped reader when MTP "
+            "speculative decoding is on (the disk reader cannot run under MTP). Memory-mapped reads go "
+            "through the PC's file cache; Whole table in PC memory preloads all 48 GB and needs that much "
+            "free RAM. Set by hand only to compare readers; a wrong choice is corrected at start with a note."
+        ),
+    ),
+    Dial(
         "CudaGraphMaxBS", "number", 4, "batch size", "Maximum batch size captured into CUDA graphs (-1 disables graph capture).",
         "Server & advanced", minimum=-1, maximum=1024, engine_mapping="--cuda-graph-max-bs <N>",
         plain="CUDA graph max batch", blurb="Largest batch size included in CUDA graph capture.", slider=(1, 16, 1), auto_value=-1, auto_label="Off",

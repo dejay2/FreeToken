@@ -43,7 +43,7 @@ EXPECTED_TAB_DIALS = {
     "Pictures": ("EnableVision", "VisionPackagesPath", "VisionExecution", "VisionWeights"),
     "Server & advanced": (
         "ExpertLoad", "EnableCacheReport", "CollectRoutingStats", "Port", "DesktopPython",
-        "FREETOKEN_AUTO_RESTART", "FREETOKEN_DIAGNOSTIC_MODE", "CudaGraphMaxBS",
+        "FREETOKEN_AUTO_RESTART", "FREETOKEN_DIAGNOSTIC_MODE", "PleBackend", "CudaGraphMaxBS",
     ),
 }
 
@@ -51,7 +51,7 @@ EXPECTED_TAB_DIALS = {
 def test_every_dial_has_one_tab_and_a_short_page_blurb():
     assert tuple(GROUP_INFO) == TAB_GROUPS
     assert {group: tuple(dial.name for dial in DIALS if dial.group == group) for group in TAB_GROUPS} == EXPECTED_TAB_DIALS
-    assert sum(len(names) for names in EXPECTED_TAB_DIALS.values()) == len(DIALS) == 48
+    assert sum(len(names) for names in EXPECTED_TAB_DIALS.values()) == len(DIALS) == 49
     for dial in DIALS:
         assert dial.group in TAB_GROUPS, dial.name
         assert dial.plain, dial.name

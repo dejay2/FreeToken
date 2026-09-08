@@ -159,3 +159,14 @@ def test_stop_servers_kills_the_selection_and_waits_for_the_ports(monkeypatch):
     report = ll.stop_servers(2020, timeout=30, sleep=lambda _: None, monotonic=lambda: float(next(clock)))
     assert report["ok"] is True and report["killed"] == [41, 42] and report["remaining"] == []
     assert {pid for pid, _ in killed} == {41, 42}
+
+
+def test_ple_backend_dial_overrides_auto_and_mtp_still_forces_mmap():
+    plan = _plan({"PleBackend": "mmap"})
+    assert _arg(plan, "--ple-backend") == "mmap" and plan.notes == [], "MTP off, mmap by hand: honoured as is"
+    plan = _plan({"PleBackend": "disk", "FREETOKEN_MTP_SPECULATE": "1"})
+    assert _arg(plan, "--ple-backend") == "mmap" and any("does not support MTP" in n for n in plan.notes)
+    plan = _plan({"PleBackend": "pinned"})
+    assert _arg(plan, "--ple-backend") == "pinned"
+    plan = _plan({"PleBackend": "auto"})
+    assert _arg(plan, "--ple-backend") == "disk"
