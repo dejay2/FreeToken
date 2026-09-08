@@ -1124,7 +1124,7 @@
         `<div class="stat"><span class="small">MoE cache slots</span><strong>${escapeHtml(geometry.moeCacheSize ? fmt(geometry.moeCacheSize) : '—')}</strong><div class="sub">${escapeHtml((geometry.gpuOwnedLayers || []).length)} GPU-owned layers</div></div>`,
         `<div class="stat"><span class="small">KV cache tokens</span><strong>${escapeHtml(geometry.numPages ? fmt(geometry.numPages * (geometry.pageSize || 1)) : '—')}</strong><div class="sub">${geometry.numPages ? `${escapeHtml(fmt(geometry.numPages))} pages of ${escapeHtml(fmt(geometry.pageSize || 0))} tokens` : 'not running'}</div></div>`,
         `<div class="stat"><span class="small">KV parking</span><strong>${parkingText}</strong>${parking.lastError ? `<div class="error">${escapeHtml(parking.lastError)}</div>` : ''}</div>`,
-        `<div class="stat"><span class="small">Memory governor</span><strong>${escapeHtml(govLayers.owned ?? 0)} owned · ${escapeHtml(govLayers.pinned ?? 0)} pinned · ${escapeHtml(govLayers.disk ?? 0)} disk</strong><div class="sub">${govText}</div></div>`,
+        `<div class="stat"><span class="small">Memory governor</span><strong>${escapeHtml(govLayers.owned ?? 0)} owned${govLayers.parked ? ` (${escapeHtml(govLayers.parked)} parked)` : ''} · ${escapeHtml(govLayers.pinned ?? 0)} pinned · ${escapeHtml(govLayers.disk ?? 0)} disk</strong><div class="sub">${govText}</div></div>`,
       ].join('');
       $('status-updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
       if (body.currentJob && body.currentJob.jobId && !state.jobId && !['serving', 'stopped', 'failed'].includes(body.currentJob.stage)) { state.jobId = body.currentJob.jobId; const jobToken = ++state.jobToken; setBusy(true, body.currentJob.stage === 'stopping'); pollJob(jobToken); }

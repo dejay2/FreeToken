@@ -59,7 +59,7 @@ def test_step_request_shape_and_log_line(monkeypatch, caplog):
         loop._execute_action(Action("vram", "down", ram_tight=True), int(1.2 * GIB), 8 * GIB)
     assert server.requests == [{"axis": "vram", "direction": "down", "ram_tight": True}]
     assert loop.last_action == "governor: vram down -> slots 6144->5632 (free 1.2->2.6 GiB)"
-    assert loop.last_layers == {"owned": 6, "pinned": 42, "disk": 0}
+    assert loop.last_layers == {"owned": 6, "pinned": 42, "disk": 0, "parked": 0}
     assert loop.status()["layers"]["pinned"] == 42
 
 
@@ -195,7 +195,7 @@ def test_status_path_reads_the_boot_file_and_never_dials_the_server(tmp_path, mo
         popen=lambda *_a, **_k: SimpleNamespace(poll=lambda: None),
     )
     status = process.governor_status()
-    assert status["layers"] == {"owned": 0, "pinned": 0, "disk": 0}
+    assert status["layers"] == {"owned": 0, "pinned": 0, "disk": 0, "parked": 0}
     assert status["last_action"] is None
     assert isinstance(status["enabled"], bool)
 

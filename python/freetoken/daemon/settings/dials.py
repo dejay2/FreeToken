@@ -360,7 +360,10 @@ DIALS: tuple[Dial, ...] = (
         effects=("speed:down",),
         info=(
             "Steps expert layers between GPU memory, host RAM, and SSD disk storage when other apps or games "
-            "use memory, keeping the server alive. At start-up the card cushion below is also the free "
+            "use memory, keeping the server alive. When PC memory runs short it first parks layers on the "
+            "card (each one costs one layer's worth of shared expert slots, about 3 words a second on "
+            "Qwen3.8) and only uses the SSD once the shared slots reach their floor, because a single "
+            "SSD layer drops answers to 8-11 words a second. At start-up the card cushion below is also the free "
             "memory the expert slot sizing leaves untouched (the same thing 'Free card memory cushion' "
             "sets by hand; the larger of the two wins)."
         ),

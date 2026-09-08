@@ -113,3 +113,19 @@ levers that need no code change: `FREETOKEN_QSA_TORCH_TOPK=1` (swap the Triton t
   door wait or letting the MoE-only rebuild run between prefill chunks.
 - Jay set `GovernorRAMRungsBeforeUp` to 1 (from 2) at 06:0x; the recall bar is now
   cushion + 1 rung + margin = 5.82 GiB of Windows free.
+
+## Card-first RAM ladder (2026-09-08, Jay's suggestion)
+
+Measured on this card: a layer on the SSD costs the whole model its CUDA graphs (8-11 tok/s);
+a layer parked on the card costs 512 shared expert slots, ~3 tok/s by the 2026-09-02 slot sweep
+(5.8 tok/s per 1,000 slots, 8k chat), and on 2026-09-07 13:51 the server ran 8 parked layers with
+1,024 shared slots at ~45 tok/s. So the RAM ladder now parks first: shrink the slot cache by one
+layer's slots (card-neutral), promote the busiest pinned layer in the learned routing, repeat while
+the shared slots stay at or above the streaming floor (1,024 with prefill overlap, the same rule
+the settings page's fit check enforces), and only then spill to the SSD. Recovery brings SSD layers
+home first, then unparks (last parked first) and grows the slots back toward the boot size. With
+today's 5,917 slots that is up to 9 parked layers, ~12 GB of host RAM, before the SSD is touched.
+Cost to note: a park or unpark is two rebuilds (shrink, then promote; or demote, then grow), each a
+full graph teardown and re-capture, inside the same 60 s step window that already answers 504
+behind a long eager prefill; the card needs 512 MiB free before a park is attempted, otherwise the
+rung is skipped and the SSD rung runs as before.

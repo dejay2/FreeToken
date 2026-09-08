@@ -989,7 +989,8 @@ class Scheduler(SchedulerIOMixin):
                     layer=res.get("layer"),
                     at_floor=bool(res.get("at_floor", False)),
                     moe_cache_size=int(res.get("moe_cache_size", 0) or 0),
-                    layers={k: report.get(k, 0) for k in ("owned", "pinned", "disk")} if report else None,
+                    layers=({**{k: report.get(k, 0) for k in ("owned", "pinned", "disk")},
+                             "parked": len(report.get("ram_parked") or [])} if report else None),
                     vram_free_bytes=int(res.get("vram_free_bytes", 0) or 0),
                     error=error or res.get("reason"),
                 )

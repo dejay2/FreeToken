@@ -583,10 +583,12 @@ def test_step_memory_ram_axis_and_ram_tight(tmp_path: Path):
     model_dir.mkdir()
     disk_dir = tmp_path / "disk_cache"
 
+    # cache_size at the streaming floor (num_experts): the card cannot take a parked layer,
+    # so the RAM ladder goes straight to its SSD rung, which is what this test covers.
     eng = FakeDiskEngine(
         num_layers=4,
         num_experts=64,
-        cache_size=128,
+        cache_size=64,
         owned_layers=(0,),  # layer 0 is gpu_owned; 1, 2, 3 are pinned
         model_dir=model_dir,
         disk_dir=disk_dir,
@@ -759,8 +761,8 @@ def test_materialize_layer_runs_slot_bookkeeping_for_disk_layer(tmp_path: Path, 
 
 
 def test_ram_axis_skips_layers_the_writer_has_not_finished(tmp_path: Path):
-    eng = FakeDiskEngine(num_layers=4, num_experts=8, cache_size=16, owned_layers=(0,),
-                         model_dir=tmp_path / "model", disk_dir=tmp_path / "disk")
+    eng = FakeDiskEngine(num_layers=4, num_experts=8, cache_size=8, owned_layers=(0,),
+                         model_dir=tmp_path / "model", disk_dir=tmp_path / "disk")  # slots at the floor: SSD rung
     _complete_layers(eng, (2,))  # layers 1 and 3 are still being written
     r = eng.step_memory(axis="ram", direction="down")
     assert r["applied"] == "pinned->disk" and r["layer"] == 2
@@ -810,3 +812,45 @@ def test_disk_gather_scratch_matches_routing_and_id_dtype(tmp_path: Path):
     for row in range(topk_ids.shape[0]):
         for k in range(topk_ids.shape[1]):
             assert torch.equal(views[0][ids[row, k]], banks["gate_up"][0][topk_ids[row, k]])
+
+
+def test_ram_ladder_parks_then_spills_then_recalls_then_unparks_end_to_end(tmp_path: Path):
+    """Card first, SSD last, and back: real promotions, a real spill through the disk copy, a
+    byte-identical recall, then the parked layers come home in reverse with the slots regrown."""
+    eng = FakeDiskEngine(num_layers=4, num_experts=8, cache_size=32, owned_layers=(0,), overlap=True,
+                         model_dir=tmp_path / "model", disk_dir=tmp_path / "disk")
+    _complete_layers(eng, (1, 2, 3))
+    def _t(src):
+        return src.tensor if hasattr(src, "tensor") else src
+
+    originals = {lid: {n: _t(eng.moe_offload_cache.bank_sources[n][lid]).clone() for n in eng.bank_schema} for lid in (1, 2, 3)}
+    # overlap floor = 16: two parks fit (32 -> 24 -> 16), the third layer must spill
+    r = eng.step_memory(axis="ram", direction="down")
+    assert r["applied"] == "pinned->gpu_owned" and r["layer"] == 1 and r["moe_cache_size"] == 24
+    r = eng.step_memory(axis="ram", direction="down")
+    assert r["applied"] == "pinned->gpu_owned" and r["layer"] == 2 and r["moe_cache_size"] == 16
+    assert eng._ram_parked_layers == [1, 2]
+    assert eng.moe_offload_cache.layer_residency[1] == "gpu_owned" and eng.moe_offload_cache.layer_residency[2] == "gpu_owned"
+    r = eng.step_memory(axis="ram", direction="down")
+    assert r["applied"] == "pinned->disk" and r["layer"] == 3 and r["moe_cache_size"] == 16
+    assert eng.moe_offload_cache.layer_residency[3] == "disk" and eng._ram_spilled_layers == [3]
+    assert eng.moe_offload_cache.prefill_overlap is False, "a disk layer suspends prefill overlap"
+    r = eng.step_memory(axis="ram", direction="down")
+    assert r["applied"] is None and r["at_floor"] is True, "nothing pinned is left to move"
+    # up: the SSD layer first (it is what costs the graphs), then the parks in reverse
+    r = eng.step_memory(axis="ram", direction="up")
+    assert r["applied"] == "disk->pinned" and r["layer"] == 3 and r["moe_cache_size"] == 16
+    for n in eng.bank_schema:
+        assert torch.equal(_t(eng.moe_offload_cache.bank_sources[n][3]), originals[3][n])
+    assert eng.moe_offload_cache.prefill_overlap is True, "the last recall resumes prefill overlap"
+    r = eng.step_memory(axis="ram", direction="up")
+    assert r["applied"] == "gpu_owned->pinned" and r["layer"] == 2 and r["moe_cache_size"] == 24
+    r = eng.step_memory(axis="ram", direction="up")
+    assert r["applied"] == "gpu_owned->pinned" and r["layer"] == 1 and r["moe_cache_size"] == 32
+    assert eng._ram_parked_layers == [] and eng.moe_offload_cache.cache_size == 32
+    assert eng.moe_offload_cache.layer_residency[0] == "gpu_owned", "the boot-owned layer never moved"
+    for lid in (1, 2):
+        for n in eng.bank_schema:
+            assert torch.equal(_t(eng.moe_offload_cache.bank_sources[n][lid]), originals[lid][n])
+    r = eng.step_memory(axis="ram", direction="up")
+    assert r["applied"] is None

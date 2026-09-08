@@ -987,7 +987,7 @@ class ProcessManager:
         return {
             "enabled": enabled,
             "last_action": None,
-            "layers": {"owned": 0, "pinned": 0, "disk": 0},
+            "layers": {"owned": 0, "pinned": 0, "disk": 0, "parked": 0},
             "free_vram_gb": 0.0,
             "free_ram_gb": 0.0,
         }

@@ -109,10 +109,13 @@ class FakeEngine:
     _stash_vram_ledger_inputs = Engine._stash_vram_ledger_inputs
 
 
-def test_step_memory_ram_axis_returns_not_built():
-    eng = FakeEngine()
+def test_step_memory_ram_axis_returns_not_built_once_the_card_is_full():
+    eng = FakeEngine(cache_size=4)  # at the slot floor: no room to park, and no disk copy
     rep = eng.step_memory(axis="ram", direction="down")
-    assert rep == {"applied": None, "reason": "disk rung not built"}
+    assert rep["applied"] is None and rep["reason"] == "disk rung not built" and rep["at_floor"] is True
+    eng = FakeEngine()  # room to park: the SSD is not needed for the first rung
+    rep = eng.step_memory(axis="ram", direction="down")
+    assert rep["applied"] == "pinned->gpu_owned"
 
 
 def test_step_memory_invalid_arguments():
@@ -264,3 +267,169 @@ def test_step_up_promotion_failure_propagates():
 
     with pytest.raises(RuntimeError, match="promotion"):
         eng.step_memory("vram", "up", is_idle=True, rebuild=boom)
+
+
+# ---------------------------------------------------------------------------------------
+# RAM ladder: park on the card before the SSD (2026-09-08). A parked layer frees one layer
+# of host RAM at the price of one layer of shared slots; the SSD rung costs eager decode.
+# ---------------------------------------------------------------------------------------
+
+
+class _DiskCopyStub:
+    def layer_complete(self, layer_id: int) -> bool:
+        return True
+
+    def bank_bytes(self, name: str) -> int:
+        return 0
+
+
+def _ram_engine(cache_size: int = 16, overlap: bool = False):
+    fe = FakeEngine(num_layers=4, num_experts=4, cache_size=cache_size, owned_layers=(), overlap=overlap)
+    fe.expert_disk_copy = _DiskCopyStub()
+    calls: list[dict] = []
+
+    def rebuild(**kwargs):
+        calls.append(kwargs)
+        moves = kwargs.get("layer_moves") or []
+        if any(tgt == "disk" or fe.moe_offload_cache.layer_residency[lid] == HostResidency.DISK.value
+               for lid, tgt in moves):
+            # A real spill or recall needs the disk reader; the test only checks the rung chosen.
+            return
+        fe._mock_rebuild(**kwargs)
+
+    return fe, calls, rebuild
+
+
+def test_ram_down_parks_on_the_card_before_spilling_and_stops_at_the_slot_floor():
+    fe, calls, rebuild = _ram_engine(cache_size=16)  # floor without overlap: num_experts = 4
+    parked = []
+    for expected_slots in (12, 8, 4):
+        res = fe.step_memory("ram", "down", rebuild=rebuild)
+        assert res["applied"] == "pinned->gpu_owned", res
+        assert res["moe_cache_size"] == expected_slots
+        assert fe.moe_offload_cache.cache_size == expected_slots
+        parked.append(res["layer"])
+        assert fe.moe_offload_cache.layer_residency[res["layer"]] == HostResidency.GPU_OWNED.value
+    assert parked == [0, 1, 2], "lowest ids first without routing stats"
+    assert fe._ram_parked_layers == parked
+    assert fe.residency_report()["ram_parked"] == parked
+    # shrink-then-promote, never the other way round
+    assert [list(c) for c in calls[:2]] == [["moe_cache_size"], ["layer_moves"]]
+    res = fe.step_memory("ram", "down", rebuild=rebuild)
+    assert res["applied"] == "pinned->disk" and res["layer"] == 3, "at the slot floor the SSD is next"
+    assert calls[-1] == {"layer_moves": [(3, "disk")]}
+    assert res["moe_cache_size"] == 4
+
+
+def test_ram_up_unparks_after_recalls_and_grows_the_slots_back():
+    fe, calls, rebuild = _ram_engine(cache_size=16)
+    fe.step_memory("ram", "down", rebuild=rebuild)
+    fe.step_memory("ram", "down", rebuild=rebuild)
+    assert fe.moe_offload_cache.cache_size == 8 and fe._ram_parked_layers == [0, 1]
+    calls.clear()
+    res = fe.step_memory("ram", "up", rebuild=rebuild)
+    assert res["applied"] == "gpu_owned->pinned" and res["layer"] == 1, "last parked, first unparked"
+    assert res["moe_cache_size"] == 12 and fe.moe_offload_cache.cache_size == 12
+    assert [list(c) for c in calls] == [["layer_moves"], ["moe_cache_size"]], "free the card first, then grow"
+    assert fe.moe_offload_cache.layer_residency[1] == HostResidency.PINNED.value
+    res = fe.step_memory("ram", "up", rebuild=rebuild)
+    assert res["applied"] == "gpu_owned->pinned" and res["layer"] == 0 and res["moe_cache_size"] == 16
+    assert fe._ram_parked_layers == []
+    res = fe.step_memory("ram", "up", rebuild=rebuild)
+    assert res["applied"] is None, "nothing left to bring home"
+
+
+def test_ram_up_recalls_a_disk_layer_before_unparking():
+    fe, calls, rebuild = _ram_engine(cache_size=16)
+    fe.step_memory("ram", "down", rebuild=rebuild)
+    fe._ram_spilled_layers = [3]
+    fe.moe_offload_cache.layer_residency[3] = HostResidency.DISK.value  # as a real spill would leave it
+    calls.clear()
+    res = fe.step_memory("ram", "up", rebuild=rebuild)
+    assert res["applied"] == "disk->pinned" and res["layer"] == 3
+    assert fe._ram_parked_layers == [0], "the parked layer waits for the eager-decode penalty to go first"
+
+
+def test_ram_up_never_grows_the_slots_past_the_boot_size():
+    fe, calls, rebuild = _ram_engine(cache_size=16)
+    fe.step_memory("ram", "down", rebuild=rebuild)  # 12 slots, layer 0 parked
+    fe._mock_rebuild(moe_cache_size=16)  # the VRAM axis regrew the slots meanwhile
+    calls.clear()
+    res = fe.step_memory("ram", "up", rebuild=rebuild)
+    assert res["applied"] == "gpu_owned->pinned" and res["moe_cache_size"] == 16
+    assert calls == [{"layer_moves": [(0, "pinned")]}], "no growth call when already at the boot size"
+
+
+def test_the_vram_axis_leaves_a_ram_parked_layer_alone_and_takes_slots_instead():
+    fe, calls, rebuild = _ram_engine(cache_size=16)
+    fe.step_memory("ram", "down", rebuild=rebuild)  # 12 slots, layer 0 parked
+    assert fe._ram_parked_layers == [0]
+    res = fe.step_memory("vram", "down", ram_tight=True, rebuild=rebuild)
+    assert res["applied"] == "slots" and res["moe_cache_size"] == 4, "not gpu_owned->disk: the park stands"
+    assert calls[-1] == {"moe_cache_size": 4}
+    assert fe.moe_offload_cache.layer_residency[0] == HostResidency.GPU_OWNED.value
+    assert fe._ram_parked_layers == [0]
+    # a boot-owned layer is still fair game for the VRAM axis
+    fe2 = FakeEngine(num_layers=4, num_experts=4, cache_size=16, owned_layers=(3,))
+    fe2.expert_disk_copy = _DiskCopyStub()
+    fe2.step_memory("ram", "down", rebuild=lambda **kw: fe2._mock_rebuild(**kw))
+    assert fe2._ram_parked_layers == [0] and fe2._gpu_owned_layer_ids == {0, 3}
+    res = fe2.step_memory("vram", "down", ram_tight=False, rebuild=lambda **kw: fe2._mock_rebuild(**kw))
+    assert res["applied"] == "gpu_owned->pinned" and res["layer"] == 3
+
+
+def test_a_parked_layer_moved_by_hand_is_forgotten():
+    fe, calls, rebuild = _ram_engine(cache_size=16)
+    fe.step_memory("ram", "down", rebuild=rebuild)
+    fe._move_layer(0, "pinned")
+    assert fe._ram_parked_layers == [], "back in RAM by another route: not parked any more"
+    assert fe.step_memory("ram", "up", rebuild=rebuild)["applied"] is None
+
+
+def test_a_rejected_promote_gives_the_slots_back():
+    from freetoken.engine.engine import CacheRebuildRejected
+
+    fe, calls, _ = _ram_engine(cache_size=16)
+
+    def rebuild(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("layer_moves"):
+            raise CacheRebuildRejected("promoting needs more than the free MiB")
+        fe._mock_rebuild(**kwargs)
+
+    res = fe.step_memory("ram", "down", rebuild=rebuild)
+    assert res["applied"] is None and "park rejected" in res["reason"]
+    assert res["moe_cache_size"] == 16 and fe.moe_offload_cache.cache_size == 16
+    assert [list(c) for c in calls] == [["moe_cache_size"], ["layer_moves"], ["moe_cache_size"]]
+    assert fe._ram_parked_layers == [] and fe.rebuild_teardown_started is False
+
+
+def test_no_park_without_vram_margin_on_a_cuda_device():
+    fe, calls, rebuild = _ram_engine(cache_size=16)
+    fe.device = torch.device("cuda")
+    fe._sync_get_memory = lambda: (100 << 20, 32 << 30)  # 100 MiB free: below the 512 MiB margin
+    res = fe.step_memory("ram", "down", rebuild=rebuild)
+    assert res["applied"] == "pinned->disk", "no margin on the card: the SSD rung, not a half-done park"
+    fe._sync_get_memory = lambda: (1 << 30, 32 << 30)
+    fe.device = torch.device("cpu")  # promotions in this harness allocate on cpu
+    res = fe.step_memory("ram", "down", rebuild=rebuild)
+    assert res["applied"] == "pinned->gpu_owned"
+
+
+def test_ram_down_parks_the_busiest_layer_when_routing_stats_exist(monkeypatch):
+    fe, calls, rebuild = _ram_engine(cache_size=16)
+    fe.config.model_path = "/models/demo"
+    import freetoken.moe.learned_routing as lr
+
+    stats = SimpleNamespace(freq=[[1, 1, 1, 1], [9, 9, 9, 9], [2, 2, 2, 2], [0, 0, 0, 0]])
+    monkeypatch.setattr(lr, "load_routing_stats", lambda *a, **k: stats)
+    res = fe.step_memory("ram", "down", rebuild=rebuild)
+    assert res["applied"] == "pinned->gpu_owned" and res["layer"] == 1, "the layer that routes most goes to the card"
+
+
+def test_ram_down_respects_the_overlap_floor():
+    fe, calls, rebuild = _ram_engine(cache_size=12, overlap=True)  # floor with overlap: 2 * 4 = 8
+    res = fe.step_memory("ram", "down", rebuild=rebuild)
+    assert res["applied"] == "pinned->gpu_owned" and res["moe_cache_size"] == 8
+    res = fe.step_memory("ram", "down", rebuild=rebuild)
+    assert res["applied"] == "pinned->disk", "8 - 4 would leave fewer than the 8 the overlap path needs"

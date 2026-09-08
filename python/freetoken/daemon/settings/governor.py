@@ -286,7 +286,7 @@ class GovernorLoop(threading.Thread):
         self._stop_event = threading.Event()
         self.enabled: bool = True
         self.last_action: str | None = None
-        self.last_layers: dict[str, int] = {"owned": 0, "pinned": 0, "disk": 0}
+        self.last_layers: dict[str, int] = {"owned": 0, "pinned": 0, "disk": 0, "parked": 0}
         self.last_free_vram: int | None = None
         self.last_free_ram: int | None = None
         self._serving_since: float | None = None
@@ -402,6 +402,7 @@ class GovernorLoop(threading.Thread):
                 "owned": reply["layers"].get("owned", 0),
                 "pinned": reply["layers"].get("pinned", 0),
                 "disk": reply["layers"].get("disk", 0),
+                "parked": reply["layers"].get("parked", self.last_layers.get("parked", 0)),
             }
         old_slots = self.last_moe_cache_size
         new_slots = reply.get("moe_cache_size")
@@ -414,13 +415,20 @@ class GovernorLoop(threading.Thread):
         new_vram_gb = vram_free_bytes / GIB
 
         at_floor_only = False
-        if old_slots is not None and new_slots is not None and old_slots != new_slots:
+        slots_changed = old_slots is not None and new_slots is not None and old_slots != new_slots
+        if applied and "->" in str(applied) and slots_changed:
+            # A park or unpark moves a layer and the slot cache together; say both.
+            change_desc = f"{applied} layer {reply.get('layer')}, slots {old_slots}->{new_slots}"
+        elif slots_changed:
             change_desc = f"slots {old_slots}->{new_slots}"
         elif applied:
             change_desc = str(applied)
         elif reply.get("at_floor"):
             change_desc = "at floor"
             at_floor_only = True
+        elif reply.get("reason") or reply.get("error"):
+            # e.g. "park rejected, slots restored: ..." — the one line that explains a no-op step
+            change_desc = str(reply.get("reason") or reply.get("error"))
         else:
             change_desc = reply.get("status", "none")
 
@@ -450,6 +458,7 @@ class GovernorLoop(threading.Thread):
                         "owned": rep.get("owned", 0),
                         "pinned": rep.get("pinned", 0),
                         "disk": rep.get("disk", 0),
+                        "parked": len(rep.get("ram_parked") or []),
                     }
                     if "moe_cache_size" in rep:
                         self.last_moe_cache_size = rep["moe_cache_size"]

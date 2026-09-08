@@ -450,6 +450,7 @@ class Engine:
         self.expert_disk_copy = None
         self.expert_disk_writer = None
         self._ram_spilled_layers: list[int] = []
+        self._ram_parked_layers: list[int] = []  # RAM-axis parks (card-neutral), unparked in reverse
         self._deferred_graph_bs: list[int] | None = None
         self._graphs_deferred: str | None = None
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
@@ -1466,6 +1467,10 @@ class Engine:
                 demoted.remove(layer_id)
         else:
             raise NotImplementedError(f"unsupported target residency {target!r}")
+        if target != HostResidency.GPU_OWNED.value:
+            parked = getattr(self, "_ram_parked_layers", None)
+            if parked and layer_id in parked:
+                parked.remove(layer_id)
 
     def step_memory(
         self,
@@ -1490,8 +1495,17 @@ class Engine:
           4. at floor
         VRAM up: reverse order.
         RAM axis:
-          down: pinned layer -> disk, picking fewest routes in learned routing or highest pinned id.
-          up: disk -> pinned, in reverse spill order.
+          down: 1. park a pinned layer on the card (slot cache -num_experts, then
+                   pinned -> gpu_owned: card-neutral, frees one layer of host RAM) while the
+                   shared slots stay at or above the streaming floor (1024 with overlap);
+                   the busiest layer in the learned routing goes first (it never misses again).
+                   Measured 2026-09-07 13:51 on the 5090: 8 parked layers with 1,024 shared slots
+                   still decoded at ~45 tok/s, against 8-11 tok/s with a single disk layer
+                   (any disk layer forces eager decode), so the card is always tried first.
+                2. pinned layer -> disk, picking fewest routes in learned routing or highest pinned id.
+          up:   1. disk -> pinned, in reverse spill order (removes the eager-decode penalty first).
+                2. unpark: gpu_owned -> pinned for a RAM-parked layer, then slot cache +num_experts
+                   back toward its boot size.
         """
         if axis == "ram":
             disk_copy = getattr(self, "expert_disk_copy", None) or (
@@ -1499,8 +1513,6 @@ class Engine:
                 if self.moe_offload_cache is not None
                 else None
             )
-            if disk_copy is None:
-                return {"applied": None, "reason": "disk rung not built"}
             if direction not in ("down", "up"):
                 raise ValueError(f"unknown direction {direction!r} (expected 'down' or 'up')")
 
@@ -1551,8 +1563,65 @@ class Engine:
                     except Exception:
                         stats = None
 
-                # Only a layer the background writer has finished can be spilled; picking an
-                # incomplete one would raise inside the rebuild, after the graphs are gone.
+                # 1. Park on the card while the shared slot cache can pay for it: shrink by one
+                #    layer's worth of slots (exactly the parked banks' bytes, so the card's free
+                #    memory is unchanged), then promote. Two rebuilds on purpose: a combined call
+                #    promotes before it shrinks and would need a spare layer of VRAM mid-way.
+                num_experts = cache.num_experts
+                overlap = getattr(self.config, "moe_prefill_overlap", False) if hasattr(self, "config") else False
+                park_floor = 2 * num_experts if overlap else num_experts
+                # The promote's own guard wants the layer's bytes plus 256 MiB free; the shrink
+                # returns exactly the layer's bytes, so the card must already hold the margin
+                # (checked before anything is torn down, or a rejected promote would leave the
+                # slots shrunk with nothing parked: a game taking VRAM at the same moment).
+                card_has_margin = self.device.type != "cuda" or free_vram >= _PARK_VRAM_MARGIN
+                if current_slots - num_experts >= park_floor and card_has_margin:
+                    if not hasattr(self, "_ram_parked_layers"):
+                        self._ram_parked_layers = []
+                    if stats is not None and stats.freq:
+                        park_layer = max(pinned_layers, key=lambda l: (sum(stats.freq[l]), -l))
+                    else:
+                        park_layer = min(pinned_layers)
+                    new_slots = current_slots - num_experts
+                    rebuild(moe_cache_size=new_slots)
+                    # Each rebuild is complete on its own: the scheduler's "failed after teardown"
+                    # verdict must not carry over from the first into the second.
+                    self.rebuild_teardown_started = False
+                    try:
+                        rebuild(layer_moves=[(park_layer, "gpu_owned")])
+                    except CacheRebuildRejected as exc:
+                        self.rebuild_teardown_started = False
+                        rebuild(moe_cache_size=current_slots)  # give the slots back
+                        return {
+                            "applied": None,
+                            "reason": f"park rejected, slots restored: {exc}",
+                            "layer": park_layer,
+                            "moe_cache_size": current_slots,
+                            "at_floor": False,
+                            "vram_free_bytes": free_vram,
+                        }
+                    if park_layer not in self._ram_parked_layers:
+                        self._ram_parked_layers.append(park_layer)
+                    return {
+                        "applied": "pinned->gpu_owned",
+                        "layer": park_layer,
+                        "moe_cache_size": new_slots,
+                        "at_floor": False,
+                        "vram_free_bytes": free_vram,
+                    }
+                if disk_copy is None:
+                    return {
+                        "applied": None,
+                        "reason": "disk rung not built",
+                        "layer": None,
+                        "moe_cache_size": current_slots,
+                        "at_floor": True,
+                        "vram_free_bytes": free_vram,
+                    }
+
+                # 2. Spill to the SSD. Only a layer the background writer has finished can be
+                #    spilled; picking an incomplete one would raise inside the rebuild, after the
+                #    graphs are gone.
                 spillable = [l for l in pinned_layers if disk_copy.layer_complete(l)]
                 if not spillable:
                     return {
@@ -1599,10 +1668,36 @@ class Engine:
                         if r == HostResidency.DISK.value
                     ]
                 if not candidates:
+                    # 2. Unpark: give a RAM-parked layer its host bank back (frees its card
+                    #    bytes), then grow the shared slot cache by the same amount, capped at
+                    #    the boot size. Last parked, first unparked.
+                    parked = [
+                        l for l in reversed(getattr(self, "_ram_parked_layers", []))
+                        if cache.layer_residency[l] == HostResidency.GPU_OWNED.value
+                    ]
+                    if not parked:
+                        return {
+                            "applied": None,
+                            "layer": None,
+                            "moe_cache_size": current_slots,
+                            "at_floor": False,
+                            "vram_free_bytes": free_vram,
+                        }
+                    unpark_layer = parked[0]
+                    init_slots = getattr(self, "_initial_moe_cache_size", None)
+                    grown = current_slots + cache.num_experts
+                    if init_slots:
+                        grown = min(int(init_slots), grown)
+                    rebuild(layer_moves=[(unpark_layer, "pinned")])
+                    if grown > current_slots:
+                        self.rebuild_teardown_started = False
+                        rebuild(moe_cache_size=grown)
+                    else:
+                        grown = current_slots
                     return {
-                        "applied": None,
-                        "layer": None,
-                        "moe_cache_size": current_slots,
+                        "applied": "gpu_owned->pinned",
+                        "layer": unpark_layer,
+                        "moe_cache_size": grown,
                         "at_floor": False,
                         "vram_free_bytes": free_vram,
                     }
@@ -1640,9 +1735,14 @@ class Engine:
                 pass
 
         if direction == "down":
-            # 1. gpu_owned -> disk (if ram_tight and complete on disk) else gpu_owned -> pinned
-            if cache is not None and self._gpu_owned_layer_ids:
-                layer_id = max(self._gpu_owned_layer_ids)
+            # 1. gpu_owned -> disk (if ram_tight and complete on disk) else gpu_owned -> pinned.
+            #    A layer the RAM axis parked is not a candidate: demoting it would hand its
+            #    bytes back to the RAM that axis just freed (or send it to the SSD, the cliff the
+            #    park avoided) while the slots stay shrunk. The slot rung below serves instead.
+            parked = set(getattr(self, "_ram_parked_layers", []))
+            demotable = [l for l in self._gpu_owned_layer_ids if l not in parked]
+            if cache is not None and demotable:
+                layer_id = max(demotable)
                 disk_copy = getattr(self, "expert_disk_copy", None) or (
                     getattr(cache, "expert_disk_copy", None) if cache is not None else None
                 )
@@ -1763,6 +1863,7 @@ class Engine:
                 "pinned": 0,
                 "disk": 0,
                 "layer_bytes": 0,
+                "ram_parked": [],
             }
         layer_bytes = 0
         try:
@@ -1793,6 +1894,7 @@ class Engine:
             "pinned": pinned,
             "disk": disk,
             "layer_bytes": layer_bytes,
+            "ram_parked": list(getattr(self, "_ram_parked_layers", [])),
         }
 
     @torch.inference_mode()
@@ -2758,6 +2860,10 @@ def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[
 # identical under mean missing_per_step and under the pooled union.json. A fixed constant,
 # never a runtime heuristic; _auto_cpu_layers' U-shaped head+tail guess is NOT supported by
 # this data (the tail 39-47 is mid-pack, the minimum is layer 31) and must not be reused.
+# Free VRAM the RAM ladder wants before parking a layer on the card: the shrink returns exactly
+# the layer's bytes and rebuild_runtime_cache's promote guard asks for those plus 256 MiB.
+_PARK_VRAM_MARGIN = 512 << 20
+
 GPU_OWNED_LAYER_RANK = (
     1, 6, 0, 2, 7, 22, 10, 13, 5, 18, 21, 38, 8, 12, 34, 11,
     24, 26, 29, 14, 28, 17, 19, 4, 35, 9, 37, 30, 33, 20, 3, 23,
