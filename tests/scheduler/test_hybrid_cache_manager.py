@@ -220,7 +220,10 @@ def test_finish_marks_deepest_snapshot_parkable_when_length_is_unaligned():
     pool = _pool()
     page_table = torch.zeros(4, 64, dtype=torch.int32)
     # Minimal park-store double: CacheManager only reads these at init and in _park_candidates.
-    store = SimpleNamespace(min_tokens=1, mode="ram", page_size=2, idle_ms=0, generation=0)
+    store = SimpleNamespace(
+        min_tokens=1, mode="ram", page_size=2, idle_ms=0, generation=0,
+        lookup=lambda *_args, **_kwargs: None,   # match_req probes the store; a cold miss
+    )
     cm = CacheManager(64, 2, page_table, "hybrid_radix", linear_state_pool=pool, park_store=store)
 
     mr = cm.match_req(_pend([1, 2, 3, 4, 5]))
