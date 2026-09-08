@@ -64,8 +64,17 @@ The fault is intermittent and content-dependent; ~8,000 synthetic decode steps a
 - Which kernel: unknown. Same faulting instruction both times. Next occurrence: rerun the offending
   request with `CUDA_LAUNCH_BLOCKING=1` (the Python traceback then names the launch), or under
   `compute-sanitizer` if the prompt can be captured.
-- The server stays dead after a scheduler crash ("Backend worker is gone and cannot be restarted");
-  the settings helper does not restart it. That is what left 2020 unreachable from 23:38 to 04:20.
+- ~~The server stays dead after a scheduler crash~~ Fixed the same morning (a14dcec, helper 1.4.0):
+  the helper's crash watchdog restarts a server that stops answering unasked (three misses ten
+  seconds apart, at most three restarts an hour), the service unit now has `LimitCORE=0` so the
+  5-6 minute crash dump is gone, and a `Diagnostic mode` dial boots with `CUDA_LAUNCH_BLOCKING=1`
+  and every graph off so the next fault names its kernel.
+- Follow-ups found on the way: `POST /api/server/start` against a server that is already serving
+  boots a twin that loads 60 GB of banks before failing to bind the port (05:33, squeezed Windows to
+  2.5 GB free and spilled a live layer); the page never does this but the API allows it. And
+  `stop_servers` waits for whole-card VRAM below 3 GiB, which a game or QUASAR can hold up for the
+  full 120 s timeout; the watchdog sidesteps it by using a plain start when no server process is
+  left, a page Restart does not.
 
 ## Code audit of the long-context decode path (2026-09-08, read-only)
 
