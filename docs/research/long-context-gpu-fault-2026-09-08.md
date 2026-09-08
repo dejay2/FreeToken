@@ -168,3 +168,17 @@ unchanged), so it is not stalling on disk. The cost-aware / min-emitted catches 
 speculation from losing. MTP also holds 2.56 GiB of the card for its draft head (512 fewer slots).
 Left: MTP off, `PleBackend` back to auto (disk at the next start). A dynamic on/off worth its name
 means fixing the cost-aware gate inside the spike (`engine/spec_*.py`), a separate job.
+
+### The real guess-ahead slowdown: the SSD rung dropped its verify graphs (07:57-08:01, fixed 19f061b)
+
+Restart with MTP on (depth 3, mmap reader), `bench.py` median decode tok/s: 48.8 before any move;
+50.6 and 50.2 after one governor park (slots 6429 -> 5917); 14.7 with layer 47 on the SSD (eager,
+expected); **20.5 and 20.8 after the recall**, with the plain graphs recaptured but no
+`MTP spec graph width 1: captured` line ever again. Cause: `rebuild_runtime_cache` destroyed the
+speculative verify runner and re-armed it only on the capture branch; the spill's deferred branch
+dropped it, so the recall rebuild had nothing to re-arm and, with the draft head present, every
+decode step took the eager path (`use_graph` is false whenever a capture is wanted). Fixed by
+remembering the boot-armed widths and re-arming after both branches (19f061b); the verify step
+leaves the runner aside while graphs are deferred. So the morning's 20 tok/s "MTP cost" was this
+bug, not speculation: with MTP on and no SSD trip the box does ~49-50 tok/s, the same as MTP off
+on the mmap reader. The 2.5x figure recorded above is withdrawn.
