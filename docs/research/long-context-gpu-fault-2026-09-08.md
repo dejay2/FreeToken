@@ -52,11 +52,12 @@ So every long-context decode step in the log ran on the disk/MTP-off setup; the 
 | Setup | Test | Result |
 |---|---|---|
 | mmap + MTP on | one 151,822-token prompt, 48 then 200 output tokens | OK, 5 logged decode steps at 152k |
+| mmap + MTP on | the same three rounds as below (152k prompt, 12-turn 124k chat, 8-turn `/v1/messages` at 155k) | OK, 05:20-05:30 |
 | disk + MTP off | same 151,822-token prompt, 200 output tokens | OK, 54.8 s |
 | disk + MTP off | 12-turn chat on 124k tokens of repo source, 120 tokens per turn, cached prefix | OK |
 | disk + MTP off | 8-turn `/v1/messages` chat with thinking + a tool at 155k tokens, up to 400 tokens per turn | OK |
 
-The fault is intermittent and content-dependent; ~4,000 synthetic decode steps at 124k-155k did not hit it.
+The fault is intermittent and content-dependent; ~8,000 synthetic decode steps at 124k-155k across both setups did not hit it.
 
 ## Open
 
