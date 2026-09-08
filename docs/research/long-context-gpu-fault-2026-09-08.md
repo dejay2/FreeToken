@@ -93,3 +93,23 @@ per-step host-to-device expert copies rise with context and with what the prompt
 levers that need no code change: `FREETOKEN_QSA_TORCH_TOPK=1` (swap the Triton top-k),
 `--cuda-graph-max-bs 0` (graphs off, so the faulting launch is attributable), bf16 KV instead of fp8,
 `CUDA_LAUNCH_BLOCKING=1`, or `compute-sanitizer --tool memcheck` on one long request.
+
+## Memory facts measured while recovering from the twin boot (06:00-06:10)
+
+- Windows `FreePhysicalMemory` is the truth; the WSL VM's own `MemFree` (15 GB at the time) is
+  not spare memory. `hv_balloon` runs "cold memory discard hint" (order 9): the guest reports free
+  pages, Windows drops their backing, the guest still counts them free. Pinning a layer inside the
+  VM took ~1.3 GB off Windows free and left VM `MemFree` unchanged; an 8 GB grab on Windows left
+  VM `MemFree` unchanged too (Windows compressed its own pages instead: free 4.9 -> 0.4 GB, then
+  9.9 GB after release). `drop_caches` and `compact_memory` inside the VM changed nothing.
+- So the governor's RAM axis reads the right number. What looked like "WSL holding 17 GB" was
+  Windows genuinely short: server ~65 GB + Windows ~9 GB + compressed/standby ~3 GB.
+- A Windows-side memory grab has a lasting side effect: Windows trims its standby/compressed
+  pages and stays at the higher free figure afterwards (5 -> 10 GB free).
+- `POST /v1/cache/step` answers 504 after 60 s when a long eager prefill is running (8192-token
+  chunks at ~10 s each with a disk layer); the step still applies when the prefill ends. While it
+  waits, `maintenance` is "rebuilding" and the front door holds new requests up to 120 s, so a
+  recall queued behind a 3-minute prefill can bounce a new request with 503. Worth a longer front
+  door wait or letting the MoE-only rebuild run between prefill chunks.
+- Jay set `GovernorRAMRungsBeforeUp` to 1 (from 2) at 06:0x; the recall bar is now
+  cushion + 1 rung + margin = 5.82 GiB of Windows free.
