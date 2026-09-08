@@ -129,3 +129,23 @@ Cost to note: a park or unpark is two rebuilds (shrink, then promote; or demote,
 full graph teardown and re-capture, inside the same 60 s step window that already answers 504
 behind a long eager prefill; the card needs 512 MiB free before a park is attempted, otherwise the
 rung is skipped and the SSD rung runs as before.
+
+### Live proof of the card-first ladder (07:02-07:08, branch at c0f4780, governor ON)
+
+Boot dip: Windows free 3.6 GB right after serving; the governor parked 4 layers (slots 5917 -> 3869),
+nothing to the SSD, graphs kept. Squeeze: `hammer.py` 270 s of short chats plus `grab.py` taking
+4 then 8 GB of Windows RAM (hold 60 s). Governor moves from the server log:
+
+| Time | Move |
+|---|---|
+| 07:03:06-07:03:27 | four more parks (8 parked, slots 1821) |
+| 07:03:34 | one pinned->disk (the 9th rung: card margin / floor reached) |
+| 07:04:35 | disk->pinned first, once Windows read 10 GB free during the hold |
+| 07:04:41-07:05:19 | six unparks, one every 7 s, slots growing back 512 at a time |
+
+Every `POST /v1/cache/step` answered 200 (no 504s with short chats). Hammer: 64 requests,
+0 failed, p50 15.8 tok/s, min 8.8 tok/s, max first-token wait 7.3 s. Yesterday's same squeeze on
+the SSD-first ladder saw 6-11 disk layers and 2.6-4.6 tok/s at the worst point. Windows free did
+not move per park (it went up: Windows trims its own standby pages under the grab), so the proof
+that a park frees host RAM is the recovery direction: each unpark cost ~1.3 GB of Windows free.
+After release one layer stayed parked at Windows free 4.8 GB (recall bar 6.25 GB); ~3 tok/s.
