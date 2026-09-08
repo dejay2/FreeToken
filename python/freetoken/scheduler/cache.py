@@ -729,13 +729,20 @@ class CacheManager:
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
                 self._bump_park_generation()
-                self._mark_finished_park_node(req.input_ids[:insert_len])
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                 keep_live = not mamba_exist           # tree now owns linear_slot_idx
             else:
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto :])
+            # The turn is over: whichever snapshot node is deepest on this request's path is
+            # the one worth parking -- the donated full-sequence state when cached_len was
+            # page-aligned, otherwise the last x64 prefill/decode snapshot (match_prefix walks
+            # up to the deepest LIVE snapshot). Marking only inside the donate branch left every
+            # real chat unparkable: the 2026-09-08 22:49 live run (190,004-token prompt + 48
+            # answer tokens, cached_len 190,052, not a multiple of 64) parked nothing in 90 s
+            # and re-read all 190k tokens on turn two (141 s).
+            self._mark_finished_park_node(req.input_ids[:insert_len])
             self._free_req_slots(req, keep_live=keep_live)
             return
 

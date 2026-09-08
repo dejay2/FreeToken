@@ -210,3 +210,36 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn):
             fn()
             print(f"{name}: PASS")
+
+
+def test_finish_marks_deepest_snapshot_parkable_when_length_is_unaligned():
+    """2026-09-08 22:49 live run: a 190,004-token prompt + 48 answer tokens ends at cached_len
+    190,052, not a page multiple, so the finish-donate is skipped. The park marker must then
+    land on the deepest x64 snapshot, or nothing is ever parked (90 s idle parked 0 entries and
+    turn two re-read 190k tokens in 141 s)."""
+    pool = _pool()
+    page_table = torch.zeros(4, 64, dtype=torch.int32)
+    # Minimal park-store double: CacheManager only reads these at init and in _park_candidates.
+    store = SimpleNamespace(min_tokens=1, mode="ram", page_size=2, idle_ms=0, generation=0)
+    cm = CacheManager(64, 2, page_table, "hybrid_radix", linear_state_pool=pool, park_store=store)
+
+    mr = cm.match_req(_pend([1, 2, 3, 4, 5]))
+    live, pp = pool.alloc(1)[0], tuple(pool.alloc(2))
+    page_table[0, :6] = torch.tensor([100, 101, 102, 103, 104, 105], dtype=torch.int32)
+    req = Req(input_ids=torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32), table_idx=0,
+              cached_len=4, output_len=1, uid=0, sampling_params=SamplingParams(),
+              cache_handle=mr.cuda_handle)
+    req.linear_slot_idx, req.mamba_ping_pong = live, pp
+    req.mamba_next_track_idx = 1
+    req.mamba_last_track_seqlen = 4
+    cm.lock(mr.cuda_handle)
+
+    cm.cache_req(req, finished=False)        # x64-style chunk snapshot at boundary 4: unfinished
+    assert cm._park_candidates() == []       # an intermediate snapshot must not be parked
+
+    req.cached_len = 5                       # one decoded token: no longer page-aligned
+    cm.cache_req(req, finished=True)         # finish-donate skipped -> deepest snapshot marked
+    candidates = cm._park_candidates()
+    assert len(candidates) == 1
+    assert candidates[0].node.park_finished is True
+    assert candidates[0].mamba_slot == pp[0]
