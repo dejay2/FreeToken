@@ -157,6 +157,7 @@ class ProcessManager:
         self._start_log_offset = 0
         self._temporary_boot_files: set[Path] = set()
         self._governor: Any = None
+        self._watchdog: Any = None
         self._lock = threading.RLock()
 
     # ---- job API ---------------------------------------------------------
@@ -180,6 +181,10 @@ class ProcessManager:
             if self._active_id is not None:
                 active = self._jobs[self._active_id]
                 if action == "stop" and active.action in {"start", "restart"}:
+                    if self._watchdog is not None:
+                        # An accepted Stop against a boot in flight, the watchdog's own included:
+                        # the page's wish wins over the reboot.
+                        self._watchdog.disarm("stopped by the page")
                     active.cancel_event.set()
                     if active.cleanup_pending and active.stage == "failed":
                         active.stage = "stopping"
@@ -196,6 +201,11 @@ class ProcessManager:
                     "Cannot start another action."
                 )
 
+            if action in {"stop", "restart"} and self._watchdog is not None:
+                # Only an accepted request disarms: the page asked for the server to go down,
+                # and a restart re-arms when serving returns. (The watchdog's own jobs keep it
+                # armed; see CrashWatchdog.disarm.)
+                self._watchdog.disarm("stopped by the page" if action == "stop" else None)
             settings_snapshot = copy.deepcopy(settings) if settings is not None else None
             source_boot = self.boot_file
             initial = "stopping" if action in {"stop", "restart"} else "booting"
@@ -753,6 +763,10 @@ class ProcessManager:
             if self._active_id == job_id:
                 self._active_id = None
         self.start_governor(settings=job.settings_snapshot)
+        if self._watchdog is not None:
+            # A profile Start carries its own flag; re-read it the way the governor is rebuilt.
+            self.apply_watchdog_settings(job.settings_snapshot, quiet=True)
+            self._watchdog.arm()
 
     def _finish(self, job_id: str, stage: str, progress: str, error: str | None = None) -> None:
         with self._lock:
@@ -976,6 +990,79 @@ class ProcessManager:
             "layers": {"owned": 0, "pinned": 0, "disk": 0},
             "free_vram_gb": 0.0,
             "free_ram_gb": 0.0,
+        }
+
+    # ---- crash watchdog --------------------------------------------------
+
+    @staticmethod
+    def _auto_restart_enabled(settings: dict[str, Any]) -> bool:
+        # An env toggle: absent from the boot file reads back as its default "1" (on).
+        value = settings.get("FREETOKEN_AUTO_RESTART", "1")
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def start_watchdog(self, settings: dict[str, Any] | None = None, **kwargs: Any) -> None:
+        """Start the crash watchdog with the helper; it adopts a serving server on its first tick."""
+        from .watchdog import CrashWatchdog
+
+        if settings is None:
+            try:
+                from .boot_parser import BootFile
+
+                settings = BootFile(self.boot_file).load()
+            except Exception:
+                settings = {}
+        self.stop_watchdog()
+        watchdog = CrashWatchdog(self, **kwargs)
+        watchdog.enabled = self._auto_restart_enabled(settings)
+        self._watchdog = watchdog
+        watchdog.start()
+
+    def apply_watchdog_settings(self, settings: dict[str, Any] | None, *, quiet: bool = False) -> None:
+        """A Save or profile change flips the watchdog on or off without touching the server."""
+        if settings is None:
+            try:
+                from .boot_parser import BootFile
+
+                settings = BootFile(self.boot_file).load()
+            except Exception:
+                settings = {}
+        enabled = self._auto_restart_enabled(settings)
+        watchdog = self._watchdog
+        if watchdog is not None and watchdog.enabled != enabled:
+            watchdog.enabled = enabled
+        if not quiet:
+            logger.info("auto-restart %s", "enabled" if enabled else "disabled")
+
+    def stop_watchdog(self) -> None:
+        watchdog = self._watchdog
+        if watchdog is not None:
+            try:
+                watchdog.stop()
+                if watchdog.is_alive():
+                    watchdog.join(timeout=5.0)  # a tick past its checks must not queue a job as the helper exits
+            except Exception:
+                pass
+            self._watchdog = None
+
+    def watchdog_status(self) -> dict[str, Any]:
+        if self._watchdog is not None:
+            return self._watchdog.status()
+        try:
+            from .boot_parser import BootFile
+
+            enabled = self._auto_restart_enabled(BootFile(self.boot_file).load())
+        except Exception:
+            enabled = True
+        return {
+            "enabled": enabled,
+            "armed": False,
+            "misses": 0,
+            "restarts_last_hour": 0,
+            "last_restart_at": None,
+            "last_reason": None,
+            "gave_up": False,
         }
 
     def _iso_now(self) -> str:

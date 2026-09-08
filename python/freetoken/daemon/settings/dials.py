@@ -656,6 +656,33 @@ DIALS: tuple[Dial, ...] = (
             "installed, which already has the graphics-card libraries. Leave it unless that install moves."
         ),
     ),
+    # Deliberately an env toggle although only the helper reads it: an absent line loads as the
+    # default "1" (on), which a launcher switch cannot express (absent = off). The server ignores it.
+    Dial(
+        "FREETOKEN_AUTO_RESTART", "toggle", "1", "boolean",
+        "Settings helper watchdog: start the model server again on its own when it dies while it was meant to be running (rate-limited). Absent from the boot file means on.",
+        "Server & advanced", source="env", engine_mapping="$env:FREETOKEN_AUTO_RESTART (read by the helper, not the server)",
+        plain="Auto-restart after a crash", blurb="Start the server again by itself if it dies.",
+        info=(
+            "This page keeps an eye on the server. If it was running and then stops answering without "
+            "anyone pressing Stop, the page starts it again with the saved settings, at most three times "
+            "an hour. It does not fix the cause; it just gets you serving again within a few minutes. "
+            "A crash that keeps coming back is still written to the log."
+        ),
+    ),
+    Dial(
+        "FREETOKEN_DIAGNOSTIC_MODE", "toggle", "0", "boolean",
+        "Diagnostic boot (Linux/WSL helper only): CUDA_LAUNCH_BLOCKING=1, CUDA graphs and MTP spec graphs off so a card fault is reported at the kernel that caused it.",
+        "Server & advanced", source="env", engine_mapping="$env:CUDA_LAUNCH_BLOCKING='1', FREETOKEN_MTP_SPEC_GRAPH=0 and --cuda-graph-max-bs 0 (Linux/WSL launch)",
+        plain="Diagnostic mode", blurb="Slower boot that names the routine behind a card fault.", advanced=True,
+        effects=("speed:down",),
+        info=(
+            "Turn this on only while hunting a crash. The server runs each piece of card work one at a "
+            "time and skips its recorded fast path, so when the card reports a bad memory access the log "
+            "names the exact routine instead of the next thing that happened to wait on it. Answers come "
+            "noticeably slower. Turn it off again once the fault has been caught."
+        ),
+    ),
     Dial(
         "CudaGraphMaxBS", "number", 4, "batch size", "Maximum batch size captured into CUDA graphs (-1 disables graph capture).",
         "Server & advanced", minimum=-1, maximum=1024, engine_mapping="--cuda-graph-max-bs <N>",

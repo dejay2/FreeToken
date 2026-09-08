@@ -51,11 +51,16 @@ def main(argv: list[str] | None = None) -> int:
     # server is serving and picks the adopted one up on its next tick; a page Start re-reads
     # the cushions and replaces it.
     process_manager.start_governor()
+    # Same reasoning for the crash watchdog: it must outlive page Starts and adopt a server
+    # that is already serving, so it starts with the helper (2026-09-07: port 2020 sat dead
+    # from 23:38 to 04:20 after a scheduler crash because nothing watched it).
+    process_manager.start_watchdog()
     try:
         import uvicorn
 
         uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info")
     finally:
+        process_manager.stop_watchdog()
         process_manager.stop_governor()
         process_manager.close()
     return 0

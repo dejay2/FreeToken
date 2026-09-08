@@ -361,6 +361,14 @@ def build_launch(
     # The governor's timing and rung controls are helper-only knobs. They are read by the
     # torch-free settings watcher, not passed to the model server's launch command.
     graph_bs = _int(_get(settings, "CudaGraphMaxBS"), -1)
+    if env.get("FREETOKEN_DIAGNOSTIC_MODE") == "1":
+        # Crash hunting (2026-09-07: two "illegal memory access" faults at 117k/153k tokens surfaced
+        # at an unrelated event sync). Synchronous launches put the Python traceback on the kernel
+        # that faulted, and graphs off means a replay cannot hide it behind one launch.
+        env["CUDA_LAUNCH_BLOCKING"] = "1"
+        env["FREETOKEN_MTP_SPEC_GRAPH"] = "0"  # the MTP draft/verify replays are graphs too
+        graph_bs = 0
+        notes.append("Diagnostic mode: CUDA_LAUNCH_BLOCKING=1, CUDA graphs and MTP spec graphs off; expect slower answers")
     if graph_bs >= 0:
         argv += ["--cuda-graph-max-bs", str(graph_bs)]
     kv_tokens = _int(_get(settings, "KVCacheTokens"))

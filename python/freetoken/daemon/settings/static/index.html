@@ -1114,8 +1114,10 @@
       const governor = body.governor || {};
       const govLayers = governor.layers || {};
       const govText = governor.enabled === false ? 'Off' : (governor.last_action ? escapeHtml(governor.last_action) : 'Watching');
+      const auto = body.autoRestart || {};
+      const autoText = auto.enabled === false ? 'Auto-restart off' : auto.gave_up ? `Auto-restart gave up: ${escapeHtml(auto.last_reason || '')}` : `Auto-restart ${auto.armed ? 'watching' : 'idle'}${auto.restarts_last_hour ? ` · ${escapeHtml(auto.restarts_last_hour)} restart${auto.restarts_last_hour === 1 ? '' : 's'} this hour` : ''}`;
       $('status').innerHTML = [
-        `<div class="stat"><span class="small">Main server</span><strong><span class="dot ${escapeHtml(stateName)}"></span>${escapeHtml(pretty)}</strong><div class="sub">Port ${escapeHtml(server.port ?? '')}${server.uptimeS ? ` · up ${escapeHtml(fmtUptime(server.uptimeS))}` : ''}</div></div>`,
+        `<div class="stat"><span class="small">Main server</span><strong><span class="dot ${escapeHtml(stateName)}"></span>${escapeHtml(pretty)}</strong><div class="sub">Port ${escapeHtml(server.port ?? '')}${server.uptimeS ? ` · up ${escapeHtml(fmtUptime(server.uptimeS))}` : ''}</div><div class="sub">${autoText}</div></div>`,
         `<div class="stat"><span class="small">This settings page</span><strong><span class="dot serving"></span>${escapeHtml(body.helper?.status === 'up' ? 'Up' : (body.helper?.status || 'unknown'))}</strong><div class="sub">v${escapeHtml(body.helper?.version || '')} · up ${escapeHtml(fmtUptime(body.helper?.uptimeS))}</div></div>`,
         `<div class="stat"><span class="small">Active requests</span><strong>${escapeHtml(server.activeRequests ?? 0)}</strong><div class="sub">GPU busy ${escapeHtml(gpu.gpuUtilPercent ?? 0)}%</div></div>`,
         `<div class="stat"><span class="small">VRAM</span><strong>${escapeHtml(fmtMb(gpu.vramUsedMb))} <span class="muted">/ ${escapeHtml(fmtMb(gpu.vramTotalMb))}</span></strong><div class="bar" aria-label="VRAM used"><span style="width:${percent}%"></span></div></div>`,

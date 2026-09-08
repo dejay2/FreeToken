@@ -31,7 +31,7 @@ from .memory_fit import EstimateUnavailable, MemoryFitService, SettingsValidatio
 from .process_manager import LifecycleError, ProcessManager
 from .profiles_manager import ProfileError, ProfileValidationError, ProfilesManager
 
-HELPER_VERSION = "1.3.0"
+HELPER_VERSION = "1.4.0"
 
 
 class SettingsBody(BaseModel):
@@ -315,6 +315,9 @@ def create_app(
             apply_governor = getattr(process_manager, "apply_governor_settings", None)
             if callable(apply_governor):
                 apply_governor(saved)
+            apply_watchdog = getattr(process_manager, "apply_watchdog_settings", None)
+            if callable(apply_watchdog):
+                apply_watchdog(saved)
         except BootValidationError as exc:
             return _validation_response(exc.errors)
         except BootParseError as exc:
@@ -324,6 +327,16 @@ def create_app(
             "backupPath": str(boot.backup_path),
             "settings": saved,
         }
+
+    def _reapply_helper_flags(settings):
+        # A profile rewrites the boot file without going through PUT /api/settings; the
+        # watchdog's on/off flag lives only in the helper, so re-read it here (None = the file).
+        apply_watchdog = getattr(process_manager, "apply_watchdog_settings", None)
+        if callable(apply_watchdog):
+            try:
+                apply_watchdog(settings)
+            except Exception:  # noqa: BLE001 - a profile change must not fail on the watchdog
+                pass
 
     @app.get("/api/browse")
     async def browse(path: str = Query(default=""), kind: str = Query(default="folder")):
@@ -377,6 +390,7 @@ def create_app(
         except ProfileError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         set_active_boot(result["bootFilePath"])
+        _reapply_helper_flags(None)
         return result
 
     @app.post("/api/profiles/{profile_id}/apply")
@@ -407,6 +421,7 @@ def create_app(
             set_active_boot(result["bootFilePath"])
         else:
             profiles.sync_active(result.get("settings") or {})
+        _reapply_helper_flags(result.get("settings") if not result.get("activated") else None)
         return result
 
     @app.get("/api/status")
@@ -456,6 +471,15 @@ def create_app(
                 "layers": {"owned": 0, "pinned": 0, "disk": 0},
                 "free_vram_gb": 0.0,
                 "free_ram_gb": 0.0,
+            },
+            "autoRestart": process_manager.watchdog_status() if hasattr(process_manager, "watchdog_status") else {
+                "enabled": True,
+                "armed": False,
+                "misses": 0,
+                "restarts_last_hour": 0,
+                "last_restart_at": None,
+                "last_reason": None,
+                "gave_up": False,
             },
             "currentJob": process_manager.current_job(),
         }

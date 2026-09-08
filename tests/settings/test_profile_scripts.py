@@ -52,6 +52,8 @@ def _qwen_settings() -> dict[str, object]:
         "FREETOKEN_MTP_SPEC_DEPTH": 3,
         "FREETOKEN_MTP_SPEC_CONF_CUT": 0.65,
         "FREETOKEN_MTP_SPEC_MIN_EMITTED": 2.4,
+        "FREETOKEN_AUTO_RESTART": "1",
+        "FREETOKEN_DIAGNOSTIC_MODE": "0",
         "FREETOKEN_MTP_SPEC_COST_AWARE": "1",
     }
 
@@ -96,6 +98,8 @@ def _dense_settings() -> dict[str, object]:
         "FREETOKEN_MTP_SPEC_DEPTH": 5,
         "FREETOKEN_MTP_SPEC_CONF_CUT": 0.8,
         "FREETOKEN_MTP_SPEC_MIN_EMITTED": 2.4,
+        "FREETOKEN_AUTO_RESTART": "1",
+        "FREETOKEN_DIAGNOSTIC_MODE": "0",
         "FREETOKEN_MTP_SPEC_COST_AWARE": "1",
     }
 

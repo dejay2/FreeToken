@@ -162,7 +162,13 @@ def test_status_logs_and_lifecycle_job_routes(tmp_path):
     client, _ = make_client(tmp_path)
     status = client.get("/api/status")
     assert status.status_code == 200
-    assert status.json()["helper"]["version"] == "1.3.0"
+    assert status.json()["helper"]["version"] == "1.4.0"
+    auto = status.json()["autoRestart"]
+    assert auto["enabled"] is True and auto["gave_up"] is False and "restarts_last_hour" in auto
+    saved = client.put("/api/settings", json={"settings": {"FREETOKEN_AUTO_RESTART": False}})
+    assert saved.status_code == 200
+    assert client.get("/api/status").json()["autoRestart"]["enabled"] is False, "a Save reaches the watchdog flag"
+    client.put("/api/settings", json={"settings": {"FREETOKEN_AUTO_RESTART": True}})
     assert client.get("/api/logs?limit=10").json()["lines"] == []
     response = client.post("/api/server/start", json={})
     assert response.status_code == 202
