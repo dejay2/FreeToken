@@ -57,6 +57,9 @@ class _OfferParkStore:
     def __init__(self):
         self.offers = []
 
+    def lookup(self, *_args, **_kwargs):
+        return None                      # cold miss: admission still probes the store
+
     def offer(self, input_ids, page_bases, state_slot):
         self.offers.append((input_ids.clone(), page_bases.clone(), state_slot))
         copied = Event()
@@ -188,3 +191,35 @@ def test_two_turn_chat_parks_one_entry_per_turn():
     assert len(store.offers) == 2
     assert [offer[0].tolist() for offer in store.offers] == [[1, 3], [2, 3]]
     assert state_pool.num_free_slots == 17
+
+
+def test_admission_pass_drains_completed_parks_before_the_size_gate():
+    """Live 2026-09-08 23:18: a 190k prefix was parked at the end of turn one, its pages stayed
+    in _pending_parks (drained only at idle or inside allocation), and the pending turn-two
+    request failed the size gate forever because available_size did not count them. The
+    admission pass must drain completed parks first."""
+    store = _OfferParkStore()
+    cache_manager, state_pool, _page_table = _hybrid_manager(num_pages=16, park_store=store)
+    copied = Event()
+    copied.set()
+    held = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    evicted = SimpleNamespace(lock_node=None, mamba_slots=[state_pool.alloc(1)[0]], kv_indices=held)
+    cache_manager.free_slots = cache_manager.free_slots[4:]           # pages 0-3 belong to the park
+    cache_manager._pending_parks.append((SimpleNamespace(copy_done=copied), evicted))
+    before = cache_manager.available_size
+
+    manager = PrefillManager(
+        cache_manager=cache_manager,
+        table_manager=TableManager(max_running_reqs=2, page_table=_page_table),
+        decode_manager=DecodeManager(page_size=1),
+    )
+    manager.schedule_next_batch(prefill_budget=8)                       # empty pending list: early return
+    assert cache_manager.available_size == before                       # nothing drained without a pass
+    manager.pending_list.append(
+        PendingReq(uid=1, input_ids=torch.arange(8, dtype=torch.int32),
+                   sampling_params=SamplingParams(max_tokens=1))
+    )
+    batch = manager.schedule_next_batch(prefill_budget=8)
+    assert cache_manager.available_size >= before + len(held)          # the park's pages came back
+    assert cache_manager._pending_parks == []
+    assert batch is not None and len(batch.reqs) == 1

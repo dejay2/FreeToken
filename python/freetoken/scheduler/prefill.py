@@ -305,6 +305,16 @@ class PrefillManager:
     def _admit_next_batch(self, prefill_budget: int) -> Batch | None:
         """Prefix match, admission gates, page/GDN allocation and the prompt's H2D copies."""
         # estimated offset due to in-flight decode
+        # Hand back the pages of parks whose device->host copy has completed BEFORE the size
+        # gate sees available_size. Draining used to happen only at idle (run_when_idle) or
+        # inside the allocation paths; a pending request that fails the size gate keeps the
+        # scheduler out of idle and never reaches allocation, so a 190k prefix parked at the
+        # end of turn one held its 2.6 GB of pages hostage and turn two could never be admitted
+        # (live 2026-09-08 23:18-23:36: one parked entry, main thread spinning in overlap_loop,
+        # request pending 18 min). The old per-iteration re-probe reached _allocate by
+        # accident; the once-per-generation gate does not, so drain here on purpose.
+        if getattr(self.cache_manager, "park_store", None) is not None:
+            self.cache_manager.drain_pending_parks()
         adder = PrefillAdder(
             token_budget=prefill_budget,
             reserved_size=self.decode_manager.inflight_tokens,
