@@ -423,9 +423,12 @@ class GovernorLoop(threading.Thread):
             self.last_action = "off: " + str(reply.get("error", "steps unsupported"))
             return
 
-        applied = reply.get("applied")
+        # Rejected/busy/failed replies carry default slots=0, not a memory snapshot. J11
+        # reproduced those defaults clearing RAM exhaustion after a rejected VRAM step.
+        ok = reply.get("status") == "ok"
+        applied = reply.get("applied") if ok else None
         layers = None
-        if isinstance(reply.get("layers"), dict):
+        if ok and isinstance(reply.get("layers"), dict):
             layers = {
                 "owned": reply["layers"].get("owned", 0),
                 "pinned": reply["layers"].get("pinned", 0),
@@ -433,7 +436,7 @@ class GovernorLoop(threading.Thread):
                 "parked": reply["layers"].get("parked", self.last_layers.get("parked", 0)),
             }
         old_slots = self.last_moe_cache_size
-        new_slots = reply.get("moe_cache_size")
+        new_slots = reply.get("moe_cache_size") if ok else None
         # Compare before overwriting: a change on EITHER axis invalidates every remembered
         # "nothing to do" (a VRAM spill leaves a disk layer for RAM to recall, review F3).
         self._forget_exhausted_if_changed(layers=layers, slots=new_slots, applied=bool(applied))
@@ -442,7 +445,7 @@ class GovernorLoop(threading.Thread):
         if new_slots is not None:
             self.last_moe_cache_size = new_slots
 
-        if action.direction == "up" and reply.get("exhausted"):
+        if ok and action.direction == "up" and reply.get("exhausted"):
             self._up_exhausted.add(action.axis)
         vram_free_bytes = reply.get("vram_free_bytes", free_vram)
         old_vram_gb = free_vram / GIB
@@ -526,17 +529,18 @@ class GovernorLoop(threading.Thread):
         """Drop every remembered exhausted verdict when a fact it rests on has changed.
 
         Called BEFORE the caller stores the new snapshot, with only the facts the reply or
-        report carried (None = not reported, never a change). A previously unknown slot or
-        page count (first report after a start) is learnt silently.
+        report carried (None = not reported, never a change). If exhaustion was remembered
+        before a geometry field became known, recheck once: failed residency queries may
+        have hidden a size change. Later identical reports preserve suppression.
         """
         if not self._up_exhausted:
             return
         changed = applied
         if layers is not None and layers != self.last_layers:
             changed = True
-        if slots is not None and self.last_moe_cache_size is not None and slots != self.last_moe_cache_size:
+        if slots is not None and slots != self.last_moe_cache_size:
             changed = True
-        if pages is not None and self.last_num_pages is not None and pages != self.last_num_pages:
+        if pages is not None and pages != self.last_num_pages:
             changed = True
         if changed:
             logger.info(

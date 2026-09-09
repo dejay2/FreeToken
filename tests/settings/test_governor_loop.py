@@ -525,3 +525,54 @@ def test_a_step_reply_with_new_geometry_re_arms_even_without_applied(monkeypatch
     loop._execute_action(Action("ram", "up"), int(2.5 * GIB), 40 * GIB)
     # The changed placement cleared both; this reply's own exhausted verdict re-adds RAM only.
     assert loop._up_exhausted == {"ram"}
+
+
+def test_first_known_pages_re_arm_an_exhausted_axis_after_residency_timeouts(monkeypatch):
+    """J11: a step can prove exhaustion before a failed residency query learns the KV size.
+    A later first report must allow one recheck, not silently adopt a possibly reduced pool.
+    """
+    exhausted = _exhausted_reply()[1]
+    exhausted["layers"] = {"owned": 3, "pinned": 1, "disk": 0, "parked": 0}
+    server = _FakeServer([(200, exhausted)])
+    loop = _loop(monkeypatch, server)
+
+    def unavailable(*args, **kwargs):
+        raise TimeoutError("residency unavailable past the up hold")
+
+    monkeypatch.setattr(governor.urllib.request, "urlopen", unavailable)
+    for _ in range(3):
+        loop._query_residency()
+    assert loop.last_num_pages is None
+    monkeypatch.setattr(governor.urllib.request, "urlopen", server.urlopen)
+    loop._execute_action(Action("vram", "up"), 20 * GIB, 40 * GIB)
+    assert loop._up_exhausted == {"vram"} and loop.last_num_pages is None
+
+    report = {"owned": 3, "pinned": 1, "disk": 0, "ram_parked": [],
+              "moe_cache_size": 6144, "num_pages": 3072}
+    monkeypatch.setattr(governor.urllib.request, "urlopen",
+                        lambda *a, **k: io.BytesIO(json.dumps(report).encode()))
+    loop._query_residency()
+    assert loop._up_exhausted == set(), "the first known size may already be smaller than at exhaustion"
+    assert loop.last_num_pages == 3072
+    # Rechecking once is enough: identical reports must not bring back recurring no-op steps.
+    loop._up_exhausted.add("vram")
+    loop._query_residency()
+    assert loop._up_exhausted == {"vram"}
+
+
+@pytest.mark.parametrize("status", ["rejected", "busy", "failed"])
+def test_non_success_step_defaults_do_not_change_geometry_or_re_arm_exhaustion(monkeypatch, status):
+    """J11: the scheduler serializes zero slots on errors; zero is not a memory snapshot."""
+    error = f"step {status} without a geometry report"
+    reply = (503, {"status": status, "applied": None, "moe_cache_size": 0,
+                   "layers": None, "vram_free_bytes": 0, "error": error})
+    server = _FakeServer([_exhausted_reply(), reply, reply])
+    loop = _loop(monkeypatch, server)
+    loop._execute_action(Action("ram", "up"), 20 * GIB, 40 * GIB)
+    assert loop._up_exhausted == {"ram"} and loop.last_moe_cache_size == 6144
+    for _ in range(2):
+        loop._execute_action(Action("vram", "up"), 20 * GIB, 40 * GIB)
+        assert loop._up_exhausted == {"ram"}, "an error default is not a real memory change"
+        assert loop.last_moe_cache_size == 6144
+        assert loop.last_layers == {"owned": 0, "pinned": 48, "disk": 0, "parked": 0}
+        assert error in loop.last_action
