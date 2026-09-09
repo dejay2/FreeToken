@@ -1123,16 +1123,27 @@ class ParkStore:
         if needed > budget:
             return None
         before = len(self._entries)
-        fits = self._evict_to_fit(needed)
-        if self.mode == "ssd" and len(self._entries) != before:
-            self._write_manifest()
-        if not fits:
-            return None
-        op = _SaveOp(key=key, tokens=tokens, keys=keys, reserved_bytes=needed)
+        op = _SaveOp(key=key, tokens=tokens, keys=keys)
         self._adopt_parent(op, parent)
-        self._reserved_bytes += needed
-        self._inflight.add(key)
-        return op
+        try:
+            # Pin before eviction: the 2026-09-09 CPU pressure probe otherwise rewrote
+            # 311,448 KV bytes instead of 152 by evicting its own selected parent.
+            fits = self._evict_to_fit(needed)
+            if not fits and parent is not None:
+                self._adopt_parent(op, None)
+                needed = self._planned_bytes(len(tokens), None)
+                fits = needed <= budget and self._evict_to_fit(needed)
+            if self.mode == "ssd" and len(self._entries) != before:
+                self._write_manifest()
+            if not fits:
+                return None
+            op.reserved_bytes = needed
+            self._reserved_bytes += needed
+            self._inflight.add(key)
+            return op
+        finally:
+            if not op.reserved_bytes:
+                self._adopt_parent(op, None)
 
     def _adopt_parent(self, op: _SaveOp, parent: ParkedEntry | None) -> None:
         """Pin the new parent's family before releasing the old pin."""
@@ -1384,23 +1395,26 @@ class ParkStore:
             op = self._begin_op(tokens, keys)
             if op is None:
                 return None
-            source_ready = None
-            if self._stream is not None:
-                source_ready = torch.cuda.Event(enable_timing=False)
-                source_ready.record(torch.cuda.current_stream(self.kv_pool.device))
-            pending = PendingPark(
-                tokens,
-                bases,
-                int(state_slot),
-                source_ready,
-                reserved_bytes=op.reserved_bytes,
-                op=op,
-            )
             try:
+                source_ready = None
+                if self._stream is not None:
+                    source_ready = torch.cuda.Event(enable_timing=False)
+                    source_ready.record(torch.cuda.current_stream(self.kv_pool.device))
+                pending = PendingPark(
+                    tokens,
+                    bases,
+                    int(state_slot),
+                    source_ready,
+                    reserved_bytes=op.reserved_bytes,
+                    op=op,
+                )
                 self._save_queue.put_nowait(pending)
             except Full:
                 self._finish_op(op)
                 return None
+            except Exception:
+                self._finish_op(op)
+                raise
             return pending
 
     def _worker_loop(self) -> None:
@@ -1805,6 +1819,9 @@ class ParkStore:
         }
         progress = {"key": entry.key}
         with self._lock:
+            # Staleness is not corruption: a replacement under the same key may be valid.
+            if self._entries.get(entry.key) is not entry:
+                raise ParkEntryRejected("parked entry is no longer current")
             total_pages = entry.token_count // self.page_size
             if page_offset < 0 or page_offset > total_pages:
                 raise ValueError("restore page offset is outside the parked entry")
@@ -1812,20 +1829,24 @@ class ParkStore:
             bases = page_bases.detach().to(device="cpu", dtype=torch.int32).flatten()
             if len(bases) != total_pages - page_offset:
                 raise ValueError("restore target page count does not match parked suffix")
-            span = self._entry_views(bases, state_slot)
+            # Build each destination view once. The redundant SSD split cost 105-109 ms
+            # for 2,048 CPU pages in the 2026-09-09 review, outside reported views_ms.
+            if entry.ram_buffer is not None:
+                span = self._entry_views(bases, state_slot)
+                view_bytes, view_count = span.nbytes, len(span.views)
+            else:
+                kv_span, state_span = self._split_views(bases, state_slot)
+                view_bytes = kv_span.nbytes + state_span.nbytes
+                view_count = len(kv_span.views) + len(state_span.views)
             per_page_bytes = self.page_size * self._kv_bytes_per_token()
             state_bytes = self._state_bytes()
             source_offset = page_offset * per_page_bytes
             suffix_bytes = (total_pages - page_offset) * per_page_bytes + state_bytes
-            if span.nbytes != suffix_bytes:
+            if view_bytes != suffix_bytes:
                 raise ParkEntryRejected("restore target layout does not match parked suffix")
             timing["views_ms"] = (time.perf_counter() - mark) * 1000.0
-            timing["views"] = float(len(span.views))
+            timing["views"] = float(view_count)
             try:
-                # A cached lookup result can go stale during allocation; only the object the
-                # store still holds under this key is restorable, never a same-key replacement.
-                if self._entries.get(entry.key) is not entry:
-                    raise ParkEntryRejected("parked entry is no longer current")
                 if entry.ram_buffer is not None:
                     if entry.ram_buffer.numel() != entry.payload_bytes:
                         raise ParkEntryRejected("RAM parked payload size changed")
@@ -1849,7 +1870,6 @@ class ParkStore:
                     if chain is None:
                         raise ParkEntryRejected("SSD parked chain is incomplete")
                     timing["segments"] = float(len(chain))
-                    kv_span, state_span = self._split_views(bases, state_slot)
                     if (
                         kv_span.nbytes != suffix_bytes - state_bytes
                         or state_span.nbytes != state_bytes

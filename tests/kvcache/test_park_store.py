@@ -1309,7 +1309,7 @@ def test_ssd_incremental_second_turn_writes_far_fewer_bytes(tmp_path: Path, monk
 @pytest.mark.parametrize("kv_dtype", [None, torch.float8_e4m3fn], ids=["bf16", "fp8"])
 @pytest.mark.parametrize("page_offset", [0, 1, 2, 5, 6])
 def test_ssd_incremental_restore_is_byte_identical_to_full_snapshot(
-    tmp_path: Path, kv_dtype, page_offset: int
+    tmp_path: Path, kv_dtype, page_offset: int, monkeypatch
 ):
     kv_pool = _qsa_pool(num_pages=48, kv_dtype=kv_dtype)
     state_pool = _state_pool(num_slots=8)
@@ -1363,7 +1363,16 @@ def test_ssd_incremental_restore_is_byte_identical_to_full_snapshot(
 
         hit = reopened.lookup(torch.cat([tokens, torch.tensor([999], dtype=torch.int32)]))
         assert hit is not None and hit.token_count == 24
+        page_calls = []
+        real_page_views = kv_pool.page_byte_views
+
+        def counted_page_views(page):
+            page_calls.append(page)
+            return real_page_views(page)
+
+        monkeypatch.setattr(kv_pool, "page_byte_views", counted_page_views)
         reopened.restore(hit, _bases(target_ids), slots[3], page_offset=page_offset)
+        assert page_calls == target_ids, "restore must build each destination page once"
 
         views_per_page = len(kv_pool.page_byte_views(0))
         restored_kv = _raw_bytes(_page_views(kv_pool, target_ids))
@@ -1637,6 +1646,74 @@ def test_ssd_eviction_removes_a_whole_family_and_never_orphans_a_child(tmp_path:
             assert entry.parent_key is None or entry.parent_key in store._entries
         assert sorted(path.stem for path in tmp_path.glob("*.park")) == sorted(remaining)
         assert store.lookup(base) is None
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("same_family", [False, True])
+def test_ssd_pressure_pins_the_parent_before_eviction_or_rolls_over(tmp_path: Path, same_family):
+    store, kv_pool, state_pool = _chain_store(tmp_path)
+    slots = state_pool.alloc(3)
+    tokens = torch.arange(16, dtype=torch.int32)
+    store.disk_budget_bytes = 2 * store.storage_bytes(8) + 64
+    try:
+        a = _save_turn(store, kv_pool, state_pool, tokens[:8], [1, 2], slots[0], seed=1, new_pages=[1, 2])
+        middle = tokens[:12] if same_family else torch.arange(100, 108, dtype=torch.int32)
+        middle_pages = [1, 2, 3] if same_family else [5, 6]
+        other = _save_turn(store, kv_pool, state_pool, middle, middle_pages, slots[1], seed=2,
+                           new_pages=[3] if same_family else [5, 6])
+        a.last_used_ns, other.last_used_ns = 1, 2
+        final = tokens if same_family else tokens[:12]
+        pages = [1, 2, 3, 4] if same_family else [1, 2, 3]
+        _fill_raw(_page_views(kv_pool, [pages[-1]]), seed=3)
+        pending = store.offer(final, _bases(pages), slots[2])
+        assert pending is not None and pending.wait() and pending.error is None
+        child = _entry_for(store, final)
+        assert other.key not in store._entries
+        if same_family:
+            assert child.parent_key is None and a.key not in store._entries
+        else:
+            assert child.parent_key == a.key and a.key in store._entries
+            assert child.kv_bytes == 4 * kv_pool.unit_bytes()[0]
+        assert store._occupied_bytes() <= store.disk_budget_bytes
+        assert not store._pins and not store._inflight and store._reserved_bytes == 0
+        store.restore(child, _bases([10, 11, 12, 13][:len(pages)]), slots[0])
+        _assert_raw_equal(
+            _raw_bytes(_page_views(kv_pool, [10, 11, 12, 13][:len(pages)])),
+            _raw_bytes(_page_views(kv_pool, pages)),
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("failure", ["create", "record"])
+def test_ssd_offer_event_failure_releases_the_unqueued_operation(tmp_path: Path, monkeypatch, failure):
+    store, kv_pool, state_pool = _chain_store(tmp_path)
+    slots = state_pool.alloc(2)
+    tokens = torch.arange(12, dtype=torch.int32)
+    try:
+        a = _save_turn(store, kv_pool, state_pool, tokens[:8], [1, 2], slots[0], seed=1, new_pages=[1, 2])
+
+        class FailedEvent:
+            def __init__(self, **kwargs):
+                if failure == "create":
+                    raise RuntimeError("source-ready event failed")
+
+            def record(self, stream):
+                raise RuntimeError("source-ready event failed")
+
+        monkeypatch.setattr(store, "_stream", object())
+        monkeypatch.setattr(torch.cuda, "Event", FailedEvent)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda *_args: None)
+        with pytest.raises(RuntimeError, match="source-ready event failed"):
+            store.offer(tokens, _bases([1, 2, 3]), slots[1])
+        assert store._save_queue.empty()
+        assert store._reserved_bytes == 0 and not store._pins and not store._inflight
+        assert store.status()["disabled"] is False
+        monkeypatch.setattr(store, "_stream", None)
+        pending = store.offer(tokens, _bases([1, 2, 3]), slots[1])
+        assert pending is not None and pending.wait()
+        assert _entry_for(store, tokens).parent_key == a.key
     finally:
         store.close()
 
@@ -1942,5 +2019,16 @@ def test_restore_rejects_an_entry_the_store_no_longer_holds(tmp_path: Path):
         store._drop_entry(a.key)
         with pytest.raises(ParkEntryRejected, match="no longer current"):
             store.restore(stale, _bases([3, 4]), slots[1])
+        assert store.save(base, _bases([1, 2]), slots[0])
+        replacement = store.lookup(base)
+        assert replacement is not stale
+        with pytest.raises(ParkEntryRejected, match="no longer current"):
+            store.restore(stale, _bases([3, 4]), slots[1])
+        assert store.lookup(base) is replacement and replacement.path.exists()
+        store.restore(replacement, _bases([3, 4]), slots[1])
+        _assert_raw_equal(
+            _raw_bytes(_page_views(kv_pool, [3, 4])),
+            _raw_bytes(_page_views(kv_pool, [1, 2])),
+        )
     finally:
         store.close()
