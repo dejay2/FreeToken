@@ -104,6 +104,7 @@ class FakeEngine:
 
     # Bind the methods from Engine
     step_memory = Engine.step_memory
+    step_memory_noop = Engine.step_memory_noop
     residency_report = Engine.residency_report
     _move_layer = Engine._move_layer
     _stash_vram_ledger_inputs = Engine._stash_vram_ledger_inputs
@@ -433,3 +434,55 @@ def test_ram_down_respects_the_overlap_floor():
     assert res["applied"] == "pinned->gpu_owned" and res["moe_cache_size"] == 8
     res = fe.step_memory("ram", "down", rebuild=rebuild)
     assert res["applied"] == "pinned->disk", "8 - 4 would leave fewer than the 8 the overlap path needs"
+
+
+# ---- residency-only no-op preflight (2026-09-09: 847 of 861 live governor steps were no-ops) --
+
+
+def _cuda_looking(eng: FakeEngine) -> MagicMock:
+    """Make the memory probe observable: on a CUDA device step_memory calls _sync_get_memory."""
+    eng.device = SimpleNamespace(type="cuda")
+    eng._sync_get_memory = MagicMock(return_value=(2 << 30, 2 << 30))
+    return eng._sync_get_memory
+
+
+def test_ram_up_with_everything_pinned_is_exhausted_without_a_memory_sync():
+    eng = FakeEngine(owned_layers=())  # every layer pinned in host RAM, nothing spilled or parked
+    sync = _cuda_looking(eng)
+    rep = eng.step_memory(axis="ram", direction="up")
+    assert rep["applied"] is None and rep["at_floor"] is False
+    assert rep["exhausted"] is True and rep["reason"].startswith("nothing to recall")
+    assert sync.call_count == 0, "a proven no-op must not synchronize the card"
+    assert eng.rebuild_runtime_cache.call_count == 0
+    assert eng.step_memory_noop("ram", "up") == rep
+
+
+def test_ram_up_with_a_parked_layer_is_not_a_noop_and_unparks():
+    eng = FakeEngine(owned_layers=(1,))
+    eng._ram_parked_layers = [1]
+    assert eng.step_memory_noop("ram", "up") is None
+    rep = eng.step_memory(axis="ram", direction="up")
+    assert rep["applied"] == "gpu_owned->pinned" and rep.get("exhausted", False) is False
+
+
+def test_ram_down_with_no_pinned_layer_is_a_floor_no_op_without_a_sync():
+    eng = FakeEngine(num_layers=4, owned_layers=(0, 1, 2))
+    eng.moe_offload_cache.layer_residency[3] = HostResidency.DISK.value  # the last one spilled
+    sync = _cuda_looking(eng)
+    rep = eng.step_memory(axis="ram", direction="down")
+    assert rep["applied"] is None and rep["at_floor"] is True and rep["exhausted"] is True
+    assert sync.call_count == 0
+
+
+def test_vram_up_noop_is_not_exhausted_while_a_kv_restore_waits_for_idle():
+    # Everything on the card already except a shrunk KV pool: "up" can still apply once idle,
+    # so the governor must keep asking; only a pool already at its boot size is exhausted.
+    eng = FakeEngine(num_layers=4, owned_layers=(0, 1, 2), cache_size=16, num_pages=100)
+    eng.num_pages = 75
+    assert eng.step_memory_noop("vram", "up") is None
+    rep = eng.step_memory(axis="vram", direction="up", is_idle=False)
+    assert rep["applied"] is None and rep["exhausted"] is False
+    eng.num_pages = 100
+    rep = eng.step_memory(axis="vram", direction="up", is_idle=False)
+    assert rep["applied"] is None and rep["exhausted"] is True
+    assert eng.step_memory_noop("vram", "up") == rep

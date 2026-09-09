@@ -16,6 +16,10 @@ from fastapi import FastAPI
 def build_health(state: Any, version: str) -> dict:
     """Full-lifecycle health doc: loading -> ok -> error."""
     instance_id = getattr(state, "instance_id", None)
+    # Applying the maintenance deadline here means a /health poller alone is enough to move
+    # a stuck "rebuilding" to error; it used to answer ok for as long as the gate stayed shut.
+    check = getattr(state, "check_maintenance", None)
+    maintenance = check() if callable(check) else None
     fatal = getattr(state, "fatal_error", None)
     if fatal:
         return {"status": "error", "message": fatal, "instance_id": instance_id}
@@ -39,7 +43,7 @@ def build_health(state: Any, version: str) -> dict:
 
     ready_at = getattr(state, "ready_at", None)
     uptime_s = max(0, int(time.monotonic() - ready_at)) if ready_at is not None else 0
-    return {
+    doc = {
         "status": "ok",
         "model": model,
         "instance_id": instance_id,
@@ -47,6 +51,9 @@ def build_health(state: Any, version: str) -> dict:
         "maintenance": mstate,
         "version": version,
     }
+    if isinstance(maintenance, dict) and maintenance.get("age_s") is not None:
+        doc["maintenance_age_s"] = maintenance["age_s"]
+    return doc
 
 
 def register_control_routes(

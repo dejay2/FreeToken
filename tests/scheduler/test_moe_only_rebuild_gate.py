@@ -79,3 +79,37 @@ def test_normal_loop_runs_a_moe_only_rebuild_while_decode_is_runnable():
     calls.clear()
     Scheduler.normal_loop(sched)
     assert calls == []
+
+
+def test_a_residency_proven_noop_step_is_answered_inline_and_never_queued():
+    """The engine's residency-only preflight proves "ram up" has nothing to recall: the
+    scheduler answers on receipt instead of queueing the step to a safe point, so the API
+    gate reopens in one round trip and no device sync or rebuild runs."""
+    sent: list = []
+    calls: list = []
+    s = Scheduler.__new__(Scheduler)
+    s.config = SimpleNamespace(tp_info=SimpleNamespace(size=1))
+    s.cache_manager = SimpleNamespace(supports_runtime_rebuild=True)
+    s._pending_rebuild = None
+    s._idle_wait_logged = False
+    noop = {"applied": None, "layer": None, "moe_cache_size": 6262, "at_floor": False,
+            "exhausted": True, "reason": "nothing to recall", "vram_free_bytes": 0}
+    s.engine = SimpleNamespace(
+        step_memory_noop=lambda axis, direction: calls.append((axis, direction)) or noop,
+        residency_report=lambda: {"owned": 0, "pinned": 48, "disk": 0, "ram_parked": []},
+        step_memory=lambda *a, **k: (_ for _ in ()).throw(AssertionError("step ran")),
+    )
+    s.send_result = lambda msgs: sent.extend(msgs)
+    s._process_one_msg(CacheStepBackendMsg(request_id="up-1", axis="ram", direction="up"))
+    assert calls == [("ram", "up")]
+    assert s._pending_rebuild is None, "a no-op is never queued"
+    reply = sent[0]
+    assert reply.request_id == "up-1" and reply.status == "ok"
+    assert reply.applied is None and reply.exhausted is True and reply.error == "nothing to recall"
+    assert reply.layers == {"owned": 0, "pinned": 48, "disk": 0, "parked": 0}
+
+    # A step that may apply is queued exactly as before.
+    s.engine.step_memory_noop = lambda axis, direction: None
+    msg = CacheStepBackendMsg(request_id="down-1", axis="ram", direction="down")
+    s._process_one_msg(msg)
+    assert s._pending_rebuild is msg and len(sent) == 1

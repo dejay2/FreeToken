@@ -66,6 +66,17 @@ from .stats import StatsTracker
 
 logger = init_logger(__name__, "FrontendAPI")
 
+# How long a maintenance operation (a /v1/cache/step or /v1/cache/rebuild) may keep the gate
+# closed with NO message of any kind arriving from the backend before it is declared stuck.
+# Measured on the 5090 (2026-09-09, logs/server-2020.log): runtime graph captures take 0-3 s,
+# the startup capture 9 s, a two-stage layer move 21 s from first capture to applied, and the
+# longest step ever seen waiting behind a synchronous 190k restore was 26.1 s. The explicit
+# rebuild endpoint already grants 300 s. Nothing silent for longer has ever completed; the
+# 16:25 wedge that day sat 11 min 44 s with no scheduler progress until clients gave up.
+MAINTENANCE_STUCK_S = 300.0
+# The event-loop task that applies the limit when nobody polls /health or /v1/cache/status.
+MAINTENANCE_WATCH_INTERVAL_S = 5.0
+
 _GLOBAL_STATE = None
 # Recommended sampling defaults from the checkpoint's generation_config.json, applied to
 # request fields the caller left unspecified (sglang's sampling_defaults='model').
@@ -140,6 +151,60 @@ def _unwrap_msg(msg: BaseFrontendMsg) -> List[UserReply]:
     return [msg]
 
 
+def _open_maintenance(state: Any, request_id: str, kind: str) -> None:
+    """Close the gate for one correlated operation (see FrontendManager.maintenance_op)."""
+    state.maintenance_state = "rebuilding"
+    now = getattr(state, "monotonic", time.monotonic)()
+    state.maintenance_op = {
+        "request_id": request_id,
+        "kind": kind,
+        "started_at": now,
+        "expired": False,
+    }
+    if hasattr(state, "rebuild_done"):
+        state.rebuild_done.clear()
+
+
+def _abort_maintenance(state: Any) -> None:
+    """The enqueue failed: the scheduler never saw the request and the engine is untouched."""
+    state.maintenance_op = None
+    state.maintenance_state = "serving"
+    if hasattr(state, "rebuild_done"):
+        state.rebuild_done.set()
+
+
+def _fail_open_waiters(state: Any, message: str) -> None:
+    """Resolve every open control waiter as failed. Loop thread only."""
+    result = {"status": "failed", "error": message}
+    if hasattr(state, "rebuild_done"):
+        state.rebuild_done.set()
+    for request_id in list(state.rebuild_futures):
+        fut = state.rebuild_futures.pop(request_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(dict(result))
+    # No RoutingStatsReply will arrive from a dead backend either.
+    for request_id in list(getattr(state, "routing_futures", {})):
+        fut = state.routing_futures.pop(request_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result({"stats": {}, "error": message})
+
+
+def _reply_matches_open_operation(state: Any, request_id: str) -> bool:
+    """False for a reply to some operation other than the one holding the gate closed.
+
+    Every reply still resolves its own waiter; only the operation that closed the gate may
+    reopen it. A late reply from an earlier, timed-out request while a newer operation is
+    executing must not reopen the gate under that newer operation."""
+    op = getattr(state, "maintenance_op", None)
+    if op is None or op.get("request_id") == request_id:
+        return True
+    logger.warning(
+        f"ignoring a stale cache reply for {request_id}; "
+        f"the gate belongs to {op.get('kind')} {op.get('request_id')}"
+    )
+    return False
+
+
 class GenerateRequest(BaseModel):
     prompt: str
     max_tokens: int
@@ -169,6 +234,18 @@ class FrontendManager:
     # "rebuilding"/"failed" for runtime cache rebuilds.
     maintenance_state: str = "loading"
     last_rebuild: Dict[str, Any] | None = None
+    # The one operation allowed to have closed the gate: {request_id, kind, started_at,
+    # expired}. Only ITS reply may reopen the gate; a stale reply from an earlier, timed-out
+    # request resolves its own waiter and nothing else. ``backend_last_seen`` is the monotonic
+    # time of the last message of any kind from the backend (tokens, park snapshots, replies):
+    # while it keeps moving the scheduler is alive and the operation is merely queued or slow;
+    # once it stops for MAINTENANCE_STUCK_S with the gate closed the operation is stuck, and
+    # check_maintenance latches "failed" (never "serving": the engine may be half torn down)
+    # so the helper's watchdog performs a controlled restart.
+    maintenance_op: Dict[str, Any] | None = None
+    backend_last_seen: float = 0.0
+    maintenance_stuck_s: float = MAINTENANCE_STUCK_S
+    monotonic: Callable[[], float] = time.monotonic
     load_progress: Any = None
     # Monotonic timestamp the server became ready; drives /health + /v1/stats uptime without
     # being affected by wall-clock adjustments.
@@ -341,6 +418,8 @@ class FrontendManager:
     async def listen(self):
         while True:
             msg = await self.recv_tokenizer.get()
+            # Every message here was produced by the scheduler side: it is proof of progress.
+            self.backend_last_seen = self.monotonic()
             if isinstance(msg, CacheParkStatusReply):
                 self.parking_status = dict(msg.status)
                 continue
@@ -394,6 +473,8 @@ class FrontendManager:
         fut = self.rebuild_futures.pop(msg.request_id, None)
         if fut is not None and not fut.done():
             fut.set_result(self.last_rebuild)
+        if not _reply_matches_open_operation(self, msg.request_id):
+            return
         if self.fatal_error is not None:
             # A dead backend stays failed regardless of any (possibly stale/buffered) reply.
             self.maintenance_state = "failed"
@@ -401,6 +482,7 @@ class FrontendManager:
                 self.rebuild_done.set()
             return
         self.maintenance_state = "failed" if msg.status == "failed" else "serving"
+        self.maintenance_op = None
         if hasattr(self, "rebuild_done"):
             self.rebuild_done.set()
 
@@ -418,12 +500,16 @@ class FrontendManager:
                     "layers": msg.layers,
                     "vram_free_bytes": msg.vram_free_bytes,
                     "error": msg.error,
+                    "exhausted": bool(getattr(msg, "exhausted", False)),
                 }
             )
+        if not _reply_matches_open_operation(self, msg.request_id):
+            return
         if self.fatal_error is not None:
             self.maintenance_state = "failed"
         else:
             self.maintenance_state = "failed" if msg.status == "failed" else "serving"
+            self.maintenance_op = None
         self.rebuild_done.set()
 
     def _resolve_residency(self, msg: CacheResidencyReply) -> None:
@@ -444,31 +530,74 @@ class FrontendManager:
         loop = self._loop
         if loop is None:
             return  # listener never started -> no futures could be pending
-        result = {"status": "failed", "error": message}
-
-        def _resolve_all() -> None:
-            if hasattr(self, "rebuild_done"):
-                self.rebuild_done.set()
-            for request_id in list(self.rebuild_futures):
-                fut = self.rebuild_futures.pop(request_id, None)
-                if fut is not None and not fut.done():
-                    fut.set_result(dict(result))
-            # No RoutingStatsReply will arrive from a dead backend either.
-            for request_id in list(self.routing_futures):
-                fut = self.routing_futures.pop(request_id, None)
-                if fut is not None and not fut.done():
-                    fut.set_result({"stats": {}, "error": message})
-
         try:
-            loop.call_soon_threadsafe(_resolve_all)
+            loop.call_soon_threadsafe(_fail_open_waiters, self, message)
         except RuntimeError:
             # Loop already closed (shutdown racing the crash): nothing left to wake.
             pass
+
+    def check_maintenance(self, now: float | None = None) -> Dict[str, Any]:
+        """Report the open maintenance operation and latch "failed" once it is stuck.
+
+        Called from /health, /v1/cache/status and the loop's own watch task, so the verdict is
+        reached whether or not anything polls. A stuck operation is one whose gate has been
+        closed while the backend sent nothing for ``maintenance_stuck_s``; a slow rebuild that
+        keeps the tokens of already-running requests flowing is progressing, not stuck. The
+        latch is "failed" plus ``fatal_error`` and never "serving": the scheduler may have torn
+        graphs and pools down without rebuilding them, and only a restart is known to be safe.
+        """
+        now = self.monotonic() if now is None else now
+        op = self.maintenance_op
+        snapshot: Dict[str, Any] = {
+            "state": self.maintenance_state,
+            "operation": None,
+            "age_s": None,
+            "backend_idle_s": None,
+            "deadline_s": self.maintenance_stuck_s,
+            "stuck": False,
+        }
+        if op is None:
+            return snapshot
+        age = max(0.0, now - float(op["started_at"]))
+        idle = max(0.0, now - max(float(op["started_at"]), float(self.backend_last_seen)))
+        snapshot.update(
+            operation={"kind": op["kind"], "request_id": op["request_id"]},
+            age_s=round(age, 1),
+            backend_idle_s=round(idle, 1),
+            stuck=bool(op.get("expired")),
+        )
+        if (
+            self.maintenance_state == "rebuilding"
+            and not op.get("expired")
+            and idle > self.maintenance_stuck_s
+        ):
+            op["expired"] = True
+            message = (
+                f"cache {op['kind']} {op['request_id']} made no progress for {idle:.0f} s "
+                f"(limit {self.maintenance_stuck_s:.0f} s); the engine may be half torn down, "
+                "so the gate stays closed and the server needs a restart"
+            )
+            logger.error("Maintenance watchdog: %s", message)
+            self.fatal_error = message
+            self.maintenance_state = "failed"
+            self.last_rebuild = {"request_id": op["request_id"], "status": "stuck", "error": message}
+            _fail_open_waiters(self, message)
+            snapshot.update(state="failed", stuck=True)
+        return snapshot
+
+    async def _watch_maintenance(self) -> None:
+        while True:
+            await asyncio.sleep(MAINTENANCE_WATCH_INTERVAL_S)
+            try:
+                self.check_maintenance()
+            except Exception:  # noqa: BLE001 - the watch must outlive one bad tick
+                logger.exception("maintenance watch tick failed")
 
     def _create_listener_once(self):
         if not self.initialized:
             self._loop = asyncio.get_running_loop()
             asyncio.create_task(self.listen())
+            asyncio.create_task(self._watch_maintenance())
             self.initialized = True
 
     async def send_one(self, msg: BaseTokenizerMsg):
@@ -670,9 +799,7 @@ async def dispatch_rebuild(
     request_id = str(uuid.uuid4())
     fut = asyncio.get_running_loop().create_future()
     state.rebuild_futures[request_id] = fut
-    state.maintenance_state = "rebuilding"
-    if hasattr(state, "rebuild_done"):
-        state.rebuild_done.clear()
+    _open_maintenance(state, request_id, "rebuild")
     try:
         await state.send_one(
             CacheRebuildMsg(
@@ -690,9 +817,7 @@ async def dispatch_rebuild(
         # untouched. Roll the gate back to serving (else a transient ZMQ error would latch
         # maintenance forever with no reply ever arriving to clear it) and surface the error.
         state.rebuild_futures.pop(request_id, None)
-        state.maintenance_state = "serving"
-        if hasattr(state, "rebuild_done"):
-            state.rebuild_done.set()
+        _abort_maintenance(state)
         return {"status": "failed", "error": f"failed to dispatch rebuild: {e!r}"}
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
@@ -795,9 +920,7 @@ async def dispatch_step(
     request_id = str(uuid.uuid4())
     fut = asyncio.get_running_loop().create_future()
     state.rebuild_futures[request_id] = fut
-    state.maintenance_state = "rebuilding"
-    if hasattr(state, "rebuild_done"):
-        state.rebuild_done.clear()
+    _open_maintenance(state, request_id, "step")
     try:
         await state.send_one(
             CacheStepMsg(
@@ -809,9 +932,7 @@ async def dispatch_step(
         )
     except Exception as e:  # noqa: BLE001
         state.rebuild_futures.pop(request_id, None)
-        state.maintenance_state = "serving"
-        if hasattr(state, "rebuild_done"):
-            state.rebuild_done.set()
+        _abort_maintenance(state)
         return {"status": "failed", "error": f"failed to dispatch cache step: {e!r}"}
     try:
         reply = await asyncio.wait_for(fut, timeout=timeout)
@@ -1131,8 +1252,11 @@ async def cache_status():
     create_listener = getattr(state, "_create_listener_once", None)
     if create_listener is not None:
         create_listener()
+    check = getattr(state, "check_maintenance", None)
+    maintenance = check() if callable(check) else None
     return {
         "state": state.maintenance_state,
+        "maintenance": maintenance,
         "last_rebuild": state.last_rebuild,
         "geometry": cache_geometry(state),
         "parking": getattr(

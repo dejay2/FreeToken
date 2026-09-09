@@ -356,3 +356,28 @@ def test_powershell_candidates_include_absolute_path_when_not_on_path(monkeypatc
     monkeypatch.setattr(governor.shutil, "which", lambda name: "/usr/bin/powershell.exe")
     monkeypatch.setattr(governor.os.path, "exists", lambda p: True)
     assert governor._powershell_candidates() == ["/usr/bin/powershell.exe", governor._POWERSHELL_ABS]
+
+
+def test_exhausted_up_axes_are_neither_chosen_nor_stamped():
+    """The loop learnt "nothing left to recall" for the RAM axis: decide() must skip that up
+    step without stamping a phantom "up" (which would put the next real down inside the
+    post-up grace), while VRAM up and the RAM hold keep working."""
+    from freetoken.daemon.settings.governor import GIB, GovernorPolicy
+
+    policy = GovernorPolicy(vram_cushion=2 * GIB, ram_cushion=4 * GIB, up_hold=60.0, step_interval=5.0)
+    high_vram, high_ram = 20 * GIB, 40 * GIB
+    assert policy.decide(0.0, high_vram, high_ram, exhausted_up={"ram"}) == []
+    actions = policy.decide(61.0, high_vram, high_ram, exhausted_up={"ram"})
+    assert [(a.axis, a.direction) for a in actions] == [("vram", "up")]
+    ram_state = policy._state["ram"]
+    assert ram_state["last_step_direction"] is None and ram_state["high_since"] == 0.0
+    # Pressure right after: the down is not delayed by any phantom up.
+    actions = policy.decide(62.0, high_vram, 1 * GIB, exhausted_up={"ram"})
+    assert [(a.axis, a.direction) for a in actions] == [("ram", "down")]
+    # Cleared after the down: memory is back, so the ordinary hold runs again and the recall
+    # is asked once it is served.
+    policy.note_step_done("ram", 62.0)
+    actions = policy.decide(130.0, high_vram, high_ram)
+    assert [(a.axis, a.direction) for a in actions] == [("vram", "up")]
+    actions = policy.decide(191.0, high_vram, high_ram)
+    assert [(a.axis, a.direction) for a in actions] == [("vram", "up"), ("ram", "up")]

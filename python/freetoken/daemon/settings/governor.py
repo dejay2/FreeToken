@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Collection, Mapping
 
 from .memory_fit import _read_vram_snapshot
 
@@ -184,8 +184,15 @@ class GovernorPolicy:
         free_ram: int,
         last_actions: Any = None,
         allow_down: bool = True,
+        exhausted_up: Collection[str] = (),
     ) -> list[Action]:
-        """Decide next action(s) based on current free memory and timing."""
+        """Decide next action(s) based on current free memory and timing.
+
+        ``exhausted_up`` names axes whose last recall reply said nothing is left to recall;
+        an up step there is neither chosen nor stamped (a phantom "up" stamp would put the
+        next real down inside the post-up grace), while the high-memory hold keeps running
+        so the first recall after the axis is cleared is still immediate.
+        """
         state = last_actions if isinstance(last_actions, dict) else self._state
         ram_tight = free_ram < self.ram_cushion
         actions: list[Action] = []
@@ -256,7 +263,11 @@ class GovernorPolicy:
                     high_since = now
                     axis_state["high_since"] = now
 
-                if (now - high_since >= cur_hold) and (since_last >= self.step_interval):
+                if (
+                    (now - high_since >= cur_hold)
+                    and (since_last >= self.step_interval)
+                    and axis not in exhausted_up
+                ):
                     actions.append(Action(axis=axis, direction="up", ram_tight=ram_tight))
                     axis_state["last_step_time"] = now
                     axis_state["last_step_direction"] = "up"
@@ -293,6 +304,13 @@ class GovernorLoop(threading.Thread):
         self.last_moe_cache_size: int | None = None
         self._last_residency_query = -float("inf")
         self._floor_logged: dict[str, bool] = {}
+        # Axes whose last "up" reply was exhausted (nothing left to recall or promote). Until
+        # 2026-09-09 the loop re-asked every step interval once the high-memory hold had been
+        # served: one live boot on the 5090 answered 847 of 861 governor steps as no-ops, each
+        # closing the API gate and syncing the card for nothing. An axis leaves this set when a
+        # down step applies there, when the minute residency refresh shows the layer counts
+        # moved (a hand-driven rebuild), or when the server goes away.
+        self._up_exhausted: set[str] = set()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -312,6 +330,7 @@ class GovernorLoop(threading.Thread):
         status = self.process_manager.server_status()
         if not status.get("reachable") or status.get("state") != "serving":
             self._serving_since = None
+            self._up_exhausted.clear()
             return
         now_mono = time.monotonic()
         if self._serving_since is None:
@@ -349,7 +368,9 @@ class GovernorLoop(threading.Thread):
             # Do not charge the residency HTTP round trip to the policy's step interval.
             now = time.monotonic()
 
-        actions = self.policy.decide(now, free_vram, free_ram, allow_down=not settling)
+        actions = self.policy.decide(
+            now, free_vram, free_ram, allow_down=not settling, exhausted_up=self._up_exhausted
+        )
         for action in actions:
             self._execute_action(action, free_vram, free_ram)
             # The POST blocks for the whole rebuild; the interval and the flap window count
@@ -410,6 +431,11 @@ class GovernorLoop(threading.Thread):
             self.last_moe_cache_size = new_slots
 
         applied = reply.get("applied")
+        if action.direction == "up" and reply.get("exhausted"):
+            self._up_exhausted.add(action.axis)
+        elif action.direction == "down" and applied:
+            # A spill or park just created something to recall: ask again once memory is back.
+            self._up_exhausted.discard(action.axis)
         vram_free_bytes = reply.get("vram_free_bytes", free_vram)
         old_vram_gb = free_vram / GIB
         new_vram_gb = vram_free_bytes / GIB
@@ -454,12 +480,17 @@ class GovernorLoop(threading.Thread):
             with urllib.request.urlopen(req, timeout=5.0) as resp:
                 rep = json.loads(resp.read().decode("utf-8"))
                 if isinstance(rep, dict):
-                    self.last_layers = {
+                    layers = {
                         "owned": rep.get("owned", 0),
                         "pinned": rep.get("pinned", 0),
                         "disk": rep.get("disk", 0),
                         "parked": len(rep.get("ram_parked") or []),
                     }
+                    if layers != self.last_layers and self._up_exhausted:
+                        # Residency moved behind the loop's back (a hand-driven rebuild): the
+                        # exhausted verdict is stale, so the next hold may ask again.
+                        self._up_exhausted.clear()
+                    self.last_layers = layers
                     if "moe_cache_size" in rep:
                         self.last_moe_cache_size = rep["moe_cache_size"]
                     try:
@@ -479,4 +510,5 @@ class GovernorLoop(threading.Thread):
             "layers": dict(self.last_layers),
             "free_vram_gb": free_vram_gb,
             "free_ram_gb": free_ram_gb,
+            "up_exhausted": sorted(self._up_exhausted),
         }

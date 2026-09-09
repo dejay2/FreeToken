@@ -298,3 +298,58 @@ def test_running_server_release_uses_the_engines_own_layer_account(tmp_path, mon
     monkeypatch.setattr(ProcessManager, "_get_json", staticmethod(lambda url, *, timeout: (_ for _ in ()).throw(OSError("down"))))
     manager._stats = lambda: (_ for _ in ()).throw(OSError("down"))
     assert manager.running_server_release() == {"ram_bytes": 0, "vram_bytes": 0}
+
+
+# ---- stuck maintenance (2026-09-09 16:25: 11 min 44 s of "rebuilding" with GPU at 0%) ------
+
+
+def test_a_server_that_reports_its_operation_stuck_is_restarted(tmp_path, monkeypatch):
+    monkeypatch.setattr(wd, "_server_pids", lambda pm: {4242})  # the processes are still there
+    doc = {"state": "serving"}
+    manager, dog = _wired(tmp_path, lambda: dict(doc))
+    dog.tick()
+    assert dog.armed
+    doc.update(state="rebuilding", maintenance={"stuck": False, "age_s": 12.0})
+    dog.tick(); dog.tick()
+    assert dog.misses == 0, "a rebuild in progress is not a death"
+    doc["maintenance"] = {"stuck": True, "age_s": 400.0}
+    for _ in range(5):
+        dog.tick()
+    assert manager.current_job() is None
+    dog.tick()
+    job = manager.current_job()
+    assert job is not None and job["action"] == "restart"
+    assert "stuck in maintenance" in dog.status()["last_reason"]
+
+
+def test_rebuilding_for_longer_than_the_limit_counts_as_dead_even_without_a_verdict(tmp_path):
+    clock = Clock()
+    doc = {"state": "rebuilding"}  # an older API with no maintenance block, or a wedged loop
+    manager, dog = _wired(tmp_path, lambda: dict(doc), clock=clock)
+    dog.armed = True
+    for _ in range(10):
+        clock.now += 59.0
+        dog.tick()
+    assert dog.misses == 0 and manager.current_job() is None, "under the limit it is just busy"
+    clock.now += 80.0  # past 600 s of continuous rebuilding (the clock started at the first tick)
+    dog.tick(); dog.tick()
+    assert dog.misses == 2
+    dog.tick()
+    job = manager.current_job()
+    assert job is not None and job["action"] == "start"
+    assert "rebuilding for" in dog.status()["last_reason"]
+
+
+def test_a_rebuild_that_finishes_resets_the_rebuilding_clock(tmp_path):
+    clock = Clock()
+    doc = {"state": "rebuilding"}
+    manager, dog = _wired(tmp_path, lambda: dict(doc), clock=clock)
+    dog.armed = True
+    clock.now += 500.0
+    dog.tick()
+    doc["state"] = "serving"
+    dog.tick()
+    doc["state"] = "rebuilding"
+    clock.now += 500.0
+    dog.tick()
+    assert dog.misses == 0 and manager.current_job() is None

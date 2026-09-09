@@ -342,3 +342,101 @@ def test_boot_settle_window_drops_down_steps_but_not_up_steps(monkeypatch):
     clock["t"] += loop2.policy.up_hold + 1  # the policy's own hold, well inside the settle window
     loop2._tick()
     assert executed and all(a.direction == "up" for a in executed)
+
+
+# ---- no-change steps (2026-09-09: 847 of one boot's 861 governor steps changed nothing) ----
+
+
+def _exhausted_reply(axis="ram"):
+    return (200, {"status": "ok", "applied": None, "at_floor": False, "exhausted": True,
+                  "error": "nothing to recall: every expert layer is already pinned in host RAM",
+                  "moe_cache_size": 6144, "layers": {"owned": 0, "pinned": 48, "disk": 0, "ram_parked": []},
+                  "vram_free_bytes": 2 * GIB})
+
+
+def _idle_loop(monkeypatch, server, clock, *, free_ram=40 * GIB, free_vram=int(2.5 * GIB)):
+    loop = _loop(monkeypatch, server)
+    monkeypatch.setattr(governor.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(governor, "read_free_vram_bytes", lambda: free_vram)
+    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda: free_ram)
+    monkeypatch.setattr(loop, "_query_residency", lambda: None)
+    return loop
+
+
+def _run(loop, clock, seconds, step=2.0):
+    end = clock["t"] + seconds
+    while clock["t"] < end:
+        clock["t"] += step
+        loop._tick()
+
+
+def test_an_exhausted_recall_is_not_asked_again_for_ten_quiet_minutes(monkeypatch, caplog):
+    clock = {"t": 1000.0}
+    server = _FakeServer([_exhausted_reply()] * 200)
+    loop = _idle_loop(monkeypatch, server, clock)
+    with caplog.at_level(logging.INFO, logger="freetoken.daemon.settings.governor"):
+        _run(loop, clock, loop.policy.up_hold + 4)  # the hold is served: one recall is asked
+        assert [(r["axis"], r["direction"]) for r in server.requests] == [("ram", "up")]
+        _run(loop, clock, 600.0)  # ten quiet minutes with 48 pinned and generous RAM
+    assert len(server.requests) == 1, "the answered no-op is not re-asked"
+    assert loop.status()["up_exhausted"] == ["ram"]
+    assert loop.last_action.startswith("governor: ram up -> nothing to recall")
+    assert sum("nothing to recall" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_an_applied_spill_makes_the_axis_askable_again(monkeypatch):
+    clock = {"t": 1000.0}
+    spill = (200, {"status": "ok", "applied": "pinned->disk", "layer": 40, "moe_cache_size": 6144,
+                   "layers": {"owned": 0, "pinned": 47, "disk": 1}, "vram_free_bytes": 2 * GIB})
+    recall = (200, {"status": "ok", "applied": "disk->pinned", "layer": 40, "moe_cache_size": 6144,
+                    "layers": {"owned": 0, "pinned": 48, "disk": 0}, "vram_free_bytes": 2 * GIB})
+    server = _FakeServer([_exhausted_reply(), spill, recall, _exhausted_reply()])
+    loop = _idle_loop(monkeypatch, server, clock)
+    loop._serving_since = clock["t"] - governor.BOOT_SETTLE_SECONDS - 1
+    _run(loop, clock, loop.policy.up_hold + 4)
+    assert [r["direction"] for r in server.requests] == ["up"] and loop._up_exhausted == {"ram"}
+    # Pressure: RAM drops below the cushion, the down step applies and clears the verdict.
+    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda: 1 * GIB)
+    _run(loop, clock, 6.0)
+    assert [r["direction"] for r in server.requests] == ["up", "down"]
+    assert loop._up_exhausted == set()
+    # Memory back: after the hold (doubled, because the cushion tripped inside the post-up
+    # grace) the recall is asked, then the next no-op is remembered again.
+    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda: 40 * GIB)
+    _run(loop, clock, 2 * loop.policy.up_hold + 20)
+    assert [r["direction"] for r in server.requests] == ["up", "down", "up", "up"]
+    assert loop._up_exhausted == {"ram"}
+
+
+def test_a_residency_change_or_a_server_restart_forgets_the_verdict(monkeypatch):
+    clock = {"t": 1000.0}
+    server = _FakeServer([_exhausted_reply()] * 4)
+    loop = _idle_loop(monkeypatch, server, clock)
+    _run(loop, clock, loop.policy.up_hold + 4)
+    assert loop._up_exhausted == {"ram"}
+
+    # The minute residency refresh shows a layer moved by hand: the verdict is stale.
+    class _ResidencyResponse:
+        def __init__(self, body):
+            self.payload = json.dumps(body).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return self.payload
+
+    monkeypatch.undo()
+    monkeypatch.setattr(governor.urllib.request, "urlopen",
+                        lambda req, timeout=None: _ResidencyResponse({"owned": 0, "pinned": 47, "disk": 1, "ram_parked": []}))
+    GovernorLoop._query_residency(loop)
+    assert loop._up_exhausted == set() and loop.last_layers["disk"] == 1
+
+    # The server goes away (a restart): whatever it answered before no longer applies.
+    loop._up_exhausted.add("ram")
+    loop.process_manager.server_status = lambda: {"reachable": False, "state": "unreachable"}
+    loop._tick()
+    assert loop._up_exhausted == set()

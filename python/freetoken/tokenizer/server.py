@@ -445,6 +445,7 @@ def _forward_control_msg(m, send_backend, send_frontend) -> bool:
                 layers=m.layers,
                 vram_free_bytes=m.vram_free_bytes,
                 error=m.error,
+                exhausted=bool(getattr(m, "exhausted", False)),
             )
         )
     elif isinstance(m, CacheResidencyResultMsg):

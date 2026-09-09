@@ -1521,6 +1521,14 @@ class Engine:
             cache = self.moe_offload_cache
             rebuild = rebuild or self.rebuild_runtime_cache
             current_slots = cache.cache_size if cache is not None else 0
+            # Residency alone can prove there is nothing to do; answer before the memory probe.
+            # _sync_get_memory is torch.cuda.synchronize + empty_cache + a CPU all-reduce, and
+            # on the live 5090 (2026-09-09) 847 of one boot's 861 governor steps reached the
+            # all-pinned "ram up" no-op below through it, each one a device stall behind a
+            # closed API gate for a reply that changed nothing.
+            noop = self.step_memory_noop(axis, direction)
+            if noop is not None:
+                return noop
             free_vram = 0
             if self.device.type == "cuda" and hasattr(self, "_sync_get_memory"):
                 try:
@@ -1683,6 +1691,8 @@ class Engine:
                             "layer": None,
                             "moe_cache_size": current_slots,
                             "at_floor": False,
+                            "exhausted": True,
+                            "reason": _NOTHING_TO_RECALL,
                             "vram_free_bytes": free_vram,
                         }
                     unpark_layer = parked[0]
@@ -1729,6 +1739,9 @@ class Engine:
         slot_floor = 2 * num_experts if overlap else num_experts
         current_slots = cache.cache_size if cache is not None else 0
 
+        noop = self.step_memory_noop(axis, direction)
+        if noop is not None:
+            return noop
         free_vram = 0
         if self.device.type == "cuda" and hasattr(self, "_sync_get_memory"):
             try:
@@ -1847,13 +1860,64 @@ class Engine:
                         "vram_free_bytes": free_vram,
                     }
 
+            kv_pending = bool(init_pages and self.num_pages < init_pages)
             return {
                 "applied": None,
                 "layer": None,
                 "moe_cache_size": current_slots,
                 "at_floor": False,
+                # A shrunk KV pool grows back only when idle: that is "not yet", not exhausted.
+                "exhausted": not kv_pending,
+                "reason": None if kv_pending else _NOTHING_TO_PROMOTE,
                 "vram_free_bytes": free_vram,
             }
+
+    def step_memory_noop(self, axis: str, direction: str) -> dict | None:
+        """Residency-only preflight: the reply ``step_memory`` would give when nothing can
+        change in ``direction``, or ``None`` when a step may apply.
+
+        Reads only residency lists and pool sizes -- no CUDA synchronize, no rebuild, no
+        collective -- so the scheduler can answer it inline on receipt instead of queueing the
+        step to a safe point and closing the API gate for the wait. ``exhausted`` in the reply
+        tells the governor to stop re-asking until residency or memory pressure changes.
+        """
+        cache = self.moe_offload_cache
+        current_slots = cache.cache_size if cache is not None else 0
+        base = {"applied": None, "layer": None, "moe_cache_size": current_slots, "vram_free_bytes": 0}
+        if axis == "ram":
+            from freetoken.moe.host_banks import HostResidency
+
+            if direction == "up":
+                if cache is None:
+                    return {**base, "at_floor": False, "exhausted": True, "reason": _NOTHING_TO_RECALL}
+                residency = cache.layer_residency
+                on_disk = any(r == HostResidency.DISK.value for r in residency)
+                parked = any(
+                    residency[l] == HostResidency.GPU_OWNED.value
+                    for l in getattr(self, "_ram_parked_layers", [])
+                )
+                if on_disk or parked:
+                    return None
+                return {**base, "at_floor": False, "exhausted": True, "reason": _NOTHING_TO_RECALL}
+            if direction == "down":
+                if cache is None:
+                    return {**base, "moe_cache_size": 0, "at_floor": True, "exhausted": True,
+                            "reason": _NOTHING_TO_SPILL}
+                if any(r == HostResidency.PINNED.value for r in cache.layer_residency):
+                    return None
+                return {**base, "at_floor": True, "exhausted": True, "reason": _NOTHING_TO_SPILL}
+            return None
+        if axis == "vram" and direction == "up":
+            init_pages = getattr(self, "_initial_num_pages", None)
+            if init_pages and getattr(self, "num_pages", 0) < init_pages:
+                return None  # a KV restore may apply once idle
+            init_slots = getattr(self, "_initial_moe_cache_size", None)
+            if init_slots and current_slots < init_slots:
+                return None
+            if cache is not None and len(set(range(cache.num_layers)) - self._gpu_owned_layer_ids) > 1:
+                return None
+            return {**base, "at_floor": False, "exhausted": True, "reason": _NOTHING_TO_PROMOTE}
+        return None
 
     def residency_report(self) -> dict:
         """Report layer residency and cache dimensions for GET /v1/cache/residency."""
@@ -2879,6 +2943,11 @@ def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[
 # Free VRAM the RAM ladder wants before parking a layer on the card: the shrink returns exactly
 # the layer's bytes and rebuild_runtime_cache's promote guard asks for those plus 256 MiB.
 _PARK_VRAM_MARGIN = 512 << 20
+# Step replies that prove a direction has nothing left to do (see step_memory_noop). The
+# governor keys its "stop asking" state on the exhausted flag; the text is the log line.
+_NOTHING_TO_RECALL = "nothing to recall: every expert layer is already pinned in host RAM"
+_NOTHING_TO_SPILL = "nothing to spill: no pinned expert layer left"
+_NOTHING_TO_PROMOTE = "nothing to promote: card, slots and KV are already at their boot size"
 
 GPU_OWNED_LAYER_RANK = (
     1, 6, 0, 2, 7, 22, 10, 13, 5, 18, 21, 38, 8, 12, 34, 11,

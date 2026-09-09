@@ -910,7 +910,16 @@ class Scheduler(SchedulerIOMixin):
             elif self._pending_rebuild is not None:
                 self._reply_step(msg.request_id, "busy", error="another rebuild or step is queued")
             else:
-                self._pending_rebuild = msg
+                # Authoritative no-op preflight: residency alone can prove a step has nothing
+                # to do (every layer already pinned for "ram up"), and that answer needs no
+                # safe point, no CUDA synchronize and no rebuild. The live 5090 boot of
+                # 2026-09-09 answered 847 of 861 governor steps this way, each one queued to
+                # the safe point and paid for with a device sync while the API gate was shut.
+                noop = self._step_noop_reply(msg)
+                if noop is not None:
+                    self._reply_step(msg.request_id, "ok", noop)
+                else:
+                    self._pending_rebuild = msg
         elif isinstance(msg, CacheResidencyBackendMsg):
             try:
                 rep = self.engine.residency_report()
@@ -971,6 +980,17 @@ class Scheduler(SchedulerIOMixin):
             ]
         )
 
+    def _step_noop_reply(self, msg: CacheStepBackendMsg) -> dict | None:
+        """The engine's residency-only verdict that ``msg`` cannot change anything, or None."""
+        preflight = getattr(self.engine, "step_memory_noop", None)
+        if preflight is None:
+            return None
+        try:
+            return preflight(msg.axis, msg.direction)
+        except Exception as e:  # noqa: BLE001 - a preflight error is not a reason to skip the step
+            logger.warning(f"cache step preflight failed, queueing the step instead: {e!r}")
+            return None
+
     def _reply_step(
         self,
         request_id: str,
@@ -993,6 +1013,7 @@ class Scheduler(SchedulerIOMixin):
                              "parked": len(report.get("ram_parked") or [])} if report else None),
                     vram_free_bytes=int(res.get("vram_free_bytes", 0) or 0),
                     error=error or res.get("reason"),
+                    exhausted=bool(res.get("exhausted", False)),
                 )
             ]
         )

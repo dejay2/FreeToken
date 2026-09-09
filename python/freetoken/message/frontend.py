@@ -89,6 +89,7 @@ class CacheStepReply(BaseFrontendMsg):
     layers: dict | None = None
     vram_free_bytes: int = 0
     error: str | None = None
+    exhausted: bool = False  # see CacheStepResultMsg
 
 
 @dataclass

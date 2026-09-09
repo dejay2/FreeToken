@@ -147,6 +147,9 @@ class CacheStepResultMsg(BaseTokenizerMsg):
     layers: dict | None = None
     vram_free_bytes: int = 0
     error: str | None = None
+    # True when the engine could not change anything in this direction (every layer already
+    # recalled / promoted): the governor stops re-asking until residency or pressure changes.
+    exhausted: bool = False
 
 
 @dataclass
