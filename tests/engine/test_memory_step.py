@@ -105,6 +105,7 @@ class FakeEngine:
     # Bind the methods from Engine
     step_memory = Engine.step_memory
     step_memory_noop = Engine.step_memory_noop
+    _report_maintenance_progress = Engine._report_maintenance_progress
     residency_report = Engine.residency_report
     _move_layer = Engine._move_layer
     _stash_vram_ledger_inputs = Engine._stash_vram_ledger_inputs
@@ -486,3 +487,39 @@ def test_vram_up_noop_is_not_exhausted_while_a_kv_restore_waits_for_idle():
     rep = eng.step_memory(axis="vram", direction="up", is_idle=False)
     assert rep["applied"] is None and rep["exhausted"] is True
     assert eng.step_memory_noop("vram", "up") == rep
+
+
+# ---- maintenance progress hook (2026-09-09 review F1: silence is not proof of no work) ------
+
+
+def test_step_memory_reports_each_unit_through_the_progress_hook():
+    eng = FakeEngine(num_layers=4, owned_layers=(0, 1, 2), cache_size=16, num_pages=100)
+    seen: list = []
+    eng.maintenance_progress = lambda phase, detail=None: seen.append((phase, detail))
+    rep = eng.step_memory(axis="vram", direction="down")
+    assert rep["applied"] is not None
+    assert seen[0] == ("step:probed", "vram down"), seen
+    # The hook is optional: a direct engine caller (no scheduler) has none.
+    eng.maintenance_progress = None
+    eng.step_memory(axis="vram", direction="down")
+    # A hook that raises must not fail the step it reports on.
+    eng.maintenance_progress = lambda *a: (_ for _ in ()).throw(RuntimeError("socket gone"))
+    rep = eng.step_memory(axis="vram", direction="down")
+    assert rep is not None
+
+
+def test_a_proven_noop_step_reports_nothing_and_touches_nothing():
+    eng = FakeEngine(owned_layers=())
+    seen: list = []
+    eng.maintenance_progress = lambda phase, detail=None: seen.append(phase)
+    rep = eng.step_memory(axis="ram", direction="up")
+    assert rep["exhausted"] is True and seen == []
+
+
+def test_residency_report_carries_the_kv_pool_size():
+    """The governor invalidates a remembered "nothing to promote" when KV pages change
+    (review F4), so the residency report must say how many there are."""
+    eng = FakeEngine(num_pages=100)
+    assert eng.residency_report()["num_pages"] == 100
+    eng.num_pages = 75
+    assert eng.residency_report()["num_pages"] == 75

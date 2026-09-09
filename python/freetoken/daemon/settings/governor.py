@@ -302,14 +302,19 @@ class GovernorLoop(threading.Thread):
         self.last_free_ram: int | None = None
         self._serving_since: float | None = None
         self.last_moe_cache_size: int | None = None
+        self.last_num_pages: int | None = None
         self._last_residency_query = -float("inf")
         self._floor_logged: dict[str, bool] = {}
         # Axes whose last "up" reply was exhausted (nothing left to recall or promote). Until
         # 2026-09-09 the loop re-asked every step interval once the high-memory hold had been
         # served: one live boot on the 5090 answered 847 of 861 governor steps as no-ops, each
-        # closing the API gate and syncing the card for nothing. An axis leaves this set when a
-        # down step applies there, when the minute residency refresh shows the layer counts
-        # moved (a hand-driven rebuild), or when the server goes away.
+        # closing the API gate and syncing the card for nothing. The engine's exhausted verdict
+        # depends on layer placement (owned/pinned/disk/parked), the slot count and the KV pool
+        # size, so EVERY axis leaves this set as soon as any of those is seen to differ from
+        # the last snapshot -- in a step reply (an applied step on either axis: a VRAM spill
+        # creates a layer for RAM to recall, review F3) or in the minute residency refresh (a
+        # hand-driven rebuild that shrank slots or KV pages, review F4) -- and when the server
+        # goes away. The comparison runs before the snapshot is overwritten.
         self._up_exhausted: set[str] = set()
 
     def stop(self) -> None:
@@ -418,8 +423,10 @@ class GovernorLoop(threading.Thread):
             self.last_action = "off: " + str(reply.get("error", "steps unsupported"))
             return
 
+        applied = reply.get("applied")
+        layers = None
         if isinstance(reply.get("layers"), dict):
-            self.last_layers = {
+            layers = {
                 "owned": reply["layers"].get("owned", 0),
                 "pinned": reply["layers"].get("pinned", 0),
                 "disk": reply["layers"].get("disk", 0),
@@ -427,15 +434,16 @@ class GovernorLoop(threading.Thread):
             }
         old_slots = self.last_moe_cache_size
         new_slots = reply.get("moe_cache_size")
+        # Compare before overwriting: a change on EITHER axis invalidates every remembered
+        # "nothing to do" (a VRAM spill leaves a disk layer for RAM to recall, review F3).
+        self._forget_exhausted_if_changed(layers=layers, slots=new_slots, applied=bool(applied))
+        if layers is not None:
+            self.last_layers = layers
         if new_slots is not None:
             self.last_moe_cache_size = new_slots
 
-        applied = reply.get("applied")
         if action.direction == "up" and reply.get("exhausted"):
             self._up_exhausted.add(action.axis)
-        elif action.direction == "down" and applied:
-            # A spill or park just created something to recall: ask again once memory is back.
-            self._up_exhausted.discard(action.axis)
         vram_free_bytes = reply.get("vram_free_bytes", free_vram)
         old_vram_gb = free_vram / GIB
         new_vram_gb = vram_free_bytes / GIB
@@ -486,13 +494,19 @@ class GovernorLoop(threading.Thread):
                         "disk": rep.get("disk", 0),
                         "parked": len(rep.get("ram_parked") or []),
                     }
-                    if layers != self.last_layers and self._up_exhausted:
-                        # Residency moved behind the loop's back (a hand-driven rebuild): the
-                        # exhausted verdict is stale, so the next hold may ask again.
-                        self._up_exhausted.clear()
+                    # Geometry moved behind the loop's back (a hand-driven rebuild between two
+                    # polls, review F4): every fact the exhausted verdict rests on is compared
+                    # before the snapshot is replaced. An older server reports no num_pages.
+                    self._forget_exhausted_if_changed(
+                        layers=layers,
+                        slots=rep.get("moe_cache_size"),
+                        pages=rep.get("num_pages"),
+                    )
                     self.last_layers = layers
                     if "moe_cache_size" in rep:
                         self.last_moe_cache_size = rep["moe_cache_size"]
+                    if rep.get("num_pages") is not None:
+                        self.last_num_pages = rep["num_pages"]
                     try:
                         layer_bytes = int(rep.get("layer_bytes", 0) or 0)
                     except (TypeError, ValueError, OverflowError):
@@ -500,6 +514,41 @@ class GovernorLoop(threading.Thread):
                     self.policy.rung_bytes = layer_bytes if layer_bytes > 0 else DEFAULT_RUNG_BYTES
         except Exception:  # noqa: BLE001
             pass
+
+    def _forget_exhausted_if_changed(
+        self,
+        *,
+        layers: dict[str, int] | None = None,
+        slots: int | None = None,
+        pages: int | None = None,
+        applied: bool = False,
+    ) -> None:
+        """Drop every remembered exhausted verdict when a fact it rests on has changed.
+
+        Called BEFORE the caller stores the new snapshot, with only the facts the reply or
+        report carried (None = not reported, never a change). A previously unknown slot or
+        page count (first report after a start) is learnt silently.
+        """
+        if not self._up_exhausted:
+            return
+        changed = applied
+        if layers is not None and layers != self.last_layers:
+            changed = True
+        if slots is not None and self.last_moe_cache_size is not None and slots != self.last_moe_cache_size:
+            changed = True
+        if pages is not None and self.last_num_pages is not None and pages != self.last_num_pages:
+            changed = True
+        if changed:
+            logger.info(
+                "governor: memory geometry changed (layers %s->%s, slots %s->%s, kv pages %s->%s%s); "
+                "recall may have work again on %s",
+                self.last_layers, layers if layers is not None else self.last_layers,
+                self.last_moe_cache_size, slots if slots is not None else self.last_moe_cache_size,
+                self.last_num_pages, pages if pages is not None else self.last_num_pages,
+                ", step applied" if applied else "",
+                ",".join(sorted(self._up_exhausted)),
+            )
+            self._up_exhausted.clear()
 
     def status(self) -> dict[str, Any]:
         free_vram_gb = round(self.last_free_vram / GIB, 2) if self.last_free_vram is not None else 0.0

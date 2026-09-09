@@ -10,6 +10,8 @@ from __future__ import annotations
 import dataclasses
 
 from freetoken.message import (
+    CacheProgressMsg,
+    CacheProgressReply,
     CacheRebuildBackendMsg,
     CacheRebuildMsg,
     CacheRebuildReply,
@@ -53,6 +55,7 @@ def test_every_control_shape_is_counted():
     for t in (
         CacheRebuildMsg, CacheRebuildResultMsg, CacheStepMsg, CacheStepResultMsg,
         CacheResidencyMsg, CacheResidencyResultMsg, RoutingStatsMsg, RoutingStatsResultMsg,
+        CacheProgressMsg,
     ):
         assert t in _CONTROL_MSG_TYPES, t.__name__
 
@@ -95,3 +98,11 @@ def test_unknown_message_is_not_forwarded():
     backend, frontend = _Q(), _Q()
     assert not _forward_control_msg(object(), backend, frontend)
     assert backend.items == [] and frontend.items == []
+
+
+def test_progress_msg_forwards_to_frontend():
+    """One unit of maintenance work (scheduler -> api): the API restarts its stuck clock on it."""
+    m = CacheProgressMsg(request_id="op-1", phase="waiting", detail="drained 1 prefill")
+    out = _forward(m)
+    assert isinstance(out, CacheProgressReply)
+    _same_fields(m, out)

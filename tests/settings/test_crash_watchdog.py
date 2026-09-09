@@ -322,34 +322,98 @@ def test_a_server_that_reports_its_operation_stuck_is_restarted(tmp_path, monkey
     assert "stuck in maintenance" in dog.status()["last_reason"]
 
 
-def test_rebuilding_for_longer_than_the_limit_counts_as_dead_even_without_a_verdict(tmp_path):
+def _progress(request_id: str, idle: float, *, phase: str = "waiting", deadline: float = 600.0) -> dict:
+    """The API's maintenance block for an operation that is still reporting work."""
+    return {
+        "stuck": False,
+        "operation": {"kind": "step", "request_id": request_id},
+        "phase": phase,
+        "progress_idle_s": idle,
+        "deadline_s": deadline,
+    }
+
+
+def test_fresh_progress_is_never_counted_dead_however_long_the_operation_runs(tmp_path, monkeypatch, caplog):
+    """Review F2: the helper used to declare continuous "rebuilding" dead after 600 s even when
+    the server reported fresh progress. A step queued behind a long decode, or a rebuild that
+    keeps moving through its phases, may legitimately outlive any fixed helper timer; only
+    the server's own verdict counts."""
+    monkeypatch.setattr(wd, "_server_pids", lambda pm: {4242})
     clock = Clock()
-    doc = {"state": "rebuilding"}  # an older API with no maintenance block, or a wedged loop
+    doc = {"state": "rebuilding", "maintenance": _progress("op-1", 3.0)}
     manager, dog = _wired(tmp_path, lambda: dict(doc), clock=clock)
     dog.armed = True
-    for _ in range(10):
-        clock.now += 59.0
+    for i in range(180):  # thirty minutes of one operation that keeps reporting
+        clock.now += 10.0
+        doc["maintenance"] = _progress("op-1", 3.0 + (i % 5), phase="waiting" if i < 100 else "rebuild:capture")
         dog.tick()
-    assert dog.misses == 0 and manager.current_job() is None, "under the limit it is just busy"
-    clock.now += 80.0  # past 600 s of continuous rebuilding (the clock started at the first tick)
-    dog.tick(); dog.tick()
-    assert dog.misses == 2
-    dog.tick()
-    job = manager.current_job()
-    assert job is not None and job["action"] == "start"
-    assert "rebuilding for" in dog.status()["last_reason"]
+    assert dog.misses == 0 and manager.current_job() is None
+    assert dog.status()["last_reason"] is None
 
 
-def test_a_rebuild_that_finishes_resets_the_rebuilding_clock(tmp_path):
+def test_successive_short_operations_never_add_up_to_a_dead_verdict(tmp_path):
+    """Back-to-back governor steps each report their own fresh progress; the helper keeps no
+    timer of its own, so an hour of them is still alive."""
     clock = Clock()
     doc = {"state": "rebuilding"}
     manager, dog = _wired(tmp_path, lambda: dict(doc), clock=clock)
     dog.armed = True
-    clock.now += 500.0
-    dog.tick()
-    doc["state"] = "serving"
-    dog.tick()
-    doc["state"] = "rebuilding"
-    clock.now += 500.0
-    dog.tick()
+    for i in range(360):
+        clock.now += 10.0
+        doc["maintenance"] = _progress(f"op-{i}", 1.0)
+        dog.tick()
     assert dog.misses == 0 and manager.current_job() is None
+
+
+def test_a_server_too_old_to_report_progress_is_left_alone_and_said_once(tmp_path, caplog):
+    """A helper newer than its server (a helper restart keeps the server up) sees "rebuilding"
+    with no maintenance block. Without progress data no timer can tell a wedge from a long
+    healthy decode, so the pre-2026-09-09 behaviour stays: alive, just busy, warned once."""
+    clock = Clock()
+    doc = {"state": "rebuilding"}
+    manager, dog = _wired(tmp_path, lambda: dict(doc), clock=clock)
+    dog.armed = True
+    with caplog.at_level("WARNING", logger="freetoken.daemon.settings.watchdog"):
+        for _ in range(200):  # over thirty minutes
+            clock.now += 10.0
+            dog.tick()
+    assert dog.misses == 0 and manager.current_job() is None
+    assert sum("no maintenance progress" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_a_report_the_server_stopped_judging_counts_as_dead(tmp_path, monkeypatch):
+    """Defence in depth: progress idle for twice the server's own deadline with no verdict is
+    a server that can no longer judge itself (unreachable on a healthy build)."""
+    monkeypatch.setattr(wd, "_server_pids", lambda pm: {4242})
+    doc = {"state": "rebuilding", "maintenance": _progress("op-1", 1100.0)}
+    manager, dog = _wired(tmp_path, lambda: dict(doc))
+    dog.armed = True
+    dog.tick()
+    assert dog.misses == 0, "under twice the deadline the server still owns the verdict"
+    doc["maintenance"] = _progress("op-1", 1201.0)
+    for _ in range(5):
+        dog.tick()
+    assert manager.current_job() is None
+    dog.tick()
+    job = manager.current_job()
+    assert job is not None and job["action"] == "restart"
+    assert "has not judged it" in dog.status()["last_reason"]
+
+
+def test_loading_and_a_human_stop_stay_protected_from_the_maintenance_verdict(tmp_path, monkeypatch):
+    """The ten-minute cold expert-bank read is "loading", never an operation; and a page Stop
+    disarms the watchdog so a stuck verdict afterwards restarts nothing."""
+    monkeypatch.setattr(wd, "_server_pids", lambda pm: {4242})
+    clock = Clock()
+    doc = {"state": "loading"}
+    manager, dog = _wired(tmp_path, lambda: dict(doc), clock=clock)
+    dog.armed = True
+    for _ in range(120):  # twenty minutes of loading
+        clock.now += 10.0
+        dog.tick()
+    assert dog.misses == 0 and manager.current_job() is None
+    doc.update(state="rebuilding", maintenance={"stuck": True, "phase": "executing"})
+    dog.disarm()
+    for _ in range(12):
+        dog.tick()
+    assert manager.current_job() is None, "a page Stop is a wish for the server to be down"

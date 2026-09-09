@@ -24,6 +24,7 @@ from freetoken.message import (
     BaseTokenizerMsg,
     BatchFrontendMsg,
     CacheParkStatusReply,
+    CacheProgressReply,
     CacheRebuildMsg,
     CacheRebuildReply,
     CacheResidencyMsg,
@@ -67,13 +68,24 @@ from .stats import StatsTracker
 logger = init_logger(__name__, "FrontendAPI")
 
 # How long a maintenance operation (a /v1/cache/step or /v1/cache/rebuild) may keep the gate
-# closed with NO message of any kind arriving from the backend before it is declared stuck.
-# Measured on the 5090 (2026-09-09, logs/server-2020.log): runtime graph captures take 0-3 s,
-# the startup capture 9 s, a two-stage layer move 21 s from first capture to applied, and the
-# longest step ever seen waiting behind a synchronous 190k restore was 26.1 s. The explicit
-# rebuild endpoint already grants 300 s. Nothing silent for longer has ever completed; the
-# 16:25 wedge that day sat 11 min 44 s with no scheduler progress until clients gave up.
-MAINTENANCE_STUCK_S = 300.0
+# closed with NO progress signal before it is declared stuck. A progress signal is either a
+# CacheProgressReply correlated to the operation (the scheduler sends one when it queues the
+# operation, once per drained batch or prefill chunk while it waits for its safe point, at the
+# safe point, and once per engine phase: teardown, each layer move, pool reallocation, graph
+# capture) or any other message from the backend (tokens of running requests, park snapshots).
+# So the clock measures ONE silent unit of work, never the operation's total length: a 190k
+# prompt processed in 8192-token chunks ahead of a queued step reports per chunk, and a slow
+# rebuild reports per phase. The longest silent units measured on the 5090 (2026-09-09,
+# logs/server-2020.log and prompts/kv-parking-200k/L1-findings.md): a synchronous 66k KV
+# restore 26.1 s, the startup graph capture 9 s, runtime captures 0-3 s, one 8192-token
+# prefill chunk about 6 s (190k tokens in 145 s). 600 s is 23x the longest of those, so a
+# day 2-4x slower still cannot trip it, and it is finite: the wedge of 2026-09-09 16:25 sat
+# with no scheduler progress for 11 min 44 s before clients gave up and stayed shut until a
+# hand restart; with this limit the helper's restart lands about eleven minutes after the
+# last unit of progress. The initial ten-minute expert-bank read is "loading", not an
+# operation, and is never subject to this clock. Slightly slow to catch a real wedge beats
+# ever declaring a healthy server dead (it takes the server down until a ten-minute reboot).
+MAINTENANCE_STUCK_S = 600.0
 # The event-loop task that applies the limit when nobody polls /health or /v1/cache/status.
 MAINTENANCE_WATCH_INTERVAL_S = 5.0
 
@@ -159,6 +171,12 @@ def _open_maintenance(state: Any, request_id: str, kind: str) -> None:
         "request_id": request_id,
         "kind": kind,
         "started_at": now,
+        # "dispatched" until the scheduler reports "queued" (received), then "waiting" per
+        # drained batch ahead of it, "executing" at the safe point, then the engine phases.
+        "phase": "dispatched",
+        "progress_at": now,
+        "progress_count": 0,
+        "detail": None,
         "expired": False,
     }
     if hasattr(state, "rebuild_done"):
@@ -242,6 +260,10 @@ class FrontendManager:
     # once it stops for MAINTENANCE_STUCK_S with the gate closed the operation is stuck, and
     # check_maintenance latches "failed" (never "serving": the engine may be half torn down)
     # so the helper's watchdog performs a controlled restart.
+    # ``progress_at``/``phase`` on the record come from CacheProgressReply messages the
+    # scheduler sends for THIS operation (one per completed unit of work on or ahead of it),
+    # so "silent but working" (a chunked prompt, a slow rebuild phase) is distinguishable from
+    # "stuck": the clock restarts on each unit and only measures one silent unit.
     maintenance_op: Dict[str, Any] | None = None
     backend_last_seen: float = 0.0
     maintenance_stuck_s: float = MAINTENANCE_STUCK_S
@@ -423,6 +445,9 @@ class FrontendManager:
             if isinstance(msg, CacheParkStatusReply):
                 self.parking_status = dict(msg.status)
                 continue
+            if isinstance(msg, CacheProgressReply):
+                self._note_progress(msg)
+                continue
             if isinstance(msg, CacheRebuildReply):
                 self._resolve_rebuild(msg)
                 continue
@@ -512,6 +537,24 @@ class FrontendManager:
             self.maintenance_op = None
         self.rebuild_done.set()
 
+    def _note_progress(self, msg: CacheProgressReply) -> None:
+        """One unit of work completed on (or ahead of) the open operation: restart its clock.
+
+        A report for any other request id (an operation that already finished, or one whose
+        HTTP wait timed out and was superseded) refreshes nothing: only the operation holding
+        the gate may extend its own life."""
+        op = self.maintenance_op
+        if op is None or op.get("request_id") != msg.request_id:
+            logger.debug(
+                "ignoring maintenance progress %s for %s: not the open operation",
+                msg.phase, msg.request_id,
+            )
+            return
+        op["phase"] = msg.phase
+        op["detail"] = msg.detail
+        op["progress_at"] = self.monotonic()
+        op["progress_count"] = int(op.get("progress_count", 0)) + 1
+
     def _resolve_residency(self, msg: CacheResidencyReply) -> None:
         fut = self.routing_futures.pop(msg.request_id, None)
         if fut is not None and not fut.done():
@@ -541,29 +584,43 @@ class FrontendManager:
 
         Called from /health, /v1/cache/status and the loop's own watch task, so the verdict is
         reached whether or not anything polls. A stuck operation is one whose gate has been
-        closed while the backend sent nothing for ``maintenance_stuck_s``; a slow rebuild that
-        keeps the tokens of already-running requests flowing is progressing, not stuck. The
-        latch is "failed" plus ``fatal_error`` and never "serving": the scheduler may have torn
-        graphs and pools down without rebuilding them, and only a restart is known to be safe.
+        closed while NO progress signal arrived for ``maintenance_stuck_s``: neither a
+        CacheProgressReply for this operation (one per completed unit of work on or ahead of
+        it, see MAINTENANCE_STUCK_S) nor any other backend message (tokens of running
+        requests). A chunked prompt ahead of a queued step, a rebuild moving through its
+        phases, or a decode that keeps flowing are all progressing, not stuck. The latch is
+        "failed" plus ``fatal_error`` and never "serving": the scheduler may have torn graphs
+        and pools down without rebuilding them, and only a restart is known to be safe.
         """
         now = self.monotonic() if now is None else now
         op = self.maintenance_op
         snapshot: Dict[str, Any] = {
             "state": self.maintenance_state,
             "operation": None,
+            "phase": None,
             "age_s": None,
+            "progress_idle_s": None,
+            "progress_count": None,
             "backend_idle_s": None,
             "deadline_s": self.maintenance_stuck_s,
             "stuck": False,
         }
         if op is None:
             return snapshot
-        age = max(0.0, now - float(op["started_at"]))
-        idle = max(0.0, now - max(float(op["started_at"]), float(self.backend_last_seen)))
+        started = float(op["started_at"])
+        age = max(0.0, now - started)
+        progress_at = max(started, float(op.get("progress_at", started)))
+        backend_idle = max(0.0, now - max(started, float(self.backend_last_seen)))
+        progress_idle = max(0.0, now - progress_at)
+        idle = min(backend_idle, progress_idle)
         snapshot.update(
             operation={"kind": op["kind"], "request_id": op["request_id"]},
+            phase=op.get("phase"),
+            detail=op.get("detail"),
             age_s=round(age, 1),
-            backend_idle_s=round(idle, 1),
+            progress_idle_s=round(progress_idle, 1),
+            progress_count=int(op.get("progress_count", 0)),
+            backend_idle_s=round(backend_idle, 1),
             stuck=bool(op.get("expired")),
         )
         if (
@@ -574,8 +631,9 @@ class FrontendManager:
             op["expired"] = True
             message = (
                 f"cache {op['kind']} {op['request_id']} made no progress for {idle:.0f} s "
-                f"(limit {self.maintenance_stuck_s:.0f} s); the engine may be half torn down, "
-                "so the gate stays closed and the server needs a restart"
+                f"in phase {op.get('phase')!r} after {int(op.get('progress_count', 0))} "
+                f"progress reports (limit {self.maintenance_stuck_s:.0f} s); the engine may "
+                "be half torn down, so the gate stays closed and the server needs a restart"
             )
             logger.error("Maintenance watchdog: %s", message)
             self.fatal_error = message

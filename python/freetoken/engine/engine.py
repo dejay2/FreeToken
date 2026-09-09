@@ -1535,6 +1535,7 @@ class Engine:
                     free_vram = self._sync_get_memory()[0]
                 except Exception:
                     pass
+            self._report_maintenance_progress("step:probed", f"{axis} {direction}")
 
             from freetoken.moe.host_banks import HostResidency
 
@@ -1748,6 +1749,7 @@ class Engine:
                 free_vram = self._sync_get_memory()[0]
             except Exception:
                 pass
+        self._report_maintenance_progress("step:probed", f"{axis} {direction}")
 
         if direction == "down":
             # 1. gpu_owned -> disk (if ram_tight and complete on disk) else gpu_owned -> pinned.
@@ -1919,12 +1921,30 @@ class Engine:
             return {**base, "at_floor": False, "exhausted": True, "reason": _NOTHING_TO_PROMOTE}
         return None
 
+    def _report_maintenance_progress(self, phase: str, detail: str | None = None) -> None:
+        """Tell the scheduler one unit of a maintenance operation just completed.
+
+        ``maintenance_progress`` is set by the scheduler for the duration of a step or rebuild
+        it executes (None otherwise, so direct engine use costs one attribute read). Each call
+        restarts the API's stuck-operation clock, so the clock only ever measures ONE silent
+        unit -- a layer read, a pool reallocation, a graph capture -- never the whole operation.
+        A hook error must not fail the rebuild it is reporting on.
+        """
+        hook = getattr(self, "maintenance_progress", None)
+        if hook is None:
+            return
+        try:
+            hook(phase, detail)
+        except Exception as e:  # noqa: BLE001 - reporting is best effort
+            logger.warning(f"maintenance progress hook failed ({phase}): {e!r}")
+
     def residency_report(self) -> dict:
         """Report layer residency and cache dimensions for GET /v1/cache/residency."""
         if self.moe_offload_cache is None:
             return {
                 "layers": {},
                 "moe_cache_size": 0,
+                "num_pages": int(getattr(self, "num_pages", 0) or 0),
                 "owned": 0,
                 "pinned": 0,
                 "disk": 0,
@@ -1956,6 +1976,9 @@ class Engine:
         return {
             "layers": layers,
             "moe_cache_size": self.moe_offload_cache.cache_size,
+            # The KV pool size rides along because step_memory_noop's "vram up" verdict depends
+            # on it: the governor invalidates a remembered exhausted answer when it changes.
+            "num_pages": int(getattr(self, "num_pages", 0) or 0),
             "owned": owned,
             "pinned": pinned,
             "disk": disk,
@@ -2106,6 +2129,7 @@ class Engine:
         )
 
         torch.cuda.synchronize(self.device)
+        self._report_maintenance_progress("rebuild:validated")
         # Preserve the CUDA-graph batch-size set resolved at startup. The auto heuristic keys
         # off free memory, which is far smaller now that the caches are resident (post-cache
         # free << startup pre-load free), so re-deriving it here would silently drop large
@@ -2132,6 +2156,7 @@ class Engine:
             self.spec_graph_runner = None
         self.attn_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
+        self._report_maintenance_progress("rebuild:teardown")
 
         # 2. Apply layer moves before moe_offload_cache.rebuild: a move swaps the layer's bank
         #    sources and re-derives the fused-copy pointer tables, and the slot-cache rebuild
@@ -2139,6 +2164,7 @@ class Engine:
         if layer_moves:
             for layer_id, target in layer_moves:
                 self._move_layer(layer_id, target)
+                self._report_maintenance_progress("rebuild:layer_move", f"layer {layer_id} -> {target}")
 
         # Resize caches in place (each frees its old GPU tensors before allocating).
         # Pin the new window first (validated above) so any KV-pool rebuild below sizes the window
@@ -2182,6 +2208,7 @@ class Engine:
                 # rebuild resets the free list, so the ladder's snapshot slot would otherwise
                 # be handed out to a live request as well.
                 self.spec_state_ladder.rebind()
+        self._report_maintenance_progress("rebuild:pools")
         # 3. Refresh max_seq_len (+ generic page table) for the new token budget.
         self._refresh_seq_state(config)
         aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
@@ -2189,6 +2216,7 @@ class Engine:
         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
         gc.collect()
         free_min = self._sync_get_memory()[0]
+        self._report_maintenance_progress("rebuild:capture")
         has_disk = self.moe_offload_cache is not None and getattr(self.moe_offload_cache, "has_disk_layers", False)
         if has_disk:
             self.graph_runner = GraphRunner(
@@ -2227,6 +2255,7 @@ class Engine:
         # (measured 20 tok/s against 50 before the spill, RTX 5090, depth 3). Arming while the
         # graphs are deferred is harmless: _capture_decode_graph checks can_use_cuda_graph first.
         self._rearm_spec_graphs()
+        self._report_maintenance_progress("rebuild:captured")
 
     def _rearm_spec_graphs(self) -> None:
         """Re-arm (not re-capture) the speculative verify widths armed at boot.

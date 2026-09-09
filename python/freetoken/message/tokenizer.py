@@ -153,6 +153,19 @@ class CacheStepResultMsg(BaseTokenizerMsg):
 
 
 @dataclass
+class CacheProgressMsg(BaseTokenizerMsg):
+    # scheduler -> detokenizer worker (passthrough to CacheProgressReply): one completed unit
+    # of work on, or ahead of, the maintenance operation ``request_id`` (a queued step or
+    # rebuild). "queued" on receipt, "waiting" per drained batch/chunk while it waits for its
+    # safe point, "executing" at the safe point, then one per engine phase (teardown, each
+    # layer move, pools, capture). The API's maintenance deadline restarts on every one, so a
+    # slow-but-working operation is never mistaken for a stuck one (2026-09-09 review F1).
+    request_id: str
+    phase: str
+    detail: str | None = None
+
+
+@dataclass
 class CacheResidencyMsg(BaseTokenizerMsg):
     request_id: str
 

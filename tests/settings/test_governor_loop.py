@@ -440,3 +440,88 @@ def test_a_residency_change_or_a_server_restart_forgets_the_verdict(monkeypatch)
     loop.process_manager.server_status = lambda: {"reachable": False, "state": "unreachable"}
     loop._tick()
     assert loop._up_exhausted == set()
+
+
+# ---- re-arming the suppression (review F3/F4, 2026-09-09) ---------------------------------
+
+
+def test_a_vram_spill_re_arms_ram_recall(monkeypatch):
+    """F3: RAM-up said "nothing to recall" with one owned layer; VRAM-down then spilled that
+    owned layer to disk. The RAM axis must ask again once memory is back, even though the
+    step that changed things ran on the other axis."""
+    spill = (200, {"status": "ok", "applied": "gpu_owned->disk", "layer": 3, "moe_cache_size": 6144,
+                   "layers": {"owned": 0, "pinned": 47, "disk": 1}, "vram_free_bytes": 3 * GIB})
+    server = _FakeServer([_exhausted_reply(), spill])
+    loop = _loop(monkeypatch, server)
+    loop.last_layers = {"owned": 1, "pinned": 47, "disk": 0, "parked": 0}
+    reply = _exhausted_reply()[1]
+    reply["layers"] = {"owned": 1, "pinned": 47, "disk": 0}
+    server.replies[0] = (200, reply)
+    loop._execute_action(Action("ram", "up"), int(2.5 * GIB), 40 * GIB)
+    assert loop._up_exhausted == {"ram"}
+    loop._execute_action(Action("vram", "down", ram_tight=True), 1 * GIB, 3 * GIB)
+    assert loop._up_exhausted == set(), "a disk layer now exists: recall has work again"
+    assert loop.last_layers == {"owned": 0, "pinned": 47, "disk": 1, "parked": 0}
+    # And the policy asks once the hold is served.
+    policy = loop.policy
+    policy.decide(200.0, 20 * GIB, 40 * GIB, exhausted_up=loop._up_exhausted)
+    actions = policy.decide(200.0 + policy.up_hold + 1, 20 * GIB, 40 * GIB, exhausted_up=loop._up_exhausted)
+    assert ("ram", "up") in [(a.axis, a.direction) for a in actions]
+
+
+def test_a_size_only_rebuild_seen_by_the_refresh_re_arms_vram_recovery(monkeypatch):
+    """F4: VRAM-up said "nothing to promote"; a hand-driven rebuild between two polls then
+    shrank the slot cache (or the KV pool) without moving a layer. The minute residency
+    refresh compares every fact the verdict rests on before replacing its snapshot."""
+
+    class _ResidencyResponse:
+        def __init__(self, body):
+            self.payload = json.dumps(body).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return self.payload
+
+    report = {"owned": 2, "pinned": 46, "disk": 0, "ram_parked": [], "moe_cache_size": 6144, "num_pages": 4097}
+    loop = GovernorLoop(SimpleNamespace(server_status=lambda: {"reachable": True, "state": "serving"}),
+                        GovernorPolicy(vram_cushion=2 * GIB, ram_cushion=4 * GIB), http_port=2020)
+    monkeypatch.setattr(governor.urllib.request, "urlopen", lambda req, timeout=None: _ResidencyResponse(dict(report)))
+    GovernorLoop._query_residency(loop)  # first report after a start: learnt, nothing to forget
+    assert loop.last_moe_cache_size == 6144 and loop.last_num_pages == 4097
+    loop._up_exhausted = {"vram"}
+    GovernorLoop._query_residency(loop)
+    assert loop._up_exhausted == {"vram"}, "an unchanged report keeps the verdict"
+    report["moe_cache_size"] = 5632
+    GovernorLoop._query_residency(loop)
+    assert loop._up_exhausted == set(), "fewer slots than the verdict assumed: ask again"
+    assert loop.last_moe_cache_size == 5632
+    loop._up_exhausted = {"vram", "ram"}
+    report["num_pages"] = 3072
+    GovernorLoop._query_residency(loop)
+    assert loop._up_exhausted == set(), "a smaller KV pool than the verdict assumed: ask again"
+    assert loop.last_num_pages == 3072
+    # An older server that reports no num_pages neither clears nor learns one.
+    loop._up_exhausted = {"vram"}
+    report.pop("num_pages")
+    GovernorLoop._query_residency(loop)
+    assert loop._up_exhausted == {"vram"} and loop.last_num_pages == 3072
+
+
+def test_a_step_reply_with_new_geometry_re_arms_even_without_applied(monkeypatch):
+    """A reply's layer counts are compared before they replace the snapshot, so a change made
+    by someone else between two governor steps is caught on the very next reply."""
+    reply = _exhausted_reply()[1]
+    reply["layers"] = {"owned": 0, "pinned": 47, "disk": 1}
+    server = _FakeServer([_exhausted_reply(), (200, reply)])
+    loop = _loop(monkeypatch, server)
+    loop._execute_action(Action("ram", "up"), int(2.5 * GIB), 40 * GIB)
+    loop._up_exhausted.add("vram")
+    assert loop._up_exhausted == {"ram", "vram"}
+    loop._execute_action(Action("ram", "up"), int(2.5 * GIB), 40 * GIB)
+    # The changed placement cleared both; this reply's own exhausted verdict re-adds RAM only.
+    assert loop._up_exhausted == {"ram"}

@@ -93,6 +93,15 @@ class CacheStepReply(BaseFrontendMsg):
 
 
 @dataclass
+class CacheProgressReply(BaseFrontendMsg):
+    # detokenizer worker -> api server: see CacheProgressMsg. Not a reply to a waiter; it only
+    # refreshes the open maintenance operation's progress clock.
+    request_id: str
+    phase: str
+    detail: str | None = None
+
+
+@dataclass
 class CacheResidencyReply(BaseFrontendMsg):
     # detokenizer worker -> api server: result of a GET /v1/cache/residency request.
     request_id: str

@@ -27,12 +27,17 @@ DEAD_STATES = frozenset({"unreachable", "failed"})
 # "rebuilding" used to be alive-just-busy for ever: on 2026-09-09 16:25 the 5090's scheduler
 # stopped answering a governor step, the API left its gate shut, /health kept saying ok and
 # three requests sat at 0% GPU for 11 min 44 s before clients gave up, with no restart. The
-# API now judges its own operation after 300 s of backend silence (api_server
-# MAINTENANCE_STUCK_S, from 0-3 s captures, 9 s startup capture, 21 s two-stage layer moves
-# and a 26.1 s restore wait) and reports ``maintenance.stuck``; this limit is the helper's
-# own backstop for an API whose event loop is wedged too, twice the API's deadline so the
-# API verdict normally lands first.
-REBUILDING_LIMIT_S = 600.0
+# API now tracks the one operation holding its gate, restarts a clock on every unit of work
+# the scheduler reports for it (a drained batch or prompt chunk ahead of it, each rebuild
+# phase) and after MAINTENANCE_STUCK_S (600 s, api_server) of no progress reports
+# ``maintenance.stuck``. That verdict is the ONLY thing that makes "rebuilding" count as dead
+# here. The helper keeps no timer of its own over a reporting server: a healthy step can sit
+# queued behind a long decode for longer than any fixed limit (review F2, 2026-09-09), and
+# only the API knows whether work is still completing. The one exception below is a report
+# that is plainly stale (no progress for STALE_PROGRESS_FACTOR times the API's own deadline
+# without a verdict), which cannot happen while the API judges itself and so costs nothing.
+# A wedged API answers nothing at all, which is "unreachable" and already counted dead.
+STALE_PROGRESS_FACTOR = 2.0
 
 
 def _server_pids(process_manager: Any) -> set[int] | None:
@@ -59,15 +64,13 @@ class CrashWatchdog(threading.Thread):
         max_restarts_per_hour: int = 3,
         monotonic: Callable[[], float] = time.monotonic,
         wall_now: Callable[[], float] = time.time,
-        rebuilding_limit: float = REBUILDING_LIMIT_S,
     ) -> None:
         super().__init__(name="crash-watchdog", daemon=True)
         self.process_manager = process_manager
         self.interval = float(interval)
         self.misses_needed = int(misses_needed)
         self.max_restarts_per_hour = int(max_restarts_per_hour)
-        self.rebuilding_limit = float(rebuilding_limit)
-        self._rebuilding_since: float | None = None
+        self._legacy_rebuilding_warned = False
         self._monotonic = monotonic
         self._wall_now = wall_now
         self._stop_event = threading.Event()
@@ -148,7 +151,6 @@ class CrashWatchdog(threading.Thread):
             document = {"state": "unreachable", "error": str(exc)}
         state = document.get("state") if isinstance(document, dict) else "unreachable"
         if state == "serving":
-            self._rebuilding_since = None
             with self._lock:
                 if not self.armed:
                     logger.info("crash watchdog: adopted a serving model server")
@@ -162,8 +164,6 @@ class CrashWatchdog(threading.Thread):
                 with self._lock:
                     self.misses = 0
                 return
-        else:
-            self._rebuilding_since = None
         if state not in DEAD_STATES and not state.startswith("stuck"):
             # loading, stopping: alive, just busy
             with self._lock:
@@ -215,20 +215,42 @@ class CrashWatchdog(threading.Thread):
     def _rebuilding_verdict(self, document: dict) -> str | None:
         """None while a rebuild is allowed to continue; otherwise the reason it counts as dead.
 
-        Two signals: the API's own ``maintenance.stuck`` verdict (its operation went
-        REBUILDING_LIMIT_S / 2 without any backend message), and this helper's backstop of
-        continuous "rebuilding" for ``rebuilding_limit`` seconds, for an API that can no longer
-        judge itself. A rebuild that finishes, or a server that comes back serving, clears both.
+        The server's ``maintenance`` report is authoritative: ``stuck`` is its verdict that the
+        open operation reported no progress for its deadline. Fresh progress (``progress_idle_s``
+        under the deadline, whatever the operation's total age) is alive, and each operation
+        is judged on its own record, so successive short operations never add up. A server
+        that does not report at all (a build older than 2026-09-09) is treated the way it
+        always was, alive-just-busy, and said so once: without progress data there is no
+        limit that cannot kill a healthy long decode, and Jay's bar is no false restarts.
         """
-        now = self._monotonic()
-        if self._rebuilding_since is None:
-            self._rebuilding_since = now
         maintenance = document.get("maintenance")
-        if isinstance(maintenance, dict) and maintenance.get("stuck"):
-            return "stuck in maintenance: the server reports its cache operation made no progress"
-        elapsed = now - self._rebuilding_since
-        if elapsed > self.rebuilding_limit:
-            return f"stuck in maintenance: rebuilding for {int(elapsed)} s"
+        if not isinstance(maintenance, dict):
+            if not self._legacy_rebuilding_warned:
+                self._legacy_rebuilding_warned = True
+                logger.warning(
+                    "crash watchdog: the server reports no maintenance progress (older build); "
+                    "a stuck cache operation will not be restarted until it runs this build"
+                )
+            return None
+        if maintenance.get("stuck"):
+            phase = maintenance.get("phase")
+            return (
+                "stuck in maintenance: the server reports its cache operation made no progress"
+                + (f" (phase {phase})" if phase else "")
+            )
+        # Defence in depth for a report the server has stopped judging (its own check runs
+        # inside the status handler, so this is unreachable on a healthy API): no progress for
+        # STALE_PROGRESS_FACTOR times its deadline with no verdict counts as dead.
+        try:
+            idle = float(maintenance.get("progress_idle_s") or 0.0)
+            deadline = float(maintenance.get("deadline_s") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if deadline > 0 and idle > STALE_PROGRESS_FACTOR * deadline:
+            return (
+                f"stuck in maintenance: no progress reported for {int(idle)} s and the "
+                f"server has not judged it (deadline {int(deadline)} s)"
+            )
         return None
 
     # ---- reporting -------------------------------------------------------

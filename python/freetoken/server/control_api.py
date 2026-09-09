@@ -53,6 +53,8 @@ def build_health(state: Any, version: str) -> dict:
     }
     if isinstance(maintenance, dict) and maintenance.get("age_s") is not None:
         doc["maintenance_age_s"] = maintenance["age_s"]
+        doc["maintenance_phase"] = maintenance.get("phase")
+        doc["maintenance_progress_idle_s"] = maintenance.get("progress_idle_s")
     return doc
 
 

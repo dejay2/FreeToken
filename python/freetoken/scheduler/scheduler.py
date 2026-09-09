@@ -25,6 +25,7 @@ from freetoken.message import (
     BaseBackendMsg,
     BatchBackendMsg,
     CacheParkStatusMsg,
+    CacheProgressMsg,
     CacheRebuildBackendMsg,
     CacheRebuildResultMsg,
     CacheResidencyBackendMsg,
@@ -54,6 +55,12 @@ from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
+
+# Least time between two "waiting" progress reports for a queued maintenance operation. Each
+# drained batch or prefill chunk is one unit of real completed work ahead of the operation;
+# at decode rates (~50 steps/s on the 5090) reporting every one would be noise on the reply
+# socket, and the API only needs to see the clock move well inside its 600 s deadline.
+MAINTENANCE_PROGRESS_INTERVAL_S = 2.0
 
 if TYPE_CHECKING:
     from freetoken.engine import BatchSamplingArgs, ForwardOutput
@@ -150,6 +157,10 @@ class Scheduler(SchedulerIOMixin):
         # A received-but-not-yet-executed runtime cache rebuild (CacheRebuildBackendMsg),
         # run at the next idle safe point in overlap_loop. None when no rebuild is pending.
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
+        # The request id of the queued or executing maintenance operation, so progress reports
+        # (see _note_maintenance_progress) correlate to the operation holding the API gate.
+        self._maintenance_request_id: str | None = None
+        self._maintenance_progress_at = -float("inf")
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -254,6 +265,7 @@ class Scheduler(SchedulerIOMixin):
             and (num_pages is not None or num_mamba_slots is not None)
         ):
             self.cache_manager.prepare_rebuild()
+        self._note_maintenance_progress("rebuild:prepared", force=True)
         self.engine.rebuild_runtime_cache(
             moe_cache_size=moe_cache_size,
             num_pages=num_pages,
@@ -274,6 +286,7 @@ class Scheduler(SchedulerIOMixin):
                 self.table_manager.rebuild(self.engine.page_table)
                 self.token_pool = self.table_manager.token_pool
             self.cache_manager.check_integrity()
+            self._note_maintenance_progress("rebuild:rethreaded", force=True)
         # The prefill chunk cap tracks the CURRENT window-pool size (DSV4); a rebuild that
         # shrank the pool must shrink the cap too, or the next long prompt is chunked against
         # the stale budget and crashes _alloc_window.
@@ -472,6 +485,13 @@ class Scheduler(SchedulerIOMixin):
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
         # The step is host-settled exactly here, on a sync this path already owned.
+        if getattr(self, "_maintenance_request_id", None) is not None:
+            # A queued step or rebuild waits behind this work. Intermediate prefill chunks
+            # emit no token reply, so without this the API would see silence for the whole
+            # prompt (review F1, 2026-09-09); a drained batch is real completed work.
+            self._note_maintenance_progress(
+                "waiting", f"drained {len(batch.reqs)} {'prefill' if batch.is_prefill else 'decode'}"
+            )
         self._spec_record_plain(batch)
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
@@ -898,7 +918,7 @@ class Scheduler(SchedulerIOMixin):
                 # are already freed — so they do not block a rebuild.)
                 self._reply_rebuild(msg.request_id, "busy")
             else:
-                self._pending_rebuild = msg
+                self._queue_maintenance(msg)
         elif isinstance(msg, CacheStepBackendMsg):
             # Never run a step inline here: in overlap mode the batch launched last iteration
             # may still be executing on the GPU (self._last_data), and step_memory rebuilds
@@ -919,7 +939,7 @@ class Scheduler(SchedulerIOMixin):
                 if noop is not None:
                     self._reply_step(msg.request_id, "ok", noop)
                 else:
-                    self._pending_rebuild = msg
+                    self._queue_maintenance(msg)
         elif isinstance(msg, CacheResidencyBackendMsg):
             try:
                 rep = self.engine.residency_report()
@@ -979,6 +999,42 @@ class Scheduler(SchedulerIOMixin):
                 )
             ]
         )
+
+    def _queue_maintenance(self, msg) -> None:
+        """Hold a step or rebuild for the safe point and tell the API it was received."""
+        self._pending_rebuild = msg
+        self._maintenance_request_id = msg.request_id
+        self._note_maintenance_progress("queued", force=True)
+
+    def _note_maintenance_progress(
+        self, phase: str, detail: str | None = None, *, force: bool = False
+    ) -> None:
+        """Report one completed unit of work on, or ahead of, the queued/executing operation.
+
+        The API restarts its stuck-operation clock on every report, so the clock measures a
+        single silent unit (one drained batch, one layer move, one graph capture), never the
+        operation's total length: a 190k prompt processed in chunks or a slow rebuild that
+        keeps reporting is never declared stuck. "waiting" reports are throttled to one per
+        MAINTENANCE_PROGRESS_INTERVAL_S; phase changes (``force``) always go out. Sending is
+        best effort: a reporting failure must not fail the work it reports on.
+        """
+        request_id = getattr(self, "_maintenance_request_id", None)
+        if request_id is None:
+            return
+        now = time.monotonic()
+        if not force and now - getattr(self, "_maintenance_progress_at", -float("inf")) < (
+            MAINTENANCE_PROGRESS_INTERVAL_S
+        ):
+            return
+        self._maintenance_progress_at = now
+        try:
+            self.send_result([CacheProgressMsg(request_id=request_id, phase=phase, detail=detail)])
+        except Exception as e:  # noqa: BLE001 - progress is advisory
+            logger.warning(f"maintenance progress report failed ({phase}): {e!r}")
+
+    def _engine_maintenance_progress(self, phase: str, detail: str | None = None) -> None:
+        """The hook rebuild_runtime_cache / step_memory call once per engine phase."""
+        self._note_maintenance_progress(phase, detail, force=True)
 
     def _step_noop_reply(self, msg: CacheStepBackendMsg) -> dict | None:
         """The engine's residency-only verdict that ``msg`` cannot change anything, or None."""
@@ -1162,11 +1218,23 @@ class Scheduler(SchedulerIOMixin):
         self._reply_step(msg.request_id, "ok", res)
 
     def _execute_pending_rebuild(self) -> None:
-        from freetoken.engine.engine import CacheRebuildRejected
-
         msg = self._pending_rebuild
         assert msg is not None
         self._pending_rebuild = None
+        # The safe point is reached: from here every engine phase reports through the hook,
+        # so the API's clock measures one phase at a time (see _note_maintenance_progress).
+        self._maintenance_request_id = msg.request_id
+        self._note_maintenance_progress("executing", force=True)
+        self.engine.maintenance_progress = self._engine_maintenance_progress
+        try:
+            self._execute_pending_operation(msg)
+        finally:
+            self.engine.maintenance_progress = None
+            self._maintenance_request_id = None
+
+    def _execute_pending_operation(self, msg) -> None:
+        from freetoken.engine.engine import CacheRebuildRejected
+
         if isinstance(msg, CacheStepBackendMsg):
             self._execute_pending_step(msg)
             return

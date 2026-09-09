@@ -22,6 +22,8 @@ from freetoken.message import (
     BatchTokenizerMsg,
     CacheParkStatusMsg,
     CacheParkStatusReply,
+    CacheProgressMsg,
+    CacheProgressReply,
     CacheRebuildBackendMsg,
     CacheRebuildMsg,
     CacheRebuildReply,
@@ -373,6 +375,7 @@ class _MultimodalProcessor:
 # how a missing passthrough shows up: the worker exits instead of silently dropping the request.
 _CONTROL_MSG_TYPES = (
     CacheParkStatusMsg,
+    CacheProgressMsg,
     CacheRebuildMsg,
     CacheRebuildResultMsg,
     CacheResidencyMsg,
@@ -394,6 +397,10 @@ def _forward_control_msg(m, send_backend, send_frontend) -> bool:
     """
     if isinstance(m, CacheParkStatusMsg):
         send_frontend.put(CacheParkStatusReply(status=m.status))
+    elif isinstance(m, CacheProgressMsg):
+        send_frontend.put(
+            CacheProgressReply(request_id=m.request_id, phase=m.phase, detail=m.detail)
+        )
     elif isinstance(m, CacheRebuildMsg):
         send_backend.put(
             CacheRebuildBackendMsg(
