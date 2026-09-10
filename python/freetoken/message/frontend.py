@@ -116,4 +116,3 @@ class RoutingStatsReply(BaseFrontendMsg):
     request_id: str
     stats: dict
     error: str | None = None
-

@@ -43,9 +43,13 @@ unrelated validation failures. The implementation also reproduces the offline re
 projection for all nine sampled requests with the full serving tokenizer. Six ordinary
 renderings, with/without tools and with thinking enabled/disabled/default, are unchanged.
 
-The full server/tokenizer CPU run has one existing failure:
+With the unrelated PLE-default test deselected, the full server/tokenizer CPU run passed
+644 tests, skipped five, and deselected one. The deselected
 `test_ple_backend_is_exposed_by_the_server_cli` expects a pinned PLE default where the Linux
-CLI selects disk. It also fails on the unchanged parent revision. It is unrelated to this fix.
+CLI selects disk; it fails identically on the unchanged parent revision. All 54 targeted
+Anthropic/tokenizer tests also passed in the GPU machine's environment without generation.
+Synthetic `--check-prefix` runs passed at 100k and 200k tokens locally and at 100k tokens in
+that environment.
 
 For GPU acceptance, use `scripts/bench/kv_ram_agent_live.py` with RAM parking and cache
 reporting enabled. It generates two synthetic long archives, asks the model to report
@@ -58,7 +62,8 @@ so their host-transfer checks do not depend on incidental GPU memory pressure or
 Initial responses must contain reasoning, which is carried into the next requests. The
 benchmark records partial results if a later assertion fails. Run it against an
 idle validation server: unrelated traffic can evict a family or replace the global transfer
-diagnostic before the test reads it. `--check-prefix` runs only local tokenization.
+diagnostic before the test reads it. `--check-prefix` runs only local tokenization. The GPU
+generation phase of this benchmark remains pending.
 
 Initial cold fills, rewritten historical content, and memory-driven family eviction can
 still cause misses. A concurrent branch may arrive before the first checkpoint exists or

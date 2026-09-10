@@ -3183,11 +3183,3 @@ Every numbered spec requirement maps to a task:
 | 8 tests | every task |
 | 9 live verification | 8 |
 | 11 risks (`device_ptr`, three layer-0 special cases, parallel interleaving, two allocation sites) | 3, 5 |
-
-
-
-
-
-
-
-
