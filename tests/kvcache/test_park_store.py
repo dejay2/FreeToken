@@ -1506,18 +1506,18 @@ def test_ssd_root_fallback_declines_when_the_only_evictable_family_is_pinned(
 
     checks = []
 
-    def blocked_check(span, chain):
+    def blocked_check(span, chain, cut):
         # Only B (the first check) sees a changed prefix byte; C shares the same physical
         # page 0 and must still match A.
         checks.append(1)
         if len(checks) > 1:
-            return real_check(span, chain)
+            return real_check(span, chain, cut)
         started.set()
         release.wait(timeout=10)
         page0 = kv_pool.page_byte_views(0)[0].view(torch.uint8).reshape(-1)
         page0[5] ^= 0xFF
         try:
-            return real_check(span, chain)
+            return real_check(span, chain, cut)
         finally:
             page0[5] ^= 0xFF
 
@@ -1767,7 +1767,7 @@ def test_ssd_restart_recovers_a_chain_behind_a_stale_or_old_manifest(tmp_path: P
     oracle_state = _raw_bytes(state_pool.slot_byte_views(slots[1]))
     store.close()
 
-    for manifest in (stale, stale.replace('"version": 4', '"version": 3')):
+    for manifest in (stale, stale.replace('"version": 5', '"version": 4')):
         (tmp_path / "park.json").write_text(manifest, encoding="utf-8")
         reopened = _chain_store(tmp_path, pools=(kv_pool, state_pool))[0]
         try:
@@ -1778,7 +1778,7 @@ def test_ssd_restart_recovers_a_chain_behind_a_stale_or_old_manifest(tmp_path: P
             _assert_raw_equal(_raw_bytes(_page_views(kv_pool, [10, 11, 12])), oracle)
             _assert_raw_equal(_raw_bytes(state_pool.slot_byte_views(slots[2])), oracle_state)
             doc = json.loads((tmp_path / "park.json").read_text(encoding="utf-8"))
-            assert doc["version"] == 4
+            assert doc["version"] == 5
             assert {row["key"]: row["parent_key"] for row in doc["entries"]} == {
                 a.key: None,
                 b.key: a.key,
@@ -2032,3 +2032,588 @@ def test_restore_rejects_an_entry_the_store_no_longer_holds(tmp_path: Path):
         )
     finally:
         store.close()
+
+
+# ---- branch-aware (v5) parking ---------------------------------------------------------
+
+
+def _pages(store: ParkStore, token_count: int) -> int:
+    return token_count // store.page_size
+
+
+def _reaches(store: ParkStore, entry, ancestor) -> bool:
+    seen = set()
+    current = entry
+    while current is not None and current.key not in seen:
+        if current is ancestor:
+            return True
+        seen.add(current.key)
+        current = store._entries.get(current.parent_key) if current.parent_key else None
+    return False
+
+
+def _recurrence(state_views, steps: int = 3) -> torch.Tensor:
+    """A deterministic CPU stand-in for continuing the recurrence from a restored state: any
+    byte difference in the state diverges within one step."""
+    value = torch.cat([view.view(torch.uint8).reshape(-1).to(torch.int64) for view in state_views])
+    for _ in range(steps):
+        value = (value * 31 + torch.arange(value.numel(), dtype=torch.int64) + 7) % 251
+    return value
+
+
+@pytest.mark.parametrize(
+    "gap, shorter_side",
+    [(44, False), (148, False), (46, False), (44, True)],
+    ids=["gap44", "gap148", "gap46-unaligned", "gap44-shorter-side"],
+)
+def test_ssd_agent_shaped_saves_share_prompt_checkpoint(
+    tmp_path: Path, monkeypatch, gap: int, shorter_side: bool
+):
+    """The 2026-09-10 live shape: one main request, two side requests that share its prefix
+    with different tails, then the real next turn that diverges inside the previous side
+    save's last pages (44/148 tokens before its end on the 5090). Every later request must
+    attach to the main prompt checkpoint C and write only its own pages plus states, never a
+    full copy; the shorter-side case is the observed shorter-exact-prefix save (71,424 of
+    71,552), which must become a zero-KV child of the longer segment.
+
+    The pool carries 32-wide heads (about 290 KV bytes per token) rather than the 38-byte
+    fixture default: every segment stores its whole token list verbatim at 4 bytes per token,
+    so with tiny KV the bound would measure the token list, not the pages. Live fp8 KV is
+    over 10 KB per token, where the token list is noise; this is still not a live byte bound.
+    """
+    kv_pool = QSAKVCache(
+        num_kv_heads=1,
+        num_layers=2,
+        head_dim=32,
+        num_pages=4400,
+        page_size=4,
+        dtype=torch.bfloat16,
+        kv_dtype=None,
+        device=torch.device("cpu"),
+        index_head_dim=8,
+        num_index_layers=2,
+        index_ratio=2,
+        num_req_slots=2,
+        layer_ids=(0, 1),
+    )
+    state_pool = _state_pool(num_slots=16)
+    slots = state_pool.alloc(12)
+    per_token = kv_pool.unit_bytes()[0]
+    state_bytes = state_pool.bytes_per_slot()
+    control_dir = tmp_path / "control"
+    control_dir.mkdir()
+    control_spy = _WriteSpy(monkeypatch, control_dir)
+    main_dir = tmp_path / "s"
+    main_dir.mkdir()
+    store = _store("ssd", main_dir, kv_pool, state_pool, disk_budget_bytes=64 << 20)
+    spy = _WriteSpy(monkeypatch, main_dir)
+    next_page = [0]
+
+    def fresh_pages(count: int, seed: int) -> list[int]:
+        ids = list(range(next_page[0], next_page[0] + count))
+        next_page[0] += count
+        _fill_raw(_page_views(kv_pool, ids), seed=seed)
+        return ids
+
+    def state(slot: int, seed: int) -> int:
+        _fill_raw(state_pool.slot_byte_views(slot), seed=seed)
+        return slot
+
+    def checkpoint(tokens, pages, slot) -> None:
+        # The scheduler's eager, synchronous prompt-checkpoint save.
+        assert store.save(tokens, _bases(pages), slot)
+
+    def finish(tokens, pages, slot) -> None:
+        # The ordinary finish-time offer -> background write -> flush.
+        pending = store.offer(tokens, _bases(pages), slot)
+        assert pending is not None, (len(tokens), store.status(), store._inflight, store._pins)
+        assert pending.wait() and pending.error is None, (len(tokens), store.status())
+        store.flush()
+
+    written: dict[str, int] = {}
+
+    def measure(name: str, fn) -> None:
+        spy.reset()
+        fn()
+        written[name] = spy.total
+
+    def control(name: str, tokens, pages, slot) -> int:
+        control_spy.reset()
+        full = _store("ssd", control_dir, kv_pool, state_pool, disk_budget_bytes=64 << 20)
+        try:
+            assert full.save(tokens, _bases(pages), slot)
+            entry = _entry_for(full, tokens)
+            assert entry is not None and entry.parent_key is None
+        finally:
+            full.close()
+        for path in control_dir.iterdir():
+            path.unlink()
+        return control_spy.total
+
+    try:
+        # Main: an 8,194-token prompt (checkpoint C at the aligned 8,192) and a 6-token answer.
+        main_prompt = torch.arange(1, 8195, dtype=torch.int32)
+        main_answer = torch.arange(50_000, 50_006, dtype=torch.int32)
+        main_tokens = torch.cat([main_prompt, main_answer])          # 8,200: aligned finish
+        main_pages = fresh_pages(_pages(store, 8200), seed=1)
+        slot_c, slot_mf = state(slots[0], 10), state(slots[1], 11)
+
+        def do_main():
+            checkpoint(main_tokens[:8192], main_pages[:2048], slot_c)
+            finish(main_tokens, main_pages, slot_mf)
+
+        measure("main", do_main)
+        c = _entry_for(store, main_tokens[:8192])
+        mf = _entry_for(store, main_tokens)
+        assert c is not None and c.parent_key is None
+        assert mf is not None and mf.parent_key == c.key and mf.parent_token_count == 8192
+        c_file = c.path.read_bytes()
+
+        # Side 1 (permission classifier): main prefix + a 63-token tail, 8-token answer.
+        side1_tokens = torch.cat([main_tokens, torch.arange(60_000, 60_068, dtype=torch.int32)])
+        side1_pages = main_pages + fresh_pages(_pages(store, 8268) - 2050, seed=2)
+        slot_c1, slot_f1 = state(slots[2], 12), state(slots[3], 13)
+
+        def do_side1():
+            checkpoint(side1_tokens[:8260], side1_pages[:2065], slot_c1)   # prompt 8,263 -> C1
+            finish(side1_tokens, side1_pages, slot_f1)                     # answer -> 8,268
+
+        measure("side1", do_side1)
+        c1 = _entry_for(store, side1_tokens[:8260])
+        f1 = _entry_for(store, side1_tokens)
+        assert c1.parent_key == mf.key and c1.parent_token_count == 8200
+        assert c1.kv_bytes == 60 * per_token
+        assert f1.parent_key == c1.key and f1.kv_bytes == 8 * per_token
+
+        # Side 2 (status line): either a longer different tail, or -- the observed shorter
+        # case -- a prompt that is an exact prefix of the earlier, longer side-1 save.
+        if shorter_side:
+            side2_tokens = side1_tokens[:8256]
+            side2_pages = side1_pages[:2064]
+            slot_c2 = state(slots[4], 14)
+
+            def do_side2():
+                checkpoint(side2_tokens, side2_pages, slot_c2)   # prompt 8,256; unaligned finish
+
+            measure("side2", do_side2)
+            c2 = _entry_for(store, side2_tokens)
+            assert c2.parent_key == c1.key, "the shortest longer donor wins, deterministically"
+            assert c2.parent_token_count == 8256 == c2.token_count < c1.token_count
+            assert c2.kv_bytes == 0 and c2.state_bytes == state_bytes
+            assert c2.total_bytes == store._segment_bytes(8256, 8256)
+            assert c2.total_bytes >= park_module._align_up(4096 + 8256 * 4) + state_bytes
+            last_side_tokens, last_side_pages = side2_tokens, side2_pages
+        else:
+            side2_tokens = torch.cat(
+                [main_tokens, torch.arange(70_000, 70_208, dtype=torch.int32)]
+            )                                                            # prompt 8,407, +1 answer
+            side2_pages = main_pages + fresh_pages(_pages(store, 8408) - 2050, seed=3)
+            slot_c2, slot_f2 = state(slots[4], 14), state(slots[5], 15)
+
+            def do_side2():
+                checkpoint(side2_tokens[:8404], side2_pages[:2101], slot_c2)
+                finish(side2_tokens, side2_pages, slot_f2)
+
+            measure("side2", do_side2)
+            c2 = _entry_for(store, side2_tokens[:8404])
+            f2 = _entry_for(store, side2_tokens)
+            assert c2.parent_key == mf.key and c2.kv_bytes == 204 * per_token
+            assert f2.parent_key == c2.key and f2.kv_bytes == 4 * per_token
+            last_side_tokens, last_side_pages = side2_tokens, side2_pages
+
+        # The real next turn: shares the previous side save only up to ``gap`` tokens before
+        # its end (inside its last pages), then continues with 300 new tokens.
+        shared = len(last_side_tokens) - gap
+        assert shared >= 8200, "the next turn must still contain the main finish"
+        next_prompt = torch.cat(
+            [last_side_tokens[:shared], torch.arange(80_000, 80_300, dtype=torch.int32)]
+        )
+        aligned_shared = shared - shared % 4
+        assert aligned_shared < c2.token_count
+        # No arbitrary-LCP state: before the next turn is saved, the longest saved endpoint
+        # inside its prefix is the main finish, not a slice of the side save at the divergence.
+        probe = store.lookup(next_prompt)
+        assert probe is mf and probe.token_count == 8200
+        l_n = len(next_prompt) - len(next_prompt) % 4
+        next_tokens = torch.cat([next_prompt[:l_n], torch.arange(90_000, 90_004, dtype=torch.int32)])
+        next_pages = main_pages + fresh_pages(_pages(store, l_n + 4) - 2050, seed=4)
+        slot_ln, slot_fn = state(slots[6], 16), state(slots[7], 17)
+
+        def do_next():
+            checkpoint(next_tokens[:l_n], next_pages[: _pages(store, l_n)], slot_ln)
+            finish(next_tokens, next_pages, slot_fn)
+
+        measure("real_next", do_next)
+        ln = _entry_for(store, next_tokens[:l_n])
+        fn = _entry_for(store, next_tokens)
+        assert ln.parent_key == mf.key and ln.parent_token_count == 8200
+        assert ln.kv_bytes == (l_n - 8200) * per_token
+        assert fn.parent_key == ln.key and fn.kv_bytes == 4 * per_token
+
+        # Every later entry reaches the shared main checkpoint C, whose file never changed.
+        for entry in store._entries.values():
+            assert _reaches(store, entry, c), entry.token_count
+        assert c.path.read_bytes() == c_file
+        assert {entry.root_key for entry in store._entries.values()} == {c.key}
+
+        # Each later request wrote far less than an independent full copy of its own path.
+        controls = {
+            "side1": control("side1", side1_tokens, side1_pages, slot_f1),
+            "side2": control("side2", last_side_tokens, last_side_pages, slot_c2),
+            "real_next": control("real_next", next_tokens, next_pages, slot_fn),
+        }
+        for name, full_bytes in controls.items():
+            assert written[name] < 0.25 * full_bytes, (name, written[name], full_bytes, written)
+        assert written["main"] > controls["side1"] * 0.9, "the first save is the full one"
+
+        # Real restore hits for the side and next paths, at their own saved endpoints.
+        hits_before = store.status()["hits"]
+        probe_tail = torch.tensor([999], dtype=torch.int32)
+        assert store.lookup(torch.cat([side1_tokens, probe_tail])) is f1
+        assert store.lookup(torch.cat([next_tokens, probe_tail])) is fn
+        side2_hit = store.lookup(torch.cat([last_side_tokens, probe_tail]))
+        assert side2_hit is (c2 if shorter_side else f2)
+        assert store.status()["hits"] == hits_before + 3
+        if shorter_side:
+            # The zero-KV side checkpoint restores its own state and the donor's KV bytes.
+            target_pages = list(range(next_page[0], next_page[0] + 2064))
+            target_slot = slots[8]
+            store.restore(c2, _bases(target_pages), target_slot)
+            _assert_raw_equal(
+                _raw_bytes(_page_views(kv_pool, target_pages)),
+                _raw_bytes(_page_views(kv_pool, side2_pages)),
+            )
+            _assert_raw_equal(
+                _raw_bytes(state_pool.slot_byte_views(target_slot)),
+                _raw_bytes(state_pool.slot_byte_views(slot_c2)),
+            )
+        assert store._reserved_bytes == 0 and not store._pins and not store._inflight
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("kv_dtype", [None, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("page_offset", [0, 1, 5, 6], ids=["zero", "inside", "boundary", "state-only"])
+@pytest.mark.parametrize("source", ["checkpoint", "shorter"])
+def test_ssd_partial_prefix_restore_is_byte_identical(
+    tmp_path: Path, monkeypatch, kv_dtype, page_offset: int, source: str
+):
+    """A prompt that starts with a page-aligned prefix of a saved chat, shorter than the whole
+    save, restores KV and GDN state at that cut byte for byte -- from C's own saved state,
+    never from the longer N's. ``checkpoint``: C was saved first (the eager prompt
+    checkpoint) and N is its continuation. ``shorter``: N was saved first and C is a zero-KV
+    child borrowing N's bytes through its own cut."""
+    kv_pool = _qsa_pool(num_pages=64, kv_dtype=kv_dtype)
+    state_pool = _state_pool(num_slots=8)
+    slots = state_pool.alloc(4)
+    source_ids = [4, 20, 8, 36, 12, 28, 40, 44, 48]     # scattered physical pages
+    tokens = torch.arange(36, dtype=torch.int32) + 5
+    _fill_raw(_page_views(kv_pool, source_ids), seed=10)
+    _fill_raw(state_pool.slot_byte_views(slots[0]), seed=20)   # C's state
+    _fill_raw(state_pool.slot_byte_views(slots[1]), seed=21)   # N's state, deliberately different
+    assert not torch.equal(
+        torch.cat(_raw_bytes(state_pool.slot_byte_views(slots[0]))),
+        torch.cat(_raw_bytes(state_pool.slot_byte_views(slots[1]))),
+    )
+    oracle_kv = _raw_bytes(_page_views(kv_pool, source_ids[:6]))
+    oracle_state = _raw_bytes(state_pool.slot_byte_views(slots[0]))
+    store = _store("ssd", tmp_path / "s", kv_pool, state_pool, pinned_window_bytes=4096)
+    if source == "checkpoint":
+        assert store.save(tokens[:24], _bases(source_ids[:6]), slots[0])
+        assert store.save(tokens, _bases(source_ids), slots[1])
+        c, n = _entry_for(store, tokens[:24]), _entry_for(store, tokens)
+        assert c.parent_key is None and n.parent_key == c.key and n.parent_token_count == 24
+    else:
+        assert store.save(tokens, _bases(source_ids), slots[1])
+        assert store.save(tokens[:24], _bases(source_ids[:6]), slots[0])
+        c, n = _entry_for(store, tokens[:24]), _entry_for(store, tokens)
+        assert n.parent_key is None and c.parent_key == n.key
+        assert c.parent_token_count == 24 and c.kv_bytes == 0
+    store.close()
+    (tmp_path / "s" / "park.json").unlink()
+
+    reopened = _store("ssd", tmp_path / "s", kv_pool, state_pool, pinned_window_bytes=3 * 4096)
+    try:
+        assert set(reopened._entries) == {c.key, n.key}
+        target_ids = [1, 3, 5, 7, 9, 11][page_offset:]
+        untouched = [
+            page for page in range(64)
+            if page not in source_ids and page not in target_ids
+        ]
+        _fill_raw(_page_views(kv_pool, untouched), seed=90)
+        _fill_raw(state_pool.slot_byte_views(slots[3]), seed=91)
+        sentinel_kv = _raw_bytes(_page_views(kv_pool, untouched))
+        sentinel_state = _raw_bytes(state_pool.slot_byte_views(slots[3]))
+
+        # Incoming prompt: C's 24 tokens, then 8 tokens that diverge from N before its end.
+        prompt = torch.cat([tokens[:24], torch.arange(900, 908, dtype=torch.int32)])
+        hit = reopened.lookup(prompt)
+        assert hit is not None and hit.token_count == 24 and hit.key == c.key
+        reads: list[tuple[str, int, int]] = []
+        real_read = reopened._read_region
+
+        def spying_read(ctx, segment, handle, reader, **region):
+            reads.append((segment.key, region["file_offset"], region["length"]))
+            return real_read(ctx, segment, handle, reader, **region)
+
+        monkeypatch.setattr(reopened, "_read_region", spying_read)
+        page_calls = []
+        real_page_views = kv_pool.page_byte_views
+        monkeypatch.setattr(
+            kv_pool, "page_byte_views", lambda page: page_calls.append(page) or real_page_views(page)
+        )
+        reopened.restore(hit, _bases(target_ids), slots[2], page_offset=page_offset)
+        assert page_calls == target_ids, "restore must build each destination page once"
+        chain_c = reopened._entries[c.key]
+        chain_n = reopened._entries[n.key]
+        if source == "checkpoint":
+            expected_reads = [
+                (c.key, chain_c.kv_offset, chain_c.kv_bytes),
+                (c.key, chain_c.state_offset, chain_c.state_bytes),
+            ]
+        else:
+            # The whole donor KV region is read and hashed once (its unused tail included);
+            # C's own empty KV region and C's state follow. N's state is never read.
+            expected_reads = [
+                (n.key, chain_n.kv_offset, chain_n.kv_bytes),
+                (c.key, chain_c.kv_offset, 0),
+                (c.key, chain_c.state_offset, chain_c.state_bytes),
+            ]
+        assert reads == expected_reads
+
+        views_per_page = len(real_page_views(0))
+        restored_kv = _raw_bytes(_page_views(kv_pool, target_ids))
+        _assert_raw_equal(restored_kv, oracle_kv[page_offset * views_per_page :])
+        restored_state = _raw_bytes(state_pool.slot_byte_views(slots[2]))
+        _assert_raw_equal(restored_state, oracle_state)
+        assert torch.equal(_recurrence(restored_state), _recurrence(oracle_state))
+        assert not torch.equal(
+            torch.cat(restored_state),
+            torch.cat(_raw_bytes(state_pool.slot_byte_views(slots[1]))),
+        ), "the restored state must be C's own, not N's"
+        _assert_raw_equal(_raw_bytes(_page_views(kv_pool, source_ids)), _raw_bytes(_page_views(kv_pool, source_ids)))
+        _assert_raw_equal(_raw_bytes(_page_views(kv_pool, untouched)), sentinel_kv)
+        _assert_raw_equal(_raw_bytes(state_pool.slot_byte_views(slots[3])), sentinel_state)
+        assert reopened.status()["last_restore_breakdown_ms"]["segments"] == (
+            1.0 if source == "checkpoint" else 2.0
+        )
+    finally:
+        reopened.close()
+
+    # Negative: only the longer N exists. A request that ends before N must miss: there is no
+    # saved state at any shorter cut, and a longer file is never sliced into one.
+    only_n = _store("ssd", tmp_path / "n", kv_pool, state_pool)
+    try:
+        assert only_n.save(tokens, _bases(source_ids), slots[1])
+        misses = only_n.status()["misses"]
+        assert only_n.lookup(prompt) is None
+        assert only_n.lookup(tokens[:24]) is None
+        assert only_n.status()["misses"] == misses + 2
+        assert set(only_n._entries) == {n.key}
+    finally:
+        only_n.close()
+
+
+def test_ssd_partial_lookup_honors_min_and_max_lengths(tmp_path: Path):
+    store, kv_pool, state_pool = _chain_store(tmp_path)
+    slots = state_pool.alloc(2)
+    tokens = torch.arange(16, dtype=torch.int32)
+    try:
+        n = _save_turn(store, kv_pool, state_pool, tokens, [1, 2, 3, 4], slots[0], seed=1, new_pages=[1, 2, 3, 4])
+        c = _save_turn(store, kv_pool, state_pool, tokens[:8], [1, 2], slots[1], seed=2, new_pages=[])
+        assert c.parent_key == n.key and c.kv_bytes == 0
+        prompt = torch.cat([tokens[:12], torch.tensor([500, 501, 502, 503], dtype=torch.int32)])
+        assert store.lookup(prompt) is c
+        assert store.lookup(prompt, max_len=8) is c
+        assert store.lookup(prompt, min_len=12) is None
+        assert store.lookup(torch.cat([tokens, tokens[:1]]), max_len=8) is c
+        assert store.lookup(torch.cat([tokens, tokens[:1]])) is n
+    finally:
+        store.close()
+
+
+def test_ssd_chain_with_several_zero_kv_checkpoints_restores_each_endpoint(tmp_path: Path):
+    """A(16) <- B(20) continuation; C(12) and D(8) are zero-KV checkpoints that borrow from
+    the shortest longer donor. Each endpoint restores its own state and exactly its prefix;
+    a donor's unused tail never lands anywhere."""
+    store, kv_pool, state_pool = _chain_store(tmp_path, num_slots=12)
+    slots = state_pool.alloc(8)
+    tokens = torch.arange(20, dtype=torch.int32) + 100
+    try:
+        a = _save_turn(store, kv_pool, state_pool, tokens[:16], [1, 2, 3, 4], slots[0], seed=1, new_pages=[1, 2, 3, 4])
+        b = _save_turn(store, kv_pool, state_pool, tokens, [1, 2, 3, 4, 5], slots[1], seed=2, new_pages=[5])
+        c = _save_turn(store, kv_pool, state_pool, tokens[:12], [1, 2, 3], slots[2], seed=3, new_pages=[])
+        d = _save_turn(store, kv_pool, state_pool, tokens[:8], [1, 2], slots[3], seed=4, new_pages=[])
+        assert b.parent_key == a.key and b.parent_token_count == 16
+        assert c.parent_key == a.key and c.parent_token_count == 12 and c.kv_bytes == 0
+        assert d.parent_key == c.key and d.parent_token_count == 8 and d.kv_bytes == 0
+        assert store._chain(d) == (a, c, d)
+        assert [(s.key, lo, hi) for s, lo, hi in store._chain_ranges((a, c, d), 8)] == [
+            (a.key, 0, 8), (c.key, 12, 12), (d.key, 8, 8)
+        ]
+        for entry, pages, slot, target in (
+            (d, [1, 2], slots[3], [10, 11]),
+            (c, [1, 2, 3], slots[2], [20, 21, 22]),
+            (b, [1, 2, 3, 4, 5], slots[1], [30, 31, 32, 33, 34]),
+            (a, [1, 2, 3, 4], slots[0], [40, 41, 42, 43]),
+        ):
+            sentinel_pages = [page for page in range(50, 60)]
+            _fill_raw(_page_views(kv_pool, sentinel_pages), seed=77)
+            sentinel = _raw_bytes(_page_views(kv_pool, sentinel_pages))
+            hit = store.lookup(torch.cat([tokens[: entry.token_count], torch.tensor([999], dtype=torch.int32)]))
+            assert hit is entry
+            store.restore(hit, _bases(target), slots[5])
+            _assert_raw_equal(_raw_bytes(_page_views(kv_pool, target)), _raw_bytes(_page_views(kv_pool, pages)))
+            _assert_raw_equal(
+                _raw_bytes(state_pool.slot_byte_views(slots[5])),
+                _raw_bytes(state_pool.slot_byte_views(slot)),
+            )
+            _assert_raw_equal(_raw_bytes(_page_views(kv_pool, sentinel_pages)), sentinel)
+        # Offset restore of D through the clipped donor: only page 1 of A lands in the target.
+        store.restore(d, _bases([12]), slots[6], page_offset=1)
+        _assert_raw_equal(_raw_bytes(_page_views(kv_pool, [12])), _raw_bytes(_page_views(kv_pool, [2])))
+    finally:
+        store.close()
+
+
+def test_ssd_shorter_checkpoint_falls_back_to_a_root_when_donor_bytes_differ(tmp_path: Path):
+    """Equal tokens are not byte provenance: a shorter checkpoint whose current KV differs
+    from the longer donor's file bytes becomes a standalone root, and a donor whose file is
+    corrupt is dropped with its dependants instead of being trusted."""
+    store, kv_pool, state_pool = _chain_store(tmp_path)
+    slots = state_pool.alloc(4)
+    tokens = torch.arange(16, dtype=torch.int32) + 7
+    try:
+        a = _save_turn(store, kv_pool, state_pool, tokens, [1, 2, 3, 4], slots[0], seed=1, new_pages=[1, 2, 3, 4])
+        page1 = kv_pool.page_byte_views(1)[0].view(torch.uint8).reshape(-1)
+        page1[3] ^= 0xFF
+        _fill_raw(state_pool.slot_byte_views(slots[1]), seed=5)
+        assert store.save(tokens[:8], _bases([1, 2]), slots[1])
+        c = _entry_for(store, tokens[:8])
+        assert c.parent_key is None and c.kv_bytes == 8 * kv_pool.unit_bytes()[0]
+        assert a.key in store._entries
+        store.restore(store.lookup(torch.cat([tokens[:8], tokens[:1]])), _bases([10, 11]), slots[2])
+        _assert_raw_equal(_raw_bytes(_page_views(kv_pool, [10, 11])), _raw_bytes(_page_views(kv_pool, [1, 2])))
+        page1[3] ^= 0xFF
+        store._drop_entry(c.key)
+
+        # Now the source matches again but A's file is corrupt inside the borrowed range.
+        _corrupt(a.path, a.kv_offset + 5)
+        _fill_raw(state_pool.slot_byte_views(slots[3]), seed=6)
+        assert store.save(tokens[:8], _bases([1, 2]), slots[3])
+        c2 = _entry_for(store, tokens[:8])
+        assert c2.parent_key is None
+        assert a.key not in store._entries and not a.path.exists()
+        assert store.status()["disabled"] is False
+        assert store._reserved_bytes == 0 and not store._pins and not store._inflight
+    finally:
+        store.close()
+
+
+def test_ssd_drop_order_and_restart_follow_edges_when_a_child_is_shorter(tmp_path: Path):
+    """A(16) <- C(8, zero-KV) <- D(12, cut 8, a fork after C): length no longer orders the
+    graph. Dropping the family must delete D before C before A; a restart must admit the
+    shorter child, reject a child whose parent is missing, and reject an injected cycle."""
+    store, kv_pool, state_pool = _chain_store(tmp_path)
+    slots = state_pool.alloc(4)
+    tokens = torch.arange(16, dtype=torch.int32) + 3
+    fork = torch.cat([tokens[:8], torch.arange(900, 904, dtype=torch.int32)])
+    a = _save_turn(store, kv_pool, state_pool, tokens, [1, 2, 3, 4], slots[0], seed=1, new_pages=[1, 2, 3, 4])
+    c = _save_turn(store, kv_pool, state_pool, tokens[:8], [1, 2], slots[1], seed=2, new_pages=[])
+    d = _save_turn(store, kv_pool, state_pool, fork, [1, 2, 7], slots[2], seed=3, new_pages=[7])
+    assert c.parent_key == a.key and d.parent_key == c.key and d.parent_token_count == 8
+    assert d.kv_bytes == 4 * kv_pool.unit_bytes()[0]
+    order = [entry.key for entry in store._drop_order([a, c, d])]
+    assert order.index(d.key) < order.index(c.key) < order.index(a.key)
+    oracle_d = _raw_bytes(_page_views(kv_pool, [1, 2, 7]))
+    oracle_d_state = _raw_bytes(state_pool.slot_byte_views(slots[2]))
+    store.close()
+
+    (tmp_path / "park.json").unlink()
+    reopened = _chain_store(tmp_path, pools=(kv_pool, state_pool))[0]
+    try:
+        assert set(reopened._entries) == {a.key, c.key, d.key}
+        assert reopened._entries[d.key].parent_key == c.key
+        assert {entry.root_key for entry in reopened._entries.values()} == {a.key}
+        hit = reopened.lookup(torch.cat([fork, tokens[:1]]))
+        assert hit is reopened._entries[d.key]
+        reopened.restore(hit, _bases([20, 21, 22]), slots[3])
+        _assert_raw_equal(_raw_bytes(_page_views(kv_pool, [20, 21, 22])), oracle_d)
+        _assert_raw_equal(_raw_bytes(state_pool.slot_byte_views(slots[3])), oracle_d_state)
+        # An in-memory cycle is never a valid chain and never an infinite walk; the broken
+        # endpoint is dropped and nothing shorter on that path is left to answer.
+        reopened._entries[a.key].parent_key = d.key
+        assert reopened._chain(reopened._entries[d.key]) is None
+        assert reopened.lookup(torch.cat([fork, tokens[:1]])) is None
+        assert d.key not in reopened._entries
+    finally:
+        reopened.close()
+
+    # Restart again with the shorter middle child's file gone: its dependant D (rewritten
+    # below so it exists again) must be rejected and A survives on its own.
+    (tmp_path / "park.json").unlink()
+    rewrite = _chain_store(tmp_path, pools=(kv_pool, state_pool))[0]
+    try:
+        assert set(rewrite._entries) == {a.key}
+        assert rewrite.save(tokens[:8], _bases([1, 2]), slots[1])
+        assert rewrite.save(fork, _bases([1, 2, 7]), slots[2])
+        c_again, d_again = _entry_for(rewrite, tokens[:8]), _entry_for(rewrite, fork)
+        assert c_again.parent_key == a.key and d_again.parent_key == c_again.key
+    finally:
+        rewrite.close()
+    (tmp_path / "park.json").unlink()
+    c_again.path.unlink()
+    reopened = _chain_store(tmp_path, pools=(kv_pool, state_pool))[0]
+    try:
+        assert set(reopened._entries) == {a.key}
+        assert not d_again.path.exists()
+        # Dropping the whole family removes every file, children first.
+        reopened._drop_entry(a.key)
+        assert not list(tmp_path.glob("*.park"))
+    finally:
+        reopened.close()
+
+
+def test_ssd_lookup_drops_a_broken_endpoint_and_answers_with_a_shorter_valid_one(tmp_path: Path):
+    store, kv_pool, state_pool = _chain_store(tmp_path)
+    slots = state_pool.alloc(3)
+    tokens = torch.arange(12, dtype=torch.int32)
+    try:
+        a = _save_turn(store, kv_pool, state_pool, tokens[:8], [1, 2], slots[0], seed=1, new_pages=[1, 2])
+        b = _save_turn(store, kv_pool, state_pool, tokens, [1, 2, 3], slots[1], seed=2, new_pages=[3])
+        # B names a parent digest that no longer matches: its chain is broken underneath it.
+        b.parent_metadata_sha256 = "f" * 64
+        hit = store.lookup(torch.cat([tokens, tokens[:1]]))
+        assert hit is a
+        assert b.key not in store._entries and not b.path.exists()
+        assert store.status()["hits"] == 1 and store.status()["misses"] == 0
+    finally:
+        store.close()
+
+
+def test_ssd_v4_files_and_manifest_are_invalidated_once(tmp_path: Path):
+    kv_pool, state_pool = _qsa_pool(), _state_pool()
+    pages = torch.tensor([0, 4], dtype=torch.int32)
+    slot = state_pool.alloc(1)[0]
+    _fill_entry(kv_pool, state_pool, pages, slot)
+    tokens = torch.arange(8, dtype=torch.int32)
+    store = _store("ssd", tmp_path, kv_pool, state_pool)
+    assert store.save(tokens, pages, slot)
+    store.close()
+    path = next(tmp_path.glob("*.park"))
+    raw = bytearray(path.read_bytes())
+    raw[len(park_module._MAGIC) : len(park_module._MAGIC) + 4] = (4).to_bytes(4, "little")
+    path.write_bytes(bytes(raw))
+    manifest = tmp_path / "park.json"
+    manifest.write_text(manifest.read_text(encoding="utf-8").replace('"version": 5', '"version": 4'), encoding="utf-8")
+    other = tmp_path / "unrelated.txt"
+    other.write_text("keep me", encoding="utf-8")
+
+    rebuilt = _store("ssd", tmp_path, kv_pool, state_pool)
+    try:
+        assert rebuilt.lookup(tokens) is None
+        assert rebuilt.status()["parked_count"] == 0
+        assert not path.exists() and other.exists()
+        assert json.loads(manifest.read_text(encoding="utf-8"))["version"] == 5
+    finally:
+        rebuilt.close()

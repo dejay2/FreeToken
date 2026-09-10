@@ -671,6 +671,61 @@ class CacheManager:
         if match.mamba_value is not None:
             match.node.park_finished = False
 
+    def _eager_checkpoint_wanted(self, req: Req) -> bool:
+        """SSD parking only, and never for an aborted request (an aborted chunked prefill
+        would otherwise promote a half-built prompt into a saved checkpoint)."""
+        return (
+            self.park_store is not None
+            and getattr(self.park_store, "mode", None) == "ssd"
+            and not self._temporary_lease_depth
+            and not getattr(req, "aborted", False)
+        )
+
+    def _checkpoint_match(self, match, L: int) -> bool:
+        """``match`` is the exact, page-aligned, state-bearing tree node at ``L``."""
+        store = self.park_store
+        return (
+            store is not None
+            and match.mamba_value is not None
+            and not match.node.is_root()
+            and match.cached_len == L
+            and L >= store.min_tokens
+            and L % self.page_size == 0
+        )
+
+    def _save_prompt_checkpoint(self, match, input_ids: torch.Tensor, L: int) -> bool:
+        """Persist the final-prefill checkpoint at ``L`` as its own SSD segment, synchronously
+        and without detaching anything from the tree.
+
+        On the live 5090 (2026-09-10, v4 parent links) real agent traffic linked almost no
+        saves and hit 1 restore in 18: the harness sends one conversation prefix two or three
+        times per turn with different tails, and the next real turn diverged 44-148 tokens
+        before the end of the previous *finish* save, whose state encodes the side request's
+        tail. The prefix every later request really shares is this prompt checkpoint, and it
+        must be saved now: the engine has 12 state slots, so an internal snapshot may be
+        tombstoned long before it becomes a parkable leaf. The save reads the canonical tree
+        pages and the frozen tree slot (never the request's advancing live slot) while the
+        request's lock protects them, and returns before the caller releases anything, so
+        page/state ownership is unchanged. This is a deliberate, bounded synchronous choice:
+        it may delay the final-prefill reply while the disk write completes (J4 records that
+        latency) but adds no second GPU-ownership mode or extra state slot. A first save of a
+        new conversation is the expensive one; later checkpoints add one state plus changed
+        pages. Failure or refusal leaves inference untouched and surfaces in park status.
+        """
+        store = self.park_store
+        if store is None:
+            return False
+        try:
+            return bool(
+                store.save(input_ids[:L], match.kv_indices[:: self.page_size], match.mamba_value)
+            )
+        except Exception as exc:
+            logger.warning(f"KV park prompt checkpoint save failed: {exc!r}")
+            note_error = getattr(store, "note_error", None)
+            if note_error is not None:
+                note_error(f"prompt checkpoint save failed: {exc!r}")
+            return False
+
     def _cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
         """Hybrid (GDN) cache_req: commit KV like radix AND manage the GDN state snapshot.
         Prefill chunk commit: DONATE the frozen ping-pong slot (the snapshot the forward wrote
@@ -712,7 +767,23 @@ class CacheManager:
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:L], page_indices[:L], frozen)
                 self._bump_park_generation()
-                if not mamba_exist:
+                checkpointed = False
+                if self._eager_checkpoint_wanted(req):
+                    # The frozen checkpoint at L is a strictly shorter prefix than the finish
+                    # donate below and would otherwise be freed or evicted before it could
+                    # ever be parked. Save it now from the canonical pages and tree slot,
+                    # under a temporary lock of its own node (old_handle covers only the
+                    # admission prefix), exactly as the final-prefill commit does.
+                    m = self.prefix_cache.match_prefix(req.input_ids[:L])
+                    if self._checkpoint_match(m, L):
+                        self.prefix_cache.inc_lock(m.node)
+                        try:
+                            self._save_prompt_checkpoint(m, req.input_ids, L)
+                        finally:
+                            self.prefix_cache.dec_lock(m.node)
+                        m.node.park_finished = True
+                        checkpointed = True
+                if not mamba_exist and not checkpointed:
                     self._mark_unfinished_park_node(req.input_ids[:L])
                 pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
                 req.mamba_ping_pong = None
@@ -767,8 +838,6 @@ class CacheManager:
         # evict_mamba (via ensure_mamba_slots), which would otherwise reclaim this still-unlocked
         # just-donated node -- freeing its KV pages under the still-decoding request.
         m = self.prefix_cache.match_prefix(req.input_ids[:L])
-        if not mamba_exist:
-            m.node.park_finished = False
         # Same re-point as the generic path: the dedup free above returned this request's own
         # pages for [old_handle.cached_len, prefix_len) while its row still named them.
         if prefix_len > old_handle.cached_len:
@@ -776,6 +845,18 @@ class CacheManager:
                 m.kv_indices[old_handle.cached_len : prefix_len])
         req.cache_handle = HybridCacheHandle(m.cached_len, m.node, m.kv_indices)
         self.lock(req.cache_handle)
+        # The scheduler commits only the final prefill (intermediate chunks never reach
+        # cache_req), so this node is the request's prompt checkpoint: the shared prefix every
+        # later side request and next turn starts from. With SSD parking save it now, before
+        # replacement-slot pressure below can tombstone it, and mark it a completed checkpoint
+        # so that once its children are gone the ordinary leaf path finds a duplicate key
+        # (no rewrite) and releases it. RAM mode and parking-off keep the previous behavior:
+        # an unfinished intermediate snapshot that ordinary eviction reclaims.
+        if self._eager_checkpoint_wanted(req) and self._checkpoint_match(m, L):
+            self._save_prompt_checkpoint(m, req.input_ids, L)
+            m.node.park_finished = True
+        elif not mamba_exist:
+            m.node.park_finished = False
         if not mamba_exist:                                # tree took `frozen`; replace it
             self.ensure_mamba_slots(1)
             pp = list(req.mamba_ping_pong)

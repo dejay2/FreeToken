@@ -6,17 +6,22 @@ exact bytes returned by ``QSAKVCache.page_byte_views`` plus one complete
 any page or state slot to a free list, then a later match restores into ordinary newly-allocated
 pages and inserts the prefix into the unchanged hybrid radix tree.
 
-The SSD format (version 4) stores one immutable *segment* per finished turn: a versioned 4-KiB
-header, the verbatim int32 token ids of the whole prefix, then two independently checksummed
-4-KiB-aligned regions -- the KV pages this segment adds on top of its parent segment, and one
-complete recurrent-state slot.  A root segment starts its KV at token zero; a child names its
-parent's key and immutable metadata digest, so turn N+1 writes only its new pages plus the
-current state instead of copying the whole prefix again.  Every read validates the model/layout
-fingerprint, token ids, parent chain and region digests, so stale or damaged files, broken
-chains and rolling-hash collisions become misses rather than numerics changes.  Restore walks
-root -> target once, alternating two bounded pinned windows so disk read N+1 overlaps H2D copy
-N; the background writer yields those shared windows while a restore is active.  The files are
-the source of truth; no full SSD entry remains in RAM.
+The SSD format (version 5) stores one immutable *segment* per saved checkpoint: a versioned
+4-KiB header, the verbatim int32 token ids of the whole prefix, then two independently
+checksummed 4-KiB-aligned regions -- the KV pages this segment adds on top of its parent
+segment, and one complete recurrent-state slot.  A root segment starts its KV at token zero; a
+child names its parent's key, immutable metadata digest and the page-aligned *cut* at which it
+borrows the parent's KV.  Two cuts are legal: the parent's whole length (an ordinary
+continuation, which writes only its new pages plus the current state) and the child's own
+length (a shorter checkpoint whose bytes already lie inside a longer committed segment, which
+writes no KV at all -- only its own state at that exact cut).  A segment therefore stores
+exactly one state, at its own end, and a restore never rewinds a longer segment's state to a
+shorter cut.  Every read validates the model/layout fingerprint, token ids, parent chain and
+region digests, so stale or damaged files, broken chains and rolling-hash collisions become
+misses rather than numerics changes.  Restore walks root -> target once, copying only each
+ancestor's effective range, alternating two bounded pinned windows so disk read N+1 overlaps
+H2D copy N; the background writer yields those shared windows while a restore is active.  The
+files are the source of truth; no full SSD entry remains in RAM.
 """
 
 from __future__ import annotations
@@ -49,10 +54,23 @@ _MAGIC = b"FTKVPARK"
 # averaging 863 MB, the 32 GB park directory pinned at its cap, 27 MB/s written while serving
 # and 793 GB written in 46 hours. A v4 child writes (new tokens x KV bytes/token) plus one
 # 115,642,376-byte state slot, so 65,536 + 256 tokens fall from 987,254,792 to 119,033,864
-# payload bytes (8.29x). Older versions are rejected by _parse_header and deleted once by
-# _load_or_scan, which is the intended upgrade path: parking is off by default and an entry is
-# cheap to rebuild.
-_VERSION = 4
+# payload bytes (8.29x).
+# 5: a child's parent_token_count is a *cut* that may equal the child's own length (2026-09-10).
+# Under v4 a child could only link to a parent that was a complete, exact prefix, and a lookup
+# only hit when a whole entry was a prefix of the prompt. On the live 5090 with real agent
+# traffic that linked almost nothing: in 50 minutes the manifest held 16 entries and 18.5 GB,
+# 1 hit against 18 misses, ~18 MB/s written. The harness sends the same conversation prefix
+# two or three times per turn with different tails (the real next turn, a permission
+# classifier, a status line): the next real turn shared its predecessor's save up to 44-148
+# tokens before the end (88,724 of 88,768; 74,860 of 75,008), and a side request was a
+# shorter exact prefix of an earlier, longer save (71,424 of 71,552). Neither shape linked, so
+# each was a 1-2.7 GB standalone copy. v5 lets the scheduler save the final-prefill checkpoint
+# as its own segment (the shared prefix the later requests really reach) and lets a shorter
+# checkpoint borrow KV from a longer committed segment through its own cut with zero KV bytes
+# of its own. Older versions are rejected by _parse_header and deleted once by _load_or_scan,
+# which is the intended upgrade path: parking is off by default and an entry is cheap to
+# rebuild.
+_VERSION = 5
 _HEADER_BYTES = 4096
 _ALIGNMENT = 4096
 _COPY_BYTES = 32 << 20
@@ -137,8 +155,11 @@ class ParkedEntry:
     ``payload_bytes`` is the complete snapshot size for a RAM entry but, for an SSD segment,
     only the bytes *this file* holds (its KV region plus its state region): a child segment's
     earlier pages live in its ancestors. ``ParkStore.payload_bytes(n)`` keeps the logical
-    full-snapshot meaning. ``root_key`` is in-memory only and names the family this segment
-    belongs to (itself for a root); the family is the unit of eviction.
+    full-snapshot meaning. ``parent_token_count`` is the page-aligned cut at which this segment
+    borrows its parent's KV: the parent's whole length for a continuation, or this segment's
+    own length for a shorter checkpoint that owns no KV bytes. ``root_key`` is in-memory only
+    and names the family this segment belongs to (itself for a root); the family is the unit
+    of eviction.
     """
 
     key: str
@@ -172,6 +193,9 @@ class _SaveOp:
     tokens: torch.Tensor
     keys: list[str]
     parent: ParkedEntry | None = None
+    # The cut this save borrows through: parent.token_count for a continuation, len(tokens)
+    # for a shorter checkpoint, 0 for a root. Sizing, writing and validation all use it.
+    cut: int = 0
     chain: tuple[ParkedEntry, ...] = ()
     root_key: str | None = None
     reserved_bytes: int = 0
@@ -668,19 +692,19 @@ class ParkStore:
             raise ValueError("park token_count must be page aligned")
         return token_count * self._kv_bytes_per_token() + self._state_bytes()
 
-    def _segment_layout(
-        self, token_count: int, parent_token_count: int
-    ) -> tuple[int, int, int, int]:
-        """``(kv_offset, kv_bytes, state_offset, state_bytes)`` of one v4 file."""
+    def _segment_layout(self, token_count: int, cut: int) -> tuple[int, int, int, int]:
+        """``(kv_offset, kv_bytes, state_offset, state_bytes)`` of one v5 file.
+
+        ``cut`` is the parent cut: 0 for a root, the parent's length for a continuation, or
+        ``token_count`` itself for a shorter checkpoint, whose KV region is then empty.
+        """
         kv_offset = _align_up(_HEADER_BYTES + token_count * torch.int32.itemsize)
-        kv_bytes = (token_count - parent_token_count) * self._kv_bytes_per_token()
+        kv_bytes = (token_count - cut) * self._kv_bytes_per_token()
         state_offset = _align_up(kv_offset + kv_bytes)
         return kv_offset, kv_bytes, state_offset, self._state_bytes()
 
-    def _segment_bytes(self, token_count: int, parent_token_count: int) -> int:
-        kv_offset, kv_bytes, state_offset, state_bytes = self._segment_layout(
-            token_count, parent_token_count
-        )
+    def _segment_bytes(self, token_count: int, cut: int) -> int:
+        kv_offset, kv_bytes, state_offset, state_bytes = self._segment_layout(token_count, cut)
         return state_offset + state_bytes
 
     def storage_bytes(self, token_count: int) -> int:
@@ -690,10 +714,12 @@ class ParkStore:
             return payload + token_count * torch.int32.itemsize
         return self._segment_bytes(token_count, 0)
 
-    def _planned_bytes(self, token_count: int, parent: ParkedEntry | None) -> int:
+    def _planned_bytes(self, token_count: int, cut: int) -> int:
+        """Exact file bytes of a save at ``cut``: a zero-KV child still pays header, the full
+        token list, padding and one complete state slot (about 115.6 MB on the live model)."""
         if self.mode == "ram":
             return self.storage_bytes(token_count)
-        return self._segment_bytes(token_count, parent.token_count if parent else 0)
+        return self._segment_bytes(token_count, cut)
 
     def _entry_views(self, page_bases: torch.Tensor, state_slot: int) -> _ByteSpan:
         bases = page_bases.detach().to(device="cpu", dtype=torch.int64).tolist()
@@ -822,14 +848,14 @@ class ParkStore:
         key: str,
         token_count: int,
         parent: ParkedEntry | None,
+        cut: int,
         kv_sha256: str,
         state_sha256: str,
         tokens_sha256: str,
     ) -> dict:
-        parent_tokens = parent.token_count if parent is not None else 0
-        kv_offset, kv_bytes, state_offset, state_bytes = self._segment_layout(
-            token_count, parent_tokens
-        )
+        if parent is None:
+            cut = 0
+        kv_offset, kv_bytes, state_offset, state_bytes = self._segment_layout(token_count, cut)
         meta = {
             "version": _VERSION,
             "fingerprint": self.fingerprint,
@@ -837,7 +863,7 @@ class ParkStore:
             "token_count": token_count,
             "page_size": self.page_size,
             "parent_key": parent.key if parent is not None else None,
-            "parent_token_count": parent_tokens,
+            "parent_token_count": cut,
             "parent_metadata_sha256": (
                 parent.metadata_sha256 if parent is not None else None
             ),
@@ -898,13 +924,16 @@ class ParkStore:
             if parent_tokens != 0 or parent_digest is not None:
                 raise ParkEntryRejected(f"KV park root names a parent: {path}")
         else:
+            # A cut equal to the child's own length is the v5 shorter checkpoint (zero KV
+            # bytes); whether the parent is really longer is checked against the parent
+            # entry in _parent_matches, since a header cannot see its parent.
             if (
                 not _is_hex(parent_key, 32)
                 or parent_key == meta["key"]
                 or not _is_hex(parent_digest, 64)
                 or parent_tokens <= 0
                 or parent_tokens % self.page_size
-                or parent_tokens >= token_count
+                or parent_tokens > token_count
             ):
                 raise ParkEntryRejected(f"invalid KV park parent link: {path}")
         kv_offset, kv_bytes, state_offset, state_bytes = self._segment_layout(
@@ -953,7 +982,12 @@ class ParkStore:
     # ---- chains and families ---------------------------------------------------------
 
     def _chain(self, entry: ParkedEntry) -> tuple[ParkedEntry, ...] | None:
-        """Root -> ``entry`` through committed segments only; ``None`` if any link is broken."""
+        """Root -> ``entry`` through committed segments only; ``None`` if any link is broken.
+
+        A shorter checkpoint means token length is no longer a topological order, so the walk
+        follows identity links with cycle protection and finally checks that the effective
+        ranges tile ``[0, entry.token_count)`` exactly.
+        """
         chain: list[ParkedEntry] = []
         seen: set[str] = set()
         current: ParkedEntry | None = entry
@@ -969,42 +1003,110 @@ class ParkStore:
                 return None
             current = parent
         chain.reverse()
+        if self._chain_ranges(chain, entry.token_count) is None:
+            return None
         return tuple(chain)
 
     @staticmethod
-    def _parent_matches(parent: ParkedEntry, child: ParkedEntry) -> bool:
+    def _legal_cut(parent_tokens: int, child_tokens: int, cut: int) -> bool:
+        """The only two parent relationships v5 admits (see the version note)."""
+        if cut <= 0:
+            return False
+        continuation = cut == parent_tokens and parent_tokens < child_tokens
+        shorter_checkpoint = cut == child_tokens and child_tokens < parent_tokens
+        return continuation or shorter_checkpoint
+
+    @classmethod
+    def _parent_matches(cls, parent: ParkedEntry, child: ParkedEntry) -> bool:
+        cut = child.parent_token_count
         return (
             parent.path is not None
             and parent.key == child.parent_key
-            and parent.token_count == child.parent_token_count
-            and parent.token_count < child.token_count
+            and cls._legal_cut(parent.token_count, child.token_count, cut)
             and parent.metadata_sha256 is not None
             and parent.metadata_sha256 == child.parent_metadata_sha256
-            and torch.equal(parent.token_ids, child.token_ids[: parent.token_count])
+            and torch.equal(parent.token_ids[:cut], child.token_ids[:cut])
         )
 
-    def _plan_parent(self, tokens: torch.Tensor, keys: list[str]) -> ParkedEntry | None:
-        """Longest committed, chain-complete entry that is an exact page-aligned prefix.
+    @staticmethod
+    def _chain_ranges(
+        chain: tuple[ParkedEntry, ...] | list[ParkedEntry], needed_end: int
+    ) -> list[tuple[ParkedEntry, int, int]] | None:
+        """Effective KV token range ``[start, stop)`` each segment contributes to a target
+        that needs ``[0, needed_end)``; root first. ``None`` if the ranges do not tile it.
 
-        Deliberately not ``lookup()``: planning must not move the hit/miss counters, and a
-        colliding shorter entry is merely skipped here rather than dropped.
+        Walking from the target up, a segment contributes ``[cut, needed_end)`` of its own
+        local KV interval and passes ``min(needed_end, cut)`` to its parent, so a longer donor
+        behind a shorter checkpoint is clipped to the checkpoint's cut and a zero-KV segment
+        contributes nothing. State always comes from the target alone.
+        """
+        target_end = needed_end
+        ranges: list[tuple[ParkedEntry, int, int]] = []
+        for segment in reversed(chain):
+            start = segment.parent_token_count
+            stop = needed_end if needed_end > start else start
+            if stop > segment.token_count:
+                return None
+            ranges.append((segment, start, stop))
+            needed_end = min(needed_end, start)
+        ranges.reverse()
+        cursor = 0
+        for _segment, start, stop in ranges:
+            if stop <= start:
+                continue
+            if start != cursor:
+                return None
+            cursor = stop
+        if cursor != target_end:
+            return None
+        return ranges
+
+    def _plan_parent(
+        self, tokens: torch.Tensor, keys: list[str]
+    ) -> tuple[ParkedEntry, int] | None:
+        """``(parent, cut)`` for a new save of ``tokens``, or ``None`` for a standalone root.
+
+        The largest reusable cut wins: a committed longer segment whose prefix equals the
+        whole of ``tokens`` supplies every KV byte (cut == len(tokens), a zero-KV child);
+        otherwise the longest committed chain-complete entry that is an exact page-aligned
+        prefix (cut == parent length). Among equal cuts the shorter donor with the smaller key
+        wins, deterministically, to keep verification reads small. Deliberately not
+        ``lookup()``: planning must not move the hit/miss counters, and a colliding shorter
+        entry is merely skipped here rather than dropped. The longer-donor scan compares
+        committed token lists directly (tens of entries on the live box); it computes no
+        arbitrary longest-common-prefix and never invents a cut without a saved state.
         """
         if self.mode != "ssd":
             return None
+        token_count = len(tokens)
+        best: tuple[tuple[int, str], ParkedEntry] | None = None
+        for candidate in self._entries.values():
+            if candidate.path is None or candidate.token_count <= token_count:
+                continue
+            rank = (candidate.token_count, candidate.key)
+            if best is not None and rank >= best[0]:
+                continue
+            if not torch.equal(candidate.token_ids[:token_count], tokens):
+                continue
+            if self._chain(candidate) is None:
+                continue
+            best = (rank, candidate)
+        if best is not None:
+            return best[1], token_count
         for page_number in range(len(keys) - 1, 0, -1):
-            token_count = page_number * self.page_size
-            if token_count < self.min_tokens:
+            cut = page_number * self.page_size
+            if cut < self.min_tokens:
                 break
             candidate = self._entries.get(keys[page_number - 1])
             if candidate is None or candidate.path is None:
                 continue
-            if candidate.token_count != token_count:
+            if candidate.token_count != cut:
                 continue
-            if not torch.equal(candidate.token_ids, tokens[:token_count]):
+            if not torch.equal(candidate.token_ids, tokens[:cut]):
                 continue
             if self._chain(candidate) is None:
                 continue
-            return candidate
+            return candidate, cut
         return None
 
     def _pin(self, root_key: str) -> None:
@@ -1061,10 +1163,40 @@ class ParkStore:
                     queue.append(child_key)
         return members
 
+    def _drop_order(self, victims: list[ParkedEntry]) -> list[ParkedEntry]:
+        """Child-before-parent order over the actual parent edges (iterative postorder).
+
+        Under v4 descendants were strictly longer than ancestors, so longest-first was a safe
+        order; a v5 shorter checkpoint is a *shorter* child, so length no longer orders the
+        graph. An interrupted drop must still leave valid roots, never orphans.
+        """
+        pending = {
+            victim.key: victim
+            for victim in victims
+            if self._entries.get(victim.key) is victim
+        }
+        order: list[ParkedEntry] = []
+        visited: set[str] = set()
+        for key in list(pending):
+            if key in visited:
+                continue
+            stack: list[tuple[str, bool]] = [(key, False)]
+            while stack:
+                current, expanded = stack.pop()
+                if expanded:
+                    order.append(pending[current])
+                    continue
+                if current in visited:
+                    continue
+                visited.add(current)
+                stack.append((current, True))
+                for child_key in self._children.get(current, ()):
+                    if child_key in pending and child_key not in visited:
+                        stack.append((child_key, False))
+        return order
+
     def _drop_entries(self, victims: list[ParkedEntry], *, write_manifest: bool) -> None:
-        # Descendants are strictly longer than their ancestors, so longest-first is a safe
-        # child-before-parent order: an interrupted drop leaves valid roots, never orphans.
-        for victim in sorted(victims, key=lambda entry: -entry.token_count):
+        for victim in self._drop_order(victims):
             if self._entries.get(victim.key) is not victim:
                 continue
             del self._entries[victim.key]
@@ -1117,21 +1249,23 @@ class ParkStore:
             self._drop_entry(key)
         if any(path.stem == key for _root, path, _nbytes in self._pending_unlinks):
             return None
-        parent = self._plan_parent(tokens, keys)
-        needed = self._planned_bytes(len(tokens), parent)
+        plan = self._plan_parent(tokens, keys)
+        parent, cut = plan if plan is not None else (None, 0)
+        needed = self._planned_bytes(len(tokens), cut)
         budget = self.ram_budget_bytes if self.mode == "ram" else self.disk_budget_bytes
         if needed > budget:
             return None
         before = len(self._entries)
         op = _SaveOp(key=key, tokens=tokens, keys=keys)
-        self._adopt_parent(op, parent)
+        self._adopt_parent(op, parent, cut)
         try:
             # Pin before eviction: the 2026-09-09 CPU pressure probe otherwise rewrote
-            # 311,448 KV bytes instead of 152 by evicting its own selected parent.
+            # 311,448 KV bytes instead of 152 by evicting its own selected parent. A zero-KV
+            # child pins its donor family the same way.
             fits = self._evict_to_fit(needed)
             if not fits and parent is not None:
-                self._adopt_parent(op, None)
-                needed = self._planned_bytes(len(tokens), None)
+                self._adopt_parent(op, None, 0)
+                needed = self._planned_bytes(len(tokens), 0)
                 fits = needed <= budget and self._evict_to_fit(needed)
             if self.mode == "ssd" and len(self._entries) != before:
                 self._write_manifest()
@@ -1143,15 +1277,16 @@ class ParkStore:
             return op
         finally:
             if not op.reserved_bytes:
-                self._adopt_parent(op, None)
+                self._adopt_parent(op, None, 0)
 
-    def _adopt_parent(self, op: _SaveOp, parent: ParkedEntry | None) -> None:
+    def _adopt_parent(self, op: _SaveOp, parent: ParkedEntry | None, cut: int) -> None:
         """Pin the new parent's family before releasing the old pin."""
         new_root = parent.root_key if parent is not None else None
         if new_root is not None:
             self._pin(new_root)
         old_root = op.root_key
         op.parent = parent
+        op.cut = cut if parent is not None else 0
         op.root_key = new_root
         op.chain = (self._chain(parent) or ()) if parent is not None else ()
         if old_root is not None:
@@ -1167,22 +1302,24 @@ class ParkStore:
         return True
 
     def _replan(self, op: _SaveOp) -> bool:
-        """At the writer: re-check the pinned parent and prefer any longer one committed since."""
+        """At the writer: re-check the pinned parent and prefer any larger cut committed since."""
         if op.parent is not None and self._chain(op.parent) is None:
-            self._adopt_parent(op, None)
-        best = self._plan_parent(op.tokens, op.keys)
-        if best is not None and (op.parent is None or best.token_count > op.parent.token_count):
-            needed = self._planned_bytes(len(op.tokens), best)
-            if self._resize_reservation(op, needed):
-                self._adopt_parent(op, best)
+            self._adopt_parent(op, None, 0)
+        plan = self._plan_parent(op.tokens, op.keys)
+        if plan is not None:
+            best, cut = plan
+            if op.parent is None or cut > op.cut:
+                needed = self._planned_bytes(len(op.tokens), cut)
+                if self._resize_reservation(op, needed):
+                    self._adopt_parent(op, best, cut)
         if op.parent is None:
-            return self._resize_reservation(op, self._planned_bytes(len(op.tokens), None))
+            return self._resize_reservation(op, self._planned_bytes(len(op.tokens), 0))
         return True
 
     def _switch_to_root(self, op: _SaveOp) -> bool:
         """The source prefix no longer matches the parent bytes: fall back to a standalone root."""
-        self._adopt_parent(op, None)
-        return self._resize_reservation(op, self._planned_bytes(len(op.tokens), None))
+        self._adopt_parent(op, None, 0)
+        return self._resize_reservation(op, self._planned_bytes(len(op.tokens), 0))
 
     def _finish_op(self, op: _SaveOp) -> None:
         """Release whatever the operation still owns; safe to call exactly once per op."""
@@ -1216,21 +1353,40 @@ class ParkStore:
 
     # ---- writing -----------------------------------------------------------------------
 
-    def _prefix_matches(self, span: _ByteSpan, chain: tuple[ParkedEntry, ...]) -> bool:
-        """Byte-identity guard: hash the *current* source KV prefix against each ancestor region.
+    def _prefix_matches(
+        self, span: _ByteSpan, chain: tuple[ParkedEntry, ...], cut: int
+    ) -> bool:
+        """Byte-identity guard: the *current* source KV prefix ``[0, cut)`` must equal the
+        bytes the chain would restore there.
 
         Equal tokens do not prove a cold recomputation produced identical floating-point KV,
         and today's save contract carries no provenance, so the reused prefix is streamed
-        through the bounded windows and compared with the digests the ancestors recorded. It
-        costs one D2H+hash pass over the prefix but writes nothing; the SSD traffic this job
-        targets is the write side. Restores may interleave between chunks as with the writer.
+        through the bounded windows and compared with what the ancestors recorded. A segment
+        used in full is compared through its recorded region digest (one D2H+hash pass, no
+        disk read). A donor clipped to a shorter cut has no stored digest for that prefix, so
+        its whole KV region is read back and hashed through one window while the borrowed
+        intersection is compared byte-for-byte against the staged source through the other
+        window: extra reads, never a skipped check, and never a full prefix buffer. Both cost
+        nothing on the write side, which is the SSD traffic this job targets. Restores may
+        interleave between chunks as with the writer.
         """
         assert self._windows is not None
+        ranges = self._chain_ranges(chain, cut)
+        if ranges is None:
+            return False
         per_token = self._kv_bytes_per_token()
-        for segment in chain:
+        for segment, start_tokens, stop_tokens in ranges:
+            if stop_tokens <= start_tokens:
+                continue
+            if stop_tokens < segment.token_count:
+                if not self._clipped_prefix_matches(
+                    span, segment, start_tokens * per_token, stop_tokens * per_token
+                ):
+                    return False
+                continue
             digest = self._new_payload_digest(segment.digest_chunk_bytes)
-            start = segment.parent_token_count * per_token
-            stop = segment.token_count * per_token
+            start = start_tokens * per_token
+            stop = stop_tokens * per_token
             for offset in range(start, stop, self.pinned_window_bytes):
                 length = min(self.pinned_window_bytes, stop - offset)
                 with self._window_lock:
@@ -1240,6 +1396,55 @@ class ParkStore:
             if digest.hexdigest() != segment.kv_sha256:
                 return False
         return True
+
+    def _clipped_prefix_matches(
+        self, span: _ByteSpan, segment: ParkedEntry, use_lo: int, use_hi: int
+    ) -> bool:
+        """Read ``segment``'s whole KV region, verify its digest, and compare the logical bytes
+        ``[use_lo, use_hi)`` with the current source. A digest mismatch is corruption: the
+        segment and its dependants are dropped so no later save or restore trusts them."""
+        assert self._windows is not None
+        if segment.path is None:
+            return False
+        per_token = self._kv_bytes_per_token()
+        region_base = segment.parent_token_count * per_token
+        digest = self._new_payload_digest(segment.digest_chunk_bytes)
+        equal = True
+        damaged: str | None = None
+        try:
+            with segment.path.open("rb", buffering=0) as handle:
+                handle.seek(segment.kv_offset)
+                for offset in range(0, segment.kv_bytes, self.pinned_window_bytes):
+                    take = min(self.pinned_window_bytes, segment.kv_bytes - offset)
+                    with self._window_lock:
+                        disk, source = self._windows
+                        raw = memoryview(disk[:take].numpy()).cast("B")
+                        if handle.readinto(raw) != take:
+                            damaged = "short read"
+                            break
+                        _release_file_cache(handle)
+                        digest.update(raw)
+                        chunk_lo = region_base + offset
+                        lo = max(chunk_lo, use_lo)
+                        hi = min(chunk_lo + take, use_hi)
+                        if equal and lo < hi:
+                            self._stage_source_chunk(span, lo, hi - lo, source)
+                            if not torch.equal(
+                                source[: hi - lo], disk[lo - chunk_lo : hi - chunk_lo]
+                            ):
+                                equal = False
+        except OSError as exc:
+            damaged = repr(exc)
+        if damaged is None and digest.hexdigest() != segment.kv_sha256:
+            damaged = "checksum mismatch"
+        if damaged is not None:
+            # The donor, not the source, is at fault: forget it and its dependants so no later
+            # save or restore trusts it, and let this save fall back to a standalone root.
+            logger.warning(f"KV park donor unreadable ({damaged}), dropping: {segment.path}")
+            with self._lock:
+                self._drop_entry(segment.key)
+            return False
+        return equal
 
     def _write_region(
         self,
@@ -1278,10 +1483,8 @@ class ParkStore:
         tokens = op.tokens
         parent = op.parent
         token_count = len(tokens)
-        parent_tokens = parent.token_count if parent is not None else 0
-        kv_offset, kv_bytes, state_offset, state_bytes = self._segment_layout(
-            token_count, parent_tokens
-        )
+        cut = op.cut if parent is not None else 0
+        kv_offset, kv_bytes, state_offset, state_bytes = self._segment_layout(token_count, cut)
         per_token = self._kv_bytes_per_token()
         tokens_digest = _tokens_sha256(tokens)
         final = self.ssd_dir / f"{op.key}.park"
@@ -1290,6 +1493,7 @@ class ParkStore:
             key=op.key,
             token_count=token_count,
             parent=parent,
+            cut=cut,
             kv_sha256=_PLACEHOLDER_DIGEST,
             state_sha256=_PLACEHOLDER_DIGEST,
             tokens_sha256=tokens_digest,
@@ -1306,9 +1510,7 @@ class ParkStore:
                     handle,
                     bytes(kv_offset - _HEADER_BYTES - token_count * torch.int32.itemsize),
                 )
-                kv_sha256 = self._write_region(
-                    handle, span, parent_tokens * per_token, kv_bytes
-                )
+                kv_sha256 = self._write_region(handle, span, cut * per_token, kv_bytes)
                 _write_all(handle, bytes(state_offset - kv_offset - kv_bytes))
                 state_sha256 = self._write_region(
                     handle,
@@ -1321,6 +1523,7 @@ class ParkStore:
                     key=op.key,
                     token_count=token_count,
                     parent=parent,
+                    cut=cut,
                     kv_sha256=kv_sha256,
                     state_sha256=state_sha256,
                     tokens_sha256=tokens_digest,
@@ -1342,7 +1545,7 @@ class ParkStore:
             last_used_ns=time.time_ns(),
             path=final,
             parent_key=parent.key if parent is not None else None,
-            parent_token_count=parent_tokens,
+            parent_token_count=cut,
             parent_metadata_sha256=parent.metadata_sha256 if parent is not None else None,
             kv_offset=kv_offset,
             kv_bytes=kv_bytes,
@@ -1545,7 +1748,7 @@ class ParkStore:
                         ram_buffer=buffer,
                     )
                 else:
-                    if chain and not self._prefix_matches(span, chain):
+                    if chain and not self._prefix_matches(span, chain, op.cut):
                         with self._lock:
                             if not self._switch_to_root(op):
                                 logger.info(
@@ -1610,6 +1813,17 @@ class ParkStore:
                     self._drop_entry(key)
                     self._misses += 1
                     return None
+                # Every committed endpoint is independently resumable: an ordinary finish, a
+                # scheduler-saved prompt checkpoint or a zero-KV shorter checkpoint, each with
+                # its own state at exactly ``token_count``. A longer entry is never sliced into
+                # a synthetic shorter hit: there is no saved state at that cut. An entry whose
+                # chain broke underneath it is dropped here so a shorter valid endpoint can
+                # still answer.
+                if entry.token_count != token_count or (
+                    entry.path is not None and self._chain(entry) is None
+                ):
+                    self._drop_entry(key)
+                    continue
                 entry.last_used_ns = time.time_ns()
                 self._hits += 1
                 return entry
@@ -1626,9 +1840,19 @@ class ParkStore:
         source_offset: int,
         length: int,
         span: _ByteSpan,
+        copy_lo: int | None = None,
+        copy_hi: int | None = None,
     ) -> bool:
+        """Copy the part of one read chunk that lands inside the destination span and, when
+        given, inside the segment's effective logical range ``[copy_lo, copy_hi)``: a donor
+        clipped by a shorter checkpoint must never write its unused tail over the target's
+        own suffix, not even into pages the caller freshly allocated."""
         restore_start = max(chunk_offset, source_offset)
         restore_stop = min(chunk_offset + chunk_length, source_offset + length)
+        if copy_lo is not None:
+            restore_start = max(restore_start, copy_lo)
+        if copy_hi is not None:
+            restore_stop = min(restore_stop, copy_hi)
         if restore_start >= restore_stop:
             return False
         window_offset = restore_start - chunk_offset
@@ -1656,12 +1880,15 @@ class ParkStore:
         dest_offset: int,
         dest_length: int,
         cuda: bool,
+        copy_lo: int | None = None,
+        copy_hi: int | None = None,
     ) -> None:
         """Read one checksummed file region through the alternating windows.
 
         Chunk ``o`` of the region holds logical snapshot bytes ``logical_base + o``; the part
-        that overlaps ``[dest_offset, dest_offset + dest_length)`` lands in ``span``. Bytes
-        before the caller's live prefix are still read and hashed -- chain integrity is checked
+        that overlaps ``[dest_offset, dest_offset + dest_length)`` and the segment's effective
+        range ``[copy_lo, copy_hi)`` lands in ``span``. Bytes before the caller's live prefix
+        or past a clipping cut are still read and hashed -- chain integrity is checked
         conservatively -- but never copied anywhere.
         """
         assert self._windows is not None
@@ -1703,7 +1930,7 @@ class ParkStore:
                 with torch.cuda.stream(self._stream):
                     copied = self._copy_restored_chunk(
                         window, logical_base + offset, chunk_length,
-                        dest_offset, dest_length, span,
+                        dest_offset, dest_length, span, copy_lo, copy_hi,
                     )
                     if copied:
                         done = torch.cuda.Event(enable_timing=False)
@@ -1711,7 +1938,8 @@ class ParkStore:
                         events[index] = done
             else:
                 self._copy_restored_chunk(
-                    window, logical_base + offset, chunk_length, dest_offset, dest_length, span
+                    window, logical_base + offset, chunk_length,
+                    dest_offset, dest_length, span, copy_lo, copy_hi,
                 )
             timing["copy_ms"] += (time.perf_counter() - mark) * 1000.0
         if digest.hexdigest() != expected_sha256:
@@ -1733,15 +1961,23 @@ class ParkStore:
         timing: dict[str, float],
         progress: dict,
     ) -> None:
-        """Read every segment's KV region once, then only the target's state region."""
+        """Read each contributing segment's whole KV region once, copying only its effective
+        range, then only the target's state region.
+
+        A segment whose effective range is empty (a zero-KV checkpoint, or a longer donor
+        wholly behind a shorter one) lends no bytes, so only its identity is verified.
+        """
         assert self._windows is not None
         target = chain[-1]
         per_token = self._kv_bytes_per_token()
         dest_offset = page_offset * self.page_size * per_token
+        ranges = self._chain_ranges(chain, target.token_count)
+        if ranges is None:
+            raise ParkEntryRejected("SSD parked chain does not tile its prefix")
         ctx = {"timing": timing, "events": [None] * len(self._windows), "chunk": 0}
         cuda = self._stream is not None
         with self._window_lock:
-            for segment in chain:
+            for segment, start_tokens, stop_tokens in ranges:
                 progress["key"] = segment.key
                 if segment.path is None:
                     raise ParkEntryRejected("SSD parked entry has no file")
@@ -1762,16 +1998,19 @@ class ParkStore:
                 handle = None if reader is not None else segment.path.open("rb", buffering=0)
                 try:
                     read = self._read_payload_cuda if cuda else self._read_payload_cpu
-                    read(
-                        ctx, segment, handle, reader,
-                        file_offset=segment.kv_offset,
-                        length=segment.kv_bytes,
-                        expected_sha256=segment.kv_sha256,
-                        span=kv_span,
-                        logical_base=segment.parent_token_count * per_token,
-                        dest_offset=dest_offset,
-                        dest_length=kv_span.nbytes,
-                    )
+                    if stop_tokens > start_tokens or segment.kv_bytes == 0:
+                        read(
+                            ctx, segment, handle, reader,
+                            file_offset=segment.kv_offset,
+                            length=segment.kv_bytes,
+                            expected_sha256=segment.kv_sha256,
+                            span=kv_span,
+                            logical_base=segment.parent_token_count * per_token,
+                            dest_offset=dest_offset,
+                            dest_length=kv_span.nbytes,
+                            copy_lo=start_tokens * per_token,
+                            copy_hi=stop_tokens * per_token,
+                        )
                     if segment is target:
                         read(
                             ctx, segment, handle, reader,
@@ -2018,23 +2257,56 @@ class ParkStore:
         # A valid but stale manifest must not orphan extra files forever; validate the extras too.
         for path in sorted(self.ssd_dir.glob("*.park")):
             admit(path, None)
-        # Parents are strictly shorter than children, so ascending length is a topological
-        # order: every parent is judged before any child that names it, and a cycle is
-        # impossible. A child whose parent is missing, rejected or different becomes a miss.
+        # Under v4 ascending length was a topological order; a v5 shorter checkpoint is a child
+        # shorter than its parent, so parent identity is resolved over the actual links
+        # instead: walk each candidate's ancestry once with an explicit visiting set, so a
+        # missing, rejected or different parent, or a cycle, rejects the child and everything
+        # that depends on it, and a valid shorter child of a longer parent is admitted.
+        resolved: dict[str, bool] = {}
+        for start in candidates:
+            if start in resolved:
+                continue
+            trail: list[str] = []
+            visiting: set[str] = set()
+            key = start
+            while True:
+                if key in resolved:
+                    verdict = resolved[key]
+                    break
+                entry = candidates.get(key)
+                if entry is None or key in visiting:
+                    verdict = False
+                    break
+                visiting.add(key)
+                trail.append(key)
+                if entry.parent_key is None:
+                    verdict = True
+                    break
+                key = entry.parent_key
+            for key in reversed(trail):
+                entry = candidates[key]
+                if verdict and entry.parent_key is not None:
+                    verdict = self._parent_matches(candidates[entry.parent_key], entry)
+                resolved[key] = verdict
         self._entries = {}
         self._children = {}
-        for entry in sorted(candidates.values(), key=lambda item: item.token_count):
-            if entry.parent_key is None:
-                entry.root_key = entry.key
-            else:
-                parent = self._entries.get(entry.parent_key)
-                if parent is None or not self._parent_matches(parent, entry):
-                    assert entry.path is not None
-                    entry.path.unlink(missing_ok=True)
-                    continue
-                entry.root_key = parent.root_key
-                self._children.setdefault(parent.key, set()).add(entry.key)
-            self._entries[entry.key] = entry
+        for key, entry in candidates.items():
+            if not resolved.get(key, False):
+                assert entry.path is not None
+                entry.path.unlink(missing_ok=True)
+                continue
+            self._entries[key] = entry
+        for entry in self._entries.values():
+            root = entry
+            while root.parent_key is not None:
+                root = self._entries[root.parent_key]
+            entry.root_key = root.key
+            if entry.parent_key is not None:
+                self._children.setdefault(entry.parent_key, set()).add(entry.key)
+        # Belt and braces: a chain whose effective ranges do not tile its prefix is unusable.
+        broken = [entry for entry in self._entries.values() if self._chain(entry) is None]
+        for entry in broken:
+            self._drop_entry(entry.key, write_manifest=False)
         self._evict_to_fit(0)
         self._write_manifest()
 
