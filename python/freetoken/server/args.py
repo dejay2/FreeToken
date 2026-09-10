@@ -260,7 +260,7 @@ def parse_args(
         "--kv-park",
         default=os.getenv("FREETOKEN_KV_PARK", ServerArgs.kv_park).strip().lower(),
         choices=["off", "ram", "ssd"],
-        help="Park completed hybrid KV/GDN prefixes outside VRAM (default: off).",
+        help="Park reusable hybrid KV/GDN checkpoints outside VRAM (default: off).",
     )
     parser.add_argument(
         "--kv-park-idle-ms",
@@ -278,7 +278,7 @@ def parse_args(
         "--kv-park-ram-gib",
         type=_positive_float,
         default=os.getenv("FREETOKEN_KV_PARK_RAM_GIB", str(ServerArgs.kv_park_ram_gib)),
-        help="LRU budget for full page-locked RAM entries (default: 2 GiB).",
+        help="LRU budget for parent-linked page-locked RAM segments (default: 2 GiB).",
     )
     parser.add_argument(
         "--kv-park-ssd-dir",
@@ -295,7 +295,10 @@ def parse_args(
         "--kv-park-window-mib",
         type=_positive_int,
         default=os.getenv("FREETOKEN_KV_PARK_WINDOW_MIB", str(ServerArgs.kv_park_window_mib)),
-        help="Size of each of the two page-locked SSD staging windows (default: 256 MiB).",
+        help=(
+            "Size of each page-locked SSD staging window; RAM parent checks use at most "
+            "16 MiB (default: 256 MiB)."
+        ),
     )
 
     parser.add_argument(

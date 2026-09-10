@@ -312,8 +312,8 @@ class EngineConfig:
     # Main QSA K/V storage. The compressed QSA index and every non-QSA pool keep ``dtype``.
     kv_dtype: str = "bf16"
     # Complete QSA + GDN/PLE prefixes can leave VRAM between turns. Off constructs nothing;
-    # enabled modes are bounded independently because RAM owns full entries while SSD owns only
-    # two staging windows plus files under its disk LRU.
+    # enabled modes are bounded independently because RAM owns parent-linked checkpoint segments,
+    # while SSD owns only two staging windows plus files under its disk LRU.
     kv_park: str = "off"
     kv_park_idle_ms: int = 0
     kv_park_min_tokens: int = 8192

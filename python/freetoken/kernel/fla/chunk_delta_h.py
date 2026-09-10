@@ -16,8 +16,8 @@ from freetoken.kernel.fla.index import (
 from freetoken.kernel.fla.op import exp, safe_exp
 from freetoken.kernel.fla.utils import (
     autotune_cache_kwargs,
-    is_nvidia_hopper,
     is_nvidia,
+    is_nvidia_hopper,
 )
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]

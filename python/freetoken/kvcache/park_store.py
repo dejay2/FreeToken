@@ -1,12 +1,15 @@
 """Host-RAM and SSD parking for page-aligned QSA/GDN prefix snapshots.
 
-A parked entry is deliberately opaque to the attention and recurrent-state code: it is the
-exact bytes returned by ``QSAKVCache.page_byte_views`` plus one complete
-``LinearStatePool.slot_byte_views`` snapshot.  The scheduler copies those bytes before returning
-any page or state slot to a free list, then a later match restores into ordinary newly-allocated
-pages and inserts the prefix into the unchanged hybrid radix tree.
+A parked checkpoint is deliberately opaque to the attention and recurrent-state code: its
+parent-linked segments reconstruct the exact bytes returned by ``QSAKVCache.page_byte_views``
+plus one complete ``LinearStatePool.slot_byte_views`` snapshot at that endpoint. The scheduler
+copies the segment's source bytes before returning any page or state slot to a free list, then a
+later match restores into ordinary newly-allocated pages and inserts the prefix into the unchanged
+hybrid radix tree.
 
-The SSD format (version 5) stores one immutable *segment* per saved checkpoint: a versioned
+The RAM tier keeps each immutable segment as a tensor: a child owns only its private KV suffix
+plus its complete endpoint state, while family eviction preserves the ancestry needed to restore
+it. The SSD format (version 5) applies the same parent/cut model to files with a versioned
 4-KiB header, the verbatim int32 token ids of the whole prefix, then two independently
 checksummed 4-KiB-aligned regions -- the KV pages this segment adds on top of its parent
 segment, and one complete recurrent-state slot.  A root segment starts its KV at token zero; a
@@ -154,11 +157,12 @@ class ParkedEntry:
     """One committed snapshot.
 
     ``payload_bytes`` counts the private KV suffix plus the complete state for either tier:
-    a child segment's earlier pages live in its ancestors. ``ParkStore.payload_bytes(n)`` keeps the logical
-    full-snapshot meaning. ``parent_token_count`` is the page-aligned cut at which this segment
-    borrows its parent's KV: the parent's whole length for a continuation, or this segment's
-    own length for a shorter checkpoint that owns no KV bytes. ``root_key`` is in-memory only
-    and names the family this segment belongs to (itself for a root); the family is the unit
+    a child segment's earlier pages live in its ancestors. ``ParkStore.payload_bytes(n)`` keeps
+    the logical full-snapshot meaning. ``parent_token_count`` is the page-aligned cut at which
+    this segment borrows its parent's KV: the parent's whole length for a continuation, or this
+    segment's own length for a shorter checkpoint that owns no KV bytes. ``root_key`` is
+    in-memory only and names the family this segment belongs to (itself for a root); the family
+    is the unit
     of eviction.
     """
 
@@ -557,9 +561,9 @@ class ParkStore:
         self.disk_budget_bytes = int(disk_budget_bytes)
         self.pinned_window_bytes = int(pinned_window_bytes)
         self._entries: dict[str, ParkedEntry] = {}
-        # Family bookkeeping (SSD chains). A parent may be pinned by queued/active saves of its
-        # children; a pinned family is never evicted and its dropped files are unlinked only
-        # once the last pin goes, so a writer can always re-validate the parent it named.
+        # Family bookkeeping for RAM and SSD chains. A parent may be pinned by queued/active
+        # saves of its children; a pinned family is never evicted, and dropped payloads remain
+        # charged until the last pin goes, so a writer can always re-validate the parent it named.
         self._children: dict[str, set[str]] = {}
         self._pins: dict[str, int] = {}
         self._inflight: set[str] = set()
@@ -726,8 +730,8 @@ class ParkStore:
         return self._segment_bytes(token_count, 0)
 
     def _planned_bytes(self, token_count: int, cut: int) -> int:
-        """Exact file bytes of a save at ``cut``: a zero-KV child still pays header, the full
-        token list, padding and one complete state slot (about 115.6 MB on the live model)."""
+        """Exact tier bytes reserved for a save at ``cut``. Every child pays for the full token
+        list and one complete state slot; SSD segments also pay for their header and padding."""
         if self.mode == "ram":
             return self.storage_bytes(token_count) - cut * self._kv_bytes_per_token()
         return self._segment_bytes(token_count, cut)
@@ -1131,11 +1135,14 @@ class ParkStore:
 
     def _occupied_bytes(self) -> int:
         committed = sum(entry.total_bytes for entry in self._entries.values())
-        return (committed + sum(nbytes for _root, _path, nbytes in self._pending_unlinks)
-                + sum(entry.total_bytes for entry in self._pending_ram))
+        return (
+            committed
+            + sum(nbytes for _root, _path, nbytes in self._pending_unlinks)
+            + sum(entry.total_bytes for entry in self._pending_ram)
+        )
 
     def _sweep_unlinks(self) -> None:
-        """Delete dropped files whose family is no longer pinned; a failed unlink stays charged."""
+        """Release dropped payloads once unpinned; a failed SSD unlink stays charged."""
         kept: list[tuple[str, Path, int]] = []
         for root_key, path, nbytes in self._pending_unlinks:
             if self._pins.get(root_key, 0):
@@ -1262,14 +1269,14 @@ class ParkStore:
     # ---- save planning -------------------------------------------------------------------
 
     def _begin_op(self, tokens: torch.Tensor, keys: list[str]) -> _SaveOp | None:
-        """Under ``_lock``: pick a parent, reserve the exact file size, pin, mark in flight."""
+        """Under ``_lock``: pick a parent, reserve its exact tier bytes, pin, mark in flight."""
         key = keys[-1]
         if key in self._inflight:
             return None
         existing = self._entries.get(key)
         if existing is not None:
             # Same rolling key, different tokens: a hash collision. Invalidate the old family
-            # member and its dependants rather than writing over a file a child still needs.
+            # member and its dependants rather than replacing a payload a child still needs.
             self._drop_entry(key)
         if any(path.stem == key for _root, path, _nbytes in self._pending_unlinks):
             return None
@@ -1829,7 +1836,7 @@ class ParkStore:
                     on_copied()
                 with self._lock:
                     if not self._publish(op, entry):
-                        # The parent was invalidated while this file was being written.
+                        # The parent was invalidated while this payload was being written.
                         if entry.path is not None:
                             entry.path.unlink(missing_ok=True)
                         return False

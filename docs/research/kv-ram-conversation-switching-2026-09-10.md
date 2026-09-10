@@ -12,6 +12,7 @@ The history already joins all of the relevant work:
      -> 91589fb fix/governor-nochange-steps --+
      -> 6c42613 perf/kv-park-incremental ----+-> 82249a9 live/governor-kvpark
                                                -> 28c9249 perf/kv-park-branch
+                                                  -> 0a28836 RAM checkpoint repair
 ```
 
 The consolidated feature branch fast-forwards this history; it does not cherry-pick or
@@ -56,7 +57,7 @@ Tests that inspect published entries therefore wait for publication as well.
 
 The serving checkout had an uncommitted change in `kernel/fla/chunk_delta_h.py`, selecting
 `SGLANG_GDN_CHUNK_H_NUM_WARPS=2` instead of four. The consolidated code preserves two warps
-by default on compute capability 12.0 (the tested RTX 5090); other devices retain four, and
+by default on compute capability 12.0 (the tested RTX 5090); other GPUs retain four, and
 the environment override remains authoritative. This is a recovered launch workaround,
 not proof that the original illegal-access root cause has been identified.
 
@@ -71,7 +72,6 @@ Hardware: RTX 5090 32 GiB, Windows/WSL Linux; Qwen3.8-Flash-Next-NVFP4, FP8 KV,
 - Initial selected baseline: 106 CPU cache/store tests passed.
 - New regression: RAM final-prefill checkpoint was absent before the repair.
 - New RAM segment and budget tests failed before their corresponding changes.
-- Selected final cache/store/scheduler run: 147 passed, two CUDA tests skipped on the devbox.
 - Both CUDA RAM ownership tests passed on the RTX 5090 (BF16 and FP8).
 - All six existing GDN reference/chunk/decode tests passed on the RTX 5090 with two warps.
 - Broad CPU suite baseline: 112 failed, 964 passed, eight skipped. The changed tree initially
@@ -106,7 +106,6 @@ retained GPU pages. Successful restore sequence numbers increased from one throu
 
 | Request | Restored tokens | Tail processed | Restore seconds | Full response seconds |
 |---|---:|---:|---:|---:|
-
 | A / 2 (next turn) | 200,000 | 114 | 1.747 | 9.783 |
 | B / 2 (next turn) | 200,000 | 112 | 1.711 | 7.992 |
 | A / 3 (next turn) | 200,064 | 104 | 1.683 | 6.202 |
@@ -161,5 +160,3 @@ a changed model/layout, or a prompt that diverges before every saved checkpoint 
 cold prefill. Each retained checkpoint pays for a complete recurrent state, so a long-lived
 session with many checkpoints can eventually reach the budget. Page alignment leaves a short
 tail to process; the test proves that the 200k-token saved prefix itself was not reprocessed.
-
-Delivery verification and final branch SHA are recorded after the publication gate.

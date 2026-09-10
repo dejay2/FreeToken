@@ -2,7 +2,7 @@
 
 ## Status
 
-Design draft, 2026-09-02. Nothing implemented. Written read-only against `mtp-upstream-merge` at `8591caf` while another agent owns the GPU for server reboots and a third edits code in a separate worktree. Every source claim below carries a `file:line`; every number is either read out of the live server's `/v1/cache/status`, taken from a committed measurement file in `docs/research/`, or measured by the PCIe microbenchmark described in the companion document (`2026-09-02-qwen38-kv-host-tier-sparse-attention-design.md`). Nothing here changes numerics.
+Historical preimplementation design draft, 2026-09-02, written against `mtp-upstream-merge` at `8591caf`. It is not the current behavior contract; see [README: KV prefix parking](../../README.md#kv-prefix-parking) for user-facing behavior and [the RAM conversation-switching report](../research/kv-ram-conversation-switching-2026-09-10.md) for the implemented RAM checkpoint design and evidence. The source locations and measurements below record the design-time state.
 
 ## Purpose
 

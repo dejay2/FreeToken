@@ -115,7 +115,7 @@ The launcher script `start-qwen38-flash-next-mmap-windows.ps1` defaults to `--pl
 
 ### KV prefix parking
 
-Hybrid QSA/GDN conversations can keep completed prefixes outside GPU memory and restore them on
+Hybrid QSA/GDN conversations can keep reusable checkpoints outside GPU memory and restore them on
 the next matching turn instead of recomputing. The feature is **off by default**. In `off` mode
 FreeToken constructs no parking store, copy stream, page-locked buffer, worker thread, directory,
 or manifest, and the existing cache paths do not add a device synchronization.
@@ -129,7 +129,7 @@ Choose `--kv-park off|ram|ssd`, `FREETOKEN_KV_PARK`, or the Windows launcher's `
 | `--kv-park-ram-gib` | `FREETOKEN_KV_PARK_RAM_GIB` / `-KVParkRAMGiB` | `2` | LRU budget for shared checkpoint segments in page-locked host RAM. |
 | `--kv-park-ssd-dir` | `FREETOKEN_KV_PARK_SSD_DIR` / `-KVParkSSDDir` | `~/.cache/freetoken/kv-park` | Persistent SSD root; tensor-parallel ranks use separate subdirectories. |
 | `--kv-park-ssd-gib` | `FREETOKEN_KV_PARK_SSD_GIB` / `-KVParkSSDGiB` | `32` | On-disk LRU budget per tensor-parallel rank. |
-| `--kv-park-window-mib` | `FREETOKEN_KV_PARK_WINDOW_MIB` / `-KVParkWindowMiB` | `256` | Size of each of two shared page-locked SSD windows; restore alternates both to overlap disk reads with GPU copies (512 MiB total by default). |
+| `--kv-park-window-mib` | `FREETOKEN_KV_PARK_WINDOW_MIB` / `-KVParkWindowMiB` | `256` | Size of each of two shared page-locked SSD windows; restore alternates both to overlap disk reads with GPU copies (512 MiB total by default). RAM sharing checks use one temporary buffer capped at the smaller of this value and 16 MiB. |
 
 `ram` retains exact QSA K/V, compressed-index, FP8-scale (when enabled), GDN and PLE sibling-state
 bytes until its RAM LRU drops them. Both tiers save the exact final-prefill checkpoint
@@ -137,9 +137,10 @@ synchronously before its recurrent state can be reclaimed. This preserves a reus
 even when the next request branches before the previous answer ends. Finished idle leaves use
 a bounded background worker; their GPU pages and state remain owned until copying finishes.
 A full worker queue falls back to ordinary cache eviction instead of blocking request admission.
-Checkpoints share unchanged parent pages and retain their own complete state; a new turn adds
-its changed pages and state instead of retaining another full prefix. Parent bytes are checked
-against the source before sharing. RAM writes no parking files and is lost on server restart.
+Parent-linked checkpoints share unchanged pages, but each saved endpoint owns a complete state
+and cannot be rewound. A new turn adds only its new KV pages and state instead of retaining
+another full prefix. Parent bytes are checked against the source before sharing. RAM writes no
+parking files and is lost on server restart.
 
 `ssd` keeps the same segments in version-5 files with a 4-KiB header, separate SHA-256 checksums
 for KV and state regions, and an atomic manifest. Parent-linked segments append new pages;

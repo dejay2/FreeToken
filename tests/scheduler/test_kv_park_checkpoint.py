@@ -1,9 +1,9 @@
 """Branch-aware RAM and SSD parking at the scheduler seam (2026-09-10).
 
 The final-prefill commit (``cache_req(finished=False)``) and an early finish that still
-carries a frozen prefill snapshot must persist that exact checkpoint as its own RAM or SSD segment
-before state-slot pressure can tombstone it, from the canonical tree pages and the frozen
-tree slot, without detaching or freeing anything. Parking-off, private and aborted
+carries a frozen prefill snapshot must persist that exact checkpoint as its own RAM or SSD
+segment before state-slot pressure can tombstone it, from the canonical tree pages and the
+frozen tree slot, without detaching or freeing anything. Parking-off, private and aborted
 requests keep the previous behavior. CPU only: a pure-Python key compare stands in for the
 native radix extension when it is absent (the devbox), so nothing here is skipped.
 """
@@ -197,8 +197,8 @@ def _restore_equals(cm, kv, state, entry, expected_kv, expected_state) -> None:
 
 @pytest.mark.parametrize("mode", ["ram", "ssd"])
 def test_final_prefill_checkpoint_is_saved_before_slot_pressure_and_survives_eviction(tmp_path, mode):
-    # 4,107 tokens: the SSD restore margin in _lookup_parked is 4,096 tokens, so a manager-level
-    # restore hit needs a checkpoint at least that long (L = 4,104 here).
+    # 4,107 tokens: this covers the larger SSD restore margin in _lookup_parked (4,096 tokens),
+    # so both parameterized modes can produce a manager-level restore hit (L = 4,104 here).
     cm, kv, state, table = _manager(tmp_path, mode=mode, num_pages=2200)
     store = cm.park_store
     ids = torch.arange(100, 100 + 4107, dtype=torch.int32)
@@ -211,7 +211,7 @@ def test_final_prefill_checkpoint_is_saved_before_slot_pressure_and_survives_evi
 
     cm.cache_req(req, finished=False)
 
-    # The checkpoint at L is on disk now, from the canonical pages and the frozen tree slot.
+    # The checkpoint at L is stored now, from the canonical pages and the frozen tree slot.
     entry = _entry(cm, ids[:L])
     assert entry is not None and entry.token_count == L and entry.parent_key is None
     assert store.status()["parked_count"] == 1 and store.status()["disabled"] is False
@@ -239,7 +239,7 @@ def test_final_prefill_checkpoint_is_saved_before_slot_pressure_and_survives_evi
     assert finish.cached_len == finish_len and finish.node.park_finished is True
 
     # State pressure tombstones the internal checkpoint on the card (make it the LRU snapshot
-    # explicitly: the finish walk stamped both nodes alike); the SSD copy answers.
+    # explicitly: the finish walk stamped both nodes alike); the parked copy answers.
     node.timestamp = 0
     evicted = cm.prefix_cache.evict_mamba(1)
     assert node.mamba_value is None and evicted.mamba_slots == [frozen]
@@ -283,7 +283,7 @@ def test_final_prefill_checkpoint_is_saved_before_slot_pressure_and_survives_evi
 def test_a_saved_checkpoint_leaves_the_live_tree_without_a_rewrite(tmp_path, monkeypatch, mode):
     """Once its children are gone, a saved prompt checkpoint is an ordinary eligible leaf:
     the duplicate key makes its park a no-write and ordinary detach releases it, so a live
-    internal checkpoint never suppresses the SSD hit forever."""
+    internal checkpoint never suppresses the parked hit forever."""
     cm, kv, state, table = _manager(tmp_path, mode=mode)
     store = cm.park_store
     ids = torch.arange(200, 209, dtype=torch.int32)        # 9 tokens -> L = 8
