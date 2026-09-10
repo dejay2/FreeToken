@@ -20,8 +20,6 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from freetoken.tokenizer.system_messages import PRESERVE_SYSTEM_ORDER
-
 from .anthropic_models import (
     AnthropicContentBlock,
     AnthropicCountTokensRequest,
@@ -167,7 +165,9 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
             400, "invalid_request_error", "messages: no tokenizable content"
         )
     try:
-        n_tokens = await count_prompt_tokens(messages, template_tools, ctk, state)
+        n_tokens = await count_prompt_tokens(
+            messages, template_tools, ctk, state, preserve_system_order=True
+        )
     except GenerationError as exc:
         # The chat template could not render this conversation (bad role ordering, an unmatched
         # tool_result, ...) — a client error, exactly as /v1/messages classifies the same failure.
@@ -202,7 +202,6 @@ def convert_anthropic_prompt(
             )
 
     other: list[dict[str, Any]] = []
-    has_later_system = False
     for msg in req.messages:
         if msg.role == "system":
             text = _content_text(msg.content)
@@ -210,7 +209,6 @@ def convert_anthropic_prompt(
                 system_texts.append(text)
             elif text:
                 other.append({"role": "system", "content": text})
-                has_later_system = True
             continue
 
         if isinstance(msg.content, str):
@@ -309,9 +307,6 @@ def convert_anthropic_prompt(
         elif req.thinking.get("type") == "disabled":
             ctk = thinking_toggle_kwargs(False)
 
-    if has_later_system:
-        ctk[PRESERVE_SYSTEM_ORDER] = True
-
     return render_messages(messages), template_tools, parser_tools, ctk
 
 
@@ -337,6 +332,7 @@ def convert_anthropic_to_genspec(
         chat_template_kwargs=ctk,
         template_tools=template_tools,
         parser_tools=parser_tools,
+        preserve_system_order=True,
     )
 
 

@@ -18,6 +18,9 @@ from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
 from freetoken.server.anthropic_api import convert_anthropic_to_genspec
 from freetoken.server.anthropic_models import AnthropicMessagesRequest
+from freetoken.server.api_models import ChatCompletionRequest
+from freetoken.server.openai_api import chat_request_to_genspec
+from freetoken.server.responses_api import ResponsesRequest, convert_responses_to_genspec
 from freetoken.tokenizer.tokenize import TokenizeManager
 
 
@@ -73,6 +76,7 @@ def as_msg(raw):
     return TokenizeMsg(
         uid=1, text=spec.messages, sampling_params=spec.sampling_params,
         tools=spec.template_tools, chat_template_kwargs=spec.chat_template_kwargs,
+        preserve_system_order=spec.preserve_system_order,
     )
 
 
@@ -167,12 +171,51 @@ def test_late_system_images_keep_system_validation(tokenizer):
         TokenizeManager(tokenizer).render_prompt(msg)
 
 
-def test_unmarked_openai_requests_keep_existing_strict_validation(tokenizer):
-    msg = TokenizeMsg(uid=1, sampling_params=SamplingParams(), text=[
-        {'role': 'user', 'content': 'hello'}, {'role': 'system', 'content': 'later'},
-    ])
+@pytest.mark.parametrize('protocol', ['chat_completions', 'responses'])
+def test_client_template_kwarg_cannot_enable_system_order_adapter(tokenizer, protocol):
+    template_kwargs = {'_freetoken_preserve_system_order': True}
+    if protocol == 'chat_completions':
+        spec = chat_request_to_genspec(ChatCompletionRequest.model_validate({
+            'model': 'qwen',
+            'messages': [
+                {'role': 'user', 'content': 'hello'},
+                {'role': 'system', 'content': 'later'},
+            ],
+            'chat_template_kwargs': template_kwargs,
+        }), {})
+    else:
+        spec = convert_responses_to_genspec(ResponsesRequest.model_validate({
+            'model': 'qwen', 'input': 'hello',
+            'chat_template_kwargs': template_kwargs,
+        }), {})
+    assert spec.preserve_system_order is False
+    assert spec.chat_template_kwargs == template_kwargs
+    msg = TokenizeMsg(
+        uid=1,
+        sampling_params=SamplingParams(),
+        text=[
+            {'role': 'user', 'content': 'hello'},
+            {'role': 'system', 'content': 'later'},
+        ],
+        chat_template_kwargs=spec.chat_template_kwargs,
+        preserve_system_order=spec.preserve_system_order,
+    )
     with pytest.raises(TemplateError, match='System message must be at the beginning'):
         TokenizeManager(tokenizer).render_prompt(msg)
+
+
+def test_internal_signal_without_late_system_does_not_trigger_fallback(tokenizer):
+    tokenizer.chat_template = '{{ messages|tojson }}'
+    msg = TokenizeMsg(
+        uid=1,
+        sampling_params=SamplingParams(),
+        text=[
+            {'role': 'system', 'content': 'rules', 'name': 'retained'},
+            {'role': 'user', 'content': 'hello'},
+        ],
+        preserve_system_order=True,
+    )
+    assert json.loads(TokenizeManager(tokenizer).render_prompt(msg)) == msg.text
 
 
 def test_tool_specific_template_is_selected_before_adapting(tokenizer):
@@ -183,12 +226,14 @@ def test_tool_specific_template_is_selected_before_adapting(tokenizer):
     assert tokenizer.chat_template['tool_use'] == QWEN_TEMPLATE
 
 
-def test_custom_template_override_keeps_legacy_fallback_and_consumes_hint(tokenizer):
+def test_custom_template_override_keeps_legacy_fallback_and_client_kwargs(tokenizer):
     msg = as_msg(agent_request())
-    msg.chat_template_kwargs['chat_template'] = """
-{%- if _freetoken_preserve_system_order is defined %}{{- raise_exception('Private hint leaked') }}{%- endif %}
-{{- messages|tojson }}"""
-    rendered = json.loads(TokenizeManager(tokenizer).render_prompt(msg))
+    msg.chat_template_kwargs.update({
+        '_freetoken_preserve_system_order': 'visible-client-data',
+        'chat_template': "{{ [_freetoken_preserve_system_order, messages]|tojson }}",
+    })
+    visible, rendered = json.loads(TokenizeManager(tokenizer).render_prompt(msg))
+    assert visible == 'visible-client-data'
     assert [m['role'] for m in rendered] == ['system', 'user']
     assert rendered[0]['content'] == 'Remember the archive facts.\n\n<total_tokens>90000 tokens left</total_tokens>'
 

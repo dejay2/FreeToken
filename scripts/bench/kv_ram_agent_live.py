@@ -35,6 +35,7 @@ def encode(manager, request):
     return manager.tokenize([TokenizeMsg(
         uid=0, text=spec.messages, sampling_params=spec.sampling_params,
         tools=spec.template_tools, chat_template_kwargs=spec.chat_template_kwargs,
+        preserve_system_order=spec.preserve_system_order,
     )])[0].tolist()
 
 

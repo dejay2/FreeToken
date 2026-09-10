@@ -32,6 +32,7 @@ from freetoken.server.generation import (  # noqa: E402
     GenResult,
     ReasoningDelta,
     ToolCallsDelta,
+    prerender_error,
 )
 
 
@@ -250,6 +251,8 @@ def test_convert_preserves_later_system_messages_in_order():
         {"role": "system", "content": "mid-stream sys"},
         {"role": "assistant", "content": "hi"},
     ]
+    assert spec.preserve_system_order is True
+    assert spec.chat_template_kwargs == {}
 
 
 def test_convert_merges_only_leading_system_messages():
@@ -446,6 +449,7 @@ class FakeState:
         )
         self._uid = 0
         self._count_manager = None
+        self.sent = []
 
     def frontend_tokenizer(self):
         return self._count_manager
@@ -455,7 +459,7 @@ class FakeState:
         return self._uid
 
     async def send_one(self, msg):
-        return None
+        self.sent.append(msg)
 
     async def wait_for_ack(self, uid):
         for text, finished, pt, ct in self._outputs:
@@ -497,6 +501,7 @@ def test_route_nonstream_text():
     assert body["stop_reason"] == "end_turn"
     assert body["usage"]["input_tokens"] == 5
     assert body["usage"]["output_tokens"] == 2
+    assert fake.sent[0].preserve_system_order is True
 
 
 def test_route_stream_text():
@@ -641,6 +646,10 @@ class _FakeTokenizeManager:
         self.msgs.extend(msgs)
         return [_FakeIds(len(str(m.text))) for m in msgs]
 
+    def render_prompt(self, msg):
+        self.msgs.append(msg)
+        return "prompt"
+
 
 def _count_client(manager=None, maintenance_state="serving"):
     fake = FakeState([])
@@ -680,6 +689,25 @@ def test_count_tokens_route():
     assert msg.text == spec.messages
     assert msg.tools == spec.template_tools
     assert msg.chat_template_kwargs == spec.chat_template_kwargs
+    assert msg.preserve_system_order == spec.preserve_system_order is True
+
+
+def test_prerender_carries_anthropic_system_order_signal():
+    manager = _FakeTokenizeManager()
+    fake = FakeState([])
+    fake._count_manager = manager
+    spec = A.convert_anthropic_to_genspec(
+        AnthropicMessagesRequest.model_validate({
+            "model": "claude-x", "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "later"},
+            ],
+        }),
+        {},
+    )
+    assert asyncio.run(prerender_error(spec, fake)) is None
+    assert manager.msgs[0].preserve_system_order is True
 
 
 def test_count_tokens_empty_messages_400():

@@ -140,6 +140,7 @@ class GenSpec:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
+    preserve_system_order: bool = False
 
     @property
     def parse_tools(self) -> bool:
@@ -295,6 +296,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
+            preserve_system_order=spec.preserve_system_order,
         )
     )
     return uid
@@ -305,12 +307,13 @@ async def count_prompt_tokens(
     tools: list[dict[str, Any]] | None,
     chat_template_kwargs: dict[str, Any],
     state: Any,
+    preserve_system_order: bool = False,
 ) -> int:
-    """Token count of an already-converted (messages, tools, chat_template_kwargs) prompt,
-    using the frontend's own tokenizer (``state.frontend_tokenizer()``) so the count equals the
-    ``usage.input_tokens`` a real generation of the same prompt would report. The neutral
-    counterpart to ``submit_generation`` — any protocol's count endpoint converts to this triple
-    and calls it. The caller validates the prompt first (non-empty, has tokenizable content).
+    """Token count of an already-converted prompt, using the frontend's own tokenizer
+    (``state.frontend_tokenizer()``) so the count equals the ``usage.input_tokens`` a real
+    generation of the same prompt would report. The neutral counterpart to
+    ``submit_generation`` carries the same messages, tools, template arguments, and internal
+    rendering options. The caller validates the prompt first (non-empty, tokenizable content).
 
     Failure classification mirrors ``/v1/messages``: a chat template that rejects the specific
     conversation (bad role ordering, an unmatched tool_result, an explicit raise_exception) is
@@ -324,6 +327,7 @@ async def count_prompt_tokens(
         sampling_params=SamplingParams(),
         chat_template_kwargs=chat_template_kwargs,
         tools=tools,
+        preserve_system_order=preserve_system_order,
     )
     manager = await asyncio.to_thread(state.frontend_tokenizer)  # init failure -> server fault
     try:
@@ -351,6 +355,7 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
         sampling_params=SamplingParams(),
         chat_template_kwargs=spec.chat_template_kwargs,
         tools=spec.template_tools,
+        preserve_system_order=spec.preserve_system_order,
     )
     try:
         manager = await asyncio.to_thread(build)

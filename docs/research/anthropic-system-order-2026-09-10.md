@@ -19,9 +19,9 @@ The private sample is not a repository fixture. Tests use synthetic archives and
 ## Compatibility
 
 The Anthropic converter merges only leading system messages and retains later system turns
-in order. A private rendering hint carries that intent through the existing tokenization
-message, including the count-tokens path. The renderer consumes the hint before calling
-any checkpoint template or custom encoder.
+in order. A typed internal field carries that protocol-specific intent through generation,
+pre-render validation, and the count-tokens path. Client template arguments cannot enable
+this behavior for OpenAI Chat Completions or Responses requests.
 
 For the recognized Qwen ChatML structure, the renderer substitutes only the late-system
 position guard. It renders that turn using the template's existing system-content validator

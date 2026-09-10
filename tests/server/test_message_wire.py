@@ -152,6 +152,18 @@ def test_old_shape_less_one_dimensional_tensor_record_still_decodes():
     assert torch.equal(out, original)
 
 
+def test_tokenize_msg_preserve_system_order_roundtrip():
+    msg = TokenizeMsg(
+        uid=1,
+        text=[{"role": "user", "content": "hi"}],
+        sampling_params=SamplingParams(),
+        preserve_system_order=True,
+    )
+    out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+    assert isinstance(out, TokenizeMsg)
+    assert out.preserve_system_order is True
+
+
 def test_client_dicts_with_the_wire_tag_key_survive_intact():
     """Tool JSON Schemas and chat_template_kwargs are free-form client data. A field literally
     named ``__type__`` (a common discriminator) must not be read back as a serialized class --

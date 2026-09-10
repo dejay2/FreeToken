@@ -83,7 +83,10 @@ class TokenizeManager:
         if not isinstance(msg.text, list):
             return msg.text
         return self._render(
-            msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
+            msg.text,
+            msg.tools,
+            self._sanitize_effort(msg.chat_template_kwargs or {}),
+            msg.preserve_system_order,
         )
 
     def _render(
@@ -91,11 +94,16 @@ class TokenizeManager:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any],
+        preserve_system_order: bool = False,
     ) -> str:
         """Raw render, no effort sanitation — the probe needs unsupported values
         to actually reach the template so rejection is observable."""
         messages, chat_template_kwargs = prepare_system_messages(
-            messages, self.tokenizer, tools, chat_template_kwargs,
+            messages,
+            self.tokenizer,
+            tools,
+            chat_template_kwargs,
+            preserve_system_order,
         )
         if self._dsv4_encoder is not None:
             return _apply_dsv4_chat_encoder(

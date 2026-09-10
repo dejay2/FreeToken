@@ -1,8 +1,8 @@
 """Template compatibility for chronological Anthropic system messages.
 
 Only the recognized Qwen ChatML guard is adapted. Other templates and custom
-encoders retain the adapter's former leading-system conversion. The private
-request hint is consumed here, never passed to a checkpoint's Jinja/encoder.
+encoders retain the adapter's former leading-system conversion. A typed internal
+signal selects this behavior independently of client template data.
 """
 from __future__ import annotations
 
@@ -10,8 +10,6 @@ import re
 from functools import lru_cache
 from typing import Any
 
-
-PRESERVE_SYSTEM_ORDER = "_freetoken_preserve_system_order"
 
 _QWEN_CONTENT_MACRO = re.compile(
     r"\{%[-]?\s*macro\s+render_content\(\s*content\s*,\s*do_vision_count\s*,"
@@ -56,25 +54,30 @@ def prepare_system_messages(
     tokenizer: Any,
     tools: list[dict[str, Any]] | None,
     kwargs: dict[str, Any],
+    preserve_system_order: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Resolve the adapter's chronology hint for the selected checkpoint."""
-    if PRESERVE_SYSTEM_ORDER not in kwargs:
-        return messages, kwargs
-    kwargs = dict(kwargs)
-    preserve = kwargs.pop(PRESERVE_SYSTEM_ORDER)
-    if not preserve:
+    """Resolve Anthropic chronology for the selected checkpoint."""
+    seen_non_system = False
+    has_later_system = False
+    for message in messages:
+        if message.get("role") == "system":
+            if seen_non_system:
+                has_later_system = True
+                break
+        else:
+            seen_non_system = True
+    if not preserve_system_order or not has_later_system:
         return messages, kwargs
 
-    # Resolve named/default/tool-specific templates exactly as transformers does.
-    # Custom encoders (DSV4) have no Jinja template and take the legacy fallback.
     if getattr(tokenizer, "chat_template", None) or kwargs.get("chat_template"):
         template = tokenizer.get_chat_template(
             chat_template=kwargs.get("chat_template"), tools=tools,
         )
         adapted = _qwen_system_template(template)
         if adapted is not None:
-            kwargs["chat_template"] = adapted
-            return messages, kwargs
+            adapted_kwargs = dict(kwargs)
+            adapted_kwargs["chat_template"] = adapted
+            return messages, adapted_kwargs
 
     system_texts = [m.get("content") for m in messages if m.get("role") == "system"]
     others = [m for m in messages if m.get("role") != "system"]
