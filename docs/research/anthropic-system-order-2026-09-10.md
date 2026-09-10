@@ -52,7 +52,11 @@ reporting enabled. It generates two synthetic long archives, asks the model to r
 their exact facts through a tool call, carries forward its reasoning/tool history, appends
 system budget updates, and runs both concurrent continuations and serial revisits. It checks
 frontend/local/generated token-count agreement, cached input, bounded tail prefill, unchanged
-instance, and complete RAM attention/state transfers on serial revisits. Run it against an
+instance, and complete RAM attention/state transfers on serial revisits. An idle-only cache
+rebuild at the current state-slot count clears GPU prefixes before those serial requests,
+so their host-transfer checks do not depend on incidental GPU memory pressure or idle delay.
+Initial responses must contain reasoning, which is carried into the next requests. The
+benchmark records partial results if a later assertion fails. Run it against an
 idle validation server: unrelated traffic can evict a family or replace the global transfer
 diagnostic before the test reads it. `--check-prefix` runs only local tokenization.
 

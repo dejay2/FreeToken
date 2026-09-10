@@ -2,7 +2,9 @@
 
 Uses only synthetic archive facts. Two initial fills are followed by concurrent
 continuations and serial revisits. Run against an idle validation server with
-RAM parking/cache reporting enabled; unrelated traffic can evict these families
+RAM parking/cache reporting enabled. Before serial revisits, an idle-only cache
+rebuild keeps the same state-slot count but clears GPU prefixes, forcing RAM
+reloads without a server restart. Unrelated traffic can evict these families
 or overwrite the global restore diagnostic used by the serial assertions.
 
 --check-prefix performs only local rendering/tokenization, without generation.
@@ -16,6 +18,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from freetoken.message import TokenizeMsg
@@ -162,6 +165,40 @@ def main():
     results = []
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
+    def record(result):
+        results.append(result)
+        print(json.dumps(result), flush=True)
+        args.output.write_text(json.dumps({'complete': False, 'instance': instance, 'results': results}, indent=2) + '\n')
+
+    def clear_gpu_prefixes():
+        # A normal GPU hit is valid behavior, so explicitly park/reset its radix
+        # before demanding a host transfer. if_idle refuses active requests;
+        # neither this test nor the endpoint aborts them to obtain the safe point.
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            current = get('/v1/cache/status')
+            if current['state'] != 'serving' or get('/v1/stats')['requests']['active']:
+                time.sleep(0.5)
+                continue
+            slots = current['geometry']['num_mamba_slots']
+            body = {'mode': 'if_idle', 'num_mamba_slots': slots}
+            wire = Request(url + '/v1/cache/rebuild', data=json.dumps(body).encode(),
+                           headers={'Content-Type': 'application/json'})
+            try:
+                with urlopen(wire, timeout=360) as response:
+                    rebuilt = json.load(response)
+            except HTTPError as exc:
+                detail = json.loads(exc.read())
+                if detail.get('status') == 'busy':
+                    time.sleep(0.5)
+                    continue
+                raise
+            assert rebuilt['status'] == 'ok' and rebuilt['num_mamba_slots'] == slots, rebuilt
+            assert get('/health')['instance_id'] == instance, 'server restarted'
+            print(json.dumps({'event': 'gpu_prefixes_cleared', 'state_slots': slots}), flush=True)
+            return
+        raise TimeoutError('validation server did not become idle for GPU-prefix displacement')
+
     def run_one(family, turn):
         local_tokens = len(encode(manager, requests[family]))
         counted = http_json(url + '/v1/messages/count_tokens', requests[family], timeout=60)[1]
@@ -179,6 +216,8 @@ def main():
         result.update(cached_tokens=cached, total_prompt_tokens=total)
         assert total == local_tokens, 'generation and token counting disagree'
         assert total >= args.tokens, result
+        if turn == 0:
+            assert result['thinking_chars'] > 0, 'initial response omitted reasoning; replay would not be exercised'
         if turn:
             assert cached >= args.tokens - 64, 'old archive was reprocessed'
             assert total - cached <= 4096, 'unexpectedly large new prefill'
@@ -193,20 +232,18 @@ def main():
         return result
 
     for family in 'AB':
-        results.append(run_one(family, 0))
-        print(json.dumps(results[-1]), flush=True)
+        record(run_one(family, 0))
         time.sleep(2)
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(run_one, family, 1) for family in 'AB']
         for future in futures:
-            results.append(future.result())
-            print(json.dumps(results[-1]), flush=True)
+            record(future.result())
     time.sleep(2)
+    clear_gpu_prefixes()
     for family in 'AB':
-        results.append(run_one(family, 2))
-        print(json.dumps(results[-1]), flush=True)
+        record(run_one(family, 2))
         time.sleep(2)
-    args.output.write_text(json.dumps({'instance': instance, 'results': results}, indent=2) + '\n')
+    args.output.write_text(json.dumps({'complete': True, 'instance': instance, 'results': results}, indent=2) + '\n')
     print(json.dumps({'event': 'agent_ram_pass', 'requests': len(results), 'instance': instance}), flush=True)
 
 
