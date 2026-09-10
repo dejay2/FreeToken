@@ -193,7 +193,7 @@ def main():
                     time.sleep(0.5)
                     continue
                 raise
-            assert rebuilt['status'] == 'ok' and rebuilt['num_mamba_slots'] == slots, rebuilt
+            assert rebuilt['status'] == 'ok' and rebuilt['mamba_slots'] == slots, rebuilt
             assert get('/health')['instance_id'] == instance, 'server restarted'
             print(json.dumps({'event': 'gpu_prefixes_cleared', 'state_slots': slots}), flush=True)
             return
