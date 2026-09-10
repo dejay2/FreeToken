@@ -228,10 +228,9 @@ def test_convert_thinking_replay_in_tool_loop():
     assert spec.messages[2]["role"] == "tool"
 
 
-def test_convert_hoists_and_merges_system_messages():
-    # Claude Code interleaves system messages mid-array; strict chat templates
-    # (e.g. Qwen3.5: "System message must be at the beginning") require ONE system
-    # message at the front. Merge top-level system + in-array system, hoist to front.
+def test_convert_preserves_later_system_messages_in_order():
+    # Moving an appended system update ahead of old history invalidates its KV
+    # prefix. Preserve chronology; template compatibility belongs to the renderer.
     req = AnthropicMessagesRequest.model_validate(
         {
             "model": "claude-x",
@@ -245,10 +244,29 @@ def test_convert_hoists_and_merges_system_messages():
         }
     )
     spec = A.convert_anthropic_to_genspec(req, {})
-    assert [m["role"] for m in spec.messages] == ["system", "user", "assistant"]
-    assert sum(1 for m in spec.messages if m["role"] == "system") == 1
-    assert "top-level sys" in spec.messages[0]["content"]
-    assert "mid-stream sys" in spec.messages[0]["content"]
+    assert spec.messages == [
+        {"role": "system", "content": "top-level sys"},
+        {"role": "user", "content": "hello"},
+        {"role": "system", "content": "mid-stream sys"},
+        {"role": "assistant", "content": "hi"},
+    ]
+
+
+def test_convert_merges_only_leading_system_messages():
+    req = AnthropicMessagesRequest.model_validate({
+        "model": "claude-x", "max_tokens": 64, "system": "top-level sys",
+        "messages": [
+            {"role": "system", "content": "leading sys"},
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": [{"type": "text", "text": "later sys"}]},
+        ],
+    })
+    spec = A.convert_anthropic_to_genspec(req, {})
+    assert spec.messages == [
+        {"role": "system", "content": "top-level sys\n\nleading sys"},
+        {"role": "user", "content": "hello"},
+        {"role": "system", "content": "later sys"},
+    ]
 
 
 # --------------------------------------------------------------------------- #

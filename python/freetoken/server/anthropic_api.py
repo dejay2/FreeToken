@@ -20,6 +20,8 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from freetoken.tokenizer.system_messages import PRESERVE_SYSTEM_ORDER
+
 from .anthropic_models import (
     AnthropicContentBlock,
     AnthropicCountTokensRequest,
@@ -187,9 +189,9 @@ def convert_anthropic_prompt(
     """(messages, template_tools, parser_tools, chat_template_kwargs) — the prompt
     side of the conversion, shared by /v1/messages and /v1/messages/count_tokens so
     a counted prompt is exactly the prompt a generation would tokenize."""
-    # Collect all system content (top-level `system` + any system-role messages
-    # Claude Code interleaves in the array) and emit ONE system message at the
-    # front: strict chat templates (e.g. Qwen3.5) require system at the beginning.
+    # Merge only the leading system content. Moving later updates (for example
+    # an agent's changing token budget) ahead of old history invalidates its KV
+    # prefix. The renderer owns checkpoint-specific late-system compatibility.
     system_texts: list[str] = []
     if req.system:
         if isinstance(req.system, str):
@@ -200,9 +202,15 @@ def convert_anthropic_prompt(
             )
 
     other: list[dict[str, Any]] = []
+    has_later_system = False
     for msg in req.messages:
         if msg.role == "system":
-            system_texts.append(_content_text(msg.content))
+            text = _content_text(msg.content)
+            if not other:
+                system_texts.append(text)
+            elif text:
+                other.append({"role": "system", "content": text})
+                has_later_system = True
             continue
 
         if isinstance(msg.content, str):
@@ -300,6 +308,9 @@ def convert_anthropic_prompt(
             ctk = thinking_toggle_kwargs(True)
         elif req.thinking.get("type") == "disabled":
             ctk = thinking_toggle_kwargs(False)
+
+    if has_later_system:
+        ctk[PRESERVE_SYSTEM_ORDER] = True
 
     return render_messages(messages), template_tools, parser_tools, ctk
 

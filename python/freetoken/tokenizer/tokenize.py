@@ -19,6 +19,7 @@ from .effort import (
     probe_thinking_profile,
     quantize_effort,
 )
+from .system_messages import prepare_system_messages
 
 logger = init_logger(__name__)
 
@@ -93,6 +94,9 @@ class TokenizeManager:
     ) -> str:
         """Raw render, no effort sanitation — the probe needs unsupported values
         to actually reach the template so rejection is observable."""
+        messages, chat_template_kwargs = prepare_system_messages(
+            messages, self.tokenizer, tools, chat_template_kwargs,
+        )
         if self._dsv4_encoder is not None:
             return _apply_dsv4_chat_encoder(
                 self._dsv4_encoder, messages, tools, chat_template_kwargs

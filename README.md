@@ -164,11 +164,22 @@ it never turns the feature off quietly.
 The `last_restore_breakdown_ms` object also includes `sequence`, `kv_bytes`, `state_bytes`,
 and `page_offset` to distinguish a completed transfer from a lookup hit.
 
+Anthropic agents can append system messages during a conversation, such as a changing
+token-budget update. On recognized Qwen ChatML templates, FreeToken keeps those messages
+at their original positions with the system role. Moving each new update into the opening
+system message would change the old token prefix and prevent checkpoint reuse. The same
+rendering is used for generation and `/v1/messages/count_tokens`; checkpoint files are not
+modified. Unrecognized templates and custom encoders retain the previous leading-system
+conversion. Requests without later system messages keep their existing rendering.
+
 On the RTX 5090 with Qwen3.8-Flash-Next and FP8 KV, `--kv-park ram --kv-park-ram-gib 8`
-passed ten alternating requests across two 200k-token conversations. Every revisit loaded the
+passed ten alternating plain-text requests across two 200k-token conversations. Every revisit loaded the
 entire saved prefix from RAM in 1.47–1.86 seconds and processed only 48–114 tail tokens.
 Six checkpoints occupied 5.59 GiB. See the [test procedure and limitations](docs/research/kv-ram-conversation-switching-2026-09-10.md)
 and [numeric results](benchmarks/kv-ram-two-conversations-2026-09-10.json).
+`scripts/bench/kv_ram_agent_live.py` separately exercises Anthropic streaming with tools,
+reasoning, appended system updates, concurrent continuations and full RAM reloads. Its
+`--check-prefix` mode checks the selected model's tokenizer without running generation.
 
 Parking currently applies only to the hybrid QSA/GDN radix cache. Picture/private prefixes remain
 uncached. A parked hit must beat the live GPU match by one page in RAM mode or 4096 tokens in SSD
