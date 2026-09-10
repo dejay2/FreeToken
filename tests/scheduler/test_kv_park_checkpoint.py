@@ -543,6 +543,65 @@ def test_main_side_and_next_turn_park_incrementally_through_the_manager(tmp_path
     cm.close()
 
 
+def test_eager_checkpoint_survives_replacement_with_all_twelve_slots_occupied(tmp_path, monkeypatch):
+    cm, kv, state, table = _manager(tmp_path, num_pages=24, num_slots=12)
+    store = cm.park_store
+    victim_ids = torch.arange(800, 811, dtype=torch.int32)
+    victim, victim_L = _admit(cm, kv, state, table, victim_ids, table_idx=0, seed=20)
+    cm.cache_req(victim, finished=True)
+    victim_node = cm.prefix_cache.match_prefix(victim_ids[:victim_L]).node
+    victim_slot = victim_node.mamba_value
+    assert victim_slot is not None and victim_node.ref_count == 0
+
+    ids = torch.arange(900, 911, dtype=torch.int32)
+    req, L = _admit(cm, kv, state, table, ids, table_idx=1, seed=21)
+    frozen = req.mamba_ping_pong[0]
+    expected_kv = _raw(_page_views(kv, table[1, :L:PAGE]))
+    expected_state = _raw(state.slot_byte_views(frozen))
+    # Other active requests consume the remaining slots; only the victim can be reclaimed.
+    held = state.alloc(state.num_free_slots)
+    assert state.num_free_slots == 0
+    real_ensure = cm.ensure_mamba_slots
+    calls = []
+
+    def ensure(n):
+        calls.append(n)
+        assert state.num_free_slots == 0
+        entry = _entry(cm, ids[:L])
+        assert entry is not None, "save must precede replacement-slot reclamation"
+        match = cm.prefix_cache.match_prefix(ids[:L])
+        assert match.mamba_value == frozen
+        assert match.node.ref_count > 0 and match.node.mamba_ref_count > 0
+        real_ensure(n)
+        assert state.num_free_slots == n
+        assert match.node.mamba_value == frozen, "pressure must not evict the donated state"
+
+    monkeypatch.setattr(cm, "ensure_mamba_slots", ensure)
+    cm.cache_req(req, finished=False)
+    assert calls == [1]
+    assert state.num_free_slots == 0
+    assert req.mamba_ping_pong[0] == victim_slot
+    assert cm.prefix_cache.match_prefix(victim_ids[:victim_L]).mamba_value is None
+    assert all(torch.equal(a, b) for a, b in zip(
+        _raw(_page_views(kv, table[1, :L:PAGE])), expected_kv, strict=True
+    ))
+    assert all(torch.equal(a, b) for a, b in zip(
+        _raw(state.slot_byte_views(frozen)), expected_state, strict=True
+    ))
+    state.free(held)
+    monkeypatch.setattr(cm, "ensure_mamba_slots", real_ensure)
+    cm.cache_req(req, finished=True)
+    cm.check_integrity()
+    _restore_equals(cm, kv, state, _entry(cm, ids[:L]), expected_kv, expected_state)
+    while cm.park_idle(now_ns=10**30):
+        cm.drain_pending_parks(wait=True)
+        store.flush()
+    cm.check_integrity()
+    assert state.num_free_slots == state.num_slots - 1
+    assert len(cm.free_slots) == cm.num_pages
+    cm.close()
+
+
 def test_eager_save_failure_leaves_live_state_and_ordinary_finish_intact(tmp_path, monkeypatch):
     cm, kv, state, table = _manager(tmp_path)
     store = cm.park_store
