@@ -34,6 +34,7 @@ import os
 import struct
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -152,9 +153,8 @@ class ParkEntryRejected(RuntimeError):
 class ParkedEntry:
     """One committed snapshot.
 
-    ``payload_bytes`` is the complete snapshot size for a RAM entry but, for an SSD segment,
-    only the bytes *this file* holds (its KV region plus its state region): a child segment's
-    earlier pages live in its ancestors. ``ParkStore.payload_bytes(n)`` keeps the logical
+    ``payload_bytes`` counts the private KV suffix plus the complete state for either tier:
+    a child segment's earlier pages live in its ancestors. ``ParkStore.payload_bytes(n)`` keeps the logical
     full-snapshot meaning. ``parent_token_count`` is the page-aligned cut at which this segment
     borrows its parent's KV: the parent's whole length for a continuation, or this segment's
     own length for a shorter checkpoint that owns no KV bytes. ``root_key`` is in-memory only
@@ -306,6 +306,15 @@ class _ByteSpan:
     def locate(self, offset: int) -> int:
         """Index of the view holding byte ``offset``; ``len(views)`` when past the end."""
         return bisect.bisect_right(self.offsets, offset) - 1
+
+    def suffix(self, offset: int) -> "_ByteSpan":
+        """Views of the suffix, with no allocation or copy of the shared prefix."""
+        index = self.locate(offset)
+        if index == len(self.views):
+            return _ByteSpan.build(())
+        return _ByteSpan.build((
+            self.views[index][offset - self.offsets[index]:], *self.views[index + 1:]
+        ))
 
 
 def _align_up(value: int, alignment: int = _ALIGNMENT) -> int:
@@ -555,11 +564,13 @@ class ParkStore:
         self._pins: dict[str, int] = {}
         self._inflight: set[str] = set()
         self._pending_unlinks: list[tuple[str, Path, int]] = []
+        self._pending_ram: list[ParkedEntry] = []
         self._generation = 0
         self._on_change: Callable[[], None] | None = None
         self._hits = 0
         self._misses = 0
         self._last_restore_ms = 0.0
+        self._restores = 0
         self._last_restore_breakdown: dict[str, float] = {}
         self._disabled = False
         self._last_error: str | None = None
@@ -718,7 +729,7 @@ class ParkStore:
         """Exact file bytes of a save at ``cut``: a zero-KV child still pays header, the full
         token list, padding and one complete state slot (about 115.6 MB on the live model)."""
         if self.mode == "ram":
-            return self.storage_bytes(token_count)
+            return self.storage_bytes(token_count) - cut * self._kv_bytes_per_token()
         return self._segment_bytes(token_count, cut)
 
     def _entry_views(self, page_bases: torch.Tensor, state_slot: int) -> _ByteSpan:
@@ -1020,7 +1031,7 @@ class ParkStore:
     def _parent_matches(cls, parent: ParkedEntry, child: ParkedEntry) -> bool:
         cut = child.parent_token_count
         return (
-            parent.path is not None
+            (parent.path is not None or parent.ram_buffer is not None)
             and parent.key == child.parent_key
             and cls._legal_cut(parent.token_count, child.token_count, cut)
             and parent.metadata_sha256 is not None
@@ -1076,12 +1087,10 @@ class ParkStore:
         committed token lists directly (tens of entries on the live box); it computes no
         arbitrary longest-common-prefix and never invents a cut without a saved state.
         """
-        if self.mode != "ssd":
-            return None
         token_count = len(tokens)
         best: tuple[tuple[int, str], ParkedEntry] | None = None
         for candidate in self._entries.values():
-            if candidate.path is None or candidate.token_count <= token_count:
+            if candidate.token_count <= token_count:
                 continue
             rank = (candidate.token_count, candidate.key)
             if best is not None and rank >= best[0]:
@@ -1098,7 +1107,7 @@ class ParkStore:
             if cut < self.min_tokens:
                 break
             candidate = self._entries.get(keys[page_number - 1])
-            if candidate is None or candidate.path is None:
+            if candidate is None:
                 continue
             if candidate.token_count != cut:
                 continue
@@ -1122,7 +1131,8 @@ class ParkStore:
 
     def _occupied_bytes(self) -> int:
         committed = sum(entry.total_bytes for entry in self._entries.values())
-        return committed + sum(nbytes for _root, _path, nbytes in self._pending_unlinks)
+        return (committed + sum(nbytes for _root, _path, nbytes in self._pending_unlinks)
+                + sum(entry.total_bytes for entry in self._pending_ram))
 
     def _sweep_unlinks(self) -> None:
         """Delete dropped files whose family is no longer pinned; a failed unlink stays charged."""
@@ -1136,8 +1146,22 @@ class ParkStore:
             except OSError:
                 kept.append((root_key, path, nbytes))
         self._pending_unlinks = kept
+        ram_kept = []
+        for entry in self._pending_ram:
+            if self._pins.get(entry.root_key or entry.key, 0):
+                ram_kept.append(entry)
+            else:
+                entry.ram_buffer = None
+        self._pending_ram = ram_kept
 
     def _unlink_or_defer(self, entry: ParkedEntry) -> None:
+        if entry.ram_buffer is not None:
+            if self._pins.get(entry.root_key or entry.key, 0):
+                self._pending_ram.append(entry)
+            else:
+                # Stale lookup handles may outlive eviction. Drop their backing buffer
+                # now, before accounting allows allocating a replacement root.
+                entry.ram_buffer = None
         if entry.path is None:
             return
         record = (entry.root_key or entry.key, entry.path, entry.total_bytes)
@@ -1715,6 +1739,32 @@ class ParkStore:
             with self._lock:
                 self._finish_op(op)
 
+    def _ram_prefix_matches(self, span: _ByteSpan, chain, cut: int) -> bool:
+        """Verify borrowed bytes in bounded staging RAM, including clipped donors.
+
+        Token equality alone cannot justify sharing: a recomputed prefix can have
+        different KV bytes. Never keep a full temporary copy of the old prefix.
+        The writer lock owns this local window; restores read immutable RAM buffers.
+        """
+        ranges = self._chain_ranges(chain, cut)
+        if ranges is None:
+            return False
+        per_token = self._kv_bytes_per_token()
+        window = self._allocate_window(min(self.pinned_window_bytes, 16 << 20))
+        for segment, start, stop in ranges:
+            buffer = segment.ram_buffer
+            if buffer is None or buffer.numel() != segment.payload_bytes:
+                with self._lock:
+                    self._drop_entry(segment.key)
+                return False
+            for offset in range(start * per_token, stop * per_token, window.numel()):
+                take = min(window.numel(), stop * per_token - offset)
+                self._stage_source_chunk(span, offset, take, window)
+                local = offset - segment.parent_token_count * per_token
+                if not torch.equal(window[:take], buffer[local:local + take]):
+                    return False
+        return True
+
     def _save_op(
         self,
         op: _SaveOp,
@@ -1736,16 +1786,32 @@ class ParkStore:
                 if span.nbytes != expected:
                     raise RuntimeError(f"KV park payload {span.nbytes} != expected {expected}")
                 if self.mode == "ram":
-                    buffer = self._copy_to_ram(span)
+                    if chain and not self._ram_prefix_matches(span, chain, op.cut):
+                        with self._lock:
+                            if not self._switch_to_root(op):
+                                on_copied()
+                                return False
+                    cut_bytes = op.cut * self._kv_bytes_per_token()
+                    buffer = self._copy_to_ram(span.suffix(cut_bytes))
                     on_copied()
                     entry = ParkedEntry(
                         key=op.key,
                         token_ids=op.tokens,
                         token_count=len(op.tokens),
-                        payload_bytes=span.nbytes,
+                        payload_bytes=buffer.numel(),
                         total_bytes=op.reserved_bytes,
                         last_used_ns=time.time_ns(),
                         ram_buffer=buffer,
+                        parent_key=op.parent.key if op.parent is not None else None,
+                        parent_token_count=op.cut,
+                        parent_metadata_sha256=(
+                            op.parent.metadata_sha256 if op.parent is not None else None
+                        ),
+                        kv_bytes=(len(op.tokens) - op.cut) * self._kv_bytes_per_token(),
+                        state_bytes=self._state_bytes(),
+                        # RAM segments cannot be reopened. A unique immutable identity
+                        # prevents a replacement under the same token key lending stale bytes.
+                        metadata_sha256=uuid.uuid4().hex,
                     )
                 else:
                     if chain and not self._prefix_matches(span, chain, op.cut):
@@ -1820,7 +1886,7 @@ class ParkStore:
                 # chain broke underneath it is dropped here so a shorter valid endpoint can
                 # still answer.
                 if entry.token_count != token_count or (
-                    entry.path is not None and self._chain(entry) is None
+                    self._chain(entry) is None
                 ):
                     self._drop_entry(key)
                     continue
@@ -2032,6 +2098,25 @@ class ParkStore:
                 self._stream.synchronize()
                 timing["sync_ms"] += (time.perf_counter() - mark) * 1000.0
 
+    def _restore_ram(self, chain, kv_span, state_span, source_offset, progress) -> None:
+        """Restore disjoint KV ranges plus only the requested endpoint's full state."""
+        per_token = self._kv_bytes_per_token()
+        for segment, start, stop in self._chain_ranges(chain, chain[-1].token_count):
+            progress["key"] = segment.key
+            buffer = segment.ram_buffer
+            if buffer is None or buffer.numel() != segment.payload_bytes:
+                raise ParkEntryRejected("RAM parked payload size changed")
+            lo, hi = max(start * per_token, source_offset), stop * per_token
+            if lo < hi:
+                local = lo - segment.parent_token_count * per_token
+                self._copy_window_to_span(
+                    buffer[local:local + hi - lo], lo - source_offset, hi - lo, kv_span
+                )
+        target = chain[-1]
+        self._copy_window_to_span(
+            target.ram_buffer[target.kv_bytes:], 0, target.state_bytes, state_span
+        )
+
     def restore(
         self,
         entry: ParkedEntry,
@@ -2070,13 +2155,9 @@ class ParkStore:
                 raise ValueError("restore target page count does not match parked suffix")
             # Build each destination view once. The redundant SSD split cost 105-109 ms
             # for 2,048 CPU pages in the 2026-09-09 review, outside reported views_ms.
-            if entry.ram_buffer is not None:
-                span = self._entry_views(bases, state_slot)
-                view_bytes, view_count = span.nbytes, len(span.views)
-            else:
-                kv_span, state_span = self._split_views(bases, state_slot)
-                view_bytes = kv_span.nbytes + state_span.nbytes
-                view_count = len(kv_span.views) + len(state_span.views)
+            kv_span, state_span = self._split_views(bases, state_slot)
+            view_bytes = kv_span.nbytes + state_span.nbytes
+            view_count = len(kv_span.views) + len(state_span.views)
             per_page_bytes = self.page_size * self._kv_bytes_per_token()
             state_bytes = self._state_bytes()
             source_offset = page_offset * per_page_bytes
@@ -2085,19 +2166,22 @@ class ParkStore:
                 raise ParkEntryRejected("restore target layout does not match parked suffix")
             timing["views_ms"] = (time.perf_counter() - mark) * 1000.0
             timing["views"] = float(view_count)
+            timing["kv_bytes"] = float(kv_span.nbytes)
+            timing["state_bytes"] = float(state_span.nbytes)
+            timing["page_offset"] = float(page_offset)
             try:
                 if entry.ram_buffer is not None:
-                    if entry.ram_buffer.numel() != entry.payload_bytes:
-                        raise ParkEntryRejected("RAM parked payload size changed")
-                    source = entry.ram_buffer[
-                        source_offset : source_offset + suffix_bytes
-                    ]
+                    chain = self._chain(entry)
+                    if chain is None:
+                        raise ParkEntryRejected("RAM parked chain is incomplete")
+                    timing["segments"] = float(len(chain))
                     mark = time.perf_counter()
                     if self._stream is None:
-                        self._copy_window_to_span(source, 0, suffix_bytes, span)
+                        self._restore_ram(chain, kv_span, state_span, source_offset, progress)
                     else:
+                        self._stream.wait_stream(torch.cuda.current_stream(self.kv_pool.device))
                         with torch.cuda.stream(self._stream):
-                            self._copy_window_to_span(source, 0, suffix_bytes, span)
+                            self._restore_ram(chain, kv_span, state_span, source_offset, progress)
                         timing["copy_ms"] = (time.perf_counter() - mark) * 1000.0
                         mark = time.perf_counter()
                         self._stream.synchronize()
@@ -2115,6 +2199,8 @@ class ParkStore:
                     ):
                         raise ParkEntryRejected("restore target regions do not split cleanly")
                     self._restore_chain(chain, kv_span, state_span, page_offset, timing, progress)
+                self._restores += 1
+                timing["sequence"] = float(self._restores)
             except Exception:
                 if self._stream is not None:
                     self._stream.synchronize()

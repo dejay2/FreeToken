@@ -359,6 +359,7 @@ def test_idle_park_frees_only_after_the_copy_and_restore_is_byte_identical(tmp_p
     assert len(cm.free_slots) == free_pages_before
     assert state.num_free_slots == free_states_before
     cm.drain_pending_parks(wait=True)
+    cm.park_store.flush()  # copy_done releases GPU sources; publication may finish later.
     assert len(cm.free_slots) == free_pages_before + 2
     assert state.num_free_slots == free_states_before + 1
     assert cm.park_store.status()["parked_count"] == 1
@@ -514,6 +515,7 @@ def test_page_and_state_ownership_stays_out_of_free_lists_during_save(tmp_path: 
     cm.park_store.save = checked_save
     cm.park_idle(now_ns=10**30)
     cm.drain_pending_parks(wait=True)
+    cm.park_store.flush()  # copy_done releases GPU sources; publication may finish later.
     assert observations == [(True, True)]
     assert set(pages.tolist()).issubset(set(cm.free_slots.tolist()))
     assert slot in state._free_slots
@@ -576,6 +578,7 @@ def test_idle_threshold_waits_until_the_leaf_is_old_enough(tmp_path: Path):
     cm.park_idle(now_ns=node.timestamp + 1_000_000_000)
     assert len(cm.free_slots) == free_before
     cm.drain_pending_parks(wait=True)
+    cm.park_store.flush()  # copy_done releases GPU sources; publication may finish later.
     assert len(cm.free_slots) == free_before + 2
     assert cm.park_store.status()["parked_count"] == 1
 

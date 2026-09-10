@@ -17,12 +17,17 @@ from freetoken.kernel.fla.op import exp, safe_exp
 from freetoken.kernel.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
+    is_nvidia,
 )
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
 GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
-GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
+# Preserve the RTX 5090 serving workaround from the 2026-09-10 long-context
+# investigation. Keep one config: autotuning this in-place state update corrupts
+# the checkpoint. Other GPUs retain their existing launch; the env override wins.
+_DEFAULT_H_WARPS = "2" if is_nvidia and torch.cuda.get_device_capability() == (12, 0) else "4"
+GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", _DEFAULT_H_WARPS))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 
 

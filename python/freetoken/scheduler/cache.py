@@ -672,11 +672,11 @@ class CacheManager:
             match.node.park_finished = False
 
     def _eager_checkpoint_wanted(self, req: Req) -> bool:
-        """SSD parking only, and never for an aborted request (an aborted chunked prefill
+        """RAM and SSD parking, never for an aborted request (an aborted chunked prefill
         would otherwise promote a half-built prompt into a saved checkpoint)."""
         return (
             self.park_store is not None
-            and getattr(self.park_store, "mode", None) == "ssd"
+            and getattr(self.park_store, "mode", None) in {"ram", "ssd"}
             and not self._temporary_lease_depth
             and not getattr(req, "aborted", False)
         )
@@ -694,7 +694,7 @@ class CacheManager:
         )
 
     def _save_prompt_checkpoint(self, match, input_ids: torch.Tensor, L: int) -> bool:
-        """Persist the final-prefill checkpoint at ``L`` as its own SSD segment, synchronously
+        """Persist the final-prefill checkpoint at ``L`` as its own RAM or SSD segment, synchronously
         and without detaching anything from the tree.
 
         On the live 5090 (2026-09-10, v4 parent links) real agent traffic linked almost no
@@ -847,11 +847,10 @@ class CacheManager:
         self.lock(req.cache_handle)
         # The scheduler commits only the final prefill (intermediate chunks never reach
         # cache_req), so this node is the request's prompt checkpoint: the shared prefix every
-        # later side request and next turn starts from. With SSD parking save it now, before
+        # later side request and next turn starts from. With RAM or SSD parking save it now, before
         # replacement-slot pressure below can tombstone it, and mark it a completed checkpoint
         # so that once its children are gone the ordinary leaf path finds a duplicate key
-        # (no rewrite) and releases it. RAM mode and parking-off keep the previous behavior:
-        # an unfinished intermediate snapshot that ordinary eviction reclaims.
+        # (no rewrite) and releases it. Parking-off keeps ordinary eviction behavior.
         if self._eager_checkpoint_wanted(req) and self._checkpoint_match(m, L):
             self._save_prompt_checkpoint(m, req.input_ids, L)
             m.node.park_finished = True

@@ -126,18 +126,25 @@ Choose `--kv-park off|ram|ssd`, `FREETOKEN_KV_PARK`, or the Windows launcher's `
 |---|---|---:|---|
 | `--kv-park-idle-ms` | `FREETOKEN_KV_PARK_IDLE_MS` / `-KVParkIdleMs` | `0` | Park at the first idle scheduler point; raise it to retain recent prefixes on the GPU. |
 | `--kv-park-min-tokens` | `FREETOKEN_KV_PARK_MIN_TOKENS` / `-KVParkMinTokens` | `8192` | Smallest prefix worth parking; it must be a multiple of the model's page size. |
-| `--kv-park-ram-gib` | `FREETOKEN_KV_PARK_RAM_GIB` / `-KVParkRAMGiB` | `2` | LRU budget for full entries in page-locked host RAM. |
+| `--kv-park-ram-gib` | `FREETOKEN_KV_PARK_RAM_GIB` / `-KVParkRAMGiB` | `2` | LRU budget for shared checkpoint segments in page-locked host RAM. |
 | `--kv-park-ssd-dir` | `FREETOKEN_KV_PARK_SSD_DIR` / `-KVParkSSDDir` | `~/.cache/freetoken/kv-park` | Persistent SSD root; tensor-parallel ranks use separate subdirectories. |
 | `--kv-park-ssd-gib` | `FREETOKEN_KV_PARK_SSD_GIB` / `-KVParkSSDGiB` | `32` | On-disk LRU budget per tensor-parallel rank. |
 | `--kv-park-window-mib` | `FREETOKEN_KV_PARK_WINDOW_MIB` / `-KVParkWindowMiB` | `256` | Size of each of two shared page-locked SSD windows; restore alternates both to overlap disk reads with GPU copies (512 MiB total by default). |
 
 `ram` retains exact QSA K/V, compressed-index, FP8-scale (when enabled), GDN and PLE sibling-state
-bytes until its RAM LRU drops them. A single bounded background worker performs the copy/write;
-the scheduler keeps source pages and the state slot owned until device-to-host copying finishes.
+bytes until its RAM LRU drops them. Both tiers save the exact final-prefill checkpoint
+synchronously before its recurrent state can be reclaimed. This preserves a reusable prompt
+even when the next request branches before the previous answer ends. Finished idle leaves use
+a bounded background worker; their GPU pages and state remain owned until copying finishes.
 A full worker queue falls back to ordinary cache eviction instead of blocking request admission.
+Checkpoints share unchanged parent pages and retain their own complete state; a new turn adds
+its changed pages and state instead of retaining another full prefix. Parent bytes are checked
+against the source before sharing. RAM writes no parking files and is lost on server restart.
 
-`ssd` keeps the same bytes in version-2 files with a 4-KiB header, SHA-256 payload checksum, and
-atomic manifest. Files survive a server restart; a missing or invalid manifest is rebuilt by
+`ssd` keeps the same segments in version-5 files with a 4-KiB header, separate SHA-256 checksums
+for KV and state regions, and an atomic manifest. Parent-linked segments append new pages;
+a shorter checkpoint can borrow pages from a longer donor but must supply its own exact state.
+Files survive a server restart; a missing or invalid manifest is rebuilt by
 scanning valid headers, and incomplete temp files left by dead writers are removed before new
 writes begin. The persistent fingerprint pins one Hub snapshot before model loading and covers the
 active safetensors or FTW index and referenced shards. One payload pass both verifies the checksum
@@ -153,6 +160,14 @@ selected mode explicitly, so `-KVPark off` overrides an inherited `FREETOKEN_KV_
 restore time, whether the store disabled itself, and `last_error` (the newest failure text, `null`
 while nothing has failed) under `parking`. A parking failure is always logged at warning level too;
 it never turns the feature off quietly.
+The `last_restore_breakdown_ms` object also includes `sequence`, `kv_bytes`, `state_bytes`,
+and `page_offset` to distinguish a completed transfer from a lookup hit.
+
+On the RTX 5090 with Qwen3.8-Flash-Next and FP8 KV, `--kv-park ram --kv-park-ram-gib 8`
+passed ten alternating requests across two 200k-token conversations. Every revisit loaded the
+entire saved prefix from RAM in 1.47–1.86 seconds and processed only 48–114 tail tokens.
+Six checkpoints occupied 5.59 GiB. See the [test procedure and limitations](docs/research/kv-ram-conversation-switching-2026-09-10.md)
+and [numeric results](benchmarks/kv-ram-two-conversations-2026-09-10.json).
 
 Parking currently applies only to the hybrid QSA/GDN radix cache. Picture/private prefixes remain
 uncached. A parked hit must beat the live GPU match by one page in RAM mode or 4096 tokens in SSD

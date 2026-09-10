@@ -1,0 +1,494 @@
+{
+  "model": "Qwen3.8-Flash-Next-NVFP4",
+  "target_tokens": 200000,
+  "cold": [
+    {
+      "family": "A",
+      "turn": 0,
+      "expected": "maple7319|copper2048|violet9631",
+      "answer": "maple7319|copper2048|violet9631",
+      "usage": {
+        "prompt_tokens": 200060,
+        "completion_tokens": 21,
+        "total_tokens": 200081
+      },
+      "seconds": 71.21765971299828
+    },
+    {
+      "family": "B",
+      "turn": 0,
+      "expected": "amber5826|silver1073|willow6402",
+      "answer": "amber5826|silver1073|willow6402",
+      "usage": {
+        "prompt_tokens": 200060,
+        "completion_tokens": 19,
+        "total_tokens": 200079
+      },
+      "seconds": 58.935375880999345
+    },
+    {
+      "family": "A",
+      "turn": 1,
+      "expected": "violet9631|maple7319|copper2048",
+      "answer": "violet9631|maple7319|copper2048",
+      "usage": {
+        "prompt_tokens": 200114,
+        "completion_tokens": 21,
+        "total_tokens": 200135
+      },
+      "seconds": 58.99392888699731
+    },
+    {
+      "family": "B",
+      "turn": 1,
+      "expected": "willow6402|amber5826|silver1073",
+      "answer": "willow6402|amber5826|silver1073",
+      "usage": {
+        "prompt_tokens": 200112,
+        "completion_tokens": 19,
+        "total_tokens": 200131
+      },
+      "seconds": 58.949757873000635
+    },
+    {
+      "family": "A",
+      "turn": 2,
+      "expected": "copper2048|violet9631|maple7319",
+      "answer": "copper2048|violet9631|maple7319",
+      "usage": {
+        "prompt_tokens": 200168,
+        "completion_tokens": 21,
+        "total_tokens": 200189
+      },
+      "seconds": 59.01584064900089
+    },
+    {
+      "family": "B",
+      "turn": 2,
+      "expected": "silver1073|willow6402|amber5826",
+      "answer": "silver1073|willow6402|amber5826",
+      "usage": {
+        "prompt_tokens": 200164,
+        "completion_tokens": 19,
+        "total_tokens": 200183
+      },
+      "seconds": 59.012427400997694
+    }
+  ],
+  "ram": [
+    {
+      "event": "ram",
+      "index": 0,
+      "family": "A",
+      "turn": 0,
+      "answer": "maple7319|copper2048|violet9631",
+      "expected": "maple7319|copper2048|violet9631",
+      "usage": {
+        "prompt_tokens": 200060,
+        "completion_tokens": 21,
+        "total_tokens": 200081
+      },
+      "seconds": 132.6616663340028,
+      "cold_seconds": 71.21765971299828,
+      "hits_delta": 0,
+      "parking": {
+        "mode": "ram",
+        "parked_count": 1,
+        "parked_bytes": 2766042376,
+        "hits": 0,
+        "misses": 1,
+        "last_restore_ms": 0.0,
+        "last_restore_breakdown_ms": {},
+        "disabled": false,
+        "last_error": null
+      }
+    },
+    {
+      "event": "ram",
+      "index": 1,
+      "family": "B",
+      "turn": 0,
+      "answer": "amber5826|silver1073|willow6402",
+      "expected": "amber5826|silver1073|willow6402",
+      "usage": {
+        "prompt_tokens": 200060,
+        "completion_tokens": 19,
+        "total_tokens": 200079
+      },
+      "seconds": 66.23613201800254,
+      "cold_seconds": 58.935375880999345,
+      "hits_delta": 0,
+      "parking": {
+        "mode": "ram",
+        "parked_count": 2,
+        "parked_bytes": 5532084752,
+        "hits": 0,
+        "misses": 2,
+        "last_restore_ms": 0.0,
+        "last_restore_breakdown_ms": {},
+        "disabled": false,
+        "last_error": null
+      }
+    },
+    {
+      "event": "ram",
+      "index": 2,
+      "family": "A",
+      "turn": 1,
+      "answer": "violet9631|maple7319|copper2048",
+      "expected": "violet9631|maple7319|copper2048",
+      "usage": {
+        "prompt_tokens": 200114,
+        "completion_tokens": 21,
+        "total_tokens": 200135,
+        "prompt_tokens_details": {
+          "cached_tokens": 200000
+        }
+      },
+      "seconds": 9.782949265001662,
+      "cold_seconds": 58.99392888699731,
+      "hits_delta": 1,
+      "parking": {
+        "mode": "ram",
+        "parked_count": 3,
+        "parked_bytes": 5649375256,
+        "hits": 1,
+        "misses": 2,
+        "last_restore_ms": 1746.566902998893,
+        "last_restore_breakdown_ms": {
+          "views_ms": 777.4720139968849,
+          "header_ms": 0.0,
+          "read_ms": 0.0,
+          "hash_ms": 0.0,
+          "copy_ms": 961.7064129997743,
+          "tray_wait_ms": 0.0,
+          "sync_ms": 7.356423000601353,
+          "total_ms": 1746.566902998893,
+          "views": 187574.0,
+          "kv_bytes": 2649600000.0,
+          "state_bytes": 115642376.0,
+          "page_offset": 0.0,
+          "segments": 1.0,
+          "sequence": 1.0
+        },
+        "disabled": false,
+        "last_error": null
+      }
+    },
+    {
+      "event": "ram",
+      "index": 3,
+      "family": "B",
+      "turn": 1,
+      "answer": "willow6402|amber5826|silver1073",
+      "expected": "willow6402|amber5826|silver1073",
+      "usage": {
+        "prompt_tokens": 200112,
+        "completion_tokens": 19,
+        "total_tokens": 200131,
+        "prompt_tokens_details": {
+          "cached_tokens": 200000
+        }
+      },
+      "seconds": 7.99204362099772,
+      "cold_seconds": 58.949757873000635,
+      "hits_delta": 1,
+      "parking": {
+        "mode": "ram",
+        "parked_count": 4,
+        "parked_bytes": 5766665760,
+        "hits": 2,
+        "misses": 2,
+        "last_restore_ms": 1710.5802239966579,
+        "last_restore_breakdown_ms": {
+          "views_ms": 749.2203910005628,
+          "header_ms": 0.0,
+          "read_ms": 0.0,
+          "hash_ms": 0.0,
+          "copy_ms": 954.7674800014647,
+          "tray_wait_ms": 0.0,
+          "sync_ms": 6.561490998137742,
+          "total_ms": 1710.5802239966579,
+          "views": 187574.0,
+          "kv_bytes": 2649600000.0,
+          "state_bytes": 115642376.0,
+          "page_offset": 0.0,
+          "segments": 1.0,
+          "sequence": 2.0
+        },
+        "disabled": false,
+        "last_error": null
+      }
+    },
+    {
+      "event": "ram",
+      "index": 4,
+      "family": "A",
+      "turn": 2,
+      "answer": "copper2048|violet9631|maple7319",
+      "expected": "copper2048|violet9631|maple7319",
+      "usage": {
+        "prompt_tokens": 200168,
+        "completion_tokens": 21,
+        "total_tokens": 200189,
+        "prompt_tokens_details": {
+          "cached_tokens": 200064
+        }
+      },
+      "seconds": 6.2019190860009985,
+      "cold_seconds": 59.01584064900089,
+      "hits_delta": 1,
+      "parking": {
+        "mode": "ram",
+        "parked_count": 5,
+        "parked_bytes": 5883956520,
+        "hits": 3,
+        "misses": 2,
+        "last_restore_ms": 1682.7307799976552,
+        "last_restore_breakdown_ms": {
+          "views_ms": 733.280628999637,
+          "header_ms": 0.0,
+          "read_ms": 0.0,
+          "hash_ms": 0.0,
+          "copy_ms": 942.2549980008625,
+          "tray_wait_ms": 0.0,
+          "sync_ms": 6.848105000244686,
+          "total_ms": 1682.7307799976552,
+          "views": 187634.0,
+          "kv_bytes": 2650447872.0,
+          "state_bytes": 115642376.0,
+          "page_offset": 0.0,
+          "segments": 2.0,
+          "sequence": 3.0
+        },
+        "disabled": false,
+        "last_error": null
+      }
+    },
+    {
+      "event": "ram",
+      "index": 5,
+      "family": "B",
+      "turn": 2,
+      "answer": "silver1073|willow6402|amber5826",
+      "expected": "silver1073|willow6402|amber5826",
+      "usage": {
+        "prompt_tokens": 200164,
+        "completion_tokens": 19,
+        "total_tokens": 200183,
+        "prompt_tokens_details": {
+          "cached_tokens": 200064
+        }
+      },
+      "seconds": 6.120837132999441,
+      "cold_seconds": 59.012427400997694,
+      "hits_delta": 1,
+      "parking": {
+        "mode": "ram",
+        "parked_count": 6,
+        "parked_bytes": 6001247280,
+        "hits": 4,
+        "misses": 2,
+        "last_restore_ms": 1472.990252001182,
+        "last_restore_breakdown_ms": {
+          "views_ms": 524.664690001373,
+          "header_ms": 0.0,
+          "read_ms": 0.0,
+          "hash_ms": 0.0,
+          "copy_ms": 940.559842998482,
+          "tray_wait_ms": 0.0,
+          "sync_ms": 7.435400999384001,
+          "total_ms": 1472.990252001182,
+          "views": 187634.0,
+          "kv_bytes": 2650447872.0,
+          "state_bytes": 115642376.0,
+          "page_offset": 0.0,
+          "segments": 2.0,
+          "sequence": 4.0
+        },
+        "disabled": false,
+        "last_error": null
+      }
+    },
+    {
+      "event": "ram",
+      "index": 6,
+      "family": "A",
+      "turn": 0,
+      "answer": "maple7319|copper2048|violet9631",
+      "expected": "maple7319|copper2048|violet9631",
+      "usage": {
+        "prompt_tokens": 200060,
+        "completion_tokens": 21,
+        "total_tokens": 200081,
+        "prompt_tokens_details": {
+          "cached_tokens": 200000
+        }
+      },
+      "seconds": 4.464879929000745,
+      "cold_seconds": 71.21765971299828,
+      "hits_delta": 1,
+      "parking": {
+        "mode": "ram",
+        "parked_count": 6,
+        "parked_bytes": 6001247280,
+        "hits": 5,
+        "misses": 2,
+        "last_restore_ms": 1517.3523539997404,
+        "last_restore_breakdown_ms": {
+          "views_ms": 559.3604079986108,
+          "header_ms": 0.0,
+          "read_ms": 0.0,
+          "hash_ms": 0.0,
+          "copy_ms": 950.8068340001046,
+          "tray_wait_ms": 0.0,
+          "sync_ms": 7.158753000112483,
+          "total_ms": 1517.3523539997404,
+          "views": 187574.0,
+          "kv_bytes": 2649600000.0,
+          "state_bytes": 115642376.0,
+          "page_offset": 0.0,
+          "segments": 1.0,
+          "sequence": 5.0
+        },
+        "disabled": false,
+        "last_error": null
+      }
+    },
+    {
+      "event": "ram",
+      "index": 7,
+      "family": "B",
+      "turn": 0,
+      "answer": "amber5826|silver1073|willow6402",
+      "expected": "amber5826|silver1073|willow6402",
+      "usage": {
+        "prompt_tokens": 200060,
+        "completion_tokens": 19,
+        "total_tokens": 200079,
+        "prompt_tokens_details": {
+          "cached_tokens": 200000
+        }
+      },
+      "seconds": 3.561042916000588,
+      "cold_seconds": 58.935375880999345,
+      "hits_delta": 1,
+      "parking": {
+        "mode": "ram",
+        "parked_count": 6,
+        "parked_bytes": 6001247280,
+        "hits": 6,
+        "misses": 2,
+        "last_restore_ms": 1857.6946040011535,
+        "last_restore_breakdown_ms": {
+          "views_ms": 915.7944070029771,
+          "header_ms": 0.0,
+          "read_ms": 0.0,
+          "hash_ms": 0.0,
+          "copy_ms": 939.9741159977566,
+          "tray_wait_ms": 0.0,
+          "sync_ms": 1.8982700021297205,
+          "total_ms": 1857.6946040011535,
+          "views": 187574.0,
+          "kv_bytes": 2649600000.0,
+          "state_bytes": 115642376.0,
+          "page_offset": 0.0,
+          "segments": 1.0,
+          "sequence": 6.0
+        },
+        "disabled": false,
+        "last_error": null
+      }
+    },
+    {
+      "event": "ram",
+      "index": 8,
+      "family": "A",
+      "turn": 1,
+      "answer": "violet9631|maple7319|copper2048",
+      "expected": "violet9631|maple7319|copper2048",
+      "usage": {
+        "prompt_tokens": 200114,
+        "completion_tokens": 21,
+        "total_tokens": 200135,
+        "prompt_tokens_details": {
+          "cached_tokens": 200064
+        }
+      },
+      "seconds": 3.6467447389986773,
+      "cold_seconds": 58.99392888699731,
+      "hits_delta": 1,
+      "parking": {
+        "mode": "ram",
+        "parked_count": 6,
+        "parked_bytes": 6001247280,
+        "hits": 7,
+        "misses": 2,
+        "last_restore_ms": 1694.9746149985003,
+        "last_restore_breakdown_ms": {
+          "views_ms": 734.1396089977934,
+          "header_ms": 0.0,
+          "read_ms": 0.0,
+          "hash_ms": 0.0,
+          "copy_ms": 949.5374110010744,
+          "tray_wait_ms": 0.0,
+          "sync_ms": 10.934457997791469,
+          "total_ms": 1694.9746149985003,
+          "views": 187634.0,
+          "kv_bytes": 2650447872.0,
+          "state_bytes": 115642376.0,
+          "page_offset": 0.0,
+          "segments": 2.0,
+          "sequence": 7.0
+        },
+        "disabled": false,
+        "last_error": null
+      }
+    },
+    {
+      "event": "ram",
+      "index": 9,
+      "family": "B",
+      "turn": 1,
+      "answer": "willow6402|amber5826|silver1073",
+      "expected": "willow6402|amber5826|silver1073",
+      "usage": {
+        "prompt_tokens": 200112,
+        "completion_tokens": 19,
+        "total_tokens": 200131,
+        "prompt_tokens_details": {
+          "cached_tokens": 200064
+        }
+      },
+      "seconds": 4.085177567001665,
+      "cold_seconds": 58.949757873000635,
+      "hits_delta": 1,
+      "parking": {
+        "mode": "ram",
+        "parked_count": 6,
+        "parked_bytes": 6001247280,
+        "hits": 8,
+        "misses": 2,
+        "last_restore_ms": 1480.174308999267,
+        "last_restore_breakdown_ms": {
+          "views_ms": 532.4540360015817,
+          "header_ms": 0.0,
+          "read_ms": 0.0,
+          "hash_ms": 0.0,
+          "copy_ms": 940.5699050003022,
+          "tray_wait_ms": 0.0,
+          "sync_ms": 6.818141002440825,
+          "total_ms": 1480.174308999267,
+          "views": 187634.0,
+          "kv_bytes": 2650447872.0,
+          "state_bytes": 115642376.0,
+          "page_offset": 0.0,
+          "segments": 2.0,
+          "sequence": 8.0
+        },
+        "disabled": false,
+        "last_error": null
+      }
+    }
+  ]
+}

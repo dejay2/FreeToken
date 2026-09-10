@@ -263,6 +263,8 @@ def test_compute_cache_pools_reads_load_time_allocations():
     )
     assert compute_cache_pools(eng) == {
         "num_pages": 90112,
+        "gpu_owned_layers": [],
+        "gpu_owned_reserved_bytes": 0,
         "page_size": 1,
         "moe_cache_size": 526,
         "num_mamba_slots": 64,
@@ -277,6 +279,8 @@ def test_compute_cache_pools_zero_for_missing_pools():
     eng = SimpleNamespace(num_pages=0, config=None, moe_offload_cache=None, linear_state_pool=None)
     assert compute_cache_pools(eng) == {
         "num_pages": 0,
+        "gpu_owned_layers": [],
+        "gpu_owned_reserved_bytes": 0,
         "page_size": 0,
         "moe_cache_size": 0,
         "num_mamba_slots": 0,

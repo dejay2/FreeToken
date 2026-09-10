@@ -1,9 +1,9 @@
-"""Branch-aware SSD parking at the scheduler seam (2026-09-10).
+"""Branch-aware RAM and SSD parking at the scheduler seam (2026-09-10).
 
 The final-prefill commit (``cache_req(finished=False)``) and an early finish that still
-carries a frozen prefill snapshot must persist that exact checkpoint as its own SSD segment
+carries a frozen prefill snapshot must persist that exact checkpoint as its own RAM or SSD segment
 before state-slot pressure can tombstone it, from the canonical tree pages and the frozen
-tree slot, without detaching or freeing anything. RAM mode, parking-off, private and aborted
+tree slot, without detaching or freeing anything. Parking-off, private and aborted
 requests keep the previous behavior. CPU only: a pure-Python key compare stands in for the
 native radix extension when it is absent (the devbox), so nothing here is skipped.
 """
@@ -195,10 +195,11 @@ def _restore_equals(cm, kv, state, entry, expected_kv, expected_state) -> None:
         cm._free(cm._page_to_token(pages))
 
 
-def test_final_prefill_checkpoint_is_saved_before_slot_pressure_and_survives_eviction(tmp_path):
+@pytest.mark.parametrize("mode", ["ram", "ssd"])
+def test_final_prefill_checkpoint_is_saved_before_slot_pressure_and_survives_eviction(tmp_path, mode):
     # 4,107 tokens: the SSD restore margin in _lookup_parked is 4,096 tokens, so a manager-level
     # restore hit needs a checkpoint at least that long (L = 4,104 here).
-    cm, kv, state, table = _manager(tmp_path, num_pages=2200)
+    cm, kv, state, table = _manager(tmp_path, mode=mode, num_pages=2200)
     store = cm.park_store
     ids = torch.arange(100, 100 + 4107, dtype=torch.int32)
     req, L = _admit(cm, kv, state, table, ids, table_idx=0, seed=1)
@@ -278,11 +279,12 @@ def test_final_prefill_checkpoint_is_saved_before_slot_pressure_and_survives_evi
     cm.close()
 
 
-def test_a_saved_checkpoint_leaves_the_live_tree_without_a_rewrite(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", ["ram", "ssd"])
+def test_a_saved_checkpoint_leaves_the_live_tree_without_a_rewrite(tmp_path, monkeypatch, mode):
     """Once its children are gone, a saved prompt checkpoint is an ordinary eligible leaf:
     the duplicate key makes its park a no-write and ordinary detach releases it, so a live
     internal checkpoint never suppresses the SSD hit forever."""
-    cm, kv, state, table = _manager(tmp_path)
+    cm, kv, state, table = _manager(tmp_path, mode=mode)
     store = cm.park_store
     ids = torch.arange(200, 209, dtype=torch.int32)        # 9 tokens -> L = 8
     req, L = _admit(cm, kv, state, table, ids, table_idx=0, seed=3)
@@ -308,9 +310,9 @@ def test_a_saved_checkpoint_leaves_the_live_tree_without_a_rewrite(tmp_path, mon
     cm.close()
 
 
-@pytest.mark.parametrize("path", ["ram", "off", "private", "aborted"])
-def test_no_eager_checkpoint_on_ram_off_private_or_aborted_paths(tmp_path, path):
-    mode = {"ram": "ram", "off": None}.get(path, "ssd")
+@pytest.mark.parametrize("path", ["off", "private", "aborted"])
+def test_no_eager_checkpoint_on_off_private_or_aborted_paths(tmp_path, path):
+    mode = {"off": None}.get(path, "ssd")
     cm, kv, state, table = _manager(tmp_path, mode=mode)
     ids = torch.arange(300, 311, dtype=torch.int32)
     req, L = _admit(cm, kv, state, table, ids, table_idx=0, seed=7, private=(path == "private"))
@@ -321,9 +323,6 @@ def test_no_eager_checkpoint_on_ram_off_private_or_aborted_paths(tmp_path, path)
         cm.cache_req(req, finished=False)
     if cm.park_store is not None:
         assert cm.park_store.status()["parked_count"] == 0
-    if path == "ram":
-        node = cm.prefix_cache.match_prefix(ids[:L]).node
-        assert node.park_finished is False, "RAM mode keeps the intermediate-snapshot rule"
     if path == "aborted":
         # The frozen snapshot went into the tree as before (78f118c's finish marker still
         # applies to it); the new eager save simply did not happen.
@@ -376,12 +375,13 @@ def test_intermediate_chunk_commit_never_reaches_the_store(tmp_path):
     cm.close()
 
 
-def test_eager_save_reads_canonical_pages_not_the_freed_duplicates(tmp_path):
+@pytest.mark.parametrize("mode", ["ram", "ssd"])
+def test_eager_save_reads_canonical_pages_not_the_freed_duplicates(tmp_path, mode):
     """Two cold prefills of the same prompt: the second commit dedups against the first's
     tree node (mamba_exist), re-points its row and frees its own duplicate pages. The eager
     save must read the tree's canonical pages and slot, never the freed duplicates or the
     request's own frozen slot; the tree slot is what a restore will hand out."""
-    cm, kv, state, table = _manager(tmp_path, num_pages=24)
+    cm, kv, state, table = _manager(tmp_path, mode=mode, num_pages=24)
     store = cm.park_store
     ids = torch.arange(500, 511, dtype=torch.int32)
     first, L = _admit(cm, kv, state, table, ids, table_idx=0, seed=11)
@@ -432,8 +432,9 @@ def test_eager_save_reads_canonical_pages_not_the_freed_duplicates(tmp_path):
     cm.close()
 
 
-def test_early_eos_checkpoint_is_saved_once_and_unaligned_finish_still_falls_back(tmp_path):
-    cm, kv, state, table = _manager(tmp_path)
+@pytest.mark.parametrize("mode", ["ram", "ssd"])
+def test_early_eos_checkpoint_is_saved_once_and_unaligned_finish_still_falls_back(tmp_path, mode):
+    cm, kv, state, table = _manager(tmp_path, mode=mode)
     store = cm.park_store
     ids = torch.arange(600, 611, dtype=torch.int32)        # 11 tokens: unaligned finish
     req, L = _admit(cm, kv, state, table, ids, table_idx=0, seed=13)
@@ -543,8 +544,9 @@ def test_main_side_and_next_turn_park_incrementally_through_the_manager(tmp_path
     cm.close()
 
 
-def test_eager_checkpoint_survives_replacement_with_all_twelve_slots_occupied(tmp_path, monkeypatch):
-    cm, kv, state, table = _manager(tmp_path, num_pages=24, num_slots=12)
+@pytest.mark.parametrize("mode", ["ram", "ssd"])
+def test_eager_checkpoint_survives_replacement_with_all_twelve_slots_occupied(tmp_path, monkeypatch, mode):
+    cm, kv, state, table = _manager(tmp_path, mode=mode, num_pages=24, num_slots=12)
     store = cm.park_store
     victim_ids = torch.arange(800, 811, dtype=torch.int32)
     victim, victim_L = _admit(cm, kv, state, table, victim_ids, table_idx=0, seed=20)
@@ -602,8 +604,9 @@ def test_eager_checkpoint_survives_replacement_with_all_twelve_slots_occupied(tm
     cm.close()
 
 
-def test_eager_save_failure_leaves_live_state_and_ordinary_finish_intact(tmp_path, monkeypatch):
-    cm, kv, state, table = _manager(tmp_path)
+@pytest.mark.parametrize("mode", ["ram", "ssd"])
+def test_eager_save_failure_leaves_live_state_and_ordinary_finish_intact(tmp_path, monkeypatch, mode):
+    cm, kv, state, table = _manager(tmp_path, mode=mode)
     store = cm.park_store
     ids = torch.arange(700, 711, dtype=torch.int32)
     req, L = _admit(cm, kv, state, table, ids, table_idx=0, seed=17)

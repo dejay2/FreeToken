@@ -32,7 +32,7 @@ def _tp(monkeypatch):
     )
 
 
-def _qsa_pool(num_pages: int = 6, kv_dtype: torch.dtype | None = None) -> QSAKVCache:
+def _qsa_pool(num_pages: int = 6, kv_dtype: torch.dtype | None = None, device="cpu") -> QSAKVCache:
     return QSAKVCache(
         num_kv_heads=1,
         num_layers=2,
@@ -41,7 +41,7 @@ def _qsa_pool(num_pages: int = 6, kv_dtype: torch.dtype | None = None) -> QSAKVC
         page_size=4,
         dtype=torch.bfloat16,
         kv_dtype=kv_dtype,
-        device=torch.device("cpu"),
+        device=torch.device(device),
         index_head_dim=3,
         num_index_layers=2,
         index_ratio=2,
@@ -50,7 +50,7 @@ def _qsa_pool(num_pages: int = 6, kv_dtype: torch.dtype | None = None) -> QSAKVC
     )
 
 
-def _state_pool(num_slots: int = 5) -> LinearStatePool:
+def _state_pool(num_slots: int = 5, device="cpu") -> LinearStatePool:
     group = LinearGatedDeltaGroupConfig(
         name="linear",
         layer_ids=(0, 1),
@@ -72,7 +72,7 @@ def _state_pool(num_slots: int = 5) -> LinearStatePool:
         group=group,
         num_slots=num_slots,
         dtype=torch.bfloat16,
-        device=torch.device("cpu"),
+        device=torch.device(device),
         tp_size=1,
         slot_states=(sibling,),
     )
@@ -1200,6 +1200,199 @@ def _bases(page_ids) -> torch.Tensor:
 
 def _entry_for(store: ParkStore, tokens: torch.Tensor):
     return store._entries.get(rolling_page_keys(tokens, 4, store.fingerprint)[-1])
+
+
+@pytest.mark.parametrize("page_offset", [0, 1, 3, 5])
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_ram_two_families_share_pages_and_restore_exact_checkpoint(tmp_path, page_offset, kv_dtype):
+    """A budget for two roots plus deltas cannot hold repeated full snapshots.
+
+    Separate byte oracles cover QSA, its index, GDN and PLE sibling state after
+    every source page/slot has been overwritten by a different conversation.
+    """
+    kv, state = _qsa_pool(num_pages=32, kv_dtype=kv_dtype), _state_pool(num_slots=8)
+    slots = state.alloc(3)
+    per_token = kv.unit_bytes()[0]
+    state_bytes = sum(v.numel() * v.element_size() for v in state.slot_byte_views(slots[0]))
+    budget = 2 * (20 * per_token + 3 * state_bytes + (12 + 8 + 20) * 4)
+    store = _store("ram", tmp_path / "never-created", kv, state, ram_budget_bytes=budget)
+    snapshots = []
+    try:
+        for family in range(2):
+            tokens = torch.arange(20, dtype=torch.int32) + family * 100
+            pages = [2, 4, 6, 8, 10]
+            _fill_raw(_page_views(kv, pages), seed=family + 17)
+            # Longer donor -> shorter prompt checkpoint -> extended next turn.
+            parent = None
+            for length, seed in [(12, 1), (8, 2), (20, 3)]:
+                _fill_raw(state.slot_byte_views(slots[0]), seed=seed + family * 7)
+                expected_kv = _raw_bytes(_page_views(kv, pages[:length // 4]))
+                expected_state = _raw_bytes(state.slot_byte_views(slots[0]))
+                assert store.save(tokens[:length], _bases(pages[:length // 4]), slots[0])
+                entry = _entry_for(store, tokens[:length])
+                if length == 8:
+                    assert entry.parent_key == parent.key and entry.kv_bytes == 0
+                if length == 20:
+                    assert entry.parent_token_count == 12
+                    assert entry.ram_buffer.numel() == 8 * per_token + state_bytes
+                snapshots.append((entry, expected_kv, expected_state))
+                parent = entry
+        assert store.status()["parked_count"] == 6
+        assert store.status()["parked_bytes"] <= budget
+        assert not (tmp_path / "never-created").exists()
+        _fill_raw(_page_views(kv, list(range(32))), seed=97)
+        _fill_raw(state.slot_byte_views(slots[0]), seed=98)
+        for entry, expected_kv, expected_state in snapshots * 2:
+            offset = min(page_offset, entry.token_count // 4)
+            targets = [17, 19, 21, 23, 25][offset:entry.token_count // 4]
+            store.restore(entry, _bases(targets), slots[1], page_offset=offset)
+            per_page = len(kv.page_byte_views(0))
+            _assert_raw_equal(_raw_bytes(_page_views(kv, targets)), expected_kv[offset * per_page:])
+            _assert_raw_equal(_raw_bytes(state.slot_byte_views(slots[1])), expected_state)
+        assert store._reserved_bytes == 0 and not store._pins
+    finally:
+        store.close()
+
+
+def test_ram_changed_prefix_bytes_cannot_borrow_a_stale_parent(tmp_path):
+    kv, state = _qsa_pool(num_pages=12), _state_pool()
+    slots = state.alloc(2)
+    store = _store("ram", tmp_path, kv, state)
+    try:
+        tokens = torch.arange(12, dtype=torch.int32)
+        pages = [1, 3, 5]
+        _fill_raw(_page_views(kv, pages), seed=21)
+        _fill_raw(state.slot_byte_views(slots[0]), seed=22)
+        assert store.save(tokens[:8], _bases(pages[:2]), slots[0])
+        kv.page_byte_views(1)[0].view(torch.uint8).reshape(-1)[0] ^= 255
+        expected = _raw_bytes(_page_views(kv, pages))
+        expected_state = _raw_bytes(state.slot_byte_views(slots[0]))
+        assert store.save(tokens, _bases(pages), slots[0])
+        entry = _entry_for(store, tokens)
+        assert entry.parent_key is None
+        assert entry.kv_bytes == 12 * kv.unit_bytes()[0]
+        store.restore(entry, _bases([6, 7, 8]), slots[1])
+        _assert_raw_equal(_raw_bytes(_page_views(kv, [6, 7, 8])), expected)
+        _assert_raw_equal(_raw_bytes(state.slot_byte_views(slots[1])), expected_state)
+    finally:
+        store.close()
+
+
+def test_ram_root_fallback_releases_evicted_payload_before_allocating(tmp_path, monkeypatch):
+    import weakref
+
+    kv, state = _qsa_pool(num_pages=12), _state_pool()
+    slot = state.alloc(1)[0]
+    store = _store("ram", tmp_path, kv, state)
+    try:
+        tokens = torch.arange(12, dtype=torch.int32)
+        _fill_raw(_page_views(kv, [0, 1, 2]), seed=1)
+        _fill_raw(state.slot_byte_views(slot), seed=2)
+        assert store.save(tokens[:8], _bases([0, 1]), slot)
+        old = _entry_for(store, tokens[:8])
+        old_buffer = weakref.ref(old.ram_buffer)
+        # Room for a root and delta, or one replacement root, but not both roots.
+        store.ram_budget_bytes = old.total_bytes + store._planned_bytes(12, 8)
+        kv.page_byte_views(0)[0].view(torch.uint8).reshape(-1)[0] ^= 255
+        real_copy = store._copy_to_ram
+
+        def checked_copy(span):
+            assert old_buffer() is None, "evicted payload remains pinned during root allocation"
+            return real_copy(span)
+
+        monkeypatch.setattr(store, "_copy_to_ram", checked_copy)
+        assert store.save(tokens, _bases([0, 1, 2]), slot)
+        assert store.status()["disabled"] is False
+    finally:
+        store.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA stream/event proof")
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_ram_async_cuda_copy_owns_sources_until_event_then_restores(tmp_path, kv_dtype):
+    producer = torch.cuda.Stream()
+    with torch.inference_mode(), torch.cuda.stream(producer):
+        kv = _qsa_pool(num_pages=16, kv_dtype=kv_dtype, device="cuda:0")
+        state = _state_pool(device="cuda:0")
+        source_slot, target_slot = state.alloc(2)
+        with torch.cuda.stream(torch.cuda.default_stream()):
+            store = _store("ram", tmp_path, kv, state)
+        try:
+            tokens = torch.arange(12, dtype=torch.int32)
+            _fill_raw(_page_views(kv, [0, 2, 4]), seed=31)
+            _fill_raw(state.slot_byte_views(source_slot), seed=32)
+            assert store.save(tokens[:8], _bases([0, 2]), source_slot)
+            _fill_raw(state.slot_byte_views(source_slot), seed=33)
+            expected_kv = [v.cpu() for v in _raw_bytes(_page_views(kv, [0, 2, 4]))]
+            expected_state = [v.cpu() for v in _raw_bytes(state.slot_byte_views(source_slot))]
+            # Queue unfinished GPU work AFTER capturing the oracle. The worker must
+            # wait for this producer before reading the new page and recurrent state.
+            page = kv.page_byte_views(4)[0].view(torch.uint8).reshape(-1)
+            recurrent = state.slot_byte_views(source_slot)[0].view(torch.uint8).reshape(-1)
+            saved_page, saved_recurrent = page.clone(), recurrent.clone()
+            page.zero_()
+            recurrent.zero_()
+            torch.cuda._sleep(20_000_000)
+            page.copy_(saved_page, non_blocking=True)
+            recurrent.copy_(saved_recurrent, non_blocking=True)
+            pending = store.offer(tokens, _bases([0, 2, 4]), source_slot)
+            assert pending is not None and pending.copy_done.wait(30)
+            # This is when the scheduler may give these pages and slot to conversation B.
+            _fill_raw(_page_views(kv, [0, 2, 4]), seed=61)
+            _fill_raw(state.slot_byte_views(source_slot), seed=62)
+            assert pending.done.wait(30) and pending.success
+            hit = store.lookup(tokens)
+            assert hit.parent_key is not None
+            store.restore(hit, _bases([7, 9, 11]), target_slot)
+            got_kv = [v.cpu() for v in _raw_bytes(_page_views(kv, [7, 9, 11]))]
+            got_state = [v.cpu() for v in _raw_bytes(state.slot_byte_views(target_slot))]
+            _assert_raw_equal(got_kv, expected_kv)
+            _assert_raw_equal(got_state, expected_state)
+            transferred = store.status()["last_restore_breakdown_ms"]
+            assert transferred["kv_bytes"] == 12 * kv.unit_bytes()[0]
+            assert transferred["state_bytes"] == sum(v.numel() for v in expected_state)
+            assert transferred["page_offset"] == 0 and transferred["sequence"] == 1
+            assert store._reserved_bytes == 0 and not store._pins
+        finally:
+            store.close()
+
+
+def test_ram_invalidated_inflight_parent_remains_charged_until_unpinned(tmp_path, monkeypatch):
+    import weakref
+
+    kv, state = _qsa_pool(num_pages=12), _state_pool()
+    slot = state.alloc(1)[0]
+    store = _store("ram", tmp_path, kv, state)
+    started, release = threading.Event(), threading.Event()
+    try:
+        tokens = torch.arange(12, dtype=torch.int32)
+        _fill_raw(_page_views(kv, [0, 1, 2]), seed=11)
+        _fill_raw(state.slot_byte_views(slot), seed=12)
+        assert store.save(tokens[:8], _bases([0, 1]), slot)
+        parent = _entry_for(store, tokens[:8])
+        buffer = weakref.ref(parent.ram_buffer)
+        write = store._save_op
+
+        def paused(*args, **kwargs):
+            started.set()
+            assert release.wait(10)
+            return write(*args, **kwargs)
+
+        monkeypatch.setattr(store, "_save_op", paused)
+        pending = store.offer(tokens, _bases([0, 1, 2]), slot)
+        assert pending is not None and started.wait(10)
+        with store._lock:
+            store._drop_entry(parent.key)
+            assert store._occupied_bytes() == parent.total_bytes
+            assert buffer() is not None
+        release.set()
+        assert pending.done.wait(10) and pending.success
+        assert buffer() is None and not store._pending_ram
+        assert _entry_for(store, tokens).parent_key is None
+        assert store._reserved_bytes == 0 and not store._pins
+    finally:
+        release.set()
+        store.close()
 
 
 class _WriteSpy:
