@@ -2315,6 +2315,7 @@ def test_ssd_partial_prefix_restore_is_byte_identical(
         torch.cat(_raw_bytes(state_pool.slot_byte_views(slots[0]))),
         torch.cat(_raw_bytes(state_pool.slot_byte_views(slots[1]))),
     )
+    oracle_source_kv = _raw_bytes(_page_views(kv_pool, source_ids))
     oracle_kv = _raw_bytes(_page_views(kv_pool, source_ids[:6]))
     oracle_state = _raw_bytes(state_pool.slot_byte_views(slots[0]))
     store = _store("ssd", tmp_path / "s", kv_pool, state_pool, pinned_window_bytes=4096)
@@ -2391,7 +2392,7 @@ def test_ssd_partial_prefix_restore_is_byte_identical(
             torch.cat(restored_state),
             torch.cat(_raw_bytes(state_pool.slot_byte_views(slots[1]))),
         ), "the restored state must be C's own, not N's"
-        _assert_raw_equal(_raw_bytes(_page_views(kv_pool, source_ids)), _raw_bytes(_page_views(kv_pool, source_ids)))
+        _assert_raw_equal(_raw_bytes(_page_views(kv_pool, source_ids)), oracle_source_kv)
         _assert_raw_equal(_raw_bytes(_page_views(kv_pool, untouched)), sentinel_kv)
         _assert_raw_equal(_raw_bytes(state_pool.slot_byte_views(slots[3])), sentinel_state)
         assert reopened.status()["last_restore_breakdown_ms"]["segments"] == (
