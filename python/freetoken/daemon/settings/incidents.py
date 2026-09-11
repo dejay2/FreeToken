@@ -144,15 +144,15 @@ def capture_incident(
     if os.name == "posix":
         capture("memory", ["free", "-b"])
         capture("processes", ["ps", "-L", "-p", ",".join(str(p) for p in sorted(pids or ())) or "0", "-o", "pid,tid,stat,wchan:40,comm"])
-        since = (dt.datetime.now().astimezone() - dt.timedelta(minutes=20)).isoformat(timespec="seconds")
+        since = (dt.datetime.now() - dt.timedelta(minutes=20)).strftime("%Y-%m-%d %H:%M:%S")
         capture("kernel", ["dmesg", "--level=err,warn", "--time-format=iso", "--since", since], 1.0)
         powershell = Path("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
         if powershell.exists():
             script = (
-                "$ErrorActionPreference='Stop'; @(Get-WinEvent -FilterHashtable "
+                "$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; @(Get-WinEvent -FilterHashtable "
                 "@{LogName='System';ProviderName='nvlddmkm';StartTime=(Get-Date).AddMinutes(-20)} "
                 "-MaxEvents 30 -ErrorAction SilentlyContinue | "
-                "Select-Object TimeCreated,Id,Message) | ConvertTo-Json -Compress"
+                "ForEach-Object { $_.ToXml() }) | ConvertTo-Json -Compress"
             )
             encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
             capture("windows_gpu_events", [str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], 2.0)
