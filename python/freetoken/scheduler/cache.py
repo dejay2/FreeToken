@@ -1132,26 +1132,29 @@ class CacheManager:
             while needed_pages > len(self.free_slots) and self._park_lru():
                 pass
             self.drain_pending_parks()
-        if needed_pages > len(self.free_slots):
-            need = (needed_pages - len(self.free_slots)) * self.page_size
-            if self.is_swa:
-                # Evicting KV leaf nodes drops their swa slots too -> return both pools.
-                ev = self.prefix_cache.evict_full(need)
-                evicted = ev.kv_indices
-                self._free_swa(ev.swa_indices)
-            elif self.is_hybrid:
-                # Evicting KV leaf nodes drops their GDN snapshots too -> return both pools.
-                er = self.prefix_cache.evict_full(need)
-                evicted = er.kv_indices
-                if er.mamba_slots:
-                    self.linear_state_pool.free(er.mamba_slots)
-            else:
-                evicted = self.prefix_cache.evict(need)
-            self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
-        if needed_pages > len(self.free_slots) and self._pending_parks:
-            # Only wait when no ordinary evictable leaf can satisfy the request. The wait ends at
-            # D2H completion, never at the later SSD manifest update.
-            self.drain_pending_parks(wait=True)
+        for wait_for_parks in (False, True):
+            if wait_for_parks:
+                if needed_pages <= len(self.free_slots) or not self._pending_parks:
+                    break
+                # D2H completion releases detached leaves AND unlocks their shared source
+                # paths. Evict again below: those ancestors were protected on the first pass.
+                self.drain_pending_parks(wait=True)
+            if needed_pages > len(self.free_slots):
+                need = (needed_pages - len(self.free_slots)) * self.page_size
+                if self.is_swa:
+                    # Evicting KV leaf nodes drops their swa slots too -> return both pools.
+                    ev = self.prefix_cache.evict_full(need)
+                    evicted = ev.kv_indices
+                    self._free_swa(ev.swa_indices)
+                elif self.is_hybrid:
+                    # Evicting KV leaf nodes drops their GDN snapshots too -> return both pools.
+                    er = self.prefix_cache.evict_full(need)
+                    evicted = er.kv_indices
+                    if er.mamba_slots:
+                        self.linear_state_pool.free(er.mamba_slots)
+                else:
+                    evicted = self.prefix_cache.evict(need)
+                self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
         assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
         allocated = self.free_slots[:needed_pages]
         self.free_slots = self.free_slots[needed_pages:]

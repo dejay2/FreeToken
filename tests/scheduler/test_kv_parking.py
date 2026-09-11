@@ -714,4 +714,45 @@ def test_allocation_pressure_parks_the_lru_leaf_before_reusing_its_pages(tmp_pat
     assert len(allocated) == 2
     assert int(allocated[0]) == int(only_free[0])
     assert set(allocated.tolist()).intersection(set(pages.tolist()))
+    # Allocation waits for the source copy, which can precede store publication.
+    cm.park_store.flush()
     assert cm.park_store.lookup(tokens) is not None
+    cm.close()
+
+
+def test_allocation_reclaims_shared_prefix_unlocked_by_pending_parks(tmp_path, monkeypatch):
+    """Copying either fork pins their shared page; it becomes evictable only after both drain."""
+    cm, kv, state = _manager(tmp_path, num_pages=3)
+    first_tokens, first_pages, first_indices, *_ = _install_prefix(cm, kv, state)
+    second_tokens = torch.cat([first_tokens[:4], torch.arange(100, 104, dtype=torch.int32)])
+    second_page = cm._allocate(1)
+    second_indices = torch.cat([first_indices[:4], cm._page_to_token(second_page)])
+    cm.prefix_cache.insert(second_tokens, second_indices, state.alloc(1)[0])
+    all_pages = set(first_pages.tolist() + second_page.tolist())
+    assert cm.available_size == 12 and len(cm.free_slots) == 0
+    pending_copies = []
+
+    class Pending:
+        def __init__(self):
+            self.copy_done = threading.Event()
+
+        def wait_copied(self):
+            # No source can have been reused before its copy completes.
+            assert len(cm.free_slots) < 3
+            self.copy_done.set()
+
+    def offer(*args):
+        pending = Pending()
+        pending_copies.append(pending)
+        return pending
+
+    monkeypatch.setattr(cm.park_store, "offer", offer)
+    try:
+        allocated = cm._allocate(3)
+        assert pending_copies and all(p.copy_done.is_set() for p in pending_copies)
+        assert len(allocated) == 3 and set(allocated.tolist()) == all_pages
+        assert cm.prefix_cache.full_evictable_size == 0
+        cm._free(cm._page_to_token(allocated))
+        cm.check_integrity()
+    finally:
+        cm.close()
