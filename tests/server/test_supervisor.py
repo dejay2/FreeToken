@@ -174,6 +174,31 @@ def test_supervisor_detects_post_ready_death():
     assert "scheduler" in seen["failure"]
 
 
+def test_runtime_error_is_reported_before_the_worker_finishes_exiting():
+    """CUDA destruction can hang with is_alive=True after a fatal exception."""
+    from freetoken.server.supervisor import run_backend_supervisor
+
+    class Proc:
+        name = "scheduler"
+        polls = 0
+
+        def is_alive(self):
+            self.polls += 1
+            return self.polls < 4
+
+    proc = Proc()
+    q = queue.Queue()
+    q.put("scheduler ready")
+    q.put(("error", "runtime scheduler: CUDA illegal address"))
+    errors = []
+    run_backend_supervisor(
+        BackendHandle(q, [proc], 1), LoadProgress(), lambda: None,
+        on_failure=errors.append, poll=0.001,
+    )
+    assert errors == ["runtime scheduler: CUDA illegal address"]
+    assert proc.polls < 4, "must not wait for CUDA process teardown"
+
+
 def test_supervisor_silent_on_post_ready_death_during_shutdown():
     """An orderly stop (SIGTERM/^C) sets a shutting-down flag before the workers exit. A
     post-ready death observed while that flag is set is EXPECTED — the watchdog must return

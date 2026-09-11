@@ -31,6 +31,7 @@ from freetoken.message import (
     CacheResidencyReply,
     CacheStepMsg,
     CacheStepReply,
+    PrefillProgressReply,
     RoutingStatsMsg,
     RoutingStatsReply,
     TokenizeMsg,
@@ -266,6 +267,12 @@ class FrontendManager:
     # "stuck": the clock restarts on each unit and only measures one silent unit.
     maintenance_op: Dict[str, Any] | None = None
     backend_last_seen: float = 0.0
+    # Completed inference only: admission, polling and parking snapshots are not GPU work.
+    inference_seen: float = 0.0
+    inference_phase: str = "idle"
+    inference_prefill_tokens: int = 0
+    inference_stuck_s: float = MAINTENANCE_STUCK_S
+    inference_stuck: bool = False
     maintenance_stuck_s: float = MAINTENANCE_STUCK_S
     monotonic: Callable[[], float] = time.monotonic
     load_progress: Any = None
@@ -381,6 +388,9 @@ class FrontendManager:
         threading.Thread(target=_warm, daemon=True, name="frontend-tokenizer-warm").start()
 
     def _allocate_user(self) -> int:
+        if self.stats.active == 0:
+            self.inference_seen = self.monotonic()
+            self.inference_phase = "waiting_for_first_progress"
         uid = self.uid_counter
         self.uid_counter += 1
         self.ack_map[uid] = []
@@ -442,6 +452,11 @@ class FrontendManager:
             msg = await self.recv_tokenizer.get()
             # Every message here was produced by the scheduler side: it is proof of progress.
             self.backend_last_seen = self.monotonic()
+            if isinstance(msg, PrefillProgressReply):
+                self.inference_seen = self.monotonic()
+                self.inference_phase = "prefill"
+                self.inference_prefill_tokens += msg.processed_tokens
+                continue
             if isinstance(msg, CacheParkStatusReply):
                 self.parking_status = dict(msg.status)
                 continue
@@ -467,6 +482,9 @@ class FrontendManager:
                 # client disconnects and abort_user removes its ack queue. Delivery to a live
                 # request remains gated below, but observation must happen first.
                 self.stats.observe(msg)
+                if msg.completion_tokens_delta > 0:
+                    self.inference_seen = self.monotonic()
+                    self.inference_phase = "decode"
                 if msg.uid not in self.ack_map:
                     continue
                 self.ack_map[msg.uid].append(msg)
@@ -507,6 +525,8 @@ class FrontendManager:
                 self.rebuild_done.set()
             return
         self.maintenance_state = "failed" if msg.status == "failed" else "serving"
+        if self.maintenance_state == "serving":
+            self.inference_seen = self.monotonic()
         self.maintenance_op = None
         if hasattr(self, "rebuild_done"):
             self.rebuild_done.set()
@@ -534,6 +554,8 @@ class FrontendManager:
             self.maintenance_state = "failed"
         else:
             self.maintenance_state = "failed" if msg.status == "failed" else "serving"
+            if self.maintenance_state == "serving":
+                self.inference_seen = self.monotonic()
             self.maintenance_op = None
         self.rebuild_done.set()
 
@@ -578,6 +600,28 @@ class FrontendManager:
         except RuntimeError:
             # Loop already closed (shutdown racing the crash): nothing left to wake.
             pass
+
+    def check_inference(self) -> Dict[str, Any]:
+        """A request may run indefinitely while completed chunks/tokens keep arriving."""
+        active = self.stats.active
+        idle = max(0.0, self.monotonic() - self.inference_seen) if active else 0.0
+        if self.maintenance_state == "serving" and active and idle > self.inference_stuck_s:
+            self.inference_stuck = True
+            self.fatal_error = (
+                f"inference made no progress for {idle:.0f} s "
+                f"with {active} active request(s), last phase {self.inference_phase!r}; restart required"
+            )
+            self.maintenance_state = "failed"
+            logger.error("Inference watchdog: %s", self.fatal_error)
+            _fail_open_waiters(self, self.fatal_error)
+        return {
+            "active_requests": active,
+            "phase": self.inference_phase if active else "idle",
+            "progress_idle_s": round(idle, 1),
+            "prefill_tokens": self.inference_prefill_tokens,
+            "deadline_s": self.inference_stuck_s,
+            "stuck": self.inference_stuck,
+        }
 
     def check_maintenance(self, now: float | None = None) -> Dict[str, Any]:
         """Report the open maintenance operation and latch "failed" once it is stuck.
@@ -648,6 +692,7 @@ class FrontendManager:
             await asyncio.sleep(MAINTENANCE_WATCH_INTERVAL_S)
             try:
                 self.check_maintenance()
+                self.check_inference()
             except Exception:  # noqa: BLE001 - the watch must outlive one bad tick
                 logger.exception("maintenance watch tick failed")
 
@@ -660,7 +705,14 @@ class FrontendManager:
 
     async def send_one(self, msg: BaseTokenizerMsg):
         self._create_listener_once()
-        await self.send_tokenizer.put(msg)
+        try:
+            await self.send_tokenizer.put(msg)
+        except (Exception, asyncio.CancelledError):
+            if isinstance(msg, TokenizeMsg):
+                self.stats.on_dispatch_failed(msg.uid)
+                self.ack_map.pop(msg.uid, None)
+                self.event_map.pop(msg.uid, None)
+            raise
 
     async def wait_for_ack(self, uid: int):
         event = self.event_map[uid]
@@ -1312,8 +1364,12 @@ async def cache_status():
         create_listener()
     check = getattr(state, "check_maintenance", None)
     maintenance = check() if callable(check) else None
+    check_inference = getattr(state, "check_inference", None)
+    inference = check_inference() if callable(check_inference) else None
     return {
+        "instance_id": getattr(state, "instance_id", None),
         "state": state.maintenance_state,
+        "inference": inference,
         "maintenance": maintenance,
         "last_rebuild": state.last_rebuild,
         "geometry": cache_geometry(state),

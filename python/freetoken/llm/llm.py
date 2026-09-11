@@ -11,6 +11,7 @@ from freetoken.message import (
     BaseTokenizerMsg,
     CacheParkStatusMsg,
     DetokenizeMsg,
+    PrefillProgressMsg,
     PromptAdmittedMsg,
     UserMsg,
 )
@@ -94,7 +95,7 @@ class LLM(Scheduler):
 
     def offline_send_result(self, reply: List[BaseTokenizerMsg]) -> None:
         for msg in reply:
-            if isinstance(msg, (PromptAdmittedMsg, CacheParkStatusMsg)):
+            if isinstance(msg, (PromptAdmittedMsg, CacheParkStatusMsg, PrefillProgressMsg)):
                 # These messages feed online-server accounting and status snapshots. Offline
                 # generation owns its inputs and has no FrontendManager stats sink.
                 continue

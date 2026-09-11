@@ -22,7 +22,7 @@ import torch
 
 from freetoken.core import Batch, Req, SamplingParams
 from freetoken.kvcache.linear_state_pool import LinearStatePool
-from freetoken.message import AbortBackendMsg
+from freetoken.message import AbortBackendMsg, DetokenizeMsg, PrefillProgressMsg
 from freetoken.models.config import LinearGatedDeltaGroupConfig
 from freetoken.scheduler.cache import CacheManager
 from freetoken.scheduler.decode import DecodeManager
@@ -126,7 +126,7 @@ def test_abort_inflight_final_chunk_marks_then_drains():
     assert req.table_idx == -1                  # freed at the drain point
     assert pool.num_free_slots > free_after_mark
     assert req in stub.finished_reqs
-    assert sent == []                           # no DetokenizeMsg: abort ack stays terminal
+    assert not any(isinstance(m, DetokenizeMsg) for m in sent)  # abort ack stays terminal
     cm.check_integrity()
 
 
@@ -157,7 +157,8 @@ def test_abort_inflight_intermediate_chunk_marks_then_drains():
 
     Scheduler._process_last_data(stub, stub._last_data)
     assert chunk.table_idx == -1
-    assert sent == []                           # chunks never reply
+    assert not any(isinstance(m, DetokenizeMsg) for m in sent)  # chunks emit no sampled token
+    assert any(isinstance(m, PrefillProgressMsg) for m in sent)  # the drained chunk is progress
     cm.check_integrity()
 
 
@@ -217,7 +218,7 @@ def test_prefix_commit_sentinel_guard():
 
     assert pool.num_free_slots == free_after_abort  # nothing double-freed
     cm.check_integrity()
-    assert [m.uid for m in sent] == [UID]  # un-marked path still publishes the token
+    assert [m.uid for m in sent if isinstance(m, DetokenizeMsg)] == [UID]
 
 
 if __name__ == "__main__":

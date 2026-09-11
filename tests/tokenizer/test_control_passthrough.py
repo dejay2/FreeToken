@@ -30,6 +30,20 @@ from freetoken.message import (
 from freetoken.tokenizer.server import _CONTROL_MSG_TYPES, _forward_control_msg
 
 
+def test_completed_prefill_progress_survives_both_message_wires():
+    from freetoken.message import BaseTokenizerMsg, BaseFrontendMsg, PrefillProgressMsg, PrefillProgressReply
+    import queue
+
+    original = PrefillProgressMsg(processed_tokens=8192, batch_size=2)
+    decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(original))
+    output = queue.Queue()
+    assert isinstance(decoded, _CONTROL_MSG_TYPES)
+    assert _forward_control_msg(decoded, queue.Queue(), output)
+    delivered = output.get_nowait()
+    delivered = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(delivered))
+    assert delivered == PrefillProgressReply(processed_tokens=8192, batch_size=2)
+
+
 class _Q:
     def __init__(self) -> None:
         self.items: list = []

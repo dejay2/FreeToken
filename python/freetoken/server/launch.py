@@ -4,6 +4,8 @@ import logging
 import multiprocessing as mp
 import os
 import sys
+import threading
+import traceback
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -15,17 +17,43 @@ if TYPE_CHECKING:
     from .supervisor import BackendHandle
 
 
-def _report_startup_error(ack_queue: mp.Queue, exc: BaseException) -> None:
+def _report_startup_error(ack_queue: mp.Queue, exc: BaseException, prefix: str = "") -> None:
     """Tell the parent WHY this worker is dying — push an ("error", reason) ack before it exits,
     so the supervisor reports the real cause (e.g. a config ValueError) instead of the generic
     "backend worker … exited during load". Best-effort and flushed (close + join_thread), since
     the process is about to terminate; a failure to report must never mask the original error."""
     try:
-        ack_queue.put(("error", f"{type(exc).__name__}: {exc}"))
+        reason = f"{prefix}{type(exc).__name__}: {exc}"
+        reason = " ".join(reason.split())[:4000]
+        ack_queue.put(("error", reason))
         ack_queue.close()
         ack_queue.join_thread()
     except Exception:  # noqa: BLE001 -- reporting is a nicety; never shadow the real exception
         pass
+
+
+def _serve_scheduler(scheduler, ack_queue: mp.Queue, args: ServerArgs) -> None:
+    """Fatal errors bypass CUDA destruction; give the parent a bounded chance to hear why."""
+    try:
+        scheduler.run_forever()
+    except KeyboardInterrupt:
+        if args.tp_info.is_primary():
+            print()
+            init_logger(__name__).info("Scheduler exiting gracefully...")
+        scheduler.shutdown()
+    except Exception as exc:  # noqa: BLE001 -- an invalid CUDA context cannot resume
+        def report():
+            _report_startup_error(ack_queue, exc, f"runtime scheduler TP{args.tp_info.rank}: ")
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
+
+        try:
+            reporter = threading.Thread(target=report, daemon=True)
+            reporter.start()
+            reporter.join(timeout=1.0)
+        finally:
+            # Never synchronize CUDA or run tensor destructors after an illegal address.
+            # Even a broken ack pipe or log sink must not strand this process in cleanup.
+            os._exit(1)
 
 
 def _detach_process_group() -> None:
@@ -104,22 +132,13 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
             except Exception:  # noqa: BLE001 -- metadata is a nicety; readiness is not
                 pass
             ack_queue.put("Scheduler is ready")
-            # The supervisor stops draining ack_queue once ready, so uninstall the sink:
-            # runtime cache rebuilds re-run the graph capture (which emits progress) and
-            # would otherwise push onto a queue nobody reads for the server's lifetime.
+            # Runtime progress uses the scheduler message wire; this sink is startup-only.
             set_progress_sink(None)
 
         if args.silent_output:
             logging.disable(logging.INFO)
 
-        try:
-            scheduler.run_forever()
-        except KeyboardInterrupt:
-            logger = init_logger(__name__)
-            if args.tp_info.is_primary():
-                print()  # for a clean newline after ^C
-                logger.info("Scheduler exiting gracefully...")
-            scheduler.shutdown()
+        _serve_scheduler(scheduler, ack_queue, args)
 
 
 def launch_server(

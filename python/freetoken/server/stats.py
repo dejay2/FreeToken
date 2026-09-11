@@ -55,6 +55,11 @@ class StatsTracker:
         if uid in self._inflight:
             self._aborting.add(uid)
 
+    def on_dispatch_failed(self, uid: int) -> None:
+        """No request was handed to the tokenizer; there will be no terminal reply."""
+        self._inflight.discard(uid)
+        self._aborting.discard(uid)
+
     def observe(self, reply: Any, now: float | None = None) -> None:
         t = time.monotonic() if now is None else now
         if getattr(reply, "completion_tokens_delta", 0) > 0:

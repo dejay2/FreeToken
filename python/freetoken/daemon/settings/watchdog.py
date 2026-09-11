@@ -17,6 +17,8 @@ import time
 from collections import deque
 from typing import Any, Callable
 
+from .incidents import capture_incident_bounded as capture_incident
+
 logger = logging.getLogger(__name__)
 
 # "unreachable": nothing answers on the port. "failed": the API server's maintenance state after
@@ -81,6 +83,8 @@ class CrashWatchdog(threading.Thread):
         self.gave_up: bool = False
         self.last_reason: str | None = None
         self.last_restart_at: str | None = None
+        self.last_incident: str | None = None
+        self._incident_captured = False
         self._restarts: deque[float] = deque()
         self._own_thread: int | None = None  # the watchdog thread while it queues its own job
 
@@ -108,6 +112,7 @@ class CrashWatchdog(threading.Thread):
             self.armed = True
             self.misses = 0
             self.gave_up = False
+            self._incident_captured = False
 
     def disarm(self, reason: str | None = "stopped by the page") -> None:
         """A page Stop is a wish for the server to be down; never restart behind it.
@@ -157,6 +162,7 @@ class CrashWatchdog(threading.Thread):
                 self.armed = True
                 self.misses = 0
                 self.gave_up = False
+                self._incident_captured = False
             return
         if state == "rebuilding":
             state = self._rebuilding_verdict(document)
@@ -173,13 +179,30 @@ class CrashWatchdog(threading.Thread):
             if not self.armed or self.gave_up:
                 return
             self.misses += 1
+            capture = not self._incident_captured
+            self._incident_captured = True
+            if capture:
+                self.last_incident = None
         # Second opinion before anything is killed: with no server process left the port is
         # simply dead; with processes still there (a hung server, or a stray listener such as an
         # ssh tunnel blocking the probe) wait twice as long.
         pids = _server_pids(self.process_manager)
+        if capture:
+            try:
+                incident = capture_incident(
+                    document=document, reason=str(state), pids=pids,
+                    log_path=self.process_manager.log_path,
+                )
+                with self._lock:
+                    self.last_incident = str(incident) if incident is not None else None
+                logger.warning("crash watchdog: incident saved to %s", incident)
+            except Exception as exc:  # noqa: BLE001 - evidence must never block recovery
+                logger.warning("crash watchdog: incident capture failed: %s", exc)
+        if self.process_manager.current_job() is not None:
+            return  # a human lifecycle action may have landed during capture
         needed = self.misses_needed if not pids else 2 * self.misses_needed
         with self._lock:
-            if not self.armed or self.gave_up or self.misses < needed:
+            if not self._enabled or not self.armed or self.gave_up or self.misses < needed:
                 return  # a disarm or give-up may have landed while the lock was down
             now = self._monotonic()
             while self._restarts and now - self._restarts[0] > 3600.0:
@@ -266,6 +289,7 @@ class CrashWatchdog(threading.Thread):
                 "restarts_last_hour": recent,
                 "last_restart_at": self.last_restart_at,
                 "last_reason": self.last_reason,
+                "last_incident": self.last_incident,
                 "gave_up": self.gave_up,
             }
 

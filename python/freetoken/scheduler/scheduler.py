@@ -36,6 +36,7 @@ from freetoken.message import (
     ErrorReplyMsg,
     ExitMsg,
     PromptAdmittedMsg,
+    PrefillProgressMsg,
     RoutingStatsBackendMsg,
     RoutingStatsResultMsg,
     UserMsg,
@@ -588,7 +589,15 @@ class Scheduler(SchedulerIOMixin):
             swa_tokens=swa_tokens,
             generated_tokens=generated_tokens,
         )
-        self.send_result(reply)
+        # This seam follows copy_done.synchronize and cache commit. Intermediate prompt
+        # chunks have no token reply, but must still prove progress to the watchdog.
+        if batch.is_prefill and not getattr(batch, "mtp_verify", False):
+            self.send_result([
+                PrefillProgressMsg(processed_tokens=batch.log_new_tokens, batch_size=len(batch.reqs)),
+                *reply,
+            ])
+        else:
+            self.send_result(reply)
         send_park_status = getattr(self, "_send_park_status", None)
         if send_park_status is not None:
             send_park_status()

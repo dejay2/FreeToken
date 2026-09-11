@@ -20,9 +20,11 @@ def build_health(state: Any, version: str) -> dict:
     # a stuck "rebuilding" to error; it used to answer ok for as long as the gate stayed shut.
     check = getattr(state, "check_maintenance", None)
     maintenance = check() if callable(check) else None
+    check_inference = getattr(state, "check_inference", None)
+    inference = check_inference() if callable(check_inference) else None
     fatal = getattr(state, "fatal_error", None)
     if fatal:
-        return {"status": "error", "message": fatal, "instance_id": instance_id}
+        return {"status": "error", "message": fatal, "instance_id": instance_id, "inference": inference}
 
     mstate = getattr(state, "maintenance_state", "serving")
     config = getattr(state, "config", None)
@@ -50,6 +52,7 @@ def build_health(state: Any, version: str) -> dict:
         "uptime_s": uptime_s,
         "maintenance": mstate,
         "version": version,
+        "inference": inference,
     }
     if isinstance(maintenance, dict) and maintenance.get("age_s") is not None:
         doc["maintenance_age_s"] = maintenance["age_s"]

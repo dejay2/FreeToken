@@ -284,6 +284,14 @@ def test_offline_handler_ignores_online_prompt_accounting_signal():
     LLM.offline_send_result(offline, [PromptAdmittedMsg(uid=1, prompt_tokens=10)])
 
 
+def test_offline_handler_ignores_online_prefill_progress():
+    from freetoken.llm.llm import LLM
+    from freetoken.message import PrefillProgressMsg
+
+    offline = SimpleNamespace(status_map={}, eos_token_ids=set())
+    LLM.offline_send_result(offline, [PrefillProgressMsg(processed_tokens=8192, batch_size=1)])
+
+
 def test_frontend_manager_generates_unique_uuid_instance_ids():
     config = SimpleNamespace()
     first = FrontendManager(config=config, send_tokenizer=None, recv_tokenizer=None)

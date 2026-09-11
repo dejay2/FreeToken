@@ -93,6 +93,12 @@ class CacheStepReply(BaseFrontendMsg):
 
 
 @dataclass
+class PrefillProgressReply(BaseFrontendMsg):
+    processed_tokens: int
+    batch_size: int
+
+
+@dataclass
 class CacheProgressReply(BaseFrontendMsg):
     # detokenizer worker -> api server: see CacheProgressMsg. Not a reply to a waiter; it only
     # refreshes the open maintenance operation's progress clock.

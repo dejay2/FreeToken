@@ -58,6 +58,7 @@ class Clock:
 def _no_server_processes(monkeypatch):
     """By default the dead server left no process behind (the shipped LimitCORE=0 case)."""
     monkeypatch.setattr(wd, "_server_pids", lambda pm: set())
+    monkeypatch.setattr(wd, "capture_incident", lambda **kwargs: None, raising=False)
 
 
 def _manager(tmp_path, readiness, executor=None):
@@ -101,6 +102,42 @@ def test_starts_the_server_after_three_dead_probes_once_armed(tmp_path):
     assert dog.status()["restarts_last_hour"] == 1
     assert "starting it" in dog.status()["last_reason"]
     assert dog.armed is True, "the watchdog's own job keeps it armed so a failed reboot is still watched"
+
+
+def test_captures_once_before_restart_and_stop_during_capture_wins(tmp_path, monkeypatch):
+    state = {"state": "failed", "instance_id": "fault-1"}
+    manager, dog = _wired(tmp_path, lambda: dict(state))
+    dog.armed = True
+    captured = []
+
+    def capture(**kwargs):
+        captured.append(kwargs['document'])
+        assert manager.current_job() is None
+        dog.disarm('human Stop')
+        return str(tmp_path / 'incident')
+
+    monkeypatch.setattr(wd, 'capture_incident', capture)
+    for _ in range(6):
+        dog.tick()
+    assert captured == [state]
+    assert manager.current_job() is None
+    assert dog.status()['restarts_last_hour'] == 0
+
+
+def test_broken_incident_capture_never_prevents_recovery(tmp_path, monkeypatch):
+    manager, dog = _wired(tmp_path, lambda: {"state": "failed"})
+    dog.armed = True
+    captures = []
+
+    def capture(**kwargs):
+        captures.append(1)
+        raise OSError('disk full')
+
+    monkeypatch.setattr(wd, 'capture_incident', capture)
+    for _ in range(3):
+        dog.tick()
+    assert captures == [1]
+    assert manager.current_job()['action'] == 'start'
 
 
 def test_leftover_processes_mean_a_restart_after_twice_the_patience(tmp_path, monkeypatch):

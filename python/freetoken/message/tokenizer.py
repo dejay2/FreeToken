@@ -154,6 +154,14 @@ class CacheStepResultMsg(BaseTokenizerMsg):
 
 
 @dataclass
+class PrefillProgressMsg(BaseTokenizerMsg):
+    """Completed GPU prefill work, including chunks that emit no sampled token."""
+
+    processed_tokens: int
+    batch_size: int
+
+
+@dataclass
 class CacheProgressMsg(BaseTokenizerMsg):
     # scheduler -> detokenizer worker (passthrough to CacheProgressReply): one completed unit
     # of work on, or ahead of, the maintenance operation ``request_id`` (a queued step or

@@ -10,7 +10,6 @@ watching on top of this.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from queue import Empty
 from typing import Any, Callable, List
@@ -175,12 +174,21 @@ def run_backend_supervisor(
     on_ready()
 
     while True:
+        try:
+            msg = handle.ack_queue.get(timeout=poll)
+        except Empty:
+            msg = None
+        reason = _as_error(msg)
+        if reason is not None:
+            if not _shutting_down() and on_failure is not None:
+                on_failure(reason)
+            return
         dead = _first_dead(handle.processes)
         if dead is not None:
             if _shutting_down():
                 # Orderly stop in progress: the worker exit is expected — stay quiet.
                 return
             if on_failure is not None:
-                on_failure(f"backend worker {getattr(dead, 'name', '?')} exited")
+                reason = _drain_pending_error(lambda timeout: handle.ack_queue.get(timeout=timeout))
+                on_failure(reason or f"backend worker {getattr(dead, 'name', '?')} exited")
             return
-        time.sleep(poll)

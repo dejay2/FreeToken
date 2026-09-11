@@ -46,6 +46,7 @@ class _FakeState:
         self.last_rebuild = None
         self._loop = None
         self._send_impl = send_impl
+        self.monotonic = lambda: 1000.0
 
     async def send_one(self, msg):
         await self._send_impl(msg)
