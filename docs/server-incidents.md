@@ -44,3 +44,19 @@ engine behavior. See [NVIDIA GPU core dump documentation](https://docs.nvidia.co
 GPU core dumps have separate retention and privacy requirements from these small
 helper bundles. Do not attach another CUDA debugger or terminate the process while
 a dump is being generated.
+
+Two failure modes found during the September 2026 investigation have targeted
+regression coverage. PLE's bounded token-index cache could evict warmup tensors
+still referenced by a CUDA graph after enough distinct prefill shapes. Captured
+indices now retain tensor ownership for the model's lifetime; uncaptured shapes
+remain bounded. The GPU test churns the cache, checks ownership before replay,
+and compares replay results with the reference hash for decode and verification
+shapes. The captured live fault was a context read in `_ple_row_ids_kernel`;
+the cache-lifetime defect was reproduced separately on the GPU.
+
+RAM/SSD parking can also temporarily lock a shared prefix while detached leaves
+are copied. When those copies finish, allocation now retries eviction of the
+newly unlocked prefix before asserting that space is insufficient. A deterministic
+forked-prefix test checks this sequence and verifies page conservation. Keep the
+incident monitor enabled: these fixes do not establish that every possible cause
+of scheduler silence has been eliminated.

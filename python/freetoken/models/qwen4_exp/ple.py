@@ -654,6 +654,9 @@ class NGramEmbedding(BaseOP):
         self.ngram_heads_offsets = torch.empty(self.num_heads, dtype=torch.int64)
         self._table = table
         self._token_index_cache: dict[tuple, Tuple[torch.Tensor, torch.Tensor]] = {}
+        # Graphs retain raw pointers to warmup allocations, not their tensor owners. Keep
+        # captured shapes for the model's lifetime, independently of eager prefill eviction.
+        self._captured_token_indices: dict[tuple, Tuple[torch.Tensor, torch.Tensor]] = {}
 
     def attach_table(self, table: PLETableBackend) -> None:
         self._table = table
@@ -705,8 +708,9 @@ class NGramEmbedding(BaseOP):
 
         The fused kernel addresses the hash window through these instead of materializing the
         ``[B, ctx+max_len]`` packed window. Memoized on the shape (which is all they depend on)
-        so a captured replay reads a stable address instead of re-running the build; a build
-        that happens DURING capture is not cached, since its buffers live in the graph pool.
+        so a captured replay reads a stable address instead of re-running the build. Cached
+        warmup buffers used during capture are retained separately from the bounded eager
+        cache. A build DURING capture is not cached: its buffers live in the graph pool.
         """
         device = meta.input_ids.device
         num_tokens = meta.input_ids.numel()
@@ -719,8 +723,13 @@ class NGramEmbedding(BaseOP):
             (num_tokens,) if meta.is_decode else tuple(meta.seq_lens),
             str(device),
         )
+        cached = self._captured_token_indices.get(key)
+        if cached is not None:
+            return cached
         cached = self._token_index_cache.get(key)
         if cached is not None:
+            if capturing:
+                self._captured_token_indices[key] = cached
             return cached
         if meta.is_decode:  # one token per request, each at offset 0
             index = (

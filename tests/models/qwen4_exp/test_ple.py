@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -356,24 +357,28 @@ def test_fused_hash_matches_the_torch_reference(decode):
 
 
 @requires_cuda
-def test_fused_hash_captures_and_replays_in_a_cuda_graph():
-    """Fixed shapes, no host reads: the hash is part of the captured decode step."""
+@pytest.mark.parametrize("decode", [False, True])
+def test_fused_hash_captures_and_replays_in_a_cuda_graph(decode):
+    """Captured indices stay alive while eager prefill churns the bounded shape cache."""
     layer = _make_layer(_config(), device="cuda")
     embedding = layer.ple_embedding
     ids = torch.randint(0, VOCAB, (4,), dtype=torch.int64, device="cuda")
-    context = torch.randint(0, VOCAB, (4, embedding.ngram_size - 1), dtype=torch.int64,
-                            device="cuda")
+    num_reqs = 4 if decode else 2
+    context = torch.randint(
+        0, VOCAB, (num_reqs, embedding.ngram_size - 1), dtype=torch.int64, device="cuda"
+    )
     meta = PLEMetadata(
         input_ids=ids,
-        cu_seqlens=torch.arange(5, dtype=torch.int32, device="cuda"),
-        seq_lens=(1,) * 4,
+        cu_seqlens=torch.arange(0, 5, 1 if decode else 2, dtype=torch.int32, device="cuda"),
+        seq_lens=(1,) * 4 if decode else (2, 2),
         ngram_context=context,
-        state_slots=torch.arange(4, dtype=torch.int64, device="cuda"),
+        state_slots=torch.arange(num_reqs, dtype=torch.int64, device="cuda"),
         fresh_slots=None,
-        is_decode=True,
+        is_decode=decode,
     )
     out = torch.zeros(4, embedding.num_heads, dtype=torch.int64, device="cuda")
     embedding.row_ids(meta, out)  # prime the index cache and the JIT before capture
+    index_refs = tuple(weakref.ref(t) for t in embedding._token_index(meta))
 
     graph = torch.cuda.CUDAGraph()
     side = torch.cuda.Stream()
@@ -383,6 +388,15 @@ def test_fused_hash_captures_and_replays_in_a_cuda_graph():
     torch.cuda.current_stream().wait_stream(side)
     with torch.cuda.graph(graph):
         embedding.row_ids(meta, out)
+
+    for length in range(1, ple_module._PREFILL_INDEX_CACHE_SIZE + 2):
+        embedding._token_index(
+            _meta([list(range(length))], [[EOS, EOS]], device="cuda")
+        )
+    # Check ownership before replay so a regression reports a freed input buffer instead
+    # of launching a kernel against recycled memory and poisoning the CUDA context.
+    assert all(ref() is not None for ref in index_refs), "CUDA graph indices were freed"
+    assert len(embedding._token_index_cache) <= ple_module._PREFILL_INDEX_CACHE_SIZE
 
     for seed in range(3):
         torch.manual_seed(seed)
