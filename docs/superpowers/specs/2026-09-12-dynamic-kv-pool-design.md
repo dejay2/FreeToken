@@ -1,6 +1,6 @@
 # Dynamic KV pool: grow the conversation memory on demand, shrink it back on a timer
 
-Date: 2026-09-12. Status: approved design (Jay), written by the Fable lead; revised the same day after two external review rounds (commit 8262e14: seven required changes; commit 702543b: four more), each verified against the code before being applied. Target: Qwen3.8-Flash-Next-NVFP4 in the `vllm` WSL distro on the RTX 5090, branch `mtp-upstream-merge`. Linux/WSL launch only; the old Windows launcher is out of scope.
+Date: 2026-09-12. Status: approved design (Jay), written by the Fable lead; revised the same day after two external review rounds (commit 8262e14: seven required changes; commit 702543b: four more; commit 70d79c7: two admission corrections), each verified against the code before being applied. Target: Qwen3.8-Flash-Next-NVFP4 in the `vllm` WSL distro on the RTX 5090, branch `mtp-upstream-merge`. Linux/WSL launch only; the old Windows launcher is out of scope.
 
 ## Goal
 
@@ -73,11 +73,15 @@ running decode, no chunked continuation, no held request being admitted.
      (`scheduler/cache.py:114-205`), so it is a mutating operation whatever locking is skipped.
      Instead a genuinely non-mutating `CacheManager.probe_admission(input_ids, output_len)` walks
      the radix tree only (no park lookup, no restore, no lock) and returns
-     `(need_now, to_protect, fits_empty, fits_now)`, where `to_protect` is the page count of the
-     matched prefix that is currently evictable and would become locked on real admission. The
-     real path checks capacity before and after `lock` (`prefill.py:96-99`) precisely because
-     locking removes those pages from `available_size`; the probe reproduces the post-lock answer
-     as `need_now + reserved_size <= available_size - to_protect`. A parked-but-not-resident prefix
+     `(need_now, protect_tokens, fits_empty, fits_now)`. **Every quantity is in tokens**:
+     `available_size` is tokens (`cache.py:274-277`, evictable tokens plus free pages times
+     `page_size`), `reserved_size` is tokens, and `protect_tokens = protect_pages * page_size`
+     where `protect_pages` is the matched prefix's pages that are currently evictable and would
+     become locked on real admission. The real path checks capacity before and after `lock`
+     (`prefill.py:96-99`) precisely because locking removes those pages from `available_size`; the
+     probe reproduces the post-lock answer as
+     `fits_now = need_now + reserved_size + uncommitted_tokens <= available_size - protect_tokens`
+     (`uncommitted_tokens` is defined under "Same-batch arrivals" below). A parked-but-not-resident prefix
      counts as not cached (its restore would allocate the whole prefix again). Both the probe and
      `_try_admit` call one pure function `admission_fits(need_now, reserved, available, to_protect)`
      so there is a single admission formula. A request sharing a large locked prefix must not
@@ -91,13 +95,29 @@ running decode, no chunked continuation, no held request being admitted.
      `target = min(ceiling, max(pool + step, round_up(need_total + 1, step)))`, funded by slots,
      then drains the FIFO: each entry is re-planned against the geometry its predecessor left;
      entries that fit are admitted with no further rebuild.
-   - Else if `need_now + reserved_size > available_size` (it fits an empty pool but other requests
-     hold the room) and `pool < ceiling`: hold with a growth target of
+   - Else if `fits_empty and not fits_now and pool < ceiling` (the probe's post-lock verdict, not a
+     separate inequality: the decision must consume the same `fits_now` the probe computed): hold
+     with a growth target of
      `round_up(sum(need_total of running and pending requests) + need_total + 1, step)`, capped at
      `ceiling`. The shared-prefix overestimate here only rounds the target up, never triggers a
      hold on its own. The request waits for the running requests to finish, as it would have waited
      on pages today, then the pool grows so the two run side by side next time.
    - Else: admitted at once, no rebuild.
+   **Same-batch arrivals.** The scheduler drains every received message before it schedules, and
+   `PrefillManager.add_one_req` only appends to the pending list (`prefill.py:278`); reservations
+   are charged later, in the admission pass (`prefill.py:200`). Two requests arriving in one batch
+   would each see the full pool, both be appended, and then serialise in prefill with no grow.
+   Two rules close this. (a) The controller keeps `uncommitted_tokens`: the sum of `need_now` for
+   requests it passed to `add_one_req` whose admission pass has not yet run; the probe adds it (see
+   `fits_now` above). The entry for a uid is removed the moment `_try_admit` charges the real
+   reservation for it, or on abort, so nothing is charged twice. (b) Escalation: when `_try_admit`
+   returns `None` for capacity on a never-started pending request (no chunk running, no pages
+   held) while `pool < ceiling`, the prefill manager hands it back to the controller, which moves it
+   into the held FIFO with the concurrent growth target and the drain barrier engages. Rule (a)
+   catches the common case at arrival; rule (b) is the safety net for anything that slipped past
+   the estimate. Regression test: two distinct-prefix requests of `need_total` 39,936 delivered in
+   one batch into a 65,536 pool, no third arrival; the second is held (or escalated) and the
+   controller plans 98,304, instead of both running one after the other with no grow.
    The controller never rebuilds while a request is active and never rebuilds twice for one
    arrival. Latency trade-off, stated plainly: a request that today runs alongside another in the
    fixed 262k pool may, while the dynamic pool is small, have to wait behind it once before the
@@ -264,13 +284,16 @@ byte monotonicity is deliberately not asserted; see rule 3).
   `next_deadline_ms(now) -> int | None`, `status() -> dict`.
 - `_process_one_msg`: the `UserMsg` branch becomes `if not self._queue_for_kv_dynamic(msg):
   self._admit_user_msg(msg)`, with `_admit_user_msg` factored out exactly as PR #300 does.
-  `need_total` uses the ceiling clip; `need_now` comes from a new read-only
-  `PrefillManager.estimate_admission(msg) -> (need_now, fits_empty, fits_now)` that runs the same
-  `match_req` / `reserved_size` / `available_size` arithmetic as `_try_admit` without locking, so
-  there is one admission formula, not two.
+  `need_total` uses the ceiling clip; `need_now`, `protect_tokens`, `fits_empty` and `fits_now`
+  come from the non-mutating `CacheManager.probe_admission(input_ids, output_len)` of rule 2
+  (tree-only walk, no park lookup, no restore, no lock), which shares the pure
+  `admission_fits(need_now, reserved, available, protect_tokens)` with `_try_admit`; the
+  controller adds its `uncommitted_tokens` to `reserved`. `_try_admit` gains the escalation hook
+  of rule 2(b) and clears the uid's `uncommitted_tokens` entry when it charges the real
+  reservation.
 - Idle point: in both `overlap_loop` and `normal_loop`, where `_execute_pending_rebuild` is
   gated today, add: when idle and `_pending_rebuild is None`, ask the controller for a plan; if
-  one comes back, set `_pending_rebuild = CacheRebuildBackendMsg(request_id=f"auto-kv:{reason}:{target_pages}", moe_cache_size=target_slots, num_pages=target_pages)`
+  one comes back, set `_pending_rebuild = CacheRebuildBackendMsg(request_id=f"auto-kv:{instance_id}:{seq}", moe_cache_size=target_slots, num_pages=target_pages)` (unique per rule 9; `reason` and `target_pages` travel in `MaintenanceBeginMsg.detail` and the log line)
   and call `_execute_pending_rebuild()`; then act on the returned outcome as rule 8 says (admit
   on `ok` or `rejected`, error-reply and stop on `failed`). `_execute_pending_operation`,
   `_execute_pending_step` and `_execute_pending_rebuild` change contract to return the outcome
@@ -338,7 +361,8 @@ byte monotonicity is deliberately not asserted; see rule 3).
 - `ParkStore(..., ttl_s: int = 0)`; `sweep_expired(now_ns) -> int` evicts every family whose newest
   `last_used_ns` is older than `ttl_s`, using the family eviction already used by `_evict_to_fit`
   (queued-save reservations and pinned buffers stay charged until released, as today).
-  `CacheManager.park_idle()` calls it once per idle tick, and `next_expiry_ms(now_ns)` feeds
+  `CacheManager.park_idle()` calls it once per idle tick, and `next_expiry_delay_ms()` (relative,
+  wall-clock arithmetic inside the store, no scheduler monotonic timestamp passed in) feeds
   `CacheManager.next_park_delay_ms` so the tick happens (rule 5). `status()` gains `ttl_s`,
   `expired_evictions` and `next_expiry_s`. Test: `tests/kvcache/test_park_store.py` with a fake clock.
 
@@ -418,7 +442,10 @@ TP > 1. DSV4. The Windows launcher. Sending to upstream.
     re-snapshotted; plus the delayed-delivery race test of rule 9.
 16. Admission probe: zero restores and zero page allocations across a run of probes over locked,
     evictable, partially shared and parked prefixes; the probe's verdict equals `_try_admit`'s on
-    each.
+    each, including the 98,304-token fully-evictable prefix with 16,384 tokens of demand that the
+    pre-lock check would wrongly accept; all quantities in tokens (a page-count regression is
+    asserted against).
+19. Same-batch arrivals test of rule 2 (two 39,936-token requests in one batch, 65,536 pool).
 17. Over-budget validator: the two transitions named in the engine section pass; a target above the
     budget is refused.
 18. Two-clock TTL test as in rule 5.
