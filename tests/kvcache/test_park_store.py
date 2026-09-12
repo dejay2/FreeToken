@@ -2823,14 +2823,17 @@ def _ram_store(ttl_s: int, wall_ns) -> ParkStore:
     return store
 
 
-def _seed_family(store: ParkStore, key: str, last_used_ns: int) -> None:
-    """Insert one already-published RAM entry directly, bypassing the save worker.
+def _seed_family(
+    store: ParkStore, key: str, last_used_ns: int, *, path: Path | None = None
+) -> None:
+    """Insert one already-published entry directly, bypassing the save worker.
 
     ``ParkedEntry`` requires ``key``, ``token_ids``, ``token_count``, ``payload_bytes``,
     ``total_bytes`` and ``last_used_ns``; everything else here takes its natural empty
     value. ``root_key`` is left at its dataclass default (``""``), which every family-grouping
     site in park_store.py (``_evict_to_fit``, ``_family_ages``) treats as "root_key or key" --
-    i.e. this entry is its own one-member family/root.
+    i.e. this entry is its own one-member family/root. ``path`` is set only for SSD-tier tests
+    that need ``_manifest_doc``/``_unlink_or_defer`` to see a real on-disk file.
     """
     entry = park_module.ParkedEntry(
         key=key,
@@ -2839,29 +2842,45 @@ def _seed_family(store: ParkStore, key: str, last_used_ns: int) -> None:
         payload_bytes=1024,
         total_bytes=1024,
         last_used_ns=last_used_ns,
+        path=path,
     )
     with store._lock:
         store._entries[key] = entry
 
 
-def test_ttl_expiry_uses_the_wall_clock_and_two_clocks_with_different_origins():
+def test_ttl_expiry_uses_the_wall_clock_and_two_clocks_with_different_origins(monkeypatch):
     """The store stamps last_used_ns with time.time_ns(); the scheduler's idle loop runs on
     time.monotonic_ns(). Ages must never mix the two (review of 702543b): a five-hour entry
-    must expire after six wall-clock hours whatever the monotonic clock says."""
+    must expire after six wall-clock hours whatever the monotonic clock says.
+
+    This is a genuine two-clock test, not just a bare constant: ``time.monotonic_ns`` is
+    monkeypatched to a second, independently-advancing fake clock with an unrelated origin
+    (seconds-since-boot vs. the wall clock's epoch), advanced by DIFFERENT amounts than the
+    wall clock at every step, so any accidental read of the wrong clock inside the store would
+    change the assertions below.
+    """
     wall = {"now": 1_700_000_000 * 10**9}          # epoch-based, 2023
-    monotonic_origin = 12_345 * 10**9               # seconds since boot, unrelated
+    mono = {"now": 12_345 * 10**9}                  # seconds since boot, unrelated origin
+    monkeypatch.setattr(park_module.time, "monotonic_ns", lambda: mono["now"])
     store = _ram_store(ttl_s=5 * 3600, wall_ns=lambda: wall["now"])
     _seed_family(store, "old", last_used_ns=wall["now"])
     assert store.next_expiry_delay_ms() == 5 * 3600 * 1000
     wall["now"] += 4 * 3600 * 10**9
+    mono["now"] += 60 * 10**9  # monotonic barely moves while 4 wall-hours pass
     assert store.sweep_expired() == 0 and store.status()["parked_count"] == 1
     wall["now"] += 2 * 3600 * 10**9
+    mono["now"] += 60 * 10**9  # again a different, much smaller amount than the wall step
     assert store.next_expiry_delay_ms() == 0
     assert store.sweep_expired() == 1
     assert store.status()["parked_count"] == 0 and store.status()["expired_evictions"] == 1
-    # A monotonic timestamp handed in by mistake would be years "younger" than any entry:
-    # the API takes no now_ns argument at all, so the mistake cannot be made.
-    assert monotonic_origin < wall["now"]
+    # Advancing ONLY the monotonic clock -- no wall-clock movement at all -- must change
+    # neither the delay nor the sweep outcome for a fresh entry.
+    _seed_family(store, "new", last_used_ns=wall["now"])
+    delay_before = store.next_expiry_delay_ms()
+    assert delay_before == 5 * 3600 * 1000
+    mono["now"] += 10 * 3600 * 10**9
+    assert store.next_expiry_delay_ms() == delay_before
+    assert store.sweep_expired() == 0
 
 
 def test_ttl_zero_never_expires_and_reports_no_deadline():
@@ -2883,3 +2902,36 @@ def test_expiry_evicts_the_oldest_family_first_and_skips_pinned_ones():
     assert store.sweep_expired() == 1
     assert set(store._entries) == {"b", "pinned"}
     assert store.next_expiry_delay_ms() == 3500 * 1000
+
+
+def test_ssd_sweep_rewrites_the_manifest(tmp_path: Path):
+    """sweep_expired's ``if self.mode == "ssd": self._write_manifest()`` branch: an expired
+    SSD family must be dropped from park.json, not just from self._entries in memory, or a
+    restart's _load_or_scan would resurrect the evicted file from a stale index."""
+    wall = {"now": 1_700_000_000 * 10**9}
+    store = ParkStore(
+        mode="ssd", page_size=4, kv_pool=_qsa_pool(), state_pool=_state_pool(),
+        fingerprint="fp", min_tokens=4, ram_budget_bytes=0, ssd_dir=tmp_path,
+        disk_budget_bytes=1 << 30, pinned_window_bytes=4096, idle_ms=0, ttl_s=3600,
+    )
+    try:
+        store._wall_ns = lambda: wall["now"]
+        payload_path = tmp_path / (("a" * 32) + ".park")
+        payload_path.touch()
+        _seed_family(store, "a" * 32, last_used_ns=wall["now"] - 7200 * 10**9, path=payload_path)
+
+        # Write the manifest once up front so this test proves the sweep REWRITES it (an
+        # already-empty/never-written file would trivially satisfy an "entries == []" check).
+        store._write_manifest()
+        manifest_path = tmp_path / "park.json"
+        before = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert [row["key"] for row in before["entries"]] == ["a" * 32]
+
+        assert store.sweep_expired() == 1
+        assert store._entries == {}
+        assert not payload_path.exists()
+
+        after = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert after["entries"] == []
+    finally:
+        store.close()
