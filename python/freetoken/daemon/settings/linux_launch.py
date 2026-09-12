@@ -337,6 +337,28 @@ def build_launch(
             "--kv-park-ssd-gib", str(_get(settings, "KVParkSSDGiB")),
             "--kv-park-window-mib", str(_int(_get(settings, "KVParkWindowMiB"), 256)),
         ]
+        argv += ["--kv-park-ttl-s", str(_int(_get(settings, "KVParkTTLHours"), 5) * 3600)]
+    if _truthy(_get(settings, "KVDynamic")) and facts.is_moe:
+        kv_floor = _int(_get(settings, "KVFloorTokens"), 65536)
+        # The dial defaults ON for every MoE model, but the engine refuses --kv-dynamic at
+        # parse time unless the floor plus the dummy page fits under the ceiling, and with
+        # KVCacheTokens unset the ceiling is the model's own context. A small-context model
+        # would therefore fail to boot on a default the user never chose: switch the pool off
+        # (with a note) rather than emit flags the parser will reject. The +64 mirrors args.py's
+        # own `floor + page > ceiling` refusal.
+        effective_ceiling = _int(_get(settings, "KVCacheTokens")) or facts.max_context
+        if kv_floor + 64 > effective_ceiling:
+            notes.append(
+                f"Dynamic KV memory switched off: the smallest size {kv_floor} is not below "
+                f"this model's largest size {effective_ceiling}"
+            )
+        else:
+            argv += [
+                "--kv-dynamic",
+                "--kv-floor-tokens", str(kv_floor),
+                "--kv-step-tokens", str(_int(_get(settings, "KVStepTokens"), 32768)),
+                "--kv-shrink-idle-s", str(_int(_get(settings, "KVShrinkIdleMin"), 10) * 60),
+            ]
     if _truthy(_get(settings, "EnableCacheReport")):
         argv.append("--enable-cache-report")
     if _truthy(_get(settings, "CollectRoutingStats")) and facts.is_moe:

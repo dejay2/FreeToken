@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
@@ -13,6 +14,23 @@ if TYPE_CHECKING:
     from .utils import PendingReq
 
 logger = init_logger(__name__)
+
+
+def admission_fits(*, need_now: int, reserved: int, available: int, protect_tokens: int) -> bool:
+    """The ONE admission inequality, in tokens. ``protect_tokens`` is the matched prefix's
+    evictable length that locking will remove from ``available`` (PrefillAdder checks
+    before and after lock for exactly this reason, prefill.py:96-99). Shared by the real
+    admission and the dynamic KV pool's probe so they can never disagree."""
+    return need_now + reserved <= available - protect_tokens
+
+
+@dataclass(frozen=True)
+class AdmissionProbe:
+    need_now: int
+    protect_tokens: int
+    fits_empty: bool
+    fits_now: bool
+    cached_len: int
 
 # Proactive out-of-window free_swa runs every `interval` forwards (== sglang SWA_EVICTION_INTERVAL).
 def _swa_eviction_interval() -> int:
@@ -276,6 +294,53 @@ class CacheManager:
                      else self.prefix_cache.size_info.evictable_size)
         return evictable + len(self.free_slots) * self.page_size
 
+    def _evictable_tokens_on_path(self, node) -> int:
+        """Tokens of the matched path that are evictable today (ref_count 0) and would become
+        protected by inc_lock. Mirrors HybridRadixCache.inc_lock's walk without mutating."""
+        total = 0
+        cur = node
+        while cur is not None and not cur.is_root():
+            if getattr(cur, "ref_count", 0) == 0:
+                total += cur.length
+            cur = cur.parent
+        return total
+
+    def probe_admission(
+        self, input_ids: torch.Tensor, output_len: int, *, reserved: int, cache_private: bool = False
+    ) -> AdmissionProbe:
+        """Rule 2 of the dynamic KV pool spec: what admission WOULD say, without doing it.
+
+        Walks the radix tree only. Never calls match_req: that path looks up parked prefixes
+        and may restore one (allocating pages and a GDN slot) as a side effect. A parked but
+        non-resident prefix therefore counts as not cached here, which is right for capacity:
+        its restore would allocate the whole prefix again."""
+        input_len = int(len(input_ids))
+        ids = input_ids[:0] if cache_private else input_ids[: max(input_len - 1, 0)]
+        m = self.prefix_cache.match_prefix(ids) if input_len > 0 else None
+        # HybridRadixCache.match_prefix returns a HybridMatch carrying cached_len/node itself;
+        # the plain radix and naive caches return MatchResult(cuda_handle=<handle>), and the
+        # handle is what holds cached_len (and, for RadixCacheHandle, node). Reading them off
+        # the result object alone made every match look empty on those caches, so every
+        # follow-up turn of a non-hybrid model planned a grow it did not need.
+        handle = getattr(m, "cuda_handle", m) if m is not None else None
+        cached_len = int(getattr(handle, "cached_len", 0)) if handle is not None else 0
+        node = getattr(handle, "node", None)
+        protect_tokens = self._evictable_tokens_on_path(node) if node is not None else 0
+        need_now = (input_len - cached_len) + int(output_len)
+        empty_limit = self.num_pages * self.page_size
+        # Mirrors PrefillAdder's "estimated_len > empty_cache_limit" gate (prefill.py's
+        # never-fits rejection), which compares against need_now (cached tokens already
+        # subtracted), not the raw prompt+output length.
+        fits_empty = need_now <= empty_limit
+        fits_now = fits_empty and admission_fits(
+            need_now=need_now, reserved=int(reserved), available=self.available_size,
+            protect_tokens=protect_tokens,
+        )
+        return AdmissionProbe(
+            need_now=need_now, protect_tokens=protect_tokens,
+            fits_empty=fits_empty, fits_now=fits_now, cached_len=cached_len,
+        )
+
     @property
     def mamba_available_size(self) -> int:
         """Hybrid only: free GDN state slots + evictable (unlocked) tree snapshots."""
@@ -374,24 +439,32 @@ class CacheManager:
                 continue
             if self._park_candidate(candidate):
                 parked += 1
+        sweep = getattr(self.park_store, "sweep_expired", None)
+        if sweep is not None and sweep():
+            self._bump_park_generation()
         return parked
 
     def next_park_delay_ms(self, *, now_ns: int | None = None) -> int | None:
-        """Milliseconds until idle parking or a pending-copy poll; ``None`` can block forever."""
+        """Milliseconds until idle parking, a pending-copy poll, or the next TTL expiry;
+        ``None`` can block forever. The expiry delay is RELATIVE and computed inside the
+        store on its own wall clock (Timer 2); ``now_ns`` here is monotonic and only ever
+        meets the tree's monotonic candidate timestamps."""
         if self.park_store is None:
             return None
+        expiry = getattr(self.park_store, "next_expiry_delay_ms", lambda: None)()
         if self._pending_parks:
-            return 10
+            return 10 if expiry is None else min(10, max(1, expiry))
         candidates = self._park_candidates()
         timestamp = min((candidate.timestamp for candidate in candidates), default=None)
         if timestamp is None:
-            return None
+            return None if expiry is None else max(1, int(expiry))
         if now_ns is None:
             import time
 
             now_ns = time.monotonic_ns()
         remaining = self.park_store.idle_ms * 1_000_000 - (now_ns - timestamp)
-        return max(1, (remaining + 999_999) // 1_000_000)
+        delay = max(1, (remaining + 999_999) // 1_000_000)
+        return delay if expiry is None else min(delay, max(1, int(expiry)))
 
     def park_status(self) -> dict[str, int | float | str | bool]:
         if self.park_store is None:

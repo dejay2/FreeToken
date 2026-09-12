@@ -113,6 +113,18 @@ Qwen3.8-Flash-Next has a 47.7 GiB n-gram (PLE) lookup table. Choose where it liv
 
 The launcher script `start-qwen38-flash-next-mmap-windows.ps1` defaults to `--ple-backend mmap`.
 
+### Dynamic KV pool
+
+`--kv-dynamic` boots with a small KV pool (default 65,536 tokens) and spends the saved VRAM on
+MoE expert slots. When a request arrives whose prompt plus output allowance needs more than the
+pool, the scheduler waits for an idle point, trades slots for pages (byte-for-byte inside one
+engine-owned budget) and admits it; requests arriving meanwhile queue behind it. After
+`--kv-shrink-idle-s` with no request the pool shrinks back and the slots return. Every resize is
+the existing idle-only rebuild (under a second on the RTX 5090 for graph sizes 1 and 2, measured
+2026-09-12) and loses no conversation because `--kv-park ram` already holds every finished prefix;
+`--kv-park-ttl-s` drops parked prefixes after a quiet spell (default 5 h). Design and measured
+inputs: `docs/superpowers/specs/2026-09-12-dynamic-kv-pool-design.md`, implementation plan: `docs/superpowers/plans/2026-09-12-dynamic-kv-pool.md`.
+
 ### KV prefix parking
 
 Hybrid QSA/GDN conversations can keep reusable checkpoints outside GPU memory and restore them on

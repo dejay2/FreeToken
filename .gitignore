@@ -233,3 +233,5 @@ benchmarks/cross_framework
 
 # Machine-local settings profile start-up files
 /boot-profiles/
+.claude/worktrees/
+.superpowers/

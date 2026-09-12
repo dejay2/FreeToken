@@ -536,6 +536,7 @@ class ParkStore:
         disk_budget_bytes: int,
         pinned_window_bytes: int,
         idle_ms: int = 0,
+        ttl_s: int = 0,
     ) -> None:
         if mode not in {"ram", "ssd"}:
             raise ValueError(f"ParkStore mode must be 'ram' or 'ssd', got {mode!r}")
@@ -545,6 +546,8 @@ class ParkStore:
             raise ValueError("park min_tokens must be a page-aligned positive prefix")
         if idle_ms < 0:
             raise ValueError("park idle_ms must be non-negative")
+        if ttl_s < 0:
+            raise ValueError("park ttl_s must be non-negative")
         if ram_budget_bytes < 0 or disk_budget_bytes < 0:
             raise ValueError("park budgets must be non-negative")
         if pinned_window_bytes < _ALIGNMENT or pinned_window_bytes % _ALIGNMENT:
@@ -556,6 +559,13 @@ class ParkStore:
         self.fingerprint = str(fingerprint)
         self.min_tokens = int(min_tokens)
         self.idle_ms = int(idle_ms)
+        self.ttl_s = int(ttl_s)
+        self._expired_evictions = 0
+        # Wall clock for age arithmetic: every last_used_ns in this store (RAM saves, lookups,
+        # the SSD index's st_mtime_ns) is time.time_ns(). The scheduler's idle loop runs on
+        # time.monotonic_ns(), whose origin is unrelated, so this store never accepts a caller's
+        # now_ns for ages: it reads its own clock and hands back RELATIVE delays.
+        self._wall_ns = time.time_ns
         self.ram_budget_bytes = int(ram_budget_bytes)
         self.ssd_dir = Path(ssd_dir).expanduser()
         self.disk_budget_bytes = int(disk_budget_bytes)
@@ -684,6 +694,7 @@ class ParkStore:
             fingerprint=fingerprint,
             min_tokens=int(getattr(config, "kv_park_min_tokens", 8192)),
             idle_ms=int(getattr(config, "kv_park_idle_ms", 0)),
+            ttl_s=int(getattr(config, "kv_park_ttl_s", 0)),
             ram_budget_bytes=int(float(getattr(config, "kv_park_ram_gib", 2.0)) * (1 << 30)),
             ssd_dir=directory,
             disk_budget_bytes=int(float(getattr(config, "kv_park_ssd_gib", 32.0)) * (1 << 30)),
@@ -1265,6 +1276,57 @@ class ParkStore:
                 return False
             _used, victim = min(candidates)
             self._drop_entries(families[victim], write_manifest=False)
+
+    def _family_ages(self) -> list[tuple[int, str, list["ParkedEntry"]]]:
+        """(newest last_used_ns, root_key, members) per unpinned family."""
+        families: dict[str, list[ParkedEntry]] = {}
+        for entry in self._entries.values():
+            families.setdefault(entry.root_key or entry.key, []).append(entry)
+        return [
+            (max(m.last_used_ns for m in members), root, members)
+            for root, members in families.items()
+            if not self._pins.get(root, 0)
+        ]
+
+    def sweep_expired(self) -> int:
+        """Drop every unpinned family whose newest use is older than ``ttl_s`` (Timer 2).
+
+        Ages are computed entirely on ``self._wall_ns()`` (``time.time_ns`` by default): the
+        scheduler's idle loop that calls this runs on ``time.monotonic_ns()``, an unrelated
+        clock origin, so no caller-supplied "now" is ever accepted here.
+        """
+        if self.ttl_s <= 0:
+            return 0
+        cutoff = self._wall_ns() - self.ttl_s * 1_000_000_000
+        evicted = 0
+        with self._lock:
+            for newest, _root, members in self._family_ages():
+                if newest <= cutoff:
+                    self._drop_entries(members, write_manifest=False)
+                    evicted += 1
+            if evicted:
+                self._expired_evictions += evicted
+                self._notify_change()
+                if self.mode == "ssd":
+                    self._write_manifest()
+        return evicted
+
+    def next_expiry_delay_ms(self) -> int | None:
+        """Milliseconds until the oldest unpinned family expires; None when nothing can.
+
+        Relative-only by construction: it takes no ``now_ns`` argument, so a caller cannot
+        accidentally hand in a `time.monotonic_ns()` value that lives in a different epoch than
+        the wall-clock ``last_used_ns`` stamps this store compares against.
+        """
+        if self.ttl_s <= 0:
+            return None
+        with self._lock:
+            ages = self._family_ages()
+        if not ages:
+            return None
+        oldest = min(newest for newest, _root, _members in ages)
+        remaining_ns = oldest + self.ttl_s * 1_000_000_000 - self._wall_ns()
+        return max(0, (remaining_ns + 999_999) // 1_000_000)
 
     # ---- save planning -------------------------------------------------------------------
 
@@ -2403,7 +2465,10 @@ class ParkStore:
         self._evict_to_fit(0)
         self._write_manifest()
 
-    def status(self) -> dict[str, int | float | str | bool]:
+    def status(self) -> dict[str, int | float | str | bool | None]:
+        # Computed before the lock below: next_expiry_delay_ms() takes self._lock itself, and
+        # while RLock makes that re-entrant-safe, calling it first keeps the locking here simple.
+        next_expiry_ms = self.next_expiry_delay_ms()
         with self._lock:
             return {
                 "mode": self.mode,
@@ -2415,6 +2480,9 @@ class ParkStore:
                 "last_restore_breakdown_ms": dict(self._last_restore_breakdown),
                 "disabled": self._disabled,
                 "last_error": self._last_error,
+                "ttl_s": self.ttl_s,
+                "expired_evictions": self._expired_evictions,
+                "next_expiry_s": None if next_expiry_ms is None else round(next_expiry_ms / 1000, 1),
             }
 
     def note_error(self, message: str) -> None:

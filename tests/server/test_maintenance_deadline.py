@@ -252,7 +252,7 @@ def test_a_stale_reply_cannot_reopen_the_gate_under_a_newer_operation():
         manager = _manager(clock)
         first = await _timed_out_step(manager)
         manager.maintenance_state = "serving"  # the operator's next request follows a recovery
-        manager.maintenance_op = None
+        manager.maintenance_ops.clear()  # maintenance_op has no setter; clear the map directly
         second = await _timed_out_step(manager)
         manager._resolve_step(_reply(first))  # the old reply lands while the new one executes
         assert manager.maintenance_state == "rebuilding"

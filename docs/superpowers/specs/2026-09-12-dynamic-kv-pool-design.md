@@ -159,7 +159,8 @@ running decode, no chunked continuation, no held request being admitted.
    the scheduler is idle by construction inside the blocking wait, so it sets `_pending_rebuild`
    and calls `_execute_pending_rebuild()` directly. If a request arrives while the timer is overdue
    and that request itself needs a grow, the shrink is skipped and one plan goes straight to the
-   grow target (never two rebuilds for one arrival).
+   grow target (never two rebuilds for one arrival). More generally a shrink is never planned while
+   a never-admitted request sits in the pending list (`plan_idle(allow_shrink=False)`).
 5. **Timer 2: RAM TTL.** `ParkStore` gains `ttl_s`; `park_idle()` (already called from
    `run_when_idle`) sweeps entries whose family `max(last_used_ns)` is older than `ttl_s` and
    evicts the family with the existing eviction path (`_evict_to_fit`'s family logic), releasing
@@ -189,6 +190,10 @@ running decode, no chunked continuation, no held request being admitted.
    - `"rejected"` (pre-teardown rejection, or a teardown failure rolled back to the prior
      geometry): the old engine is intact; admit the FIFO against the retained pool and let the
      ordinary path clip or refuse.
+   - After any non-`ok` outcome of an automatic plan the controller re-arms Timer 1 a full
+     `shrink_idle_s` away and counts a consecutive failure; after three consecutive failures no
+     further automatic shrink is planned until a request finishes or a plan succeeds (final review
+     of 9ad8f69: without this a shrink refused by the card was retried every millisecond).
    - `"failed"` (teardown failed and the rollback also failed, or tp > 1): the engine is not known
      to be usable and the frontend latches `failed`. **Do not admit.** Every held request gets an
      `ErrorReplyMsg` (`code="server_error"`, text "cache rebuild failed; server needs a restart"),

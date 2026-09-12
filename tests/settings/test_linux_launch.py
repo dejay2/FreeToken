@@ -45,7 +45,14 @@ def test_the_fast_single_chat_profile_maps_like_the_windows_launcher():
     assert "--moe-gpu-owned-layers" not in plan.argv and "--cuda-graph-max-bs" not in plan.argv
     assert plan.env["FREETOKEN_DENSE_QUANT"] == "int8" and plan.env["FREETOKEN_EMBED_HOST"] == "1"
     assert plan.env["FREETOKEN_LOAD_VISION"] == "0" and plan.env["FREETOKEN_VISION_EXECUTION"] == "gpu"
-    assert plan.notes == []
+    # KVDynamic defaults on, and this profile pins KVCacheTokens at the default floor, so the
+    # pool has nowhere to grow: the launcher drops the flags with one note rather than emit a
+    # combination the engine refuses at parse time (final review I4).
+    assert plan.notes == [
+        "Dynamic KV memory switched off: the smallest size 65536 is not below this "
+        "model's largest size 65536"
+    ]
+    assert "--kv-dynamic" not in plan.argv
 
 
 def test_mtp_on_forces_the_mmap_table_and_vision_and_parking_pass_through():

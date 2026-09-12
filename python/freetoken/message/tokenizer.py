@@ -175,6 +175,27 @@ class CacheProgressMsg(BaseTokenizerMsg):
 
 
 @dataclass
+class MaintenanceBeginMsg(BaseTokenizerMsg):
+    """scheduler -> detokenizer worker (passthrough to MaintenanceBeginReply): the scheduler
+    started a maintenance operation on its own (the dynamic KV pool growing/shrinking the
+    page pool without an API-dispatched rebuild/step). Own record in the frontend's
+    maintenance_ops map, keyed by ``request_id``, alongside any API-dispatched operation
+    (2026-09-12 review: several operations can be open at once)."""
+
+    request_id: str
+    kind: str
+    detail: str | None = None
+
+
+@dataclass
+class KVDynamicStatusMsg(BaseTokenizerMsg):
+    """scheduler -> detokenizer worker (passthrough to KVDynamicStatusReply): a dynamic-KV-pool
+    status snapshot for GET /v1/cache/status, independent of the maintenance gate."""
+
+    status: dict
+
+
+@dataclass
 class CacheResidencyMsg(BaseTokenizerMsg):
     request_id: str
 
