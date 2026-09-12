@@ -124,6 +124,9 @@ class BaseKVCachePool(ABC):
         swap with no GDN/window/layer_moves target. A swap whose own totals exceed the
         per-transition ``budget`` above but whose combined total still fits
         ``pool_budget_bytes`` is accepted rather than refused -- see the final check below.
+        A full override that does not call this base implementation (DSV4, see its own
+        ``validate_rebuild``) does not get this escape for free: it must opt in explicitly by
+        accepting and honouring both keywords itself.
         The engine supplies the memory account (baseline/weights, the MoE terms, and any
         sibling pool's fixed bytes at ITS target, e.g. the GDN state pool); the pool
         answers whether its own target geometry fits. Raises CacheRebuildRejected.

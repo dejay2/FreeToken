@@ -1324,7 +1324,15 @@ class Engine:
     def snapshot_pool_budget(self) -> int:
         """MoE slots + KV pages resident right now, in bytes: the one budget the dynamic KV
         pool's planner and the rebuild validator both read (spec rule 3). Taken at boot and
-        after every rebuild the controller did not issue, never raised by the controller."""
+        after every rebuild the controller did not issue, never raised by the controller.
+
+        Must be retaken after ANY externally-issued rebuild, including a window-only
+        (``num_swa_pages``) change with no page-count or slot-count move: ``_kv_bytes_per_page``
+        reads ``self._pool_cls.kv_cost(self.config)``, and for a window-bearing family
+        (``HybridSWAKVCache``) that per-page price depends on ``config.swa_num_pages_override``,
+        which ``_resize_pools`` mutates. The dynamic KV controller's own rebuilds never touch
+        the window, so it cannot go stale from the controller's own actions -- only from an
+        operator-issued ``num_swa_pages`` rebuild."""
         slots, per_slot = self._target_moe_and_expert_bytes(None)
         self.pool_budget_bytes = int(slots * per_slot + self.num_pages * self._kv_bytes_per_page())
         return self.pool_budget_bytes
