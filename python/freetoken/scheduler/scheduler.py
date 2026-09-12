@@ -267,6 +267,12 @@ class Scheduler(SchedulerIOMixin):
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
+        if self._engine_failed is not None:
+            # Rule 8 (2026-09-12 review): the latched loop now blocks on the queue, so this
+            # runs on every poll. Parking and the integrity check walk the page table and the
+            # pools a failed teardown left in an unknown state -- and the controller is
+            # disabled, so its idle plan is a no-op anyway. Wait for the restart, do nothing.
+            return
         if not self._idle_wait_logged:
             logger.info_rank0("Scheduler is idle, waiting for new reqs...")
             self._idle_wait_logged = True
@@ -358,13 +364,19 @@ class Scheduler(SchedulerIOMixin):
         # this iteration can only be probed by messages of the NEXT iteration, which sees it here.
         self._last_data = last_data
         blocking = not (
-            last_data is not None  # don't block if we have a batch to be processed
-            or self.prefill_manager.runnable
-            or self.decode_manager.runnable
-            or self._pending_rebuild is not None  # a queued rebuild to drain toward + execute
-            # A held request is work this loop owes: it must reach the idle point below and
-            # grow the pool, not sit on the queue waiting for a message that may never come.
-            or (self._kv_dynamic is not None and self._kv_dynamic.has_held())
+            # Rule 8 (2026-09-12 review): once latched there is no work left to spin for --
+            # every manager has been emptied and nothing may be forwarded again. Without this
+            # factor the loop busy-waited at 100% CPU until the watchdog restarted the server.
+            self._engine_failed is None
+            and (
+                last_data is not None  # don't block if we have a batch to be processed
+                or self.prefill_manager.runnable
+                or self.decode_manager.runnable
+                or self._pending_rebuild is not None  # a queued rebuild to drain toward + execute
+                # A held request is work this loop owes: it must reach the idle point below and
+                # grow the pool, not sit on the queue waiting for a message that may never come.
+                or (self._kv_dynamic is not None and self._kv_dynamic.has_held())
+            )
         )
         for msg in self.receive_msg(blocking=blocking):
             # Per-message so an idle poll never counts as traffic (freetoken/diag.py arms on
@@ -461,10 +473,13 @@ class Scheduler(SchedulerIOMixin):
 
     def normal_loop(self) -> None:
         blocking = not (
-            self.prefill_manager.runnable
-            or self.decode_manager.runnable
-            or self._pending_rebuild is not None  # a queued rebuild to execute at idle
-            or (self._kv_dynamic is not None and self._kv_dynamic.has_held())  # see overlap_loop
+            self._engine_failed is None  # see overlap_loop: latched means nothing to spin for
+            and (
+                self.prefill_manager.runnable
+                or self.decode_manager.runnable
+                or self._pending_rebuild is not None  # a queued rebuild to execute at idle
+                or (self._kv_dynamic is not None and self._kv_dynamic.has_held())  # see overlap_loop
+            )
         )
         for msg in self.receive_msg(blocking=blocking):
             # Per-message so an idle poll never counts as traffic (freetoken/diag.py arms on
@@ -1213,8 +1228,10 @@ class Scheduler(SchedulerIOMixin):
         already past it are not covered -- a never-started request in the prefill manager's
         pending list (the automatic rebuild runs with one queued, and a MoE-only operator
         rebuild runs with requests in flight) would still be picked up by
-        ``_schedule_next_batch`` and handed to the dead engine. So: error-reply everything
-        queued, answer every later arrival the same way, and schedule nothing.
+        ``_schedule_next_batch`` and handed to the dead engine, and so would a request that is
+        mid-chat in the decode manager (a MoE-only rebuild and a governor step both execute at a
+        DECODE step boundary, with requests in flight). So: error-reply everything queued and
+        everything running, answer every later arrival the same way, and schedule nothing.
 
         Deliberately not an exit: the API's ``failed`` state and the settings helper's crash
         watchdog already own the restart (spec rule 8, external review of 8d566de).
@@ -1231,6 +1248,36 @@ class Scheduler(SchedulerIOMixin):
                 self._release_request_tensors(req)
                 uids.append(req.uid)
             pending.clear()
+        # 2026-09-12 review: the pending list is not the whole of "already past the frontend's
+        # gate". A request decoding right now sits in the decode manager, and the MTP dispatch
+        # (_spec_dispatch_ready -> _speculative_decode_step) runs BEFORE _schedule_next_batch --
+        # so with speculation on, the very next loop iteration would draft and verify on the
+        # torn-down engine. It also keeps decode_manager.runnable true, which held `blocking`
+        # false and spun the loop at 100% CPU until the watchdog restarted the server.
+        decode_manager = getattr(self, "decode_manager", None)
+        running = list(getattr(decode_manager, "running_reqs", None) or ())
+        in_flight = getattr(self, "_last_data", None)
+        if in_flight is not None:
+            # Defence in depth, never expected: both loops only reach a latching maintenance
+            # point with last_data None (the previous batch is drained), which is what makes it
+            # safe to drop these requests without waiting on copy_done.
+            logger.error("_latch_engine_failed ran with a batch still in flight")
+            running += [req for req in in_flight[0].batch.reqs if req not in running]
+        finished = getattr(self, "finished_reqs", None)
+        for req in running:
+            self._release_request_tensors(req)
+            # CPU side ONLY: no _free_req_resources, no page / GDN slot return. A failed
+            # teardown leaves the pools, the page table and the CUDA graphs in an unknown
+            # state, so nothing here touches device-backed bookkeeping; the process is being
+            # restarted (rule 8) and those entries die with it.
+            req.aborted = True
+            if decode_manager is not None:
+                decode_manager.remove_req(req)
+            if finished is not None:
+                # Terminal accounting: a later drain must not ship a token for a uid that has
+                # already had its error reply.
+                finished.add(req)
+            uids.append(req.uid)
         controller = getattr(self, "_kv_dynamic", None)
         if controller is not None:
             # The same disable() this outcome has always used: it clears the FIFO, drops the
@@ -2204,7 +2251,13 @@ class Scheduler(SchedulerIOMixin):
         host ids up. Prefill wins, exactly as ``_schedule_next_batch`` has always ordered it.
         """
         return (
-            self.config.spec_decode.enabled
+            # Rule 8, first factor (2026-09-12 review): this dispatch runs AHEAD of
+            # _schedule_next_batch, so its latch check does not cover the speculative path --
+            # a request still decoding when a rebuild tore the engine down would be drafted and
+            # verified on dead pools and graphs. _latch_engine_failed empties the decode
+            # manager too, so this is belt and braces.
+            self._engine_failed is None
+            and self.config.spec_decode.enabled
             and self.engine.spec_draft is not None
             and not self.prefill_manager.runnable
             and self.decode_manager.runnable
@@ -2221,6 +2274,10 @@ class Scheduler(SchedulerIOMixin):
         error: an unprimed head (a request admitted before speculation, or one still walking
         through chunked prefill) and a request with no room for a multi-token run are normal.
         """
+        if self._engine_failed is not None:
+            # Rule 8 again (2026-09-12 review): the second half of the MTP gate, so a request
+            # that somehow survives in the decode manager after the latch is never dispatched.
+            return None
         running = self.decode_manager.running_reqs
         if len(running) != 1:
             return None

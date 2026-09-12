@@ -3,13 +3,16 @@ test_moe_only_rebuild_gate pattern): hold/admit decisions, the idle plan executi
 three outcomes, the drain barrier, and the finish hooks."""
 from __future__ import annotations
 
+import contextlib
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from freetoken.core import SamplingParams
 from freetoken.message import (
-    CacheRebuildBackendMsg, ErrorReplyMsg, KVDynamicStatusMsg, MaintenanceBeginMsg, UserMsg,
+    CacheRebuildBackendMsg, CacheStepBackendMsg, ErrorReplyMsg, KVDynamicStatusMsg,
+    MaintenanceBeginMsg, UserMsg,
 )
 from freetoken.scheduler.cache import AdmissionProbe
 from freetoken.scheduler.kv_dynamic import KVDynamicController, KVDynamicPolicy
@@ -373,3 +376,122 @@ def test_the_status_debounce_ignores_the_shrink_countdown():
     clock.now += 0.3
     s._send_kv_dynamic_status()
     assert len([m for m in s.sent if isinstance(m, KVDynamicStatusMsg)]) == 1
+
+
+# ---- PR review 2 (2026-09-12): the latch also stops MTP and the running request -------------
+
+class _RunningReq:
+    """A request decoding with a primed draft head: everything _spec_candidate reads, so the
+    real predicate (not a stub) would hand this request to _speculative_decode_step. The
+    decode manager holds requests in a set and SimpleNamespace is unhashable."""
+
+    def __init__(self, uid: int):
+        self.uid = uid
+        self.aborted = False
+        self.mm_embeds = None
+        self.can_decode = True
+        self.table_idx = 0
+        self.extend_len = 1
+        self.input_ids = torch.zeros(4, dtype=torch.int32)
+        self.device_len = 4
+        self.remain_len = 8
+
+
+def _latched_loop_shell(loop: str):
+    """A shell decoding one MTP-eligible request with a governor step queued that fails after
+    teardown. Both loops dispatch speculation BEFORE _schedule_next_batch, so the latch has to
+    be visible to the MTP path and to the decode manager, not only to the scheduler."""
+    from freetoken.engine.config import SpecDecodeConfig
+    from freetoken.scheduler.decode import DecodeManager
+
+    s = _shell(probe=None)
+    s.decode_manager = DecodeManager(page_size=PAGE)
+    req = _RunningReq(uid=7)
+    s.decode_manager.running_reqs.add(req)
+    s.finished_reqs = set()
+    s._pending_abort_acks = set()
+    s._last_data = None
+    s._idle_wait_logged = True
+    # MTP on and ready: every one of _spec_dispatch_ready's real conditions holds but the latch.
+    s.config.spec_decode = SpecDecodeConfig(enabled=True)
+    s.engine.spec_draft = SimpleNamespace(is_ready=lambda r: True)
+    s._spec_policy = lambda r: None                      # no adaptive cooldown in the shell
+    s.engine.stream = SimpleNamespace()
+    s.stream = SimpleNamespace(wait_stream=lambda other: None)
+    s.engine_stream_ctx = contextlib.nullcontext()
+    s._log_cache_geometry = lambda *a, **k: None
+
+    def _step_memory(**kwargs):
+        s.engine.rebuild_teardown_started = True        # past the point of no return
+        raise RuntimeError("CUDA out of memory re-capturing graphs")
+
+    s.engine.step_memory = _step_memory
+    s.engine.residency_report = lambda: {"owned": 0, "pinned": 48, "disk": 0, "ram_parked": []}
+    s._pending_rebuild = CacheStepBackendMsg(request_id="gov-1", axis="vram", direction="down")
+
+    calls = {"spec": [], "forward": [], "batch": [], "blocking": []}
+    s.receive_msg = lambda blocking: (calls["blocking"].append(blocking), [])[1]
+    s._speculative_decode_step = lambda r: calls["spec"].append(r)
+    s._forward = lambda forward_input: calls["forward"].append(forward_input)
+    s._process_last_data = lambda data: None
+
+    def _schedule():
+        out = Scheduler._schedule_next_batch(s)          # the real rule-8 check
+        calls["batch"].append(out)
+        return out
+
+    s._schedule_next_batch = _schedule
+    run = (
+        (lambda: Scheduler.normal_loop(s)) if loop == "normal"
+        else (lambda: Scheduler.overlap_loop(s, None))
+    )
+    return s, req, calls, run
+
+
+@pytest.mark.parametrize("loop", ["normal", "overlap"])
+def test_a_failed_step_stops_speculation_and_the_running_request(loop):
+    s, req, calls, run = _latched_loop_shell(loop)
+
+    run()                                                # the iteration that latches
+    assert s._engine_failed is not None
+    assert calls["spec"] == [] and calls["forward"] == []
+    assert calls["batch"] == [None]                      # nothing forwarded into the dead engine
+    errors = [m for m in s.sent if isinstance(m, ErrorReplyMsg)]
+    assert [(m.uid, m.code) for m in errors] == [(7, "server_error")]
+    assert "needs a restart" in errors[0].error
+    assert s.decode_manager.running_reqs == set()        # CPU side only: dropped, never freed
+    assert req.aborted is True and req in s.finished_reqs
+
+    run()                                                # the next iteration must not spin
+    assert calls["blocking"] == [False, True]
+    assert calls["spec"] == [] and calls["forward"] == []
+    assert [(m.uid, m.code) for m in s.sent if isinstance(m, ErrorReplyMsg)] == [(7, "server_error")]
+
+
+@pytest.mark.parametrize("loop", ["normal", "overlap"])
+def test_the_mtp_gate_reads_the_latch_even_with_a_request_still_eligible(loop):
+    """Belt and braces: the dispatch is refused on the latch alone, whatever the managers say."""
+    s, req, calls, run = _latched_loop_shell(loop)
+    assert s._spec_dispatch_ready() is True              # before the latch: the real predicate
+    assert s._spec_candidate() is req                    # and it really would be dispatched
+    s._latch_engine_failed("test")
+    s.decode_manager.running_reqs.add(req)               # a request that somehow survived
+    assert s._spec_dispatch_ready() is False
+    assert s._spec_candidate() is None
+
+    # ...and the loop still blocks on the queue rather than spinning on that request.
+    s._pending_rebuild = None
+    run()
+    assert calls["blocking"] == [True]
+    assert calls["spec"] == [] and calls["forward"] == [] and calls["batch"] == [None]
+
+
+def test_run_when_idle_does_nothing_once_latched():
+    """The latched loop blocks on the queue, so run_when_idle fires on every poll -- and
+    parking / the integrity check would walk pools a failed teardown left unknown."""
+    s = _shell(probe=None)
+    s.cache_manager.park_idle = lambda: (_ for _ in ()).throw(AssertionError("parked"))
+    s.cache_manager.check_integrity = lambda: (_ for _ in ()).throw(AssertionError("checked"))
+    s.cache_manager.drain_pending_parks = lambda: (_ for _ in ()).throw(AssertionError("drained"))
+    s._engine_failed = "torn down"
+    Scheduler.run_when_idle(s)
