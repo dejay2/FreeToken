@@ -98,6 +98,9 @@ class Scheduler(SchedulerIOMixin):
     # __init__, and "no controller" is exactly the right answer for those.
     _kv_dynamic: "KVDynamicController | None" = None
     _kv_dynamic_last_status: dict | None = None
+    # Set by _latch_engine_failed when a rebuild tore the engine down and could not be rolled
+    # back (rule 8). Terminal for the life of the process; class-level for the same reason.
+    _engine_failed: str | None = None
 
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
@@ -956,18 +959,14 @@ class Scheduler(SchedulerIOMixin):
     def _make_kv_dynamic(self, config) -> "KVDynamicController":
         """Bind the pure policy to this engine's measured costs (spec: Scheduler section).
 
-        Everything the policy needs is priced once, here: the KV bytes per page come from the
-        SAME expression the rebuild validator uses (engine._kv_bytes_per_page), so planner and
-        validator can never disagree about what a page costs, and the slot floor is the one
-        step_memory already enforces. The refusals are boot-time ValueErrors on purpose -- a
-        half-wired dynamic pool would only be discovered when a request needed to grow.
+        The pricing itself lives in _build_kv_dynamic_policy, which runs again after every
+        externally-issued rebuild; this is the boot half: the refusals are ValueErrors on
+        purpose -- a half-wired dynamic pool would only be discovered when a request needed
+        to grow.
         """
-        from freetoken.engine.cache_budget import expert_bytes_per_slot
+        from .kv_dynamic import KVDynamicController
 
-        from .kv_dynamic import KVDynamicController, KVDynamicPolicy
-
-        moe = self.engine.moe_offload_cache
-        if moe is None:
+        if self.engine.moe_offload_cache is None:
             raise ValueError("--kv-dynamic requires an offloaded MoE slot cache")
         if not self.cache_manager.supports_runtime_rebuild:
             raise ValueError("--kv-dynamic is unsupported by this model's KV cache")
@@ -979,22 +978,7 @@ class Scheduler(SchedulerIOMixin):
             # args.py always records it alongside kv_dynamic; a None here means the config was
             # built by hand and the pool would silently have no ceiling to grow toward.
             raise ValueError("--kv-dynamic requires kv_ceiling_tokens (set it with --num-tokens)")
-        page = config.page_size
-        num_experts = config.model_config.num_experts
-        # The floor step_memory uses: with prefill overlap two experts' worth of slots per
-        # layer can be in flight at once, else one.
-        slot_floor = 2 * num_experts if config.moe_prefill_overlap else num_experts
-        policy = KVDynamicPolicy(
-            floor_pages=config.kv_floor_tokens // page + 1,
-            # kv_ceiling_tokens INCLUDES the dummy page (it is what --num-tokens would have
-            # been for a fixed pool of that size); the usable ceiling is one page less.
-            ceiling_pages=(config.kv_ceiling_tokens - page) // page + 1,
-            step_pages=config.kv_step_tokens // page,
-            page_size=page,
-            kv_bytes_per_page=self.engine._kv_bytes_per_page(),
-            slot_bytes=expert_bytes_per_slot(moe.bank_sources, self.engine._gpu_owned_layer_ids),
-            slot_floor=slot_floor,
-        )
+        policy = self._build_kv_dynamic_policy(config)
         self.engine.snapshot_pool_budget()
         controller = KVDynamicController(
             policy, shrink_idle_s=config.kv_shrink_idle_s, instance_id=str(id(self))[-6:],
@@ -1006,6 +990,39 @@ class Scheduler(SchedulerIOMixin):
             config.kv_shrink_idle_s, self.engine.pool_budget_bytes / (1 << 30),
         )
         return controller
+
+    def _build_kv_dynamic_policy(self, config) -> "KVDynamicPolicy":
+        """Price the policy against the engine's CURRENT geometry.
+
+        Called at boot and again after every rebuild the controller did not issue: the dials
+        are boot constants, but ``kv_bytes_per_page`` is not -- an operator ``num_swa_pages``
+        rebuild moves the per-page price (``Engine.snapshot_pool_budget``'s docstring), and a
+        planner holding the boot price would divide the freshly re-snapshotted budget by the
+        wrong number. The boot-time refusals stay in ``_make_kv_dynamic``: this is pricing
+        only, and it runs on a live rebuild path.
+        """
+        from freetoken.engine.cache_budget import expert_bytes_per_slot
+
+        from .kv_dynamic import KVDynamicPolicy
+
+        page = config.page_size
+        num_experts = config.model_config.num_experts
+        # The floor step_memory uses: with prefill overlap two experts' worth of slots per
+        # layer can be in flight at once, else one.
+        slot_floor = 2 * num_experts if config.moe_prefill_overlap else num_experts
+        return KVDynamicPolicy(
+            floor_pages=config.kv_floor_tokens // page + 1,
+            # kv_ceiling_tokens INCLUDES the dummy page (it is what --num-tokens would have
+            # been for a fixed pool of that size); the usable ceiling is one page less.
+            ceiling_pages=(config.kv_ceiling_tokens - page) // page + 1,
+            step_pages=config.kv_step_tokens // page,
+            page_size=page,
+            kv_bytes_per_page=self.engine._kv_bytes_per_page(),
+            slot_bytes=expert_bytes_per_slot(
+                self.engine.moe_offload_cache.bank_sources, self.engine._gpu_owned_layer_ids
+            ),
+            slot_floor=slot_floor,
+        )
 
     def _queue_for_kv_dynamic(self, msg: UserMsg) -> bool:
         """Rule 2. True when this method handled the message (held, or refused over the
@@ -1138,15 +1155,11 @@ class Scheduler(SchedulerIOMixin):
             c.note_plan_outcome(plan.reason, outcome)
         if outcome == "failed":
             # Rule 8: the engine is not known to be usable and the frontend latches failed.
-            # Admitting anything now would schedule work on a torn-down engine.
-            for held in c.disable("cache rebuild failed and could not be rolled back"):
-                if isinstance(held.msg, UserMsg):
-                    # Never admitted, so nothing downstream releases its picture tensors.
-                    self._drop_raw_picture(held.msg)
-                self.send_result([ErrorReplyMsg(
-                    uid=held.uid, error="cache rebuild failed; server needs a restart", code="server_error",
-                )])
-            self._send_kv_dynamic_status()
+            # Admitting anything now would schedule work on a torn-down engine -- and so would
+            # the never-started request that may already be in the pending list (this idle
+            # point is reached WITH one queued; rule 4 only skips the shrink), which the
+            # frontend's gate on new arrivals does not cover. _latch_engine_failed stops both.
+            self._latch_engine_failed("cache rebuild failed and could not be rolled back")
             return
         # ok or rejected: admit the head (and any further held entries that fit as they are).
         # On "rejected" the old engine is intact, so the head is admitted against the retained
@@ -1191,6 +1204,59 @@ class Scheduler(SchedulerIOMixin):
             self.send_result([KVDynamicStatusMsg(status=status)])
             self._kv_dynamic_last_status = compared
 
+    def _latch_engine_failed(self, reason: str) -> None:
+        """Rule 8's ``failed``: stop the backend for the life of the process.
+
+        A rebuild whose destructive phase failed and could not be rolled back leaves pools and
+        CUDA graphs torn down: nothing may be forwarded into that engine again. The frontend
+        latches ``failed`` on the same reply, but that gate only refuses NEW arrivals. Requests
+        already past it are not covered -- a never-started request in the prefill manager's
+        pending list (the automatic rebuild runs with one queued, and a MoE-only operator
+        rebuild runs with requests in flight) would still be picked up by
+        ``_schedule_next_batch`` and handed to the dead engine. So: error-reply everything
+        queued, answer every later arrival the same way, and schedule nothing.
+
+        Deliberately not an exit: the API's ``failed`` state and the settings helper's crash
+        watchdog already own the restart (spec rule 8, external review of 8d566de).
+        """
+        self._engine_failed = self._engine_failed or reason
+        logger.error(
+            "Scheduler latched failed (%s) - no further requests will be scheduled; "
+            "the server needs a restart", reason,
+        )
+        uids: list[int] = []
+        pending = getattr(self.prefill_manager, "pending_list", None)
+        if pending:
+            for req in list(pending):
+                self._release_request_tensors(req)
+                uids.append(req.uid)
+            pending.clear()
+        controller = getattr(self, "_kv_dynamic", None)
+        if controller is not None:
+            # The same disable() this outcome has always used: it clears the FIFO, drops the
+            # uncommitted charges and stops all planning for the life of the process.
+            for held in controller.disable(reason):
+                self._release_request_tensors(held.msg)
+                uids.append(held.uid)
+        if uids:
+            self.send_result([
+                ErrorReplyMsg(
+                    uid=uid, error="cache rebuild failed; server needs a restart",
+                    code="server_error",
+                )
+                for uid in uids
+            ])
+        self._send_kv_dynamic_status()
+
+    def _release_request_tensors(self, req) -> None:
+        """Free the transport tensors of a request that will never run: a UserMsg's raw picture
+        tensors (they dominate request transport memory) and an already-prepared request's
+        encoded soft tokens."""
+        if isinstance(req, UserMsg):
+            self._drop_raw_picture(req)
+        if getattr(req, "mm_embeds", None) is not None:
+            req.mm_embeds = None
+
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         self._idle_wait_logged = False
         if isinstance(msg, BatchBackendMsg):
@@ -1206,6 +1272,17 @@ class Scheduler(SchedulerIOMixin):
                 logger.debug_rank0(
                     "Dropping request %d because its abort arrived before admission", msg.uid
                 )
+                return
+            if self._engine_failed is not None:
+                # The engine is torn down (rule 8). Answer instead of queueing: the request
+                # would otherwise sit in the pending list forever, since _schedule_next_batch
+                # never runs again. After the tombstone check on purpose -- an aborted request
+                # has already had its terminal acknowledgement.
+                self.send_result([ErrorReplyMsg(
+                    uid=msg.uid, error="cache rebuild failed; server needs a restart",
+                    code="server_error",
+                )])
+                self._drop_raw_picture(msg)
                 return
             # Rule 2: with the dynamic KV pool on, the clip and the fit are judged against
             # the CEILING, not today's pool, and a request that needs more room than the pool
@@ -1589,6 +1666,9 @@ class Scheduler(SchedulerIOMixin):
             # the frontend latches failed on this status. Follow-up: roll a failed rung back.
             logger.error(f"cache step failed after teardown: {e!r} — latching failed")
             self._reply_step(msg.request_id, "failed", error=repr(e))
+            # The frontend latches failed on this reply, which stops new arrivals; this stops
+            # the backend from forwarding what is already queued into the torn-down engine.
+            self._latch_engine_failed(f"cache step failed after teardown: {e!r}")
             return "failed"
         if res.get("applied"):
             self._log_cache_geometry(f"Cache stepped ({res['applied']})")
@@ -1623,6 +1703,12 @@ class Scheduler(SchedulerIOMixin):
             snap = getattr(self.engine, "snapshot_pool_budget", None)
             if snap is not None:
                 snap()
+            if self._kv_dynamic is not None:
+                # The budget above is only half the price list: a window-only rebuild moves
+                # kv_bytes_per_page too (Engine.snapshot_pool_budget's docstring) and the
+                # policy is frozen, so re-read it. replace_policy keeps the held FIFO, the
+                # uncommitted charges and Timer 1 (external review of 8d566de).
+                self._kv_dynamic.replace_policy(self._build_kv_dynamic_policy(self.config))
             self._send_kv_dynamic_status()
         return outcome
 
@@ -1672,6 +1758,7 @@ class Scheduler(SchedulerIOMixin):
                 # would desync the group. Keep the latch-failed behavior for tp>1.
                 logger.error(f"cache rebuild failed: {e!r} — tp>1, latching failed")
                 self._reply_rebuild(msg.request_id, "failed", error=repr(e))
+                self._latch_engine_failed(f"cache rebuild failed on a TP rank: {e!r}")
                 return "failed"
             # The destructive phase failed — typically a CUDA OOM while reallocating a pool or
             # recapturing graphs. The graphs/pools are already torn down, so the engine cannot
@@ -1691,6 +1778,9 @@ class Scheduler(SchedulerIOMixin):
                     msg.request_id,
                     "failed",
                     error=f"{e!r}; rollback to the prior geometry also failed: {e2!r}",
+                )
+                self._latch_engine_failed(
+                    f"cache rebuild failed ({e!r}) and the rollback failed too ({e2!r})"
                 )
                 return "failed"
             logger.warning("cache rebuild rolled back to the previous geometry — still serving")
@@ -2310,6 +2400,13 @@ class Scheduler(SchedulerIOMixin):
             batch.mm_embeds = torch.cat(parts, dim=0)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
+        if self._engine_failed is not None:
+            # Rule 8: the pools and graphs this batch would run on are gone. Everything that
+            # was queued has already been error-replied by _latch_engine_failed; this stops the
+            # loop from forwarding anything into the torn-down engine while the watchdog
+            # restarts the server. Before the managers on purpose: schedule_next_batch mutates
+            # them (it seats pending requests and allocates pages).
+            return None
         # TODO: support other policies: e.g. DECODE first
         batch = (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)

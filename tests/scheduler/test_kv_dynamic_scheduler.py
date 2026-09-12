@@ -37,11 +37,21 @@ def _shell(*, num_pages=1025, probe=None, clock=None):
     s.engine = SimpleNamespace(
         num_pages=num_pages, max_seq_len=(num_pages - 1) * PAGE,
         pool_budget_bytes=7200 * SLOT + 1025 * KV_PAGE,
-        moe_offload_cache=SimpleNamespace(cache_size=7200),
+        # bank_sources as _build_kv_dynamic_policy reads it: one bank, one streaming layer,
+        # one row per expert. expand() gives the row the real byte count with no allocation.
+        moe_offload_cache=SimpleNamespace(
+            cache_size=7200,
+            bank_sources={"w": [torch.empty(1, dtype=torch.float16).expand(1, SLOT // 2)]},
+        ),
+        _gpu_owned_layer_ids=frozenset(),
+        _kv_bytes_per_page=lambda: KV_PAGE,
         snapshot_pool_budget=lambda: s.engine.pool_budget_bytes,
         rebuild_teardown_started=False, maintenance_progress=None, kv_dynamic_floor_pages=1025,
     )
     s.config = SimpleNamespace(kv_ceiling_tokens=262_144 + 64, page_size=PAGE,
+                               kv_floor_tokens=65_536, kv_step_tokens=32_768,
+                               moe_prefill_overlap=True,
+                               model_config=SimpleNamespace(num_experts=512),
                                tp_info=SimpleNamespace(size=1))
     s.cache_manager = SimpleNamespace(
         probe_admission=lambda ids, out, reserved, cache_private=False: probe,
@@ -110,6 +120,61 @@ def test_failed_rebuild_error_replies_the_held_requests_and_disables_the_control
     errors = [m for m in s.sent if isinstance(m, ErrorReplyMsg)]
     assert sorted(m.uid for m in errors) == [2, 3] and all(m.code == "server_error" for m in errors)
     assert s.prefill_manager.added == [] and not s._kv_dynamic.enabled
+
+
+def test_a_failed_rebuild_latches_the_backend_and_schedules_nothing_afterwards():
+    """External review of 8d566de: the frontend's ``failed`` gate only stops NEW arrivals, so a
+    never-started request already in the pending list would still be handed to the torn-down
+    engine by _schedule_next_batch."""
+    s = _shell(probe=AdmissionProbe(need_now=92_000, protect_tokens=0, fits_empty=False,
+                                    fits_now=False, cached_len=0))
+    pending = PendingReq(1, torch.arange(1, 500), SamplingParams(max_tokens=10))
+    s.prefill_manager.pending_list.append(pending)          # A: queued, never started
+    s._queue_for_kv_dynamic(_user(2, 60_000, 32_000))       # B: held for the grow
+    s._execute_pending_rebuild = lambda: (setattr(s, "_pending_rebuild", None), "failed")[1]
+    s._run_kv_dynamic_idle()
+
+    errors = [m for m in s.sent if isinstance(m, ErrorReplyMsg)]
+    assert sorted(m.uid for m in errors) == [1, 2]          # exactly one reply each
+    assert all(m.code == "server_error" and "needs a restart" in m.error for m in errors)
+    assert s.prefill_manager.pending_list == [] and s.prefill_manager.added == []
+    assert s._engine_failed is not None
+    # Nothing is forwarded into the dead engine (and the managers are never touched: this
+    # shell has no schedule_next_batch at all).
+    assert s._schedule_next_batch() is None
+
+    # Later arrivals are answered, not queued -- through either door.
+    assert s._queue_for_kv_dynamic(_user(3, 1_000, 100)) is False   # controller disabled
+    s._process_one_msg(_user(3, 1_000, 100))
+    late = [m for m in s.sent if isinstance(m, ErrorReplyMsg) and m.uid == 3]
+    assert len(late) == 1 and late[0].code == "server_error"
+    assert s.prefill_manager.added == [] and s.prefill_manager.pending_list == []
+
+
+def test_an_external_rebuild_reprices_the_controller_policy():
+    """External review of 8d566de: a window-only rebuild moves the per-page price, and the
+    boot-time policy is frozen -- re-snapshotting the budget alone is half a re-pricing."""
+    s = _shell(num_pages=2049, probe=None)
+    s._kv_dynamic.on_request_finished()
+    held_before = s._kv_dynamic.last_request_finished
+    s._pending_rebuild = CacheRebuildBackendMsg(request_id="op-1", num_swa_pages=512)
+    s._execute_pending_operation = lambda msg: "ok"
+    s.engine._kv_bytes_per_page = lambda: KV_PAGE + 4_096   # the window pin moved the price
+
+    assert s._execute_pending_rebuild() == "ok"
+    assert s._kv_dynamic.policy.kv_bytes_per_page == s.engine._kv_bytes_per_page()
+    assert s._kv_dynamic.policy.floor_pages == 1025 and s._kv_dynamic.policy.ceiling_pages == 4097
+    assert s._kv_dynamic.last_request_finished == held_before   # a re-pricing, not a reset
+
+
+def test_an_automatic_rebuild_does_not_reprice():
+    """auto-kv: rebuilds never touch the window, so nothing re-reads the price for them."""
+    s = _shell(num_pages=2049, probe=None)
+    s._pending_rebuild = CacheRebuildBackendMsg(request_id="auto-kv:i:1", num_pages=1025)
+    s._execute_pending_operation = lambda msg: "ok"
+    s.engine._kv_bytes_per_page = lambda: KV_PAGE + 4_096
+    assert s._execute_pending_rebuild() == "ok"
+    assert s._kv_dynamic.policy.kv_bytes_per_page == KV_PAGE
 
 
 def test_prompt_over_the_ceiling_is_refused_with_the_existing_message():
@@ -235,6 +300,23 @@ def test_three_refused_shrinks_stop_the_planning_until_a_request_finishes():
     clock.now += 601
     s._run_kv_dynamic_idle()
     assert s.executed == [1025, 1025, 1025, 1025]
+
+
+def test_a_suspended_shrink_stops_waking_the_idle_loop():
+    """External review of 8d566de: with the cap reached and the re-armed deadline expired, the
+    old next_deadline_ms returned its 1 ms floor for ever -- a quiet server woke every
+    millisecond to re-decide not to shrink."""
+    s, clock = _refusing_shrink_shell()
+    for _ in range(3):
+        s._run_kv_dynamic_idle()
+        clock.now += 601
+    assert s.executed == [1025, 1025, 1025]
+    assert s.idle_poll_timeout_ms() is None               # no park delay either: block on the queue
+    s.cache_manager.next_park_delay_ms = lambda: 250
+    assert s.idle_poll_timeout_ms() == 250                # Timer 2 still wins on its own merit
+    s.cache_manager.next_park_delay_ms = lambda: None
+    s._note_request_finished([object()])                  # traffic re-arms the full window
+    assert s.idle_poll_timeout_ms() == 600_000
 
 
 def test_a_rejected_grow_still_admits_the_head_and_leaves_no_1ms_deadline():

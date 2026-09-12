@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from freetoken.scheduler.kv_dynamic import KVDynamicController, KVDynamicPolicy
 
 PAGE, KV_PAGE, SLOT = 64, 13_248 * 64, 2_772_480
@@ -184,6 +186,61 @@ def test_escalate_holds_a_pending_request_once_and_not_when_disabled():
     c.disable("x")
     c.escalate(8, _msg(8), need_total=92_000)
     assert not c.has_held()
+
+
+# ---- external review of 8d566de: re-pricing, and the suspended timer ----------------------
+
+def _repriced(policy, **changes):
+    fields = dict(
+        floor_pages=policy.floor_pages, ceiling_pages=policy.ceiling_pages,
+        step_pages=policy.step_pages, page_size=policy.page_size,
+        kv_bytes_per_page=policy.kv_bytes_per_page, slot_bytes=policy.slot_bytes,
+        slot_floor=policy.slot_floor,
+    )
+    fields.update(changes)
+    return KVDynamicPolicy(**fields)
+
+
+def test_replace_policy_reprices_and_keeps_the_queue_and_the_timers():
+    clock = _Clock()
+    c = _controller(clock)
+    c.decide_admission(2, _msg(2), need_total=92_000, need_now=92_000,
+                       pool_tokens=POOL, fits_empty=False, fits_now=False)
+    c.note_uncommitted(9, 1_000)
+    c.on_request_finished()
+    finished_at = c.last_request_finished
+    # What an operator num_swa_pages rebuild does: the per-page price moves, the dials do not.
+    c.replace_policy(_repriced(c.policy, kv_bytes_per_page=KV_PAGE * 2, slot_floor=2_048))
+    assert c.policy.kv_bytes_per_page == KV_PAGE * 2 and c.policy.slot_floor == 2_048
+    assert [h.uid for h in c.held] == [2] and c.uncommitted_tokens == 1_000
+    assert c.last_request_finished == finished_at and c.enabled
+
+
+def test_replace_policy_refuses_to_move_a_dial():
+    c = _controller(_Clock())
+    with pytest.raises(ValueError, match="ceiling_pages"):
+        c.replace_policy(_repriced(c.policy, ceiling_pages=c.policy.ceiling_pages + 16))
+    assert c.policy.ceiling_pages == 262_144 // PAGE + 1
+
+
+def test_a_suspended_shrink_stops_asking_to_be_woken():
+    clock = _Clock()
+    c = _controller(clock)
+    c.on_request_finished()
+    for _ in range(3):
+        clock.now += 601
+        assert c.plan_idle(current_pages=2049, pool_budget_bytes=BUDGET,
+                           running_need_tokens=0) is not None
+        c.note_plan_outcome("shrink", "rejected")
+    assert c.consecutive_failures == 3
+    clock.now += 601                       # the re-armed deadline expires again
+    assert c.plan_idle(current_pages=2049, pool_budget_bytes=BUDGET, running_need_tokens=0) is None
+    # The deadline would be the 1 ms floor here, waking the loop every millisecond for a plan
+    # the cap has already refused.
+    assert c.next_deadline_ms(current_pages=2049) is None
+    assert c.status(current_pages=2049, pool_budget_bytes=BUDGET)["shrink_in_s"] is None
+    c.on_request_finished()
+    assert c.next_deadline_ms(current_pages=2049) == 600_000
 
 
 def test_timer1_with_a_budget_below_the_floor_geometry_plans_nothing():

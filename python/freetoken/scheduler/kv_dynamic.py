@@ -337,9 +337,36 @@ class KVDynamicController:
             return None
         if current_pages <= self.policy.floor_pages:
             return None
+        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            # Suspended by the three-failure cap: plan_idle will refuse every attempt until a
+            # request finishes, and note_plan_outcome stopped moving the clock with it, so the
+            # deadline is permanently in the past. Returning the 1 ms floor below would wake
+            # the scheduler every millisecond for a shrink it has already decided not to plan
+            # (external review of 8d566de). on_request_finished clears the counter and the
+            # full shrink_idle_s deadline comes back with it.
+            return None
         now = self._clock() if now is None else now
         remaining = self.shrink_idle_s - (now - self.last_request_finished)
         return max(1, int(remaining * 1000 + 0.999))
+
+    def replace_policy(self, policy: KVDynamicPolicy) -> None:
+        """Re-price the policy after a rebuild this controller did not issue (rule 3).
+
+        The dials are boot constants, but the BYTE costs are not: a window-only
+        (``num_swa_pages``) rebuild on a window-bearing family moves ``kv_bytes_per_page``
+        (``Engine.snapshot_pool_budget``'s docstring), and the boot-time policy is frozen, so
+        re-snapshotting ``pool_budget_bytes`` alone would leave the planner dividing a fresh
+        budget by a stale per-page price. Everything the controller is HOLDING -- the FIFO,
+        the uncommitted charges, Timer 1's clock and the failure counter -- survives: this is
+        a re-pricing, not a reset (external review of 8d566de).
+        """
+        for name in ("floor_pages", "ceiling_pages", "step_pages", "page_size"):
+            if getattr(policy, name) != getattr(self.policy, name):
+                raise ValueError(
+                    f"replace_policy may only re-price the pool, but {name} changed "
+                    f"({getattr(self.policy, name)} -> {getattr(policy, name)})"
+                )
+        self.policy = policy
 
     def next_operation_id(self) -> str:
         self._seq += 1
