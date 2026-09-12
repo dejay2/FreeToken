@@ -98,17 +98,22 @@ class BaseKVCachePool(ABC):
     def validate_rebuild(
         self, config, *, num_pages: int | None, target_moe: int, per_expert_bytes: int,
         baseline_free: int, weights_bytes: int, current_num_pages: int,
-        extra_fixed_bytes: int = 0, extra_note: str = "", current_moe: int | None = None,
+        extra_fixed_bytes: int = 0, extra_note: str = "", shrink_only: bool = False,
         **targets,
     ) -> None:
         """Budget fit-check for a runtime rebuild target, BEFORE any destructive free.
 
-        ``current_moe`` (the live slot count) lets a target that is no larger than what is
-        resident right now pass even when the boot-time budget says otherwise: the rebuild
-        frees before it allocates, so a pure shrink cannot OOM. Live 5090 2026-09-12: a boot
-        that over-committed the card (explicit 524k KV on top of a 262k plan) had every
-        governor shrink (6262 -> 5750 slots) refused with "needs 21.32 GiB > budget 20.91 GiB"
-        every 8 s, so the card could never get back under its headroom.
+        ``shrink_only`` is the engine's verdict that this rebuild touches nothing but the MoE
+        slot cache and does not grow it (:meth:`Engine._is_pure_moe_shrink`). Such a target
+        skips the budget comparison: the slot cache frees before it allocates and every other
+        pool stays as it is, so it cannot OOM even when the boot-time budget says otherwise.
+        Live 5090 2026-09-12: a boot that over-committed the card (explicit 524k KV on top of
+        a 262k plan) had every governor shrink (6262 -> 5750 slots) refused with "needs 21.32
+        GiB > budget 20.91 GiB" every 8 s, so the card could never get back under its headroom.
+        The verdict is deliberately NOT a "no larger than resident" total: a sibling pool
+        growing (GDN state, pinned window) leaves the slot and page counts unchanged, and a
+        combined grow-MoE/shrink-KV request peaks above both totals because the MoE cache is
+        rebuilt before the KV pool (PR #4 review).
         The engine supplies the memory account (baseline/weights, the MoE terms, and any
         sibling pool's fixed bytes at ITS target, e.g. the GDN state pool); the pool
         answers whether its own target geometry fits. Raises CacheRebuildRejected.
@@ -133,13 +138,12 @@ class BaseKVCachePool(ABC):
             fixed_cache_size + extra_fixed_bytes,
         )
         need = required_bytes(target_moe, target_pages, per_expert_bytes, cache_per_page)
-        if current_moe is not None:
-            # Priced with the target's per-page cost: exact for a MoE-only step (the pages do
-            # not change), conservative-enough for a KV rung (same pool family, same cost).
-            resident = required_bytes(
-                current_moe, current_num_pages, per_expert_bytes, cache_per_page
-            )
-            budget = max(budget, resident)
+        if shrink_only:
+            if num_pages is not None or cost_kwargs:
+                raise CacheRebuildRejected(
+                    "shrink_only rebuild names a KV or window target; refusing to skip the budget"
+                )
+            return
         if need > budget:
             raise CacheRebuildRejected(
                 f"requested cache (moe={target_moe} slots, kv={target_pages} pages{extra_note}) "
