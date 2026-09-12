@@ -382,7 +382,7 @@ class DSV4PagedKVCache(BaseKVCachePool):
         self, config, *, num_pages: int | None, target_moe: int, per_expert_bytes: int,
         baseline_free: int, weights_bytes: int, current_num_pages: int,
         extra_fixed_bytes: int = 0, extra_note: str = "",
-        num_swa_pages: int | None = None, **targets,
+        num_swa_pages: int | None = None, shrink_only: bool = False, **targets,
     ) -> None:
         from freetoken.engine.cache_budget import net_cache_budget_bytes
         from freetoken.utils import mem_GB
@@ -416,6 +416,14 @@ class DSV4PagedKVCache(BaseKVCachePool):
         need = target_moe * per_expert_bytes + dsv4_pool_bytes(
             kv_sizes, dsv4_args, config.max_running_req + 1
         )
+        if shrink_only:
+            # The engine verified a MoE-only, non-growing rebuild (see base.validate_rebuild):
+            # the pool stays as it is and the slot cache frees before it allocates.
+            if num_pages is not None or num_swa_pages is not None:
+                raise CacheRebuildRejected(
+                    "shrink_only rebuild names a KV or window target; refusing to skip the budget"
+                )
+            return
         if need > budget:
             kv_part = f"kv={num_pages} P-pages" if num_pages is not None else "kv=current pool"
             raise CacheRebuildRejected(

@@ -145,6 +145,49 @@ def test_generic_validate_rebuild_budget_check():
     check(None, per_page * 10 + fixed)
 
 
+def test_generic_validate_rebuild_skips_the_budget_only_for_a_verified_moe_shrink():
+    """A MoE-only, non-growing rebuild frees before it allocates and moves no other pool, so
+    it cannot OOM even when the boot-time budget says otherwise. Live 5090 2026-09-12: the
+    boot over-committed the card (explicit 524k KV on top of a plan for 262k), the governor
+    asked for 6262 -> 5750 slots every 8 s, and each step was refused with "needs 21.32 GiB >
+    budget 20.91 GiB" -- a shrink that could only have helped. The engine makes that verdict
+    (Engine._is_pure_moe_shrink); the pool only honours it, and refuses to honour it for a
+    request that names a KV or window target."""
+    from freetoken.kvcache.base import CacheRebuildRejected
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    config = _generic_config()
+    object.__setattr__(config, "memory_ratio", 1.0)
+    per_page, fixed, _, _ = MHAKVCache.kv_cost(config)
+    pool = object.__new__(MHAKVCache)
+    budget = per_page * 50 + fixed  # exactly 50 pages fit
+    # Live geometry: 80 pages + 8 "slots" priced at one page each = 88 pages, over budget.
+
+    def check(target_moe, *, num_pages=None, shrink_only=False, extra_fixed_bytes=0):
+        pool.validate_rebuild(
+            config, num_pages=num_pages, num_swa_pages=None,
+            target_moe=target_moe, per_expert_bytes=per_page, baseline_free=budget,
+            weights_bytes=0, current_num_pages=80, shrink_only=shrink_only,
+            extra_fixed_bytes=extra_fixed_bytes,
+        )
+
+    check(5, shrink_only=True)  # the governor's step: over budget, but a pure shrink
+    check(8, shrink_only=True)  # unchanged geometry
+    # Without the verdict every over-budget target is still refused, including the two the
+    # PR #4 review named: a sibling pool growing while the slot/page counts stand still, and
+    # a combined grow-MoE/shrink-KV whose final total is smaller than the resident one but
+    # whose peak (MoE rebuilt before KV) is not.
+    with pytest.raises(CacheRebuildRejected, match="old cache kept"):
+        check(5)
+    with pytest.raises(CacheRebuildRejected, match="old cache kept"):
+        check(5, extra_fixed_bytes=per_page * 100)
+    with pytest.raises(CacheRebuildRejected, match="old cache kept"):
+        check(16, num_pages=70)
+    # The pool never lets the verdict cover a KV target, whoever set it.
+    with pytest.raises(CacheRebuildRejected, match="shrink_only"):
+        check(5, num_pages=70, shrink_only=True)
+
+
 def test_dsv4_validate_rebuild_floor():
     from freetoken.kvcache.base import CacheRebuildRejected
     from freetoken.kvcache.dsv4_cost_model import _dsv4_window_floor_pages

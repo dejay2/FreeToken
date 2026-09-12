@@ -728,6 +728,13 @@ class Engine:
         # paging at decode peak: measured 2x slowdown at 569 MiB free.
         fixed_cache_size += self._post_cache_reserve(config)
         total_experts = (config.model_config.num_moe_layers - len(owned)) * num_experts
+        # An explicit --num-tokens is allocated verbatim by solve_num_pages AFTER this plan,
+        # so it must be the KV floor here or the slots are sized against the smaller
+        # --kv-reserve-tokens and the pool lands on top. Live 5090 boot 2026-09-12 05:14
+        # (logs/server-2020.log): reserve 262144 + --num-tokens 524288 planned 6262 slots for
+        # 4097 pages, then allocated 8192 -- 3.24 GiB unbudgeted, 0.67 GiB free after init
+        # instead of the 1.5 GiB headroom, and the governor's every shrink refused.
+        override_pages = getattr(config, "num_page_override", None) or 0
         moe_cache_size, num_pages, overlap = resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
@@ -738,7 +745,9 @@ class Engine:
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
+            kv_reserve_tokens=max(
+                config.kv_reserve_tokens, min_reserve, override_pages * page_tokens
+            ),
             page_size=page_tokens,
             quant_format=banks.quant_format,
         )
@@ -1262,6 +1271,28 @@ class Engine:
             raise RuntimeError("Memory across TP ranks are imbalanced")
 
         return min_free_memory, max_free_memory
+
+    @staticmethod
+    def _is_pure_moe_shrink(
+        *, current_moe: int, moe_cache_size: int | None, num_pages: int | None,
+        num_mamba_slots: int | None, num_swa_pages: int | None,
+        layer_moves: "list[tuple[int, str]] | None",
+    ) -> bool:
+        """True only for a rebuild that resizes the MoE slot cache to at most its current
+        size and touches nothing else. That is the one shape the budget check may skip: the
+        slot cache frees before it allocates and no other pool moves, so it cannot OOM even
+        on a card the boot over-committed (the 2026-09-12 governor loop, see
+        validate_rebuild). A KV, GDN-state or window target, a layer move (an owned layer is a
+        full layer of VRAM) or a grow all keep the budget check, whatever the totals say.
+        """
+        return (
+            moe_cache_size is not None
+            and moe_cache_size <= current_moe
+            and num_pages is None
+            and num_mamba_slots is None
+            and num_swa_pages is None
+            and not layer_moves
+        )
 
     def _target_moe_and_expert_bytes(self, moe_cache_size: int | None) -> tuple[int, int]:
         from freetoken.engine.cache_budget import expert_bytes_per_slot
@@ -2120,6 +2151,12 @@ class Engine:
             num_swa_pages=num_swa_pages, target_moe=target_moe,
             per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
+            shrink_only=self._is_pure_moe_shrink(
+                current_moe=(self.moe_offload_cache.cache_size if self.moe_offload_cache else 0),
+                moe_cache_size=moe_cache_size, num_pages=num_pages,
+                num_mamba_slots=num_mamba_slots, num_swa_pages=num_swa_pages,
+                layer_moves=layer_moves,
+            ),
             extra_fixed_bytes=(
                 state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
             ),

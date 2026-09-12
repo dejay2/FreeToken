@@ -523,3 +523,24 @@ def test_residency_report_carries_the_kv_pool_size():
     assert eng.residency_report()["num_pages"] == 100
     eng.num_pages = 75
     assert eng.residency_report()["num_pages"] == 75
+
+
+def test_a_pure_moe_shrink_is_the_only_rebuild_that_may_skip_the_budget():
+    """The verdict validate_rebuild trusts (PR #4 review): slots at or below the current
+    count and nothing else named. A sibling-pool target, a layer move or a grow all keep the
+    budget check, whatever the resident total says."""
+    from freetoken.engine.engine import Engine
+
+    base = dict(current_moe=6262, moe_cache_size=5750, num_pages=None,
+                num_mamba_slots=None, num_swa_pages=None, layer_moves=None)
+    assert Engine._is_pure_moe_shrink(**base)
+    assert Engine._is_pure_moe_shrink(**{**base, "moe_cache_size": 6262})
+    for change in (
+        {"moe_cache_size": 6263},        # a grow
+        {"moe_cache_size": None},        # nothing to shrink
+        {"num_pages": 8000},             # KV rung, even a smaller one
+        {"num_mamba_slots": 13},         # GDN state pool
+        {"num_swa_pages": 10},           # pinned window
+        {"layer_moves": [(3, "gpu_owned")]},  # a full layer of VRAM
+    ):
+        assert not Engine._is_pure_moe_shrink(**{**base, **change}), change
