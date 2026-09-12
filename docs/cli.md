@@ -83,6 +83,11 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-backend` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family backends) |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
+| `--kv-dynamic` | off | Boot the KV pool at `--kv-floor-tokens`, grow it in `--kv-step-tokens` rungs by trading MoE slots when a request needs the room (up to `--num-tokens`), shrink back after `--kv-shrink-idle-s` with no request. Offload-family MoE backends, TP=1 |
+| `--kv-floor-tokens` | 65536 | Usable KV tokens the dynamic pool boots with and shrinks back to |
+| `--kv-step-tokens` | 32768 | Growth rung of the dynamic pool (minimum 8192) |
+| `--kv-shrink-idle-s` | 600 | Seconds with no request before the dynamic pool shrinks to the floor |
+| `--kv-park-ttl-s` | 18000 | Seconds a parked prefix may sit unused before it is dropped from RAM/SSD; 0 never |
 | `--moe-vram-reserve-bytes` | auto (-1) | VRAM the expert cache must not spend because it is allocated AFTER the cache is sized: the integrated MTP resident draft head (2.17 GiB measured), the CUDA-graph pools, the vision layer-stream workspace. Auto = 0.75 GiB of graph pools plus 2.25 GiB of draft head when speculation is on; 0 reserves nothing. Respected by `auto` and by an explicit `--moe-cache-size` |
 | `--moe-cache-headroom-bytes` | 1.5 GiB | Free VRAM the cache must leave after every reservation; an explicit `--moe-cache-size` that leaves less refuses to boot, naming the largest slot count that fits |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
