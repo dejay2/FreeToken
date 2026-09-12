@@ -120,6 +120,13 @@ def test_budget_lowered_by_the_governor_lowers_every_target():
     assert p.slots_for_pages(low, 2049) == p.slots_for_pages(high, 2049) - 512
 
 
+def test_shrink_refuses_a_budget_below_the_floor_geometry():
+    p = _policy(slot_floor=1024)
+    tiny_budget = p.floor_pages * KV_PAGE + 100 * SLOT  # below floor geometry
+    assert p.plan_shrink(current_pages=p.floor_pages + 2000, pool_budget_bytes=tiny_budget) is None
+    assert p.plan_grow(current_pages=p.floor_pages, pool_budget_bytes=tiny_budget, need_tokens=100_000) is None
+
+
 @pytest.mark.parametrize("bad", [
     dict(floor_pages=0), dict(step_pages=0), dict(slot_floor=0), dict(kv_bytes_per_page=0),
     dict(floor_pages=5000),  # above the ceiling

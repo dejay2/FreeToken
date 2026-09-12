@@ -15,9 +15,7 @@ budget (external review of 702543b, 2026-09-12).
 
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import dataclass, field
-from typing import Callable, Deque
+from dataclasses import dataclass
 
 MIN_STEP_TOKENS = 8_192
 
@@ -66,7 +64,9 @@ class KVDynamicPolicy:
 
     # ---- budget ------------------------------------------------------------------------
     def slots_for_pages(self, pool_budget_bytes: int, pages: int) -> int:
-        """Slots the budget funds beside ``pages`` (floor division: always inside the budget)."""
+        """Slots the budget funds beside ``pages`` (floor division). Clamped to slot_floor; the
+        floor clamp may exceed the budget when it is smaller than the floor geometry, so
+        callers must check fit with _fits_budget if the budget may be below floor geometry."""
         remaining = pool_budget_bytes - pages * self.kv_bytes_per_page
         return max(self.slot_floor, remaining // self.slot_bytes)
 
@@ -115,6 +115,8 @@ class KVDynamicPolicy:
 
     def plan_shrink(self, *, current_pages: int, pool_budget_bytes: int) -> KVPlan | None:
         if current_pages <= self.floor_pages:
+            return None
+        if not self._fits_budget(pool_budget_bytes, self.floor_pages, self.slot_floor):
             return None
         return KVPlan(
             target_pages=self.floor_pages,
