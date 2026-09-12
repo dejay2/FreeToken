@@ -91,10 +91,14 @@ class PrefillAdder:
             logger.warning_rank0(reason)
             return None
 
-        if estimated_len + self.reserved_size > self.cache_manager.available_size:
+        from .cache import admission_fits
+
+        if not admission_fits(need_now=estimated_len, reserved=self.reserved_size,
+                              available=self.cache_manager.available_size, protect_tokens=0):
             return None
         self.cache_manager.lock(handle)
-        if estimated_len + self.reserved_size > self.cache_manager.available_size:
+        if not admission_fits(need_now=estimated_len, reserved=self.reserved_size,
+                              available=self.cache_manager.available_size, protect_tokens=0):
             return self.cache_manager.unlock(handle)
 
         # Second currency (hybrid GDN): reserve 1 live + 2 ping-pong state slots; evict tree
