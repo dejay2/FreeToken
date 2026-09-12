@@ -544,3 +544,25 @@ def test_a_pure_moe_shrink_is_the_only_rebuild_that_may_skip_the_budget():
         {"layer_moves": [(3, "gpu_owned")]},  # a full layer of VRAM
     ):
         assert not Engine._is_pure_moe_shrink(**{**base, **change}), change
+
+
+# ----- dynamic KV pool integration (Task 7: 2026-09-12) -----
+
+
+def test_vram_down_kv_rung_shrinks_to_the_dynamic_floor_when_the_dynamic_pool_is_on():
+    eng = FakeEngine(num_layers=2, num_experts=4, cache_size=8, owned_layers=(), num_pages=400)
+    eng.config.kv_dynamic = True
+    eng.kv_dynamic_floor_pages = 100
+    # slots already at the floor (num_experts=4, overlap False) so rung 3 is reached
+    eng.moe_offload_cache.rebuild(4)
+    eng.config.moe_cache_size = 4
+    res = eng.step_memory("vram", "down", is_idle=True)
+    assert res["applied"] == "kv" and eng.num_pages == 100  # not the old 300 (-25 %)
+
+
+def test_vram_up_kv_rung_is_a_noop_under_the_dynamic_pool():
+    eng = FakeEngine(num_layers=3, num_experts=4, cache_size=4, owned_layers=(0, 1), num_pages=100)
+    eng.config.kv_dynamic = True
+    eng.kv_dynamic_floor_pages = 100
+    eng._initial_num_pages = 100
+    assert eng.step_memory_noop("vram", "up")["exhausted"] is True

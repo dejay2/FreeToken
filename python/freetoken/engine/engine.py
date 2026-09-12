@@ -1851,10 +1851,18 @@ class Engine:
                     "vram_free_bytes": free_vram,
                 }
 
-            # 3. KV pool -25% (idle-only)
+            # 3. KV pool (idle-only). With the dynamic KV pool on, the controller owns the pool
+            #    size: the governor's shrink goes straight to the controller's floor (the
+            #    freed bytes ARE the cushion it asked for; the controller re-reads
+            #    pool_budget_bytes afterwards and funds the next grow from slots). Otherwise
+            #    the historical -25 % of the boot size.
             idle = True if is_idle is None else is_idle
             init_pages = getattr(self, "_initial_num_pages", None) or getattr(self, "num_pages", 0)
-            kv_floor = max(1, int(init_pages * 0.75))
+            floor_pages = getattr(self, "kv_dynamic_floor_pages", None)
+            if getattr(self.config, "kv_dynamic", False) and floor_pages:
+                kv_floor = max(1, int(floor_pages))
+            else:
+                kv_floor = max(1, int(init_pages * 0.75))
             if idle and getattr(self, "num_pages", 0) > kv_floor:
                 rebuild(num_pages=kv_floor)
                 return {
@@ -1877,7 +1885,7 @@ class Engine:
         else:  # direction == "up"
             idle = True if is_idle is None else is_idle
             init_pages = getattr(self, "_initial_num_pages", None)
-            if idle and init_pages and self.num_pages < init_pages:
+            if idle and init_pages and self.num_pages < init_pages and not getattr(self.config, "kv_dynamic", False):
                 rebuild(num_pages=init_pages)
                 return {
                     "applied": "kv",
@@ -1969,7 +1977,7 @@ class Engine:
             return None
         if axis == "vram" and direction == "up":
             init_pages = getattr(self, "_initial_num_pages", None)
-            if init_pages and getattr(self, "num_pages", 0) < init_pages:
+            if init_pages and getattr(self, "num_pages", 0) < init_pages and not getattr(self.config, "kv_dynamic", False):
                 return None  # a KV restore may apply once idle
             init_slots = getattr(self, "_initial_moe_cache_size", None)
             if init_slots and current_slots < init_slots:
