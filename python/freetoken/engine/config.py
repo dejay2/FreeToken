@@ -353,7 +353,9 @@ class EngineConfig:
     kv_step_tokens: int = 32_768
     kv_shrink_idle_s: int = 600
     kv_park_ttl_s: int = 18_000
-    kv_ceiling_tokens: int | None = None  # resolved by server/args.py from --num-tokens
+    # Resolved by server/args.py: --num-tokens if given, else --max-seq-len-override, else the
+    # model's max_position_embeddings -- plus the dummy page in every case.
+    kv_ceiling_tokens: int | None = None
     moe_cache_policy: str = "lru"
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill

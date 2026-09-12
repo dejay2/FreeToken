@@ -970,6 +970,15 @@ def parse_args(
             parser.error("--kv-dynamic requires the offload, cpu or hybrid MoE backend")
         if kwargs["kv_step_tokens"] < 8192:
             parser.error("--kv-step-tokens must be at least 8192")
+        if kwargs.get("num_page_override"):
+            # Otherwise num_token_override gets rewritten below while num_page_override
+            # stays set from --num-pages, and the mutually-exclusive pair disagrees --
+            # engine construction fails later on a message that never mentions
+            # --kv-dynamic as the actual cause.
+            parser.error(
+                "--kv-dynamic is incompatible with --num-pages; set the ceiling with "
+                "--num-tokens"
+            )
 
         # kwargs["page_size"] is the raw --page-size CLI value (default 1, pre-model
         # resolution); only trust it here when the caller pinned it explicitly.
@@ -993,6 +1002,8 @@ def parse_args(
             ceiling = int(context) + page
 
         floor = kwargs["kv_floor_tokens"]
+        if floor % page:
+            parser.error(f"--kv-floor-tokens {floor} must be a multiple of the page size {page}")
         if floor + page > ceiling:
             parser.error(
                 f"--kv-floor-tokens {floor} must not exceed the ceiling {ceiling - page}"

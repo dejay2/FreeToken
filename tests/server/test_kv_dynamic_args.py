@@ -56,11 +56,20 @@ def test_dynamic_without_num_tokens_or_override_uses_the_model_context(tmp_path)
     assert a.kv_ceiling_tokens == 131072 + 64
 
 
+def test_dynamic_with_a_page_aligned_floor_works(tmp_path):
+    a, _ = parse_args(_base(tmp_path) + ["--kv-dynamic", "--kv-floor-tokens", "32768"])
+    assert a.kv_floor_tokens == 32768
+    assert a.num_token_override == 32768 + 64
+    assert a.kv_reserve_tokens == 32768
+
+
 @pytest.mark.parametrize("extra", [
     ["--kv-dynamic", "--kv-step-tokens", "4096"],
     ["--kv-dynamic", "--num-tokens", "32768", "--kv-floor-tokens", "65536"],
     ["--kv-dynamic", "--moe-backend", "fused"],
     ["--kv-park-ttl-s", "-1"],
+    ["--kv-dynamic", "--num-pages", "4096"],
+    ["--kv-dynamic", "--kv-floor-tokens", "70000"],
 ])
 def test_bad_dynamic_flags_are_refused(tmp_path, extra):
     with pytest.raises(SystemExit):
