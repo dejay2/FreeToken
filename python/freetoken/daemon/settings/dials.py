@@ -176,8 +176,49 @@ DIALS: tuple[Dial, ...] = (
             "the longest single chat: it grows the pool until the free card memory is used up, which "
             "can leave nothing for the look-ahead trick or the recordings. With the look-ahead trick "
             "on, or a long chat, set this to the longest single chat plus one page of 64 tokens - "
-            "262,208 for 262,144."
+            "262,208 for 262,144. With Dynamic KV memory on, this is the largest size the pool may "
+            "grow to; the pool boots at the smallest size and grows in steps."
         ),
+    ),
+    Dial(
+        "KVDynamic", "toggle", True, "switch", "Grow the KV pool on demand by trading MoE expert slots and shrink it back when idle.",
+        "Model & chats", engine_mapping="--kv-dynamic",
+        plain="Dynamic KV memory", blurb="Start small, grow when a chat needs room, shrink back when quiet.",
+        effects=("speed:up",),
+        info=(
+            "The card's chat memory starts at the smallest size below and the space saved becomes expert "
+            "slots, which type faster. When a chat arrives that could outgrow the memory, the server pauses "
+            "about a second, hands slots to the memory, and lets it in. After the quiet time below with no "
+            "chats, it shrinks back. Nothing is forgotten: parking already keeps each finished chat in PC memory. "
+            "Measured 2026-09-12 on this PC: one resize under a second; about 157 slots per 32,768 tokens; "
+            "about 6 % typing speed per 1,000 slots."
+        ),
+    ),
+    Dial(
+        "KVFloorTokens", "number", 65536, "tokens", "Usable KV tokens the dynamic pool boots with and shrinks back to.",
+        "Model & chats", minimum=8192, maximum=4194304, engine_mapping="--kv-floor-tokens <N>",
+        plain="Smallest KV memory", blurb="Chat memory when no big chat is around.", slider=(16384, 262144, 8192),
+        effects=("speed:up", "vram:down"),
+        info="Chats whose prompt plus answer allowance fit in this need no resize. Must be no larger than KV cache tokens.",
+    ),
+    Dial(
+        "KVStepTokens", "number", 32768, "tokens", "Growth rung of the dynamic KV pool.",
+        "Model & chats", minimum=8192, maximum=1048576, engine_mapping="--kv-step-tokens <N>",
+        plain="KV growth step", blurb="How much the chat memory grows at a time.", slider=(8192, 131072, 8192), advanced=True,
+        info="A big chat jumps straight to the rung it needs, so this only sets the smallest change worth a resize. Below 8,192 is refused: a resize costs about a second.",
+    ),
+    Dial(
+        "KVShrinkIdleMin", "number", 10, "min", "Minutes with no request before the dynamic KV pool shrinks to the floor.",
+        "Model & chats", minimum=1, maximum=1440, engine_mapping="--kv-shrink-idle-s <N*60>",
+        plain="Quiet time before shrinking", blurb="Timer 1: how long the card waits before giving slots back.", slider=(1, 120, 1),
+        info="Counted from the last finished chat. The shrink runs only while no chat is active and pauses the server about a second.",
+    ),
+    Dial(
+        "KVParkTTLHours", "number", 5, "h", "Hours a parked chat may sit unused in PC memory or on the SSD before it is dropped.",
+        "Model & chats", minimum=0, maximum=168, engine_mapping="--kv-park-ttl-s <N*3600>",
+        plain="Parked chat lifetime", blurb="Timer 2: when a quiet chat is dropped from PC memory for good.", slider=(0, 48, 1),
+        effects=("ram:down",),
+        info="0 keeps parked chats until the space is needed. Dropping frees the pinned RAM; a dropped chat is re-read from scratch if it returns.",
     ),
     Dial(
         "KVDtype", "choice", "bf16", "dtype", "Storage precision for QSA KV cache (bf16 is safe default; fp8 saves ~48% KV VRAM).",
@@ -1157,6 +1198,76 @@ def validate_settings(
                 settings, model, context, failed={error["field"] for error in errors}
             )
         )
+        errors.extend(_kv_dynamic_pool_errors(settings, context))
+    return errors
+
+
+def _read_setting_number(settings: dict[str, Any], context: dict[str, Any] | None, name: str) -> int | float | None:
+    """Read ``name`` from ``settings``, falling back to the saved boot-file ``context``.
+
+    Same fallback the expert-slot-charge check uses for the ``MoECacheSize``/``GpuOwnedLayers``
+    pair: a patch that only touches one half of a cross-field pair is still checked against
+    the value the boot will actually use for the other half.
+    """
+    inherited = context or {}
+    raw = settings.get(name, inherited.get(name))
+    if raw is None:
+        return None
+    try:
+        return canonical_value(DIAL_BY_NAME[name], raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _kv_dynamic_enabled(settings: dict[str, Any], context: dict[str, Any] | None) -> bool:
+    """Resolve ``KVDynamic`` the same settings-then-context way ``_read_setting_number`` does.
+
+    Falls back to the dial's own default (on) only when the flag is absent from both: a real
+    boot file loaded through ``BootFile`` always carries an explicit value for every non-helper
+    toggle (``False`` when the boot predates this dial), so this default only applies to a bare
+    settings dict checked with no boot context at all.
+    """
+    inherited = context or {}
+    raw = settings.get("KVDynamic", inherited.get("KVDynamic", True))
+    try:
+        return bool(canonical_value(DIAL_BY_NAME["KVDynamic"], raw))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _kv_dynamic_pool_errors(settings: dict[str, Any], context: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Cross-field checks for the dynamic KV pool dials, mirroring the engine's own refusals
+    (a floor above the ceiling, a step under 8192, a floor off the 64-token page grid) so the
+    user is told at save time instead of at boot. The engine only refuses these in conjunction
+    with ``--kv-dynamic``, so these checks apply only while the resolved ``KVDynamic`` is on.
+
+    Also runs only when the patch touches one of the dials in play, the same restraint
+    ``_expert_slot_charge_errors`` uses for the ``MoECacheSize``/``GpuOwnedLayers`` pair: a save
+    that changes neither half of a pair must not be refused for a combination the boot file
+    already holds.
+    """
+    errors: list[dict[str, Any]] = []
+    if not _kv_dynamic_enabled(settings, context):
+        return errors
+    if settings.keys() & {"KVFloorTokens", "KVCacheTokens"}:
+        floor = _read_setting_number(settings, context, "KVFloorTokens")
+        ceiling = _read_setting_number(settings, context, "KVCacheTokens")
+        if floor is not None and ceiling is not None and ceiling > 0 and floor > ceiling:
+            errors.append({
+                "field": "KVFloorTokens",
+                "message": f"Smallest KV memory {floor} must not exceed KV cache tokens {ceiling}",
+            })
+    if "KVFloorTokens" in settings:
+        floor = _read_setting_number(settings, context, "KVFloorTokens")
+        if floor is not None and floor % 64 != 0:
+            errors.append({
+                "field": "KVFloorTokens",
+                "message": f"Smallest KV memory {floor} must be a multiple of 64 (the shipping page size)",
+            })
+    if "KVStepTokens" in settings:
+        step = _read_setting_number(settings, context, "KVStepTokens")
+        if step is not None and step < 8192:
+            errors.append({"field": "KVStepTokens", "message": "KV growth step must be at least 8192 tokens"})
     return errors
 
 

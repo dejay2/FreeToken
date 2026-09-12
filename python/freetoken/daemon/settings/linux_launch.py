@@ -337,6 +337,14 @@ def build_launch(
             "--kv-park-ssd-gib", str(_get(settings, "KVParkSSDGiB")),
             "--kv-park-window-mib", str(_int(_get(settings, "KVParkWindowMiB"), 256)),
         ]
+        argv += ["--kv-park-ttl-s", str(_int(_get(settings, "KVParkTTLHours"), 5) * 3600)]
+    if _truthy(_get(settings, "KVDynamic")) and facts.is_moe:
+        argv += [
+            "--kv-dynamic",
+            "--kv-floor-tokens", str(_int(_get(settings, "KVFloorTokens"), 65536)),
+            "--kv-step-tokens", str(_int(_get(settings, "KVStepTokens"), 32768)),
+            "--kv-shrink-idle-s", str(_int(_get(settings, "KVShrinkIdleMin"), 10) * 60),
+        ]
     if _truthy(_get(settings, "EnableCacheReport")):
         argv.append("--enable-cache-report")
     if _truthy(_get(settings, "CollectRoutingStats")) and facts.is_moe:

@@ -708,6 +708,38 @@ def _dense_scenario_geometry(
     }
 
 
+def kv_ceiling_issue(
+    *,
+    floor_tokens: int,
+    ceiling_tokens: int,
+    lru_slots: int,
+    slot_floor: int,
+    cache_per_page: int,
+    page_tokens: int,
+    per_expert_bytes: int,
+) -> dict[str, Any] | None:
+    """Dynamic KV pool: can the slots fund growth from the floor to the ceiling? None when yes.
+
+    Pure arithmetic (no torch, no engine state) so the settings page's planner and its tests
+    can call it directly. ``slot_floor`` is the LRU slot count the still-streaming layers need
+    left over (``2 * num_experts`` with prefill overlap on, else ``num_experts`` -- the same
+    floor ``_scenario_geometry``'s explicit-slots branch charges via ``lru_slots_after_owned_charge``).
+    """
+    needed_bytes = max(0, ceiling_tokens - floor_tokens) // page_tokens * cache_per_page
+    fundable_bytes = max(0, lru_slots - slot_floor) * per_expert_bytes
+    if needed_bytes <= fundable_bytes:
+        return None
+    reachable = floor_tokens + (fundable_bytes // cache_per_page) * page_tokens
+    return {
+        "code": "kv_ceiling_unreachable",
+        "scope": "both",
+        "message": (
+            f"the largest KV size {ceiling_tokens} cannot be reached: slots would fall below "
+            f"their floor of {slot_floor}; the pool can grow to about {reachable} tokens"
+        ),
+    }
+
+
 def _scenario_geometry(
     config,
     *,
@@ -852,6 +884,21 @@ def _scenario_geometry(
             "usable_kv_tokens": int(usable_tokens),
             "prefill_overlap": bool(overlap),
         }
+        if bool(getattr(config, "kv_dynamic", False)):
+            ceiling_tokens = int(getattr(config, "kv_ceiling_tokens", None) or 0)
+            if ceiling_tokens > 0:
+                slot_floor = 2 * num_experts if overlap else num_experts
+                issue = kv_ceiling_issue(
+                    floor_tokens=int(getattr(config, "kv_floor_tokens", 0) or 0),
+                    ceiling_tokens=ceiling_tokens,
+                    lru_slots=int(lru_slots),
+                    slot_floor=slot_floor,
+                    cache_per_page=int(cache_per_page),
+                    page_tokens=int(page_tokens),
+                    per_expert_bytes=int(per_expert),
+                )
+                if issue is not None:
+                    issues.append(issue)
         # Auto slots reserve their solved pages inside the cache policy budget. Explicit slots
         # check only the requested reserve floor; their later residual KV solve does not set
         # aside post-cache reserve/headroom again. Price that actual pool only in physical need.

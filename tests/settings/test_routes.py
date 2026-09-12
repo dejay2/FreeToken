@@ -162,7 +162,7 @@ def test_status_logs_and_lifecycle_job_routes(tmp_path):
     client, _ = make_client(tmp_path)
     status = client.get("/api/status")
     assert status.status_code == 200
-    assert status.json()["helper"]["version"] == "1.4.0"
+    assert status.json()["helper"]["version"] == "1.5.0"
     auto = status.json()["autoRestart"]
     assert auto["enabled"] is True and auto["gave_up"] is False and "restarts_last_hour" in auto
     saved = client.put("/api/settings", json={"settings": {"FREETOKEN_AUTO_RESTART": False}})

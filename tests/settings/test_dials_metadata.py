@@ -22,7 +22,8 @@ TAB_GROUPS = (
 
 EXPECTED_TAB_DIALS = {
     "Model & chats": (
-        "ModelPath", "ContextTokens", "KVCacheTokens", "KVDtype", "MaxRunningRequests",
+        "ModelPath", "ContextTokens", "KVCacheTokens", "KVDynamic", "KVFloorTokens",
+        "KVStepTokens", "KVShrinkIdleMin", "KVParkTTLHours", "KVDtype", "MaxRunningRequests",
         "KVPark", "KVParkIdleMs", "KVParkMinTokens", "KVParkRAMGiB", "KVParkSSDDir",
         "KVParkSSDGiB", "KVParkWindowMiB",
     ),
@@ -51,7 +52,7 @@ EXPECTED_TAB_DIALS = {
 def test_every_dial_has_one_tab_and_a_short_page_blurb():
     assert tuple(GROUP_INFO) == TAB_GROUPS
     assert {group: tuple(dial.name for dial in DIALS if dial.group == group) for group in TAB_GROUPS} == EXPECTED_TAB_DIALS
-    assert sum(len(names) for names in EXPECTED_TAB_DIALS.values()) == len(DIALS) == 49
+    assert sum(len(names) for names in EXPECTED_TAB_DIALS.values()) == len(DIALS) == 54
     for dial in DIALS:
         assert dial.group in TAB_GROUPS, dial.name
         assert dial.plain, dial.name

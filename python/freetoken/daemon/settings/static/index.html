@@ -1112,6 +1112,10 @@
       const used = Number(gpu.vramUsedMb || 0); const total = Number(gpu.vramTotalMb || 0); const percent = total ? Math.min(100, used / total * 100) : 0;
       $('server-pill').innerHTML = `<span class="dot ${escapeHtml(stateName)}"></span> Main server: <strong>${escapeHtml(pretty)}</strong>${server.uptimeS ? `<span class="muted">· up ${escapeHtml(fmtUptime(server.uptimeS))}</span>` : ''}`;
       const parkingText = parking.mode && parking.mode !== 'off' ? `${escapeHtml(parking.mode.toUpperCase())} · ${escapeHtml(parking.parkedCount ?? 0)} parked${parking.lastRestoreMs ? ` · last restore ${escapeHtml(Math.round(parking.lastRestoreMs))} ms` : ''}` : 'Off';
+      const kv = server.kv_dynamic || null;
+      const kvTile = (kv && kv.enabled)
+        ? `<div class="stat"><span class="small">KV cache tokens</span><strong>${escapeHtml(fmt(kv.pool_tokens))} of ${escapeHtml(fmt(kv.ceiling_tokens))}</strong><div class="sub">dynamic, floor ${escapeHtml(fmt(kv.floor_tokens))}${kv.held ? `, ${escapeHtml(kv.held)} waiting` : ''}${kv.shrink_in_s != null ? `, shrinks in ${escapeHtml(Math.round(kv.shrink_in_s / 60))} min` : ''}</div></div>`
+        : `<div class="stat"><span class="small">KV cache tokens</span><strong>${escapeHtml(geometry.numPages ? fmt(geometry.numPages * (geometry.pageSize || 1)) : '—')}</strong><div class="sub">${geometry.numPages ? `${escapeHtml(fmt(geometry.numPages))} pages of ${escapeHtml(fmt(geometry.pageSize || 0))} tokens` : 'not running'}</div></div>`;
       const governor = body.governor || {};
       const govLayers = governor.layers || {};
       const govText = governor.enabled === false ? 'Off' : (governor.last_action ? escapeHtml(governor.last_action) : 'Watching');
@@ -1123,7 +1127,7 @@
         `<div class="stat"><span class="small">Active requests</span><strong>${escapeHtml(server.activeRequests ?? 0)}</strong><div class="sub">GPU busy ${escapeHtml(gpu.gpuUtilPercent ?? 0)}%</div></div>`,
         `<div class="stat"><span class="small">VRAM</span><strong>${escapeHtml(fmtMb(gpu.vramUsedMb))} <span class="muted">/ ${escapeHtml(fmtMb(gpu.vramTotalMb))}</span></strong><div class="bar" aria-label="VRAM used"><span style="width:${percent}%"></span></div></div>`,
         `<div class="stat"><span class="small">MoE cache slots</span><strong>${escapeHtml(geometry.moeCacheSize ? fmt(geometry.moeCacheSize) : '—')}</strong><div class="sub">${escapeHtml((geometry.gpuOwnedLayers || []).length)} GPU-owned layers</div></div>`,
-        `<div class="stat"><span class="small">KV cache tokens</span><strong>${escapeHtml(geometry.numPages ? fmt(geometry.numPages * (geometry.pageSize || 1)) : '—')}</strong><div class="sub">${geometry.numPages ? `${escapeHtml(fmt(geometry.numPages))} pages of ${escapeHtml(fmt(geometry.pageSize || 0))} tokens` : 'not running'}</div></div>`,
+        kvTile,
         `<div class="stat"><span class="small">KV parking</span><strong>${parkingText}</strong>${parking.lastError ? `<div class="error">${escapeHtml(parking.lastError)}</div>` : ''}</div>`,
         `<div class="stat"><span class="small">Memory governor</span><strong>${escapeHtml(govLayers.owned ?? 0)} owned${govLayers.parked ? ` (${escapeHtml(govLayers.parked)} parked)` : ''} · ${escapeHtml(govLayers.pinned ?? 0)} pinned · ${escapeHtml(govLayers.disk ?? 0)} disk</strong><div class="sub">${govText}</div></div>`,
       ].join('');
