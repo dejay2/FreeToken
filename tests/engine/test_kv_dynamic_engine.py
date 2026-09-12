@@ -71,13 +71,17 @@ def test_resize_pools_kv_only_grow_resizes_kv_alone():
 def test_resize_pools_window_only_pins_then_resizes_kv_once_at_the_current_page_count():
     calls = []
     eng = _recording_engine(calls, num_pages=1025, slots=6260)
+    eng.config.swa_num_pages_override = "unset"
+    # Override the fake to record config.swa_num_pages_override AT CALL TIME, not just the
+    # swa argument: if the window pin were written after the kv resize instead of before, the
+    # recorded value here would still be "unset" and this assertion would catch it -- a
+    # post-return check on eng.config alone cannot distinguish the two orderings.
+    eng._resize_kv_pool = lambda config, n, swa: calls.append(
+        ("kv", n, swa, getattr(config, "swa_num_pages_override", "unset"))
+    )
     Engine._resize_pools(eng, eng.config, moe_cache_size=None, num_pages=None, num_swa_pages=7,
                          num_mamba_slots=None)
-    # The window pin is written before any pool resize (object.__setattr__ is the first
-    # statement in _resize_pools), so this being 7 already proves it landed before the one
-    # recorded kv call below.
-    assert eng.config.swa_num_pages_override == 7
-    assert calls == [("kv", 1025, 7)]
+    assert calls == [("kv", 1025, 7, 7)]
 
 
 def test_resize_pools_mamba_only_rebuilds_the_state_pool_with_the_padding_sink():
