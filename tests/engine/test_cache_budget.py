@@ -1181,6 +1181,44 @@ def test_engine_auto_sizing_charges_the_draft_head_only_when_speculation_is_on()
     assert reserve(True) - reserve(False) == MTP_DRAFT_HEAD_RESERVE_BYTES
 
 
+def test_engine_auto_sizing_reserves_the_explicit_kv_override():
+    """An explicit --num-tokens larger than --kv-reserve-tokens is a hard KV reserve for the
+    MoE-first plan. Live 5090 boot 2026-09-12 05:14 (logs/server-2020.log): --kv-reserve-tokens
+    262144 with --num-tokens 524288 planned 6262 slots against 4097 pages, then solve_num_pages
+    honoured the override and allocated 8192 pages -- 3.24 GiB nobody budgeted. Free VRAM after
+    init was 0.67 GiB instead of the 1.5 GiB headroom, and every governor shrink was refused."""
+    from freetoken.engine.engine import Engine
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    StubConfig, StubBanks = _auto_sizing_stubs()
+    # Enough experts that the slot cache, not the expert count, is what the budget limits.
+    StubConfig.model_config.num_experts = 4096
+    per_slot = 512 + 256
+    per_page = MHAKVCache.kv_cost(StubConfig())[0]
+
+    def resolve(override):
+        config = StubConfig()
+        config.moe_vram_reserve_bytes = 0
+        config.num_page_override = override
+        engine = Engine.__new__(Engine)
+        engine._baseline_free = 1 << 24
+        engine._weights_bytes = 0
+        engine._pool_cls = MHAKVCache
+        size, pages, _ = engine._resolve_auto_moe_cache_size(config, StubBanks())
+        return size, pages
+
+    slots_free, pages_free = resolve(None)
+    assert pages_free < 60, "the free plan must leave fewer pages than the override asks for"
+    slots_over, pages_over = resolve(60)
+    # The plan reports at least the override's pages (plus the pool's dummy page)...
+    assert pages_over >= 60 + 1
+    # ...and the slots it keeps plus those pages still sit inside the same budget the free
+    # plan filled (one page of rounding slack), instead of the override landing on top.
+    assert slots_over * per_slot + (60 + 1) * per_page <= (
+        slots_free * per_slot + pages_free * per_page + per_page
+    )
+
+
 def test_the_vram_ledger_reports_the_kv_pages_the_boot_actually_took():
     """The ledger is emitted where num_pages is known. It used to be printed inside the MoE
     cache build -- before the KV pool is sized -- so its KV row read 0 pages on every boot

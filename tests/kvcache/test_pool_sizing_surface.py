@@ -145,6 +145,35 @@ def test_generic_validate_rebuild_budget_check():
     check(None, per_page * 10 + fixed)
 
 
+def test_generic_validate_rebuild_accepts_a_shrink_from_an_over_budget_live_cache():
+    """A rebuild frees before it allocates, so a target no larger than what is on the card
+    right now cannot OOM even when the boot-time budget says otherwise. Live 5090 2026-09-12:
+    the boot over-committed the card (explicit 524k KV on top of a plan for 262k), the
+    governor asked for 6262 -> 5750 slots every 8 s, and each step was refused with
+    "needs 21.32 GiB > budget 20.91 GiB" -- a shrink that could only have helped."""
+    from freetoken.kvcache.base import CacheRebuildRejected
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    config = _generic_config()
+    object.__setattr__(config, "memory_ratio", 1.0)
+    per_page, fixed, _, _ = MHAKVCache.kv_cost(config)
+    pool = object.__new__(MHAKVCache)
+    budget = per_page * 50 + fixed  # exactly 50 pages fit
+    # Live geometry: 80 pages + 8 "slots" priced at one page each = 88 pages, over budget.
+
+    def check(target_moe):
+        pool.validate_rebuild(
+            config, num_pages=None, num_swa_pages=None,
+            target_moe=target_moe, per_expert_bytes=per_page, baseline_free=budget,
+            weights_bytes=0, current_num_pages=80, current_moe=8,
+        )
+
+    check(5)  # 85 pages: over budget, but below the 88 already resident -> a pure shrink
+    check(8)  # unchanged geometry is never rejected either
+    with pytest.raises(CacheRebuildRejected, match="old cache kept"):
+        check(9)  # 89 pages: more than the card holds now AND over budget
+
+
 def test_dsv4_validate_rebuild_floor():
     from freetoken.kvcache.base import CacheRebuildRejected
     from freetoken.kvcache.dsv4_cost_model import _dsv4_window_floor_pages

@@ -98,9 +98,17 @@ class BaseKVCachePool(ABC):
     def validate_rebuild(
         self, config, *, num_pages: int | None, target_moe: int, per_expert_bytes: int,
         baseline_free: int, weights_bytes: int, current_num_pages: int,
-        extra_fixed_bytes: int = 0, extra_note: str = "", **targets,
+        extra_fixed_bytes: int = 0, extra_note: str = "", current_moe: int | None = None,
+        **targets,
     ) -> None:
         """Budget fit-check for a runtime rebuild target, BEFORE any destructive free.
+
+        ``current_moe`` (the live slot count) lets a target that is no larger than what is
+        resident right now pass even when the boot-time budget says otherwise: the rebuild
+        frees before it allocates, so a pure shrink cannot OOM. Live 5090 2026-09-12: a boot
+        that over-committed the card (explicit 524k KV on top of a 262k plan) had every
+        governor shrink (6262 -> 5750 slots) refused with "needs 21.32 GiB > budget 20.91 GiB"
+        every 8 s, so the card could never get back under its headroom.
         The engine supplies the memory account (baseline/weights, the MoE terms, and any
         sibling pool's fixed bytes at ITS target, e.g. the GDN state pool); the pool
         answers whether its own target geometry fits. Raises CacheRebuildRejected.
@@ -125,6 +133,13 @@ class BaseKVCachePool(ABC):
             fixed_cache_size + extra_fixed_bytes,
         )
         need = required_bytes(target_moe, target_pages, per_expert_bytes, cache_per_page)
+        if current_moe is not None:
+            # Priced with the target's per-page cost: exact for a MoE-only step (the pages do
+            # not change), conservative-enough for a KV rung (same pool family, same cost).
+            resident = required_bytes(
+                current_moe, current_num_pages, per_expert_bytes, cache_per_page
+            )
+            budget = max(budget, resident)
         if need > budget:
             raise CacheRebuildRejected(
                 f"requested cache (moe={target_moe} slots, kv={target_pages} pages{extra_note}) "
