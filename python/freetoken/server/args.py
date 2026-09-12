@@ -12,6 +12,32 @@ from freetoken.scheduler import SchedulerConfig
 from freetoken.scheduler.config import pin_kv_park_model_path_value
 from freetoken.utils import init_logger
 
+# Resolved page size for --kv-dynamic's dummy-page arithmetic (see the post-parse block in
+# parse_args below). The real page size is only final once engine._adjust_config sees the
+# model's attention backend (engine.py ~:3808, "Must stay LAST: page_size is only final
+# here"), which parse_args cannot run -- that needs a live model + CUDA backend probe. Every
+# model --kv-dynamic currently targets (offload-family MoE backend, i.e. Qwen3.8-Flash-Next's
+# QSA attention -- attention/__init__.py pins page_sizes=(64,) for qsa/qsa_sparse) resolves to
+# 64, so that is the fallback unless the caller pinned --page-size explicitly.
+_KV_DYNAMIC_DEFAULT_PAGE = 64
+
+
+def _model_max_seq_len(model_path: str) -> int:
+    """``max_position_embeddings`` for ``model_path``, used as the --kv-dynamic ceiling when
+    the caller gave neither --num-tokens nor --max-seq-len-override."""
+    from freetoken.engine.config import cached_load_hf_config
+
+    cfg = cached_load_hf_config(model_path)
+    max_pos = getattr(cfg, "max_position_embeddings", None)
+    if max_pos is None:
+        max_pos = cfg.to_dict().get("max_position_embeddings")
+    if not max_pos:
+        raise ValueError(
+            "--kv-dynamic needs a ceiling: pass --num-tokens or --max-seq-len-override, or "
+            f"point --model at a config.json with max_position_embeddings ({model_path})"
+        )
+    return int(max_pos)
+
 
 @dataclass(frozen=True)
 class ServerArgs(SchedulerConfig):
@@ -298,6 +324,43 @@ def parse_args(
         help=(
             "Size of each page-locked SSD staging window; RAM parent checks use at most "
             "16 MiB (default: 256 MiB)."
+        ),
+    )
+    parser.add_argument(
+        "--kv-dynamic",
+        action="store_true",
+        default=ServerArgs.kv_dynamic,
+        help=(
+            "Boot with a small KV pool and grow it by trading MoE slots when a request "
+            "needs the room; shrink back after --kv-shrink-idle-s idle. Needs an "
+            "offload-family MoE backend. --num-tokens becomes the ceiling."
+        ),
+    )
+    parser.add_argument(
+        "--kv-floor-tokens",
+        type=_positive_int,
+        default=ServerArgs.kv_floor_tokens,
+        help="Usable KV tokens the dynamic pool boots with and shrinks back to (default 65536).",
+    )
+    parser.add_argument(
+        "--kv-step-tokens",
+        type=_positive_int,
+        default=ServerArgs.kv_step_tokens,
+        help="Growth rung of the dynamic pool in tokens (default 32768, minimum 8192).",
+    )
+    parser.add_argument(
+        "--kv-shrink-idle-s",
+        type=_positive_int,
+        default=ServerArgs.kv_shrink_idle_s,
+        help="Seconds with no request before the dynamic pool shrinks to the floor (default 600).",
+    )
+    parser.add_argument(
+        "--kv-park-ttl-s",
+        type=int,
+        default=ServerArgs.kv_park_ttl_s,
+        help=(
+            "Seconds a parked prefix may sit unused in RAM/SSD before it is dropped "
+            "(default 18000 = 5 h; 0 never)."
         ),
     )
 
@@ -898,6 +961,45 @@ def parse_args(
     )
     if is_offload_moe_backend(kwargs["moe_backend"]) and _no_cache_flag:
         kwargs["moe_cache_auto"] = True
+
+    if kwargs["kv_park_ttl_s"] < 0:
+        parser.error("--kv-park-ttl-s must be >= 0")
+
+    if kwargs["kv_dynamic"]:
+        if not is_offload_moe_backend(kwargs["moe_backend"]):
+            parser.error("--kv-dynamic requires the offload, cpu or hybrid MoE backend")
+        if kwargs["kv_step_tokens"] < 8192:
+            parser.error("--kv-step-tokens must be at least 8192")
+
+        # kwargs["page_size"] is the raw --page-size CLI value (default 1, pre-model
+        # resolution); only trust it here when the caller pinned it explicitly.
+        if kwargs.get("page_size", ServerArgs.page_size) != ServerArgs.page_size:
+            page = kwargs["page_size"]
+        else:
+            page = _KV_DYNAMIC_DEFAULT_PAGE
+
+        ceiling = kwargs.get("num_token_override") or 0
+        if ceiling <= 0:
+            # 0/absent means "fill the card" for a fixed pool; for the dynamic pool the
+            # ceiling is the context itself plus the dummy page, never the auto
+            # card-filling size.
+            if kwargs.get("max_seq_len_override"):
+                context = kwargs["max_seq_len_override"]
+            else:
+                try:
+                    context = _model_max_seq_len(kwargs["model_path"])
+                except ValueError as exc:
+                    parser.error(str(exc))
+            ceiling = int(context) + page
+
+        floor = kwargs["kv_floor_tokens"]
+        if floor + page > ceiling:
+            parser.error(
+                f"--kv-floor-tokens {floor} must not exceed the ceiling {ceiling - page}"
+            )
+        kwargs["kv_ceiling_tokens"] = ceiling
+        kwargs["num_token_override"] = floor + page
+        kwargs["kv_reserve_tokens"] = floor
 
     # "auto" (or an unspecified dtype) resolves to the checkpoint's dtype. Multimodal /
     # hybrid configs (e.g. Qwen3.5-MoE) keep it under ``text_config`` and use the newer

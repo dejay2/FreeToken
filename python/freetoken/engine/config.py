@@ -344,6 +344,16 @@ class EngineConfig:
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
+    # Dynamic KV pool (docs/superpowers/specs/2026-09-12-dynamic-kv-pool-design.md): boot at
+    # kv_floor_tokens, grow by kv_step_tokens rungs up to kv_ceiling_tokens by trading MoE
+    # slots, shrink back after kv_shrink_idle_s with no request. kv_park_ttl_s expires parked
+    # prefixes from host RAM (Timer 2) whether or not the dynamic pool is on.
+    kv_dynamic: bool = False
+    kv_floor_tokens: int = 65_536
+    kv_step_tokens: int = 32_768
+    kv_shrink_idle_s: int = 600
+    kv_park_ttl_s: int = 18_000
+    kv_ceiling_tokens: int | None = None  # resolved by server/args.py from --num-tokens
     moe_cache_policy: str = "lru"
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
