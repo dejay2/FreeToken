@@ -64,11 +64,22 @@ def test_drain_barrier_queues_later_arrivals_behind_a_held_request_in_order():
 
 
 def test_concurrent_hold_uses_the_probe_verdict_and_the_running_sum():
+    """The running sum is the one measured AT THE HOLD, not at the plan: by the time the idle
+    point comes the requests it was waiting behind have finished and the live sum is 0."""
     c = _controller(_Clock())
     assert c.decide_admission(4, _msg(4), need_total=72_000, need_now=72_000,
-                              pool_tokens=131_072, fits_empty=True, fits_now=False) == "hold"
+                              pool_tokens=131_072, fits_empty=True, fits_now=False,
+                              running_need_tokens=142_000) == "hold"
     plan = c.plan_idle(current_pages=131_072 // PAGE + 1, pool_budget_bytes=BUDGET,
-                       running_need_tokens=142_000)
+                       running_need_tokens=0)
+    assert plan.reason == "grow-concurrent" and (plan.target_pages - 1) * PAGE == 229_376
+
+
+def test_an_escalated_request_keeps_the_reservation_it_was_refused_against():
+    c = _controller(_Clock())
+    c.escalate(7, _msg(7), 72_000, 142_000)
+    plan = c.plan_idle(current_pages=131_072 // PAGE + 1, pool_budget_bytes=BUDGET,
+                       running_need_tokens=0)
     assert plan.reason == "grow-concurrent" and (plan.target_pages - 1) * PAGE == 229_376
 
 

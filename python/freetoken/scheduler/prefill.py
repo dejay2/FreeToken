@@ -52,6 +52,15 @@ class PrefillAdder:
     on_reserved: Callable[[int], None] | None = None
     capacity_blocked: List[PendingReq] = field(default_factory=list)
 
+    def _note_capacity_blocked(self, req: PendingReq) -> None:
+        """Record a never-started request this pass could not seat, with the room the requests
+        that DID hold the pool were using. The dynamic KV controller needs that figure to size a
+        grow the blocked request can run BESIDE (spec rule 2, concurrent target): by the time it
+        escalates at the idle point those requests have finished and reserved_size is 0, so the
+        number has to be captured here, at the moment the block happened."""
+        req.blocked_reserved_tokens = self.reserved_size
+        self.capacity_blocked.append(req)
+
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
             return None
@@ -99,13 +108,13 @@ class PrefillAdder:
         if not admission_fits(need_now=estimated_len, reserved=self.reserved_size,
                               available=self.cache_manager.available_size, protect_tokens=0):
             if req.chunked_req is None:
-                self.capacity_blocked.append(req)
+                self._note_capacity_blocked(req)
             return None
         self.cache_manager.lock(handle)
         if not admission_fits(need_now=estimated_len, reserved=self.reserved_size,
                               available=self.cache_manager.available_size, protect_tokens=0):
             if req.chunked_req is None:
-                self.capacity_blocked.append(req)
+                self._note_capacity_blocked(req)
             return self.cache_manager.unlock(handle)
 
         # Second currency (hybrid GDN): reserve 1 live + 2 ping-pong state slots; evict tree
@@ -311,6 +320,9 @@ class PrefillManager:
         # shape; the ids never change while a request waits for a cache-generation change.
         pending.park_keys = None
         pending.park_probe_generation = None
+        # Set by _note_capacity_blocked; declared here so every pending request carries the
+        # attribute whether or not an admission pass has ever blocked it.
+        pending.blocked_reserved_tokens = 0
         self.pending_list.append(pending)
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
@@ -392,13 +404,22 @@ class PrefillManager:
         return rejected
 
     def pop_capacity_blocked(self) -> List[PendingReq]:
-        """Never-started requests refused for capacity this pass; removed from pending_list so
-        the dynamic controller can hold them (rule 2(b)). Empty unless a hook is installed."""
+        """Never-started requests still waiting for capacity; removed from pending_list so the
+        dynamic controller can hold them (rule 2(b)). Empty unless a hook is installed.
+
+        Filtered at POP time, not only where the entries are collected: a request blocked on one
+        admission pass is very often admitted on the next, and handing it back afterwards would
+        let the controller hold a RUNNING request and re-append it to the pending list -- a
+        second full response for one request. Anything that has left the pending list (admitted,
+        rejected or aborted) is dropped silently; it is no longer this list's business.
+        """
         blocked, self._capacity_blocked = self._capacity_blocked, []
+        still_waiting: List[PendingReq] = []
         for pending in blocked:
             if pending in self.pending_list:
                 self.pending_list.remove(pending)
-        return blocked
+                still_waiting.append(pending)
+        return still_waiting
 
     def abort_req(self, uid: int) -> Req | None:
         for i, req in enumerate(self.pending_list):

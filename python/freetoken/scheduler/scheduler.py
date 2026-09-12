@@ -381,13 +381,17 @@ class Scheduler(SchedulerIOMixin):
         if self._pending_rebuild is not None and last_data is None and self._rebuild_can_run():
             self._execute_pending_rebuild()
 
-        # The same safe point for the rebuild the controller issues itself (rules 2, 4): only
-        # when nothing is queued, running or in flight, so it can never race an operator's
-        # rebuild or resize a pool a request is reading.
-        if last_data is None and not (
-            self.prefill_manager.runnable
-            or self.decode_manager.runnable
-            or self._pending_rebuild is not None
+        # The same safe point for the rebuild the controller issues itself (rules 2, 4). The
+        # predicate is _rebuild_can_run's for KV work, NOT "no pending requests": a
+        # capacity-blocked request IS in the pending list, so gating on prefill_manager.runnable
+        # would make rule 2(b)'s escalation unreachable in exactly its own case. A
+        # never-admitted pending request owns no pages and no GDN slot, so a KV rebuild is safe
+        # with it queued; only a chunked continuation and a running decode are not.
+        if (
+            last_data is None
+            and self._pending_rebuild is None
+            and not self._prefill_has_chunked_continuation()
+            and not self.decode_manager.runnable
         ):
             self._run_kv_dynamic_idle()
 
@@ -474,12 +478,12 @@ class Scheduler(SchedulerIOMixin):
         if self._pending_rebuild is not None and self._rebuild_can_run():
             self._execute_pending_rebuild()
 
-        if not (
-            self.prefill_manager.runnable
-            or self.decode_manager.runnable
-            or self._pending_rebuild is not None
+        if (
+            self._pending_rebuild is None
+            and not self._prefill_has_chunked_continuation()
+            and not self.decode_manager.runnable
         ):
-            self._run_kv_dynamic_idle()
+            self._run_kv_dynamic_idle()  # same predicate as overlap_loop; see the note there
 
         # Non-overlap mode already drains what it launches, so the speculative step needs no
         # early drain here -- only the same dispatch.
@@ -957,6 +961,10 @@ class Scheduler(SchedulerIOMixin):
             raise ValueError("--kv-dynamic does not support DSV4's owned KV tiers")
         if config.tp_info.size != 1:
             raise ValueError("--kv-dynamic requires TP=1 in this batch")
+        if config.kv_ceiling_tokens is None:
+            # args.py always records it alongside kv_dynamic; a None here means the config was
+            # built by hand and the pool would silently have no ceiling to grow toward.
+            raise ValueError("--kv-dynamic requires kv_ceiling_tokens (set it with --num-tokens)")
         page = config.page_size
         num_experts = config.model_config.num_experts
         # The floor step_memory uses: with prefill overlap two experts' worth of slots per
@@ -1014,6 +1022,9 @@ class Scheduler(SchedulerIOMixin):
             logger.warning_rank0(f"Adjust max_tokens to {ceiling - input_len} for request {msg.uid}.")
         need_total = input_len + msg.sampling_params.max_tokens
         pool_tokens = (self.engine.num_pages - 1) * page
+        # Measured HERE, while the requests this one may have to wait behind are still running:
+        # the plan runs at an idle point, by which time the live sum is 0 (review, 2026-09-12).
+        running_need = self._running_need_tokens()
         # Non-mutating on purpose: match_req would look up parked prefixes and can restore one
         # (allocating pages and a GDN slot), which an admission QUESTION must never do.
         probe = self.cache_manager.probe_admission(
@@ -1023,7 +1034,7 @@ class Scheduler(SchedulerIOMixin):
         )
         verdict = c.decide_admission(
             msg.uid, msg, need_total=need_total, need_now=probe.need_now, pool_tokens=pool_tokens,
-            fits_empty=probe.fits_empty, fits_now=probe.fits_now,
+            fits_empty=probe.fits_empty, fits_now=probe.fits_now, running_need_tokens=running_need,
         )
         if verdict == "hold":
             logger.info_rank0(
@@ -1063,7 +1074,12 @@ class Scheduler(SchedulerIOMixin):
                 # tokens past the client's last reply -- the exact resurrection the tombstones
                 # exist to stop.
                 continue
-            c.escalate(pending.uid, pending, pending.input_len + pending.output_len)
+            # blocked_reserved_tokens is what the admission pass measured this request
+            # against when it refused it (prefill._note_capacity_blocked), not the live sum.
+            c.escalate(
+                pending.uid, pending, pending.input_len + pending.output_len,
+                getattr(pending, "blocked_reserved_tokens", 0),
+            )
         plan = c.plan_idle(
             current_pages=self.engine.num_pages, pool_budget_bytes=self.engine.pool_budget_bytes,
             running_need_tokens=self._running_need_tokens(),
@@ -1088,11 +1104,14 @@ class Scheduler(SchedulerIOMixin):
                 # Rule 3: the pool still grows as far as the slot floor funds; the held head is
                 # then admitted against THAT pool and the ordinary clip/refuse applies.
                 logger.warning_rank0("KV pool grow capped: slots at their floor %d", c.policy.slot_floor)
-            outcome = self._execute_pending_rebuild() or "ok"
+            outcome = self._execute_pending_rebuild()
         if outcome == "failed":
             # Rule 8: the engine is not known to be usable and the frontend latches failed.
             # Admitting anything now would schedule work on a torn-down engine.
             for held in c.disable("cache rebuild failed and could not be rolled back"):
+                if isinstance(held.msg, UserMsg):
+                    # Never admitted, so nothing downstream releases its picture tensors.
+                    self._drop_raw_picture(held.msg)
                 self.send_result([ErrorReplyMsg(
                     uid=held.uid, error="cache rebuild failed; server needs a restart", code="server_error",
                 )])
@@ -1557,12 +1576,14 @@ class Scheduler(SchedulerIOMixin):
         # card back bytes the governor deliberately took. Only "ok" changed the geometry:
         # "rejected" retains the old one and "failed" leaves it unknown (and the controller
         # about to be disabled). Outside the finally so the maintenance hook is already gone.
-        if (
-            outcome == "ok"
-            and self._kv_dynamic is not None
-            and not str(msg.request_id).startswith("auto-kv:")
-        ):
-            self.engine.snapshot_pool_budget()
+        if outcome == "ok" and not str(msg.request_id).startswith("auto-kv:"):
+            # NOT gated on the controller: validate_rebuild's byte-neutral swap allowance reads
+            # pool_budget_bytes whether or not the dynamic pool is on, so a stale budget after a
+            # governor step would mis-judge the NEXT operator rebuild too. _send_kv_dynamic_status
+            # no-ops without a controller. getattr for the maintenance shells' fake engines.
+            snap = getattr(self.engine, "snapshot_pool_budget", None)
+            if snap is not None:
+                snap()
             self._send_kv_dynamic_status()
         return outcome
 

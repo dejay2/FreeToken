@@ -126,7 +126,7 @@ def test_max_tokens_is_clipped_against_the_ceiling_not_the_small_pool():
     assert msg.sampling_params.max_tokens == 262_144 - 240_000
 
 
-def test_timer1_shrink_runs_from_run_when_idle_and_reports_status():
+def test_timer1_shrink_runs_at_the_idle_point_and_reports_status():
     clock = _Clock()
     s = _shell(num_pages=2049, clock=clock, probe=None)
     s._note_request_finished([object()])
@@ -147,22 +147,35 @@ def test_idle_poll_timeout_includes_the_shrink_deadline():
     assert s.idle_poll_timeout_ms() == 250
 
 
-def _blocked(uid, n, max_tokens):
-    """What PrefillManager.pop_capacity_blocked hands back: a never-started pending request
-    the admission pass could not seat (rule 2(b))."""
-    return PendingReq(uid, torch.arange(1, n + 1), SamplingParams(max_tokens=max_tokens))
+def _block(s, uid, n, max_tokens, *, reserved=0):
+    """Put a never-started pending request into the shell's pending list and arm a
+    pop_capacity_blocked that mirrors the real one: only entries STILL in the pending list come
+    back, and they leave it (prefill.py, pop-time filter)."""
+    pending = PendingReq(uid, torch.arange(1, n + 1), SamplingParams(max_tokens=max_tokens))
+    pending.blocked_reserved_tokens = reserved
+    s.prefill_manager.pending_list.append(pending)
+
+    def pop():
+        out = [p for p in [pending] if p in s.prefill_manager.pending_list]
+        for p in out:
+            s.prefill_manager.pending_list.remove(p)
+        return out
+
+    s.prefill_manager.pop_capacity_blocked = pop
+    return pending
 
 
 def test_a_capacity_blocked_request_is_escalated_and_returns_to_the_pending_list():
     s = _shell(probe=None)
-    blocked = _blocked(9, 60_000, 32_000)
-    s.prefill_manager.pop_capacity_blocked = lambda: [blocked]
+    # It needs 92,000 tokens and was refused against 100,000 tokens of other requests, so the
+    # plan is rule 2's CONCURRENT target: round_up(100,000 + 92,000 + 1) = 196,608.
+    blocked = _block(s, 9, 60_000, 32_000, reserved=100_000)
     s._execute_pending_rebuild = lambda: (
         s.executed.append(s._pending_rebuild.num_pages), setattr(s, "_pending_rebuild", None), "ok"
     )[2]
     s._run_kv_dynamic_idle()
-    # It needs 92,000 tokens, so the same grow as an arrival that never got past admission.
-    assert s.executed == [98_304 // PAGE + 1]
+    assert s.executed == [196_608 // PAGE + 1]
+    assert s._kv_dynamic.last_plan["reason"] == "grow-concurrent"
     # An escalated PendingReq is already prepared: it goes back to the pending list, never
     # through _admit_user_msg (which would re-run the picture/clip work on a UserMsg).
     assert s.prefill_manager.pending_list == [blocked] and s.prefill_manager.added == []
@@ -170,8 +183,7 @@ def test_a_capacity_blocked_request_is_escalated_and_returns_to_the_pending_list
 
 def test_an_aborted_capacity_blocked_request_is_not_resurrected():
     s = _shell(probe=None)
-    blocked = _blocked(9, 60_000, 32_000)
-    s.prefill_manager.pop_capacity_blocked = lambda: [blocked]
+    _block(s, 9, 60_000, 32_000)
     s._abort_tombstones = {9: None}          # aborted after the pass that blocked it
     s._execute_pending_rebuild = lambda: (_ for _ in ()).throw(AssertionError("no rebuild"))
     s._run_kv_dynamic_idle()

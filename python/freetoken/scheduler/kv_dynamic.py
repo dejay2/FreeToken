@@ -135,6 +135,11 @@ class HeldRequest:
     msg: object
     need_total: int
     held_at: float
+    # What the requests already holding the pool needed when this one was held. Captured at
+    # hold time on purpose: the plan runs at an IDLE point, by which time those requests have
+    # finished and the live sum is 0 -- reading it then would collapse rule 2's concurrent
+    # target back to a plain grow and the pair would keep taking turns (review, 2026-09-12).
+    running_need_tokens: int = 0
 
 
 class KVDynamicController:
@@ -169,7 +174,7 @@ class KVDynamicController:
     # ---- admission (rule 2) ------------------------------------------------------------
     def decide_admission(
         self, uid: int, msg: object, *, need_total: int, need_now: int, pool_tokens: int,
-        fits_empty: bool, fits_now: bool,
+        fits_empty: bool, fits_now: bool, running_need_tokens: int = 0,
     ) -> str:
         if not self.enabled:
             return "admit"
@@ -177,25 +182,34 @@ class KVDynamicController:
         if self.held:
             # Drain barrier: once anyone waits for growth, later arrivals queue behind it so a
             # stream of small requests can never keep the scheduler busy and starve the big one.
-            self._hold(uid, msg, need_total)
+            self._hold(uid, msg, need_total, running_need_tokens)
             return "hold"
         if need_total > pool_tokens:
-            self._hold(uid, msg, need_total)
+            self._hold(uid, msg, need_total, running_need_tokens)
             return "hold"
         if fits_empty and not fits_now and pool_tokens < ceiling_tokens:
             # It fits an empty pool but other requests hold the room: wait for them once, then
             # grow so the pair runs side by side next time.
-            self._hold(uid, msg, need_total)
+            self._hold(uid, msg, need_total, running_need_tokens)
             return "hold"
         return "admit"
 
-    def _hold(self, uid: int, msg: object, need_total: int) -> None:
-        self.held.append(HeldRequest(uid=uid, msg=msg, need_total=need_total, held_at=self._clock()))
+    def _hold(self, uid: int, msg: object, need_total: int, running_need_tokens: int = 0) -> None:
+        self.held.append(HeldRequest(
+            uid=uid, msg=msg, need_total=need_total, held_at=self._clock(),
+            running_need_tokens=int(running_need_tokens),
+        ))
 
-    def escalate(self, uid: int, msg: object, need_total: int) -> None:
-        """Rule 2(b): a never-started pending request the prefill manager could not seat."""
+    def escalate(
+        self, uid: int, msg: object, need_total: int, running_need_tokens: int = 0
+    ) -> None:
+        """Rule 2(b): a never-started pending request the prefill manager could not seat.
+
+        ``running_need_tokens`` is the reservation the admission pass measured against when it
+        refused this request, not the (by then zero) live sum.
+        """
         if self.enabled and all(h.uid != uid for h in self.held):
-            self._hold(uid, msg, need_total)
+            self._hold(uid, msg, need_total, running_need_tokens)
 
     # ---- same-batch charging (rule 2, "Same-batch arrivals") ----------------------------
     def note_uncommitted(self, uid: int, need_now: int) -> None:
@@ -233,10 +247,14 @@ class KVDynamicController:
             return None
         if self.held:
             head = self.held[0]
-            reason = "grow-concurrent" if running_need_tokens else "grow"
+            # The larger of what the head was waiting behind when it was held and whatever is
+            # queued now: the first is the figure rule 2's concurrent case is about, the second
+            # covers requests that arrived after it.
+            running = max(head.running_need_tokens, running_need_tokens)
+            reason = "grow-concurrent" if running else "grow"
             plan = self.policy.plan_grow(
                 current_pages=current_pages, pool_budget_bytes=pool_budget_bytes,
-                need_tokens=head.need_total, running_need_tokens=running_need_tokens, reason=reason,
+                need_tokens=head.need_total, running_need_tokens=running, reason=reason,
             )
             self._remember(plan)
             return plan
