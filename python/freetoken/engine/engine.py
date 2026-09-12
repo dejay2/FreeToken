@@ -477,10 +477,17 @@ class Engine:
         available_memory -= state_pool_bytes(config)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         self._initial_num_pages = self.num_pages
+        # The dynamic KV pool controller's own floor (distinct from the boot solve above);
+        # None until the controller sets one, read by the planner, never by validate_rebuild.
+        self.kv_dynamic_floor_pages: int | None = None
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
+        # Both pools this budget covers now exist (MoE offload cache above, KV pool just
+        # created): snapshot the one shared byte budget the dynamic KV controller's planner
+        # and every rebuild's validate_rebuild read from here on (spec rule 3).
+        self.snapshot_pool_budget()
         # Every term of the plan in one block, here because this is the first point where
         # they are all known: the MoE cache was sized above, the KV pages just now.
         self._log_vram_ledger(config)
@@ -1310,6 +1317,18 @@ class Engine:
         )
         return target_moe, per_expert_bytes
 
+    def _kv_bytes_per_page(self) -> int:
+        cache_per_page, _fixed, _page, _min = self._pool_cls.kv_cost(self.config)
+        return int(cache_per_page)
+
+    def snapshot_pool_budget(self) -> int:
+        """MoE slots + KV pages resident right now, in bytes: the one budget the dynamic KV
+        pool's planner and the rebuild validator both read (spec rule 3). Taken at boot and
+        after every rebuild the controller did not issue, never raised by the controller."""
+        slots, per_slot = self._target_moe_and_expert_bytes(None)
+        self.pool_budget_bytes = int(slots * per_slot + self.num_pages * self._kv_bytes_per_page())
+        return self.pool_budget_bytes
+
     def _resize_kv_pool(self, config, num_pages: int, num_swa_pages: int | None) -> None:
         # IN-PLACE, identity-preserving: the CacheManager's swa_pool reference, ctx.kv_cache and
         # the model's per-access pool property all keep pointing at THIS pool, which frees its old
@@ -2017,6 +2036,66 @@ class Engine:
             "ram_parked": list(getattr(self, "_ram_parked_layers", [])),
         }
 
+    def _resize_pools(
+        self, config, *, moe_cache_size, num_pages, num_swa_pages, num_mamba_slots,
+        layer_moves=None,
+    ) -> None:
+        """Resize the pools free-before-alloc ACROSS pools too: a KV shrink runs before a MoE
+        grow so the transient peak is max(before, after). Until 2026-09-12 the MoE cache
+        always went first, which is right for grow-KV/shrink-MoE and wrong for the dynamic
+        pool's Timer 1 shrink (KV down, slots up): the old order let a grow-MoE/shrink-KV
+        swap transiently need BOTH the new (larger) MoE total AND the old (larger) KV total
+        at once, overshooting either end state. Called from rebuild_runtime_cache with the
+        validated target; ``layer_moves`` is accepted only for the moe_cache_size-requested
+        bookkeeping branch below, which needs it in scope."""
+        # Pin the new window first (validated above) so any KV-pool rebuild below sizes the window
+        # to it (_dsv4_pool_sizes / _swa_paged_num_tokens read config.swa_num_pages_override).
+        # frozen EngineConfig — mutate in place like the moe_cache_size path; `config.x = y` raises
+        # FrozenInstanceError, which here aborts the rebuild after the CUDA graphs are gone (→ 503).
+        if num_swa_pages is not None:
+            object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
+        kv_shrinks = num_pages is not None and num_pages < self.num_pages
+        if kv_shrinks:
+            # sets self.num_pages (rebuilds KV + window) BEFORE the MoE cache grows below.
+            self._resize_kv_pool(config, num_pages, num_swa_pages)
+        if moe_cache_size is not None:
+            assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
+            if self.moe_offload_cache.quant_format == "exl3":
+                # Packed pointer tables retain references to the old slot tensors. Drop them
+                # before rebuild so resizing can actually release that allocation; the next
+                # eager call rebuilds tables for the new bank addresses before graph capture.
+                scratch = getattr(self.moe_offload_cache, "exl3_scratch", None)
+                tables = getattr(scratch, "mgemm_tables", None)
+                if tables is not None:
+                    tables.clear()
+            self.moe_offload_cache.rebuild(moe_cache_size)
+        elif layer_moves and hasattr(config, "_moe_cache_size_requested"):
+            # The LRU is untouched by a move, so the operator's total budget (LRU + owned
+            # charge, see _charge_gpu_owned_layers_to_cache_size) shrinks or grows by one
+            # layer's worth of slots; the ledger quotes this number.
+            num_experts = getattr(config.model_config, "num_experts", 0)
+            new_total = config.moe_cache_size + len(self._gpu_owned_layer_ids) * num_experts
+            object.__setattr__(config, "_moe_cache_size_requested", new_total)
+        if num_pages is not None and not kv_shrinks:
+            # sets self.num_pages (rebuilds KV + window); the MoE grow above has already
+            # freed nothing it didn't need to, so this is the "KV grows" / "KV unchanged
+            # but requested anyway" ordering -- MoE first, same as before 2026-09-12.
+            self._resize_kv_pool(config, num_pages, num_swa_pages)
+        elif num_pages is None and num_swa_pages is not None:
+            # Window-only change: no page-count change, but re-derive the window pool at the new
+            # pin against the CURRENT page count. This re-allocs the same-size full pool and
+            # the resized window, both inside the pool's own rebuild_from_config.
+            self._resize_kv_pool(config, self.num_pages, num_swa_pages)
+        if num_mamba_slots is not None:
+            # Reallocate the GDN state pool (frees old tensors first). Must sit between graph
+            # teardown and re-capture so the recaptured graphs bind the new state tensors.
+            # +1 for the reserved padding sink: num_mamba_slots is the usable count.
+            self.linear_state_pool.rebuild(num_mamba_slots + 1)
+            if self.spec_state_ladder is not None:
+                # rebuild resets the free list, so the ladder's snapshot slot would otherwise
+                # be handed out to a live request as well.
+                self.spec_state_ladder.rebind()
+
     @torch.inference_mode()
     def rebuild_runtime_cache(
         self,
@@ -2146,6 +2225,14 @@ class Engine:
             if num_mamba_slots is not None
             else (self.linear_state_pool.num_slots if self.linear_state_pool is not None else None)
         )
+        # A plain MoE+KV swap (no GDN/window/layer_moves target) may land inside the one
+        # shared pool_budget_bytes even when its own per-transition total does not: the
+        # engine resizes the shrinking pool first (see _resize_pools), so the transient peak
+        # never exceeds max(before, after) and cannot OOM (2026-09-12 review).
+        budget_swap = (
+            num_mamba_slots is None and num_swa_pages is None and not layer_moves
+            and moe_cache_size is not None and num_pages is not None
+        )
         self.kv_cache.validate_rebuild(
             config, num_pages=num_pages,
             num_swa_pages=num_swa_pages, target_moe=target_moe,
@@ -2163,6 +2250,8 @@ class Engine:
             extra_note=(
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
             ),
+            pool_budget_bytes=getattr(self, "pool_budget_bytes", None),
+            budget_swap=budget_swap,
         )
 
         torch.cuda.synchronize(self.device)
@@ -2203,48 +2292,13 @@ class Engine:
                 self._move_layer(layer_id, target)
                 self._report_maintenance_progress("rebuild:layer_move", f"layer {layer_id} -> {target}")
 
-        # Resize caches in place (each frees its old GPU tensors before allocating).
-        # Pin the new window first (validated above) so any KV-pool rebuild below sizes the window
-        # to it (_dsv4_pool_sizes / _swa_paged_num_tokens read config.swa_num_pages_override).
-        # frozen EngineConfig — mutate in place like the moe_cache_size path; `config.x = y` raises
-        # FrozenInstanceError, which here aborts the rebuild after the CUDA graphs are gone (→ 503).
-        if num_swa_pages is not None:
-            object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
-        if moe_cache_size is not None:
-            assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
-            if self.moe_offload_cache.quant_format == "exl3":
-                # Packed pointer tables retain references to the old slot tensors. Drop them
-                # before rebuild so resizing can actually release that allocation; the next
-                # eager call rebuilds tables for the new bank addresses before graph capture.
-                scratch = getattr(self.moe_offload_cache, "exl3_scratch", None)
-                tables = getattr(scratch, "mgemm_tables", None)
-                if tables is not None:
-                    tables.clear()
-            self.moe_offload_cache.rebuild(moe_cache_size)
-        elif layer_moves and hasattr(config, "_moe_cache_size_requested"):
-            # The LRU is untouched by a move, so the operator's total budget (LRU + owned
-            # charge, see _charge_gpu_owned_layers_to_cache_size) shrinks or grows by one
-            # layer's worth of slots; the ledger quotes this number.
-            num_experts = getattr(config.model_config, "num_experts", 0)
-            new_total = config.moe_cache_size + len(self._gpu_owned_layer_ids) * num_experts
-            object.__setattr__(config, "_moe_cache_size_requested", new_total)
-        if num_pages is not None:
-            # sets self.num_pages (rebuilds KV + window)
-            self._resize_kv_pool(config, num_pages, num_swa_pages)
-        elif num_swa_pages is not None:
-            # Window-only change: no page-count change, but re-derive the window pool at the new
-            # pin against the CURRENT page count. This re-allocs the same-size full pool and
-            # the resized window, both inside the pool's own rebuild_from_config.
-            self._resize_kv_pool(config, self.num_pages, num_swa_pages)
-        if num_mamba_slots is not None:
-            # Reallocate the GDN state pool (frees old tensors first). Must sit between graph
-            # teardown and re-capture so the recaptured graphs bind the new state tensors.
-            # +1 for the reserved padding sink: num_mamba_slots is the usable count.
-            self.linear_state_pool.rebuild(num_mamba_slots + 1)
-            if self.spec_state_ladder is not None:
-                # rebuild resets the free list, so the ladder's snapshot slot would otherwise
-                # be handed out to a live request as well.
-                self.spec_state_ladder.rebind()
+        # Resize caches in place (each frees its old GPU tensors before allocating), a KV
+        # shrink before a MoE grow so the transient peak cannot exceed either total.
+        self._resize_pools(
+            config, moe_cache_size=moe_cache_size, num_pages=num_pages,
+            num_swa_pages=num_swa_pages, num_mamba_slots=num_mamba_slots,
+            layer_moves=layer_moves,
+        )
         self._report_maintenance_progress("rebuild:pools")
         # 3. Refresh max_seq_len (+ generic page table) for the new token budget.
         self._refresh_seq_state(config)

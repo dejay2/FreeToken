@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from freetoken.distributed import set_tp_info, try_get_tp_info
@@ -292,3 +295,36 @@ def test_every_kv_pool_answers_the_rebuild_surface():
         for cls in (MHAKVCache, MLAKVCache, DSAKVCache, HybridSWAKVCache)
     )
     assert _mha_pool().attach_page_table(torch.zeros(1)) is None  # base no-op
+
+
+def _qsa_like_pool():
+    # validate_rebuild lives on BaseKVCachePool; any concrete subclass exercises it the same
+    # way once kv_cost is monkeypatched, so the existing MHA pool helper stands in for QSA.
+    return _mha_pool()
+
+
+def test_validate_rebuild_accepts_a_budget_swap_inside_pool_budget_on_an_over_budget_card(monkeypatch):
+    """Review of 702543b: 131,072 -> 163,840 raises the resident total by 1.6 MB and the
+    Timer 1 return to the floor by 0.7 MB; both stay inside pool_budget_bytes and must pass,
+    while the old 'no larger than resident' allowance would refuse them."""
+    from freetoken.kvcache.base import CacheRebuildRejected
+
+    KV_PAGE, SLOT = 13_248 * 64, 2_772_480
+    budget = 7200 * SLOT + 1025 * KV_PAGE
+    pool = _qsa_like_pool()  # any BaseKVCache subclass instance; kv_cost is monkeypatched below
+    config = SimpleNamespace(memory_ratio=0.9, page_size=64)
+    monkeypatch.setattr(
+        type(pool), "kv_cost", classmethod(lambda cls, cfg, **kw: (KV_PAGE, 0, 64, 0))
+    )
+    # Boot account so tight that the ordinary budget refuses everything (over-committed card).
+    tight = dict(baseline_free=1, weights_bytes=0)
+    with pytest.raises(CacheRebuildRejected):
+        pool.validate_rebuild(config, num_pages=2561, target_moe=6730, per_expert_bytes=SLOT,
+                              current_num_pages=2049, **tight)
+    pool.validate_rebuild(config, num_pages=2561, target_moe=6730, per_expert_bytes=SLOT,
+                          current_num_pages=2049, pool_budget_bytes=budget, budget_swap=True, **tight)
+    pool.validate_rebuild(config, num_pages=1025, target_moe=7200, per_expert_bytes=SLOT,
+                          current_num_pages=2561, pool_budget_bytes=budget, budget_swap=True, **tight)
+    with pytest.raises(CacheRebuildRejected):
+        pool.validate_rebuild(config, num_pages=4097, target_moe=7200, per_expert_bytes=SLOT,
+                              current_num_pages=1025, pool_budget_bytes=budget, budget_swap=True, **tight)

@@ -99,6 +99,7 @@ class BaseKVCachePool(ABC):
         self, config, *, num_pages: int | None, target_moe: int, per_expert_bytes: int,
         baseline_free: int, weights_bytes: int, current_num_pages: int,
         extra_fixed_bytes: int = 0, extra_note: str = "", shrink_only: bool = False,
+        pool_budget_bytes: int | None = None, budget_swap: bool = False,
         **targets,
     ) -> None:
         """Budget fit-check for a runtime rebuild target, BEFORE any destructive free.
@@ -112,8 +113,17 @@ class BaseKVCachePool(ABC):
         GiB > budget 20.91 GiB" every 8 s, so the card could never get back under its headroom.
         The verdict is deliberately NOT a "no larger than resident" total: a sibling pool
         growing (GDN state, pinned window) leaves the slot and page counts unchanged, and a
-        combined grow-MoE/shrink-KV request peaks above both totals because the MoE cache is
-        rebuilt before the KV pool (PR #4 review).
+        combined grow-MoE/shrink-KV request used to peak above both totals because the MoE
+        cache was always rebuilt before the KV pool (PR #4 review); ``Engine._resize_pools``
+        now resizes a shrinking pool first, so that particular peak is gone, but a request
+        that is over budget on BOTH pools' own targets still needs the ``budget_swap`` escape
+        below.
+        ``pool_budget_bytes`` / ``budget_swap`` (2026-09-12 dynamic-KV-pool review): the
+        engine's one shared budget (MoE slots + KV pages resident, see
+        ``Engine.snapshot_pool_budget``) and its verdict that this rebuild is a plain MoE+KV
+        swap with no GDN/window/layer_moves target. A swap whose own totals exceed the
+        per-transition ``budget`` above but whose combined total still fits
+        ``pool_budget_bytes`` is accepted rather than refused -- see the final check below.
         The engine supplies the memory account (baseline/weights, the MoE terms, and any
         sibling pool's fixed bytes at ITS target, e.g. the GDN state pool); the pool
         answers whether its own target geometry fits. Raises CacheRebuildRejected.
@@ -145,6 +155,14 @@ class BaseKVCachePool(ABC):
                 )
             return
         if need > budget:
+            if budget_swap and pool_budget_bytes is not None and need <= pool_budget_bytes:
+                # Dynamic KV pool (spec rule 3 + engine section): planner and validator share
+                # ONE budget, the MoE+KV bytes resident at boot / after the last external
+                # rebuild. A swap inside it cannot OOM when the engine resizes the shrinking
+                # pool first (transient peak = max(before, after)); a per-transition "no larger
+                # than resident" rule would wrongly refuse 131,072 -> 163,840 (+1.6 MB of
+                # rounding slack) and the return to the floor (+0.7 MB) on an over-budget card.
+                return
             raise CacheRebuildRejected(
                 f"requested cache (moe={target_moe} slots, kv={target_pages} pages{extra_note}) "
                 f"needs {mem_GB(need)} > budget {mem_GB(budget)}; old cache kept, still serving"
