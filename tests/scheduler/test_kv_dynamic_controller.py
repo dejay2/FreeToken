@@ -156,3 +156,30 @@ def test_status_reports_the_dials_and_the_queue():
     c.decide_admission(2, _msg(2), need_total=92_000, need_now=92_000,
                        pool_tokens=POOL, fits_empty=False, fits_now=False)
     assert c.status(current_pages=1025, pool_budget_bytes=BUDGET)["held"] == 1
+
+
+def test_escalate_holds_a_pending_request_once_and_not_when_disabled():
+    c = _controller(_Clock())
+    # Escalate uid 7 with need_total 92_000 -> has_held() and queue contains [7]
+    c.escalate(7, _msg(7), need_total=92_000)
+    assert c.has_held() and [h.uid for h in c.held] == [7]
+    # Escalate uid 7 again -> still exactly one entry (deduplication)
+    c.escalate(7, _msg(7), need_total=92_000)
+    assert [h.uid for h in c.held] == [7]
+    # A small fitting request is held because the drain barrier is engaged
+    assert c.decide_admission(3, _msg(3), need_total=5_000, need_now=5_000,
+                              pool_tokens=POOL, fits_empty=True, fits_now=True) == "hold"
+    # After disable, escalate does nothing
+    c.disable("x")
+    c.escalate(8, _msg(8), need_total=92_000)
+    assert not c.has_held()
+
+
+def test_timer1_with_a_budget_below_the_floor_geometry_plans_nothing():
+    clock = _Clock()
+    c = _controller(clock)
+    c.on_request_finished()
+    clock.now += 601  # past the shrink idle window
+    # Budget too small to fit floor geometry
+    plan = c.plan_idle(current_pages=2049, pool_budget_bytes=1025 * KV_PAGE + 100 * SLOT, running_need_tokens=0)
+    assert plan is None and c.last_plan is None
