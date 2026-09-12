@@ -1532,6 +1532,22 @@ class Engine:
             if parked and layer_id in parked:
                 parked.remove(layer_id)
 
+    def _kv_dynamic_active(self) -> bool:
+        """Return True when the dynamic KV pool is active: config.kv_dynamic is True
+        AND kv_dynamic_floor_pages is explicitly set (is not None)."""
+        return getattr(self.config, "kv_dynamic", False) and getattr(self, "kv_dynamic_floor_pages", None) is not None
+
+    def _kv_rung_floor_pages(self) -> int:
+        """Return the KV rung floor in pages: the dynamic floor if active, else -25% of boot.
+
+        When dynamic mode is on, the floor is set by the controller. Otherwise, use the
+        legacy -25% shrink-back from the boot size.
+        """
+        if self._kv_dynamic_active():
+            return max(1, int(self.kv_dynamic_floor_pages))
+        init_pages = getattr(self, "_initial_num_pages", None) or getattr(self, "num_pages", 0)
+        return max(1, int(init_pages * 0.75))
+
     def step_memory(
         self,
         axis: str,
@@ -1841,7 +1857,7 @@ class Engine:
                 new_slots = max(slot_floor, current_slots - 512)
                 rebuild(moe_cache_size=new_slots)
                 idle = True if is_idle is None else is_idle
-                can_shrink_kv = idle and getattr(self, "num_pages", 0) > 1
+                can_shrink_kv = idle and getattr(self, "num_pages", 0) > self._kv_rung_floor_pages()
                 at_floor = (new_slots == slot_floor and not can_shrink_kv)
                 return {
                     "applied": "slots",
@@ -1857,12 +1873,7 @@ class Engine:
             #    pool_budget_bytes afterwards and funds the next grow from slots). Otherwise
             #    the historical -25 % of the boot size.
             idle = True if is_idle is None else is_idle
-            init_pages = getattr(self, "_initial_num_pages", None) or getattr(self, "num_pages", 0)
-            floor_pages = getattr(self, "kv_dynamic_floor_pages", None)
-            if getattr(self.config, "kv_dynamic", False) and floor_pages:
-                kv_floor = max(1, int(floor_pages))
-            else:
-                kv_floor = max(1, int(init_pages * 0.75))
+            kv_floor = self._kv_rung_floor_pages()
             if idle and getattr(self, "num_pages", 0) > kv_floor:
                 rebuild(num_pages=kv_floor)
                 return {
@@ -1885,7 +1896,7 @@ class Engine:
         else:  # direction == "up"
             idle = True if is_idle is None else is_idle
             init_pages = getattr(self, "_initial_num_pages", None)
-            if idle and init_pages and self.num_pages < init_pages and not getattr(self.config, "kv_dynamic", False):
+            if idle and init_pages and self.num_pages < init_pages and not self._kv_dynamic_active():
                 rebuild(num_pages=init_pages)
                 return {
                     "applied": "kv",
@@ -1977,7 +1988,7 @@ class Engine:
             return None
         if axis == "vram" and direction == "up":
             init_pages = getattr(self, "_initial_num_pages", None)
-            if init_pages and getattr(self, "num_pages", 0) < init_pages and not getattr(self.config, "kv_dynamic", False):
+            if init_pages and getattr(self, "num_pages", 0) < init_pages and not self._kv_dynamic_active():
                 return None  # a KV restore may apply once idle
             init_slots = getattr(self, "_initial_moe_cache_size", None)
             if init_slots and current_slots < init_slots:
