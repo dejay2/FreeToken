@@ -31,6 +31,8 @@ from freetoken.message import (
     CacheResidencyReply,
     CacheStepMsg,
     CacheStepReply,
+    KVDynamicStatusReply,
+    MaintenanceBeginReply,
     PrefillProgressReply,
     RoutingStatsMsg,
     RoutingStatsReply,
@@ -164,11 +166,14 @@ def _unwrap_msg(msg: BaseFrontendMsg) -> List[UserReply]:
     return [msg]
 
 
-def _open_maintenance(state: Any, request_id: str, kind: str) -> None:
-    """Close the gate for one correlated operation (see FrontendManager.maintenance_op)."""
+def _open_maintenance(state: Any, request_id: str, kind: str, detail: str | None = None) -> None:
+    """Close the gate for one correlated operation. Several may be open at once: a manual
+    rebuild is recorded at DISPATCH (before the scheduler sees it) and the scheduler may begin
+    an automatic dynamic-KV operation in between, so the records are keyed by id and the gate
+    reopens only when the map is empty (2026-09-12 review of 702543b)."""
     state.maintenance_state = "rebuilding"
     now = getattr(state, "monotonic", time.monotonic)()
-    state.maintenance_op = {
+    state.maintenance_ops[request_id] = {
         "request_id": request_id,
         "kind": kind,
         "started_at": now,
@@ -177,19 +182,32 @@ def _open_maintenance(state: Any, request_id: str, kind: str) -> None:
         "phase": "dispatched",
         "progress_at": now,
         "progress_count": 0,
-        "detail": None,
+        "detail": detail,
         "expired": False,
     }
     if hasattr(state, "rebuild_done"):
         state.rebuild_done.clear()
 
 
-def _abort_maintenance(state: Any) -> None:
+def _close_maintenance(state: Any, request_id: str, *, failed: bool) -> None:
+    """Remove one record; reopen the gate only when nothing else is outstanding. A genuine
+    destructive failure latches ``failed`` whatever else is open (the engine may be torn down)."""
+    state.maintenance_ops.pop(request_id, None)
+    if failed or state.fatal_error is not None:
+        state.maintenance_state = "failed"
+        if hasattr(state, "rebuild_done"):
+            state.rebuild_done.set()
+        return
+    if not state.maintenance_ops and state.maintenance_state == "rebuilding":
+        state.maintenance_state = "serving"
+        state.inference_seen = state.monotonic()
+        if hasattr(state, "rebuild_done"):
+            state.rebuild_done.set()
+
+
+def _abort_maintenance(state: Any, request_id: str) -> None:
     """The enqueue failed: the scheduler never saw the request and the engine is untouched."""
-    state.maintenance_op = None
-    state.maintenance_state = "serving"
-    if hasattr(state, "rebuild_done"):
-        state.rebuild_done.set()
+    _close_maintenance(state, request_id, failed=False)
 
 
 def _fail_open_waiters(state: Any, message: str) -> None:
@@ -209,18 +227,15 @@ def _fail_open_waiters(state: Any, message: str) -> None:
 
 
 def _reply_matches_open_operation(state: Any, request_id: str) -> bool:
-    """False for a reply to some operation other than the one holding the gate closed.
+    """False for a reply to an operation id that is not (or no longer) open.
 
-    Every reply still resolves its own waiter; only the operation that closed the gate may
-    reopen it. A late reply from an earlier, timed-out request while a newer operation is
-    executing must not reopen the gate under that newer operation."""
-    op = getattr(state, "maintenance_op", None)
-    if op is None or op.get("request_id") == request_id:
+    Every reply still resolves its own waiter; only an operation with an open record may
+    close its own share of the gate. A late reply from an earlier, already-closed request
+    must not reopen or re-close anything under a different, still-open operation."""
+    ops = getattr(state, "maintenance_ops", None) or {}
+    if not ops or request_id in ops:
         return True
-    logger.warning(
-        f"ignoring a stale cache reply for {request_id}; "
-        f"the gate belongs to {op.get('kind')} {op.get('request_id')}"
-    )
+    logger.warning(f"ignoring a stale cache reply for {request_id}; open operations: {sorted(ops)}")
     return False
 
 
@@ -253,19 +268,28 @@ class FrontendManager:
     # "rebuilding"/"failed" for runtime cache rebuilds.
     maintenance_state: str = "loading"
     last_rebuild: Dict[str, Any] | None = None
-    # The one operation allowed to have closed the gate: {request_id, kind, started_at,
-    # expired}. Only ITS reply may reopen the gate; a stale reply from an earlier, timed-out
-    # request resolves its own waiter and nothing else. ``backend_last_seen`` is the monotonic
-    # time of the last message of any kind from the backend (tokens, park snapshots, replies):
-    # while it keeps moving the scheduler is alive and the operation is merely queued or slow;
-    # once it stops for MAINTENANCE_STUCK_S with the gate closed the operation is stuck, and
-    # check_maintenance latches "failed" (never "serving": the engine may be half torn down)
-    # so the helper's watchdog performs a controlled restart.
-    # ``progress_at``/``phase`` on the record come from CacheProgressReply messages the
-    # scheduler sends for THIS operation (one per completed unit of work on or ahead of it),
-    # so "silent but working" (a chunked prompt, a slow rebuild phase) is distinguishable from
-    # "stuck": the clock restarts on each unit and only measures one silent unit.
-    maintenance_op: Dict[str, Any] | None = None
+    # Every operation currently holding the gate closed, keyed by request_id: {request_id,
+    # kind, started_at, phase, progress_at, progress_count, detail, expired}. A manual
+    # rebuild/step is recorded at DISPATCH (before the scheduler even sees the message) and the
+    # scheduler may independently begin an automatic dynamic-KV operation while that manual one
+    # is still outstanding, so the gate is closed while this map is non-empty and reopens only
+    # once it drains (2026-09-12 review: a single record could not represent two operations
+    # open at once without one's completion wrongly reopening the gate under the other).
+    # ``backend_last_seen`` is the monotonic time of the last message of any kind from the
+    # backend (tokens, park snapshots, replies): while it keeps moving the scheduler is alive
+    # and every open operation is merely queued or slow; once it stops for MAINTENANCE_STUCK_S
+    # with the gate closed the OLDEST operation is stuck, and check_maintenance latches "failed"
+    # (never "serving": the engine may be half torn down) so the helper's watchdog performs a
+    # controlled restart.
+    # ``progress_at``/``phase`` on a record come from CacheProgressReply messages the scheduler
+    # sends for THAT operation (one per completed unit of work on or ahead of it), so "silent
+    # but working" (a chunked prompt, a slow rebuild phase) is distinguishable from "stuck": the
+    # clock restarts on each unit and only measures one silent unit.
+    maintenance_ops: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Latest dynamic-KV-pool status snapshot (KVDynamicStatusReply), surfaced on
+    # /v1/cache/status independent of the maintenance gate. None until the scheduler reports one
+    # (owned-KV models, or --kv-dynamic off, never will).
+    kv_dynamic_status: Dict[str, Any] | None = None
     backend_last_seen: float = 0.0
     # Completed inference only: admission, polling and parking snapshots are not GPU work.
     inference_seen: float = 0.0
@@ -359,6 +383,15 @@ class FrontendManager:
             self.rebuild_done.set()
         else:
             self.rebuild_done.clear()
+
+    @property
+    def maintenance_op(self) -> Dict[str, Any] | None:
+        """The oldest open operation, for existing readers (/health, check_maintenance) that
+        only ever cared about one record. No setter: callers close operations by id through
+        ``_close_maintenance``/``_abort_maintenance`` or open one via ``_open_maintenance``."""
+        if not self.maintenance_ops:
+            return None
+        return min(self.maintenance_ops.values(), key=lambda op: op["started_at"])
 
     def frontend_tokenizer(self) -> Any:
         """Lazily build and cache the frontend-side tokenizer used by count_tokens (see the
@@ -463,6 +496,12 @@ class FrontendManager:
             if isinstance(msg, CacheProgressReply):
                 self._note_progress(msg)
                 continue
+            if isinstance(msg, MaintenanceBeginReply):
+                self._begin_maintenance(msg)
+                continue
+            if isinstance(msg, KVDynamicStatusReply):
+                self._note_kv_dynamic(msg)
+                continue
             if isinstance(msg, CacheRebuildReply):
                 self._resolve_rebuild(msg)
                 continue
@@ -491,11 +530,11 @@ class FrontendManager:
                 self.event_map[msg.uid].set()
 
     def _resolve_rebuild(self, msg: CacheRebuildReply) -> None:
-        """Terminal transition for a rebuild: rebuilding -> serving | failed. This is the ONLY
-        path that reopens the gate dispatch_rebuild latches to "rebuilding", so it must always
-        land on a definite state — including for a reply that arrives after the HTTP wait timed
-        out (its future is already gone) — so a rebuild can never wedge the server in
-        "rebuilding" forever.
+        """Terminal transition for one rebuild operation: closes ITS record and, only once the
+        maintenance_ops map is empty, reopens the gate (rebuilding -> serving | failed) — see
+        _close_maintenance. Must always land on a definite state — including for a reply that
+        arrives after the HTTP wait timed out (its future is already gone) — so a rebuild can
+        never wedge the server in "rebuilding" forever.
 
         Ordering matters. Wake any waiter and record the result first, then decide the gate:
           - A fatal worker death latched "failed" (the watchdog) OUTRANKS this reply. A reply
@@ -503,7 +542,7 @@ class FrontendManager:
             "serving" — a crashed backend cannot serve. Leave it latched.
           - Otherwise only a genuine destructive "failed" latches maintenance; "ok"/"busy"/
             "rejected"/"unsupported" all leave the prior cache intact, so the engine keeps
-            serving."""
+            serving (if no other operation is still open)."""
         self.last_rebuild = {
             "request_id": msg.request_id,
             "status": msg.status,
@@ -518,21 +557,11 @@ class FrontendManager:
             fut.set_result(self.last_rebuild)
         if not _reply_matches_open_operation(self, msg.request_id):
             return
-        if self.fatal_error is not None:
-            # A dead backend stays failed regardless of any (possibly stale/buffered) reply.
-            self.maintenance_state = "failed"
-            if hasattr(self, "rebuild_done"):
-                self.rebuild_done.set()
-            return
-        self.maintenance_state = "failed" if msg.status == "failed" else "serving"
-        if self.maintenance_state == "serving":
-            self.inference_seen = self.monotonic()
-        self.maintenance_op = None
-        if hasattr(self, "rebuild_done"):
-            self.rebuild_done.set()
+        _close_maintenance(self, msg.request_id, failed=(msg.status == "failed"))
 
     def _resolve_step(self, msg: CacheStepReply) -> None:
-        """A /v1/cache/step reply: same maintenance transition as _resolve_rebuild."""
+        """A /v1/cache/step reply: same per-operation maintenance transition as
+        _resolve_rebuild."""
         fut = self.rebuild_futures.pop(msg.request_id, None)
         if fut is not None and not fut.done():
             fut.set_result(
@@ -550,25 +579,17 @@ class FrontendManager:
             )
         if not _reply_matches_open_operation(self, msg.request_id):
             return
-        if self.fatal_error is not None:
-            self.maintenance_state = "failed"
-        else:
-            self.maintenance_state = "failed" if msg.status == "failed" else "serving"
-            if self.maintenance_state == "serving":
-                self.inference_seen = self.monotonic()
-            self.maintenance_op = None
-        self.rebuild_done.set()
+        _close_maintenance(self, msg.request_id, failed=(msg.status == "failed"))
 
     def _note_progress(self, msg: CacheProgressReply) -> None:
-        """One unit of work completed on (or ahead of) the open operation: restart its clock.
-
-        A report for any other request id (an operation that already finished, or one whose
-        HTTP wait timed out and was superseded) refreshes nothing: only the operation holding
-        the gate may extend its own life."""
-        op = self.maintenance_op
-        if op is None or op.get("request_id") != msg.request_id:
+        """One unit of work completed on (or ahead of) its operation: restart that record's
+        clock. A report for an id with no open record (an operation that already finished, or
+        one whose HTTP wait timed out and was superseded) refreshes nothing: only a still-open
+        operation may extend its own life."""
+        op = self.maintenance_ops.get(msg.request_id)
+        if op is None:
             logger.debug(
-                "ignoring maintenance progress %s for %s: not the open operation",
+                "ignoring maintenance progress %s for %s: not an open operation",
                 msg.phase, msg.request_id,
             )
             return
@@ -576,6 +597,14 @@ class FrontendManager:
         op["detail"] = msg.detail
         op["progress_at"] = self.monotonic()
         op["progress_count"] = int(op.get("progress_count", 0)) + 1
+
+    def _begin_maintenance(self, msg: MaintenanceBeginReply) -> None:
+        """The scheduler started an operation on its own (dynamic KV pool). Same gate, own
+        record: see FrontendManager.maintenance_ops."""
+        _open_maintenance(self, msg.request_id, msg.kind, msg.detail)
+
+    def _note_kv_dynamic(self, msg: KVDynamicStatusReply) -> None:
+        self.kv_dynamic_status = dict(msg.status)
 
     def _resolve_residency(self, msg: CacheResidencyReply) -> None:
         fut = self.routing_futures.pop(msg.request_id, None)
@@ -648,6 +677,7 @@ class FrontendManager:
             "backend_idle_s": None,
             "deadline_s": self.maintenance_stuck_s,
             "stuck": False,
+            "open_operations": sorted(self.maintenance_ops),
         }
         if op is None:
             return snapshot
@@ -927,7 +957,7 @@ async def dispatch_rebuild(
         # untouched. Roll the gate back to serving (else a transient ZMQ error would latch
         # maintenance forever with no reply ever arriving to clear it) and surface the error.
         state.rebuild_futures.pop(request_id, None)
-        _abort_maintenance(state)
+        _abort_maintenance(state, request_id)
         return {"status": "failed", "error": f"failed to dispatch rebuild: {e!r}"}
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
@@ -1042,7 +1072,7 @@ async def dispatch_step(
         )
     except Exception as e:  # noqa: BLE001
         state.rebuild_futures.pop(request_id, None)
-        _abort_maintenance(state)
+        _abort_maintenance(state, request_id)
         return {"status": "failed", "error": f"failed to dispatch cache step: {e!r}"}
     try:
         reply = await asyncio.wait_for(fut, timeout=timeout)
@@ -1371,6 +1401,7 @@ async def cache_status():
         "state": state.maintenance_state,
         "inference": inference,
         "maintenance": maintenance,
+        "kv_dynamic": getattr(state, "kv_dynamic_status", None),
         "last_rebuild": state.last_rebuild,
         "geometry": cache_geometry(state),
         "parking": getattr(

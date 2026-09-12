@@ -38,6 +38,10 @@ from freetoken.message import (
     CacheStepResultMsg,
     DetokenizeMsg,
     ErrorReplyMsg,
+    KVDynamicStatusMsg,
+    KVDynamicStatusReply,
+    MaintenanceBeginMsg,
+    MaintenanceBeginReply,
     PromptAdmittedMsg,
     PrefillProgressMsg,
     PrefillProgressReply,
@@ -386,6 +390,8 @@ _CONTROL_MSG_TYPES = (
     CacheStepMsg,
     CacheStepResultMsg,
     ErrorReplyMsg,
+    KVDynamicStatusMsg,
+    MaintenanceBeginMsg,
     PromptAdmittedMsg,
     RoutingStatsMsg,
     RoutingStatsResultMsg,
@@ -406,6 +412,10 @@ def _forward_control_msg(m, send_backend, send_frontend) -> bool:
         send_frontend.put(
             CacheProgressReply(request_id=m.request_id, phase=m.phase, detail=m.detail)
         )
+    elif isinstance(m, MaintenanceBeginMsg):
+        send_frontend.put(MaintenanceBeginReply(request_id=m.request_id, kind=m.kind, detail=m.detail))
+    elif isinstance(m, KVDynamicStatusMsg):
+        send_frontend.put(KVDynamicStatusReply(status=m.status))
     elif isinstance(m, CacheRebuildMsg):
         send_backend.put(
             CacheRebuildBackendMsg(

@@ -18,6 +18,10 @@ from freetoken.message import (
     CacheRebuildMsg,
     CacheRebuildReply,
     CacheRebuildResultMsg,
+    KVDynamicStatusMsg,
+    KVDynamicStatusReply,
+    MaintenanceBeginMsg,
+    MaintenanceBeginReply,
     PromptAdmittedMsg,
     TokenizeMsg,
     UserMsg,
@@ -54,6 +58,30 @@ def test_cache_rebuild_reply_roundtrip():
     out = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(msg))
     assert isinstance(out, CacheRebuildReply)
     assert (out.request_id, out.status, out.error) == ("r3", "failed", "boom")
+
+
+def test_maintenance_begin_msg_and_reply_roundtrip():
+    msg = MaintenanceBeginMsg(request_id="auto-kv:i:1", kind="auto-kv", detail="grow")
+    out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+    assert isinstance(out, MaintenanceBeginMsg)
+    assert (out.request_id, out.kind, out.detail) == ("auto-kv:i:1", "auto-kv", "grow")
+
+    reply = MaintenanceBeginReply(request_id="auto-kv:i:1", kind="auto-kv", detail="grow")
+    out_reply = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(reply))
+    assert isinstance(out_reply, MaintenanceBeginReply)
+    assert (out_reply.request_id, out_reply.kind, out_reply.detail) == ("auto-kv:i:1", "auto-kv", "grow")
+
+
+def test_kv_dynamic_status_msg_and_reply_roundtrip():
+    msg = KVDynamicStatusMsg(status={"enabled": True, "held": 3})
+    out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+    assert isinstance(out, KVDynamicStatusMsg)
+    assert out.status == {"enabled": True, "held": 3}
+
+    reply = KVDynamicStatusReply(status={"enabled": True, "held": 3})
+    out_reply = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(reply))
+    assert isinstance(out_reply, KVDynamicStatusReply)
+    assert out_reply.status == {"enabled": True, "held": 3}
 
 
 def test_prompt_admitted_msg_roundtrip():
