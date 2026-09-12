@@ -35,6 +35,8 @@ from freetoken.message import (
     DetokenizeMsg,
     ErrorReplyMsg,
     ExitMsg,
+    KVDynamicStatusMsg,
+    MaintenanceBeginMsg,
     PromptAdmittedMsg,
     PrefillProgressMsg,
     RoutingStatsBackendMsg,
@@ -66,6 +68,8 @@ MAINTENANCE_PROGRESS_INTERVAL_S = 2.0
 if TYPE_CHECKING:
     from freetoken.engine import BatchSamplingArgs, ForwardOutput
 
+    from .kv_dynamic import KVDynamicController
+
 
 logger = init_logger(__name__)
 
@@ -88,6 +92,13 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
 class Scheduler(SchedulerIOMixin):
+    # Dynamic KV pool (docs/superpowers/specs/2026-09-12-dynamic-kv-pool-design.md). Declared
+    # at class level, not only in __init__, so every seam below can read them unconditionally:
+    # the maintenance tests drive real methods on Scheduler.__new__ shells that never run
+    # __init__, and "no controller" is exactly the right answer for those.
+    _kv_dynamic: "KVDynamicController | None" = None
+    _kv_dynamic_last_status: dict | None = None
+
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
 
@@ -137,6 +148,22 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
+        self._kv_dynamic = self._make_kv_dynamic(config) if config.kv_dynamic else None
+        self._kv_dynamic_last_status = None
+        if self._kv_dynamic is not None:
+            # The real reservation is charged in the admission pass, not in add_one_req, so the
+            # controller has to be told when its same-batch estimate for a uid is superseded
+            # (rule 2, "Same-batch arrivals") and when a never-started request was refused for
+            # capacity (rule 2(b)). on_capacity_blocked only has to be non-None for the prefill
+            # manager to collect them; the collection is drained at the idle point instead of
+            # mutating the FIFO from inside the admission pass.
+            self.prefill_manager.on_reserved = self._kv_dynamic.note_reserved
+            self.prefill_manager.on_capacity_blocked = lambda pending: None
+            # Rule 6: the governor's KV rung shrinks to the controller's floor rather than to
+            # -25% of the boot pool, and _initial_num_pages == floor stops step_memory_noop
+            # from ever reporting a "KV restore pending".
+            self.engine.kv_dynamic_floor_pages = self._kv_dynamic.policy.floor_pages
+            self.engine._initial_num_pages = self._kv_dynamic.policy.floor_pages
 
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
@@ -221,7 +248,19 @@ class Scheduler(SchedulerIOMixin):
             self._last_park_status = status
 
     def idle_poll_timeout_ms(self) -> int | None:
-        return self.cache_manager.next_park_delay_ms()
+        """How long the blocking receive may sleep. Both background timers feed one minimum:
+        parking/TTL (Timer 2, folded inside next_park_delay_ms) and the dynamic pool's shrink
+        (Timer 1). next_park_delay_ms returns None once nothing is pending or parkable, and
+        the loop would then block on the queue with no timer at all -- a quiet server would
+        never wake for its own shrink (spec rule 4)."""
+        delays = [
+            self.cache_manager.next_park_delay_ms(),
+            None
+            if self._kv_dynamic is None
+            else self._kv_dynamic.next_deadline_ms(current_pages=self.engine.num_pages),
+        ]
+        live = [d for d in delays if d is not None]
+        return min(live) if live else None
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
@@ -232,6 +271,11 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.park_idle()
         self.cache_manager.drain_pending_parks()
         self.cache_manager.check_integrity()
+        # Rule 4: a shrink that comes due while the scheduler blocks on the queue executes
+        # HERE. Inside the blocking wait the scheduler is idle by construction, and the parks
+        # above have already drained -- which is exactly what rebuild_cache's prepare_rebuild
+        # would otherwise have to do under the timer.
+        self._run_kv_dynamic_idle()
         self._send_park_status()
 
     @torch.inference_mode()
@@ -315,6 +359,9 @@ class Scheduler(SchedulerIOMixin):
             or self.prefill_manager.runnable
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to drain toward + execute
+            # A held request is work this loop owes: it must reach the idle point below and
+            # grow the pool, not sit on the queue waiting for a message that may never come.
+            or (self._kv_dynamic is not None and self._kv_dynamic.has_held())
         )
         for msg in self.receive_msg(blocking=blocking):
             # Per-message so an idle poll never counts as traffic (freetoken/diag.py arms on
@@ -333,6 +380,16 @@ class Scheduler(SchedulerIOMixin):
         # previous batch is drained (rebuild_cache still host-syncs). Never mid prefill chunk.
         if self._pending_rebuild is not None and last_data is None and self._rebuild_can_run():
             self._execute_pending_rebuild()
+
+        # The same safe point for the rebuild the controller issues itself (rules 2, 4): only
+        # when nothing is queued, running or in flight, so it can never race an operator's
+        # rebuild or resize a pool a request is reading.
+        if last_data is None and not (
+            self.prefill_manager.runnable
+            or self.decode_manager.runnable
+            or self._pending_rebuild is not None
+        ):
+            self._run_kv_dynamic_idle()
 
         # Order this iteration's host->device token_pool copies (issued on ``self.stream``
         # during scheduling) after the previous batch's sampled-token writes (issued on the
@@ -400,6 +457,7 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to execute at idle
+            or (self._kv_dynamic is not None and self._kv_dynamic.has_held())  # see overlap_loop
         )
         for msg in self.receive_msg(blocking=blocking):
             # Per-message so an idle poll never counts as traffic (freetoken/diag.py arms on
@@ -415,6 +473,13 @@ class Scheduler(SchedulerIOMixin):
         # A MoE-only rebuild may execute between decode steps (see overlap_loop).
         if self._pending_rebuild is not None and self._rebuild_can_run():
             self._execute_pending_rebuild()
+
+        if not (
+            self.prefill_manager.runnable
+            or self.decode_manager.runnable
+            or self._pending_rebuild is not None
+        ):
+            self._run_kv_dynamic_idle()
 
         # Non-overlap mode already drains what it launches, so the speculative step needs no
         # early drain here -- only the same dispatch.
@@ -547,6 +612,12 @@ class Scheduler(SchedulerIOMixin):
                         self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
+        # Timer 1's clock (rule 4). Resolved defensively for the same reason as
+        # _maintenance_request_id above: several drain tests drive this method unbound, with a
+        # SimpleNamespace standing in for self, and those shells own no controller.
+        note_finished = getattr(self, "_note_request_finished", None)
+        if note_finished is not None:
+            note_finished(new_finished_reqs)
         with diag.region("diag.prefill_emit" if batch.is_prefill else None):
             self._ship_replies(
                 batch,
@@ -792,6 +863,276 @@ class Scheduler(SchedulerIOMixin):
             msg.mm_image_grid_thw = None
             msg.mm_token_type_ids = None
 
+    def _admit_user_msg(self, msg: UserMsg) -> None:
+        """The ordinary admission path: picture preparation, the max_seq_len clip against the
+        CURRENT pool, and the hand-off to the prefill manager.
+
+        Factored out of _process_one_msg so the dynamic KV controller can run it later, at the
+        idle point, for a request it held while the pool grew (the clip then sees the grown
+        pool). A held picture request keeps its raw tensors until this runs: encoding at
+        arrival would burn the tower on a request that may still be error-replied.
+        """
+        has_raw_picture = any(
+            value is not None
+            for value in (
+                msg.mm_pixel_values,
+                msg.mm_image_grid_thw,
+                msg.mm_token_type_ids,
+            )
+        )
+        input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
+        max_output_len = max_seq_len - input_len
+        if max_output_len <= 0:
+            logger.warning_rank0(
+                f"Input sequence length {input_len} exceeds {max_seq_len}, "
+                f"request {msg.uid} is dropped."
+            )
+            # Tell the client instead of dropping silently — otherwise its wait_for_ack
+            # never sees a `finished` reply and hangs until the request times out.
+            self.send_result(
+                [
+                    ErrorReplyMsg(
+                        uid=msg.uid,
+                        # "prompt is too long: N tokens > M" is the phrasing Claude Code and
+                        # OpenClaw match on; the Anthropic wire has no error code to read.
+                        error=(
+                            f"prompt is too long: {input_len} tokens > {max_seq_len} maximum "
+                            f"(prompt + generation); shorten the prompt or increase the KV "
+                            f"cache budget"
+                        ),
+                        # OpenAI's standard class for this, for clients that read a code.
+                        code="context_length_exceeded",
+                    )
+                ]
+            )
+            self._drop_raw_picture(msg)
+            return
+        if has_raw_picture:
+            try:
+                self._prepare_multimodal_request(msg)
+            except Exception as exc:  # noqa: BLE001 - reject one request, keep serving
+                logger.warning_rank0(
+                    "Picture processing failed for request %d: %s", msg.uid, exc
+                )
+                self.send_result(
+                    [ErrorReplyMsg(uid=msg.uid, error=f"could not encode picture: {exc}")]
+                )
+                return
+        if msg.sampling_params.max_tokens > max_output_len:
+            msg.sampling_params.max_tokens = max_output_len
+            logger.warning_rank0(
+                f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
+            )
+        self.prefill_manager.add_one_req(msg)
+
+    @staticmethod
+    def _drop_raw_picture(msg: UserMsg) -> None:
+        """Release the CPU picture transport tensors of a request that will never be admitted.
+        They dominate request transport memory (see _prepare_multimodal_request's finally)."""
+        msg.mm_pixel_values = None
+        msg.mm_image_grid_thw = None
+        msg.mm_token_type_ids = None
+
+    # ---- dynamic KV pool (spec 2026-09-12) ----------------------------------------------
+
+    def _make_kv_dynamic(self, config) -> "KVDynamicController":
+        """Bind the pure policy to this engine's measured costs (spec: Scheduler section).
+
+        Everything the policy needs is priced once, here: the KV bytes per page come from the
+        SAME expression the rebuild validator uses (engine._kv_bytes_per_page), so planner and
+        validator can never disagree about what a page costs, and the slot floor is the one
+        step_memory already enforces. The refusals are boot-time ValueErrors on purpose -- a
+        half-wired dynamic pool would only be discovered when a request needed to grow.
+        """
+        from freetoken.engine.cache_budget import expert_bytes_per_slot
+
+        from .kv_dynamic import KVDynamicController, KVDynamicPolicy
+
+        moe = self.engine.moe_offload_cache
+        if moe is None:
+            raise ValueError("--kv-dynamic requires an offloaded MoE slot cache")
+        if not self.cache_manager.supports_runtime_rebuild:
+            raise ValueError("--kv-dynamic is unsupported by this model's KV cache")
+        if getattr(config.model_config, "dsv4_args", None) is not None:
+            raise ValueError("--kv-dynamic does not support DSV4's owned KV tiers")
+        if config.tp_info.size != 1:
+            raise ValueError("--kv-dynamic requires TP=1 in this batch")
+        page = config.page_size
+        num_experts = config.model_config.num_experts
+        # The floor step_memory uses: with prefill overlap two experts' worth of slots per
+        # layer can be in flight at once, else one.
+        slot_floor = 2 * num_experts if config.moe_prefill_overlap else num_experts
+        policy = KVDynamicPolicy(
+            floor_pages=config.kv_floor_tokens // page + 1,
+            # kv_ceiling_tokens INCLUDES the dummy page (it is what --num-tokens would have
+            # been for a fixed pool of that size); the usable ceiling is one page less.
+            ceiling_pages=(config.kv_ceiling_tokens - page) // page + 1,
+            step_pages=config.kv_step_tokens // page,
+            page_size=page,
+            kv_bytes_per_page=self.engine._kv_bytes_per_page(),
+            slot_bytes=expert_bytes_per_slot(moe.bank_sources, self.engine._gpu_owned_layer_ids),
+            slot_floor=slot_floor,
+        )
+        self.engine.snapshot_pool_budget()
+        controller = KVDynamicController(
+            policy, shrink_idle_s=config.kv_shrink_idle_s, instance_id=str(id(self))[-6:],
+        )
+        logger.info_rank0(
+            "Dynamic KV pool on: floor %d, ceiling %d, step %d tokens; shrink after %d s idle; "
+            "budget %.2f GiB", policy.usable_tokens(policy.floor_pages),
+            policy.usable_tokens(policy.ceiling_pages), config.kv_step_tokens,
+            config.kv_shrink_idle_s, self.engine.pool_budget_bytes / (1 << 30),
+        )
+        return controller
+
+    def _queue_for_kv_dynamic(self, msg: UserMsg) -> bool:
+        """Rule 2. True when this method handled the message (held, or refused over the
+        ceiling); False when the ordinary admission path should take it.
+
+        The clip is against the CEILING, not today's pool: with the dynamic pool on, a prompt
+        the pool cannot hold yet is not too long -- the pool grows to it. Only a prompt past
+        the ceiling is genuinely refused, with the phrasing clients already match on.
+        """
+        c = self._kv_dynamic
+        if c is None or not c.enabled:
+            return False
+        page = self.config.page_size
+        ceiling = int(self.config.kv_ceiling_tokens) - page
+        input_len = len(msg.input_ids)
+        if input_len >= ceiling:
+            self.send_result([ErrorReplyMsg(
+                uid=msg.uid,
+                error=(f"prompt is too long: {input_len} tokens > {ceiling} maximum "
+                       f"(prompt + generation); shorten the prompt or increase the KV cache budget"),
+                code="context_length_exceeded",
+            )])
+            # Never admitted, so nothing downstream will release the raw picture tensors.
+            self._drop_raw_picture(msg)
+            return True
+        if msg.sampling_params.max_tokens > ceiling - input_len:
+            msg.sampling_params.max_tokens = ceiling - input_len
+            logger.warning_rank0(f"Adjust max_tokens to {ceiling - input_len} for request {msg.uid}.")
+        need_total = input_len + msg.sampling_params.max_tokens
+        pool_tokens = (self.engine.num_pages - 1) * page
+        # Non-mutating on purpose: match_req would look up parked prefixes and can restore one
+        # (allocating pages and a GDN slot), which an admission QUESTION must never do.
+        probe = self.cache_manager.probe_admission(
+            msg.input_ids, msg.sampling_params.max_tokens,
+            reserved=self.decode_manager.inflight_tokens + c.uncommitted_tokens,
+            cache_private=msg.mm_embeds is not None or msg.mm_pixel_values is not None,
+        )
+        verdict = c.decide_admission(
+            msg.uid, msg, need_total=need_total, need_now=probe.need_now, pool_tokens=pool_tokens,
+            fits_empty=probe.fits_empty, fits_now=probe.fits_now,
+        )
+        if verdict == "hold":
+            logger.info_rank0(
+                "KV pool holds request %d: need %d tokens (now %d), pool %d, %d held",
+                msg.uid, need_total, probe.need_now, pool_tokens, len(c.held),
+            )
+            self._send_kv_dynamic_status()
+            return True
+        # Admitted into the pending list but not yet charged a real reservation (that happens
+        # in the admission pass). Carry the estimate until then so the next arrival in the same
+        # drained batch cannot see the same room as free (rule 2, "Same-batch arrivals").
+        c.note_uncommitted(msg.uid, probe.need_now)
+        return False
+
+    def _running_need_tokens(self) -> int:
+        """The room every already-accepted request will want in an empty pool: the concurrent
+        growth target of rule 2 is sized so the held request runs BESIDE these, not after."""
+        running = sum(len(r.input_ids) + r.output_len for r in self.decode_manager.running_reqs)
+        pending = sum(p.input_len + p.output_len for p in self.prefill_manager.pending_list)
+        return running + pending
+
+    def _run_kv_dynamic_idle(self) -> None:
+        """Rule 2/4/8 at an idle safe point: escalate capacity-blocked requests, execute the
+        controller's one plan, then drain the held FIFO according to the outcome."""
+        c = self._kv_dynamic
+        if c is None or not c.enabled or self._pending_rebuild is not None:
+            # A manual rebuild or governor step already holds the one-operation-at-a-time slot
+            # (rule 9): yield and plan at the next idle point, after its geometry re-snapshot.
+            return
+        # Rule 2(b): a never-started request the admission pass could not seat. pop_capacity_blocked
+        # has already taken it out of the pending list, so the FIFO is now its only home.
+        for pending in self.prefill_manager.pop_capacity_blocked():
+            if pending.uid in self._abort_tombstones:
+                # Aborted between the admission pass that blocked it and this idle point (it
+                # was in the pending list when it was collected and is not now). Its terminal
+                # abort ack has already gone out, so holding and re-admitting it would emit
+                # tokens past the client's last reply -- the exact resurrection the tombstones
+                # exist to stop.
+                continue
+            c.escalate(pending.uid, pending, pending.input_len + pending.output_len)
+        plan = c.plan_idle(
+            current_pages=self.engine.num_pages, pool_budget_bytes=self.engine.pool_budget_bytes,
+            running_need_tokens=self._running_need_tokens(),
+        )
+        outcome = "ok"
+        if plan is not None:
+            request_id = c.next_operation_id()
+            detail = f"{plan.reason} -> {c.policy.usable_tokens(plan.target_pages)} tokens, {plan.target_slots} slots"
+            # Rule 9: the frontend opens its own maintenance record on this and closes it on the
+            # CacheRebuildResultMsg _execute_pending_operation always sends -- so every id begun
+            # here is closed exactly once, whatever the outcome. Never begin an id without
+            # executing the operation that replies to it.
+            self.send_result([MaintenanceBeginMsg(request_id=request_id, kind="auto-kv", detail=detail)])
+            self._pending_rebuild = CacheRebuildBackendMsg(
+                request_id=request_id, moe_cache_size=plan.target_slots, num_pages=plan.target_pages,
+            )
+            logger.info_rank0("KV pool %s: %d -> %d tokens, slots -> %d%s", plan.reason,
+                              (self.engine.num_pages - 1) * self.config.page_size,
+                              c.policy.usable_tokens(plan.target_pages), plan.target_slots,
+                              " (capped by the slot floor)" if plan.capped else "")
+            if plan.capped:
+                # Rule 3: the pool still grows as far as the slot floor funds; the held head is
+                # then admitted against THAT pool and the ordinary clip/refuse applies.
+                logger.warning_rank0("KV pool grow capped: slots at their floor %d", c.policy.slot_floor)
+            outcome = self._execute_pending_rebuild() or "ok"
+        if outcome == "failed":
+            # Rule 8: the engine is not known to be usable and the frontend latches failed.
+            # Admitting anything now would schedule work on a torn-down engine.
+            for held in c.disable("cache rebuild failed and could not be rolled back"):
+                self.send_result([ErrorReplyMsg(
+                    uid=held.uid, error="cache rebuild failed; server needs a restart", code="server_error",
+                )])
+            self._send_kv_dynamic_status()
+            return
+        # ok or rejected: admit the head (and any further held entries that fit as they are).
+        # On "rejected" the old engine is intact, so the head is admitted against the retained
+        # pool and _admit_user_msg's ordinary clip or refusal applies, exactly as today.
+        head = c.pop_held()
+        while head is not None:
+            if isinstance(head.msg, UserMsg):
+                self._admit_user_msg(head.msg)
+            else:  # an escalated PendingReq goes straight back to the pending list
+                self.prefill_manager.pending_list.append(head.msg)
+            if c.has_held() and c.plan_idle(
+                current_pages=self.engine.num_pages, pool_budget_bytes=self.engine.pool_budget_bytes,
+                running_need_tokens=self._running_need_tokens(),
+            ) is not None:
+                break  # the next one needs another rebuild: next idle point
+            head = c.pop_held()
+        self._send_kv_dynamic_status()
+
+    def _note_request_finished(self, reqs) -> None:
+        """Timer 1's clock. Called from every completion path -- the drain, the speculative
+        step and the abort -- because a stale timestamp after an MTP request would delay or
+        skip the shrink entirely."""
+        if reqs and self._kv_dynamic is not None:
+            self._kv_dynamic.on_request_finished()
+
+    def _send_kv_dynamic_status(self) -> None:
+        """Publish the /v1/cache/status block, but only on a change: this is called on every
+        hold, plan and external rebuild, and an unchanged dict on the reply socket is noise."""
+        c = self._kv_dynamic
+        if c is None:
+            return
+        status = c.status(current_pages=self.engine.num_pages, pool_budget_bytes=self.engine.pool_budget_bytes)
+        if status != self._kv_dynamic_last_status:
+            self.send_result([KVDynamicStatusMsg(status=status)])
+            self._kv_dynamic_last_status = status
+
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         self._idle_wait_logged = False
         if isinstance(msg, BatchBackendMsg):
@@ -808,63 +1149,23 @@ class Scheduler(SchedulerIOMixin):
                     "Dropping request %d because its abort arrived before admission", msg.uid
                 )
                 return
-            has_raw_picture = any(
-                value is not None
-                for value in (
-                    msg.mm_pixel_values,
-                    msg.mm_image_grid_thw,
-                    msg.mm_token_type_ids,
-                )
-            )
-            input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
-            max_output_len = max_seq_len - input_len
-            if max_output_len <= 0:
-                logger.warning_rank0(
-                    f"Input sequence length {input_len} exceeds {max_seq_len}, "
-                    f"request {msg.uid} is dropped."
-                )
-                # Tell the client instead of dropping silently — otherwise its wait_for_ack
-                # never sees a `finished` reply and hangs until the request times out.
-                self.send_result(
-                    [
-                        ErrorReplyMsg(
-                            uid=msg.uid,
-                            # "prompt is too long: N tokens > M" is the phrasing Claude Code and
-                            # OpenClaw match on; the Anthropic wire has no error code to read.
-                            error=(
-                                f"prompt is too long: {input_len} tokens > {max_seq_len} maximum "
-                                f"(prompt + generation); shorten the prompt or increase the KV "
-                                f"cache budget"
-                            ),
-                            # OpenAI's standard class for this, for clients that read a code.
-                            code="context_length_exceeded",
-                        )
-                    ]
-                )
-                if has_raw_picture:
-                    msg.mm_pixel_values = None
-                    msg.mm_image_grid_thw = None
-                    msg.mm_token_type_ids = None
-                return
-            if has_raw_picture:
-                try:
-                    self._prepare_multimodal_request(msg)
-                except Exception as exc:  # noqa: BLE001 - reject one request, keep serving
-                    logger.warning_rank0(
-                        "Picture processing failed for request %d: %s", msg.uid, exc
-                    )
-                    self.send_result(
-                        [ErrorReplyMsg(uid=msg.uid, error=f"could not encode picture: {exc}")]
-                    )
-                    return
-            if msg.sampling_params.max_tokens > max_output_len:
-                msg.sampling_params.max_tokens = max_output_len
-                logger.warning_rank0(
-                    f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
-                )
-            self.prefill_manager.add_one_req(msg)
+            # Rule 2: with the dynamic KV pool on, the clip and the fit are judged against
+            # the CEILING, not today's pool, and a request that needs more room than the pool
+            # holds is held here instead of being admitted into a pool that cannot take it.
+            # This runs before any picture work: _prepare_multimodal_request encodes the tower
+            # (hundreds of ms, ~856 MiB of mapped weights) and a request refused over the
+            # ceiling must never pay for it.
+            if not self._queue_for_kv_dynamic(msg):
+                self._admit_user_msg(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
+            # Rule 7: drop a held request from the FIFO (and its uncommitted charge) before
+            # the tombstone bookkeeping, so the drain barrier does not keep a cancelled
+            # request's growth target alive. getattr like the tombstones below: the abort
+            # tests drive this branch unbound with a SimpleNamespace self.
+            kv_dynamic = getattr(self, "_kv_dynamic", None)
+            if kv_dynamic is not None:
+                kv_dynamic.on_abort(msg.uid)
             tombstones = getattr(self, "_abort_tombstones", None)
             if tombstones is None:
                 tombstones = self._abort_tombstones = {}
@@ -893,6 +1194,10 @@ class Scheduler(SchedulerIOMixin):
                     req_to_free.aborted = True
                 else:
                     self._free_req_resources(req_to_free)
+                    # The card went quiet here just as surely as on a natural finish; without
+                    # this, a server whose last request was cancelled would never shrink.
+                    if kv_dynamic is not None:
+                        kv_dynamic.on_request_finished()
             # Always acknowledge the abort, even when the request already left the manager,
             # but NOT yet: overlap_loop still has to publish the prior forward's sampled reply.
             # _flush_abort_acks runs after _process_last_data, making this a true terminal
@@ -1194,8 +1499,13 @@ class Scheduler(SchedulerIOMixin):
             return True
         return not self.decode_manager.runnable
 
-    def _execute_pending_step(self, msg: CacheStepBackendMsg) -> None:
-        """Run a governor step at the safe point through rebuild_cache (not the engine directly)."""
+    def _execute_pending_step(self, msg: CacheStepBackendMsg) -> str:
+        """Run a governor step at the safe point through rebuild_cache (not the engine directly).
+
+        Returns the outcome ("ok" | "rejected" | "failed") on top of the wire reply, which is
+        unchanged: the dynamic KV controller has to act on the same three cases the frontend
+        latches on (spec rule 8) and cannot read them off the reply it does not receive.
+        """
         from freetoken.engine.engine import CacheRebuildRejected
 
         is_idle = not (self.prefill_manager.runnable or self.decode_manager.runnable)
@@ -1211,22 +1521,23 @@ class Scheduler(SchedulerIOMixin):
         except CacheRebuildRejected as e:
             logger.warning(f"cache step rejected: {e}")
             self._reply_step(msg.request_id, "rejected", error=str(e))
-            return
+            return "rejected"
         except Exception as e:  # noqa: BLE001
             if not getattr(self.engine, "rebuild_teardown_started", True):
                 logger.error(f"cache step failed before teardown: {e!r} — old cache intact")
                 self._reply_step(msg.request_id, "rejected", error=repr(e))
-                return
+                return "rejected"
             # No geometry rollback for a step (which pool it touched is inside step_memory);
             # the frontend latches failed on this status. Follow-up: roll a failed rung back.
             logger.error(f"cache step failed after teardown: {e!r} — latching failed")
             self._reply_step(msg.request_id, "failed", error=repr(e))
-            return
+            return "failed"
         if res.get("applied"):
             self._log_cache_geometry(f"Cache stepped ({res['applied']})")
         self._reply_step(msg.request_id, "ok", res)
+        return "ok"
 
-    def _execute_pending_rebuild(self) -> None:
+    def _execute_pending_rebuild(self) -> str:
         msg = self._pending_rebuild
         assert msg is not None
         self._pending_rebuild = None
@@ -1236,17 +1547,36 @@ class Scheduler(SchedulerIOMixin):
         self._note_maintenance_progress("executing", force=True)
         self.engine.maintenance_progress = self._engine_maintenance_progress
         try:
-            self._execute_pending_operation(msg)
+            outcome = self._execute_pending_operation(msg)
         finally:
             self.engine.maintenance_progress = None
             self._maintenance_request_id = None
+        # Rule 3: one authoritative byte budget. A rebuild the controller did NOT issue (a
+        # governor /v1/cache/step, a manual /v1/cache/rebuild) moves bytes in or out of the
+        # two pools, so the planner has to re-read the total or its next plan would hand the
+        # card back bytes the governor deliberately took. Only "ok" changed the geometry:
+        # "rejected" retains the old one and "failed" leaves it unknown (and the controller
+        # about to be disabled). Outside the finally so the maintenance hook is already gone.
+        if (
+            outcome == "ok"
+            and self._kv_dynamic is not None
+            and not str(msg.request_id).startswith("auto-kv:")
+        ):
+            self.engine.snapshot_pool_budget()
+            self._send_kv_dynamic_status()
+        return outcome
 
-    def _execute_pending_operation(self, msg) -> None:
+    def _execute_pending_operation(self, msg) -> str:
+        """Run one queued step or rebuild and report which of rule 8's three outcomes it hit.
+
+        The wire replies are unchanged; the return value is what the dynamic KV controller
+        acts on -- "ok"/"rejected" both leave a usable engine (admit the held FIFO against
+        whichever geometry survived), "failed" does not (error-reply and disable).
+        """
         from freetoken.engine.engine import CacheRebuildRejected
 
         if isinstance(msg, CacheStepBackendMsg):
-            self._execute_pending_step(msg)
-            return
+            return self._execute_pending_step(msg)
         requested = {
             "moe_cache_size": msg.moe_cache_size,
             "num_pages": msg.num_pages,
@@ -1268,21 +1598,21 @@ class Scheduler(SchedulerIOMixin):
             # Rejected before any destructive free — old cache intact, keep serving.
             logger.warning(f"cache rebuild rejected: {e}")
             self._reply_rebuild(msg.request_id, "rejected", error=str(e))
-            return
+            return "rejected"
         except Exception as e:  # noqa: BLE001
             if not getattr(self.engine, "rebuild_teardown_started", True):
                 # Failed before the destructive phase began: graphs and pools are untouched and
                 # the engine is still serving. A destructive rollback would only add risk.
                 logger.error(f"cache rebuild failed before teardown: {e!r} — old cache intact")
                 self._reply_rebuild(msg.request_id, "rejected", error=repr(e))
-                return
+                return "rejected"
             if self.config.tp_info.size > 1:
                 # A lone-rank failure cannot be rolled back symmetrically: rebuild_cache runs TP
                 # barriers, and ranks that succeeded will not re-enter them — a solo rollback
                 # would desync the group. Keep the latch-failed behavior for tp>1.
                 logger.error(f"cache rebuild failed: {e!r} — tp>1, latching failed")
                 self._reply_rebuild(msg.request_id, "failed", error=repr(e))
-                return
+                return "failed"
             # The destructive phase failed — typically a CUDA OOM while reallocating a pool or
             # recapturing graphs. The graphs/pools are already torn down, so the engine cannot
             # serve as-is. Rather than latch "failed" (which forces a full process restart),
@@ -1302,17 +1632,18 @@ class Scheduler(SchedulerIOMixin):
                     "failed",
                     error=f"{e!r}; rollback to the prior geometry also failed: {e2!r}",
                 )
-                return
+                return "failed"
             logger.warning("cache rebuild rolled back to the previous geometry — still serving")
             self._log_cache_geometry("Cache rolled back")
             self._reply_rebuild(
                 msg.request_id, "rejected", error=f"rebuild failed and was rolled back: {e!r}"
             )
-            return
+            return "rejected"
         # Outside the try: an ack/send failure after a fully-applied rebuild must not be
         # mistaken for a rebuild failure and roll back the geometry the engine now serves.
         self._log_cache_geometry("Cache rebuilt")
         self._reply_rebuild(msg.request_id, "ok")
+        return "ok"
 
     def _current_cache_geometry(self) -> dict:
         """The pools' current (serving) sizes as rebuild_cache kwargs — the rollback snapshot and
@@ -1875,6 +2206,7 @@ class Scheduler(SchedulerIOMixin):
                 self._free_req_resources(req)
             finished_now.add(req)
         self.finished_reqs = finished_now
+        self._note_request_finished(finished_now)
         self._ship_replies(batch, [msg], generated_tokens=emitted)
         # After the ship, so the span is the whole of what a cycle displaces from the loop --
         # the same thing the plain-step interval measures. The next cycle's `record` is what
