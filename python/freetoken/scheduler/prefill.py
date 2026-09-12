@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, Callable, List, Tuple
 
 import torch
 from freetoken import diag
@@ -48,6 +48,9 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
+    # Dynamic KV pool hooks (scheduler/kv_dynamic.py). Both None = today's behaviour.
+    on_reserved: Callable[[int], None] | None = None
+    capacity_blocked: List[PendingReq] = field(default_factory=list)
 
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
@@ -95,10 +98,14 @@ class PrefillAdder:
 
         if not admission_fits(need_now=estimated_len, reserved=self.reserved_size,
                               available=self.cache_manager.available_size, protect_tokens=0):
+            if req.chunked_req is None:
+                self.capacity_blocked.append(req)
             return None
         self.cache_manager.lock(handle)
         if not admission_fits(need_now=estimated_len, reserved=self.reserved_size,
                               available=self.cache_manager.available_size, protect_tokens=0):
+            if req.chunked_req is None:
+                self.capacity_blocked.append(req)
             return self.cache_manager.unlock(handle)
 
         # Second currency (hybrid GDN): reserve 1 live + 2 ping-pong state slots; evict tree
@@ -202,6 +209,8 @@ class PrefillAdder:
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
         self.reserved_size += remain_len + pending_req.output_len
+        if self.on_reserved is not None:
+            self.on_reserved(pending_req.uid)
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
@@ -278,6 +287,10 @@ class PrefillManager:
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
     rejected: List[Tuple[int, str]] = field(default_factory=list)
+    # Dynamic KV pool hooks (scheduler/kv_dynamic.py). Both None = today's behaviour.
+    on_reserved: Callable[[int], None] | None = None
+    on_capacity_blocked: Callable[[PendingReq], None] | None = None
+    _capacity_blocked: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
         pending = PendingReq(
@@ -324,6 +337,7 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            on_reserved=self.on_reserved,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
@@ -360,6 +374,11 @@ class PrefillManager:
                 remaining = self.pending_list[index:]
                 break  # We cannot add more requests
         self.pending_list = chunked_list + remaining
+        if self.on_capacity_blocked is not None and adder.capacity_blocked:
+            for pending in adder.capacity_blocked:
+                if pending in self.pending_list and pending not in self._capacity_blocked:
+                    self._capacity_blocked.append(pending)
+                    self.on_capacity_blocked(pending)
         if len(reqs) == 0:
             return None
         batch = Batch(reqs=reqs, phase="prefill")
@@ -371,6 +390,15 @@ class PrefillManager:
     def pop_rejections(self) -> List[Tuple[int, str]]:
         rejected, self.rejected = self.rejected, []
         return rejected
+
+    def pop_capacity_blocked(self) -> List[PendingReq]:
+        """Never-started requests refused for capacity this pass; removed from pending_list so
+        the dynamic controller can hold them (rule 2(b)). Empty unless a hook is installed."""
+        blocked, self._capacity_blocked = self._capacity_blocked, []
+        for pending in blocked:
+            if pending in self.pending_list:
+                self.pending_list.remove(pending)
+        return blocked
 
     def abort_req(self, uid: int) -> Req | None:
         for i, req in enumerate(self.pending_list):
