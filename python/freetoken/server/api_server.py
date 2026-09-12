@@ -191,10 +191,13 @@ def _open_maintenance(state: Any, request_id: str, kind: str, detail: str | None
 
 def _close_maintenance(state: Any, request_id: str, *, failed: bool) -> None:
     """Remove one record; reopen the gate only when nothing else is outstanding. A genuine
-    destructive failure latches ``failed`` whatever else is open (the engine may be torn down)."""
+    destructive failure latches ``failed`` whatever else is open (the engine may be torn down),
+    and clears every other record too: a recovery/restart must not find orphaned entries still
+    pinning the gate closed once it comes back up (2026-09-12 review round 1)."""
     state.maintenance_ops.pop(request_id, None)
     if failed or state.fatal_error is not None:
         state.maintenance_state = "failed"
+        state.maintenance_ops.clear()
         if hasattr(state, "rebuild_done"):
             state.rebuild_done.set()
         return
@@ -285,6 +288,13 @@ class FrontendManager:
     # sends for THAT operation (one per completed unit of work on or ahead of it), so "silent
     # but working" (a chunked prompt, a slow rebuild phase) is distinguishable from "stuck": the
     # clock restarts on each unit and only measures one silent unit.
+    # Contract: every id opened here, manual or automatic, is closed by exactly one
+    # CacheRebuildReply or CacheStepReply; a producer that begins an operation must reply for it
+    # on every path, including its own aborts. The scheduler runs automatic (dynamic-KV) and
+    # manual operations through the same _execute_pending_operation path, which replies via
+    # _reply_rebuild for every outcome (ok/rejected/failed), so an automatic id is never left
+    # dangling in the map under normal operation; _close_maintenance's failed-latch path also
+    # clears the whole map as a backstop against an orphaned record surviving a crash/recovery.
     maintenance_ops: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # Latest dynamic-KV-pool status snapshot (KVDynamicStatusReply), surfaced on
     # /v1/cache/status independent of the maintenance gate. None until the scheduler reports one
@@ -600,7 +610,24 @@ class FrontendManager:
 
     def _begin_maintenance(self, msg: MaintenanceBeginReply) -> None:
         """The scheduler started an operation on its own (dynamic KV pool). Same gate, own
-        record: see FrontendManager.maintenance_ops."""
+        record: see FrontendManager.maintenance_ops.
+
+        A fatal worker death (the watchdog) or a state outside serving/rebuilding OUTRANKS this:
+        a begin that raced a crash (e.g. a buffered message) must not resurrect a dead/loading/
+        stopping engine by flipping it back to "rebuilding" and clearing rebuild_done — the same
+        reason _resolve_rebuild leaves a fatal latch alone (2026-09-12 review round 1). Also
+        idempotent: a second begin for an id already open only refreshes its detail, so a
+        duplicate/retried begin can never reset that operation's clock or progress count."""
+        if self.fatal_error is not None or self.maintenance_state not in ("serving", "rebuilding"):
+            logger.warning(
+                f"ignoring maintenance begin {msg.kind} {msg.request_id}: "
+                f"state is {self.maintenance_state!r} (fatal_error={self.fatal_error!r})"
+            )
+            return
+        existing = self.maintenance_ops.get(msg.request_id)
+        if existing is not None:
+            existing["detail"] = msg.detail
+            return
         _open_maintenance(self, msg.request_id, msg.kind, msg.detail)
 
     def _note_kv_dynamic(self, msg: KVDynamicStatusReply) -> None:

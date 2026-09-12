@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import freetoken.server.api_server as api
 from freetoken.message import (
     CacheProgressReply, CacheRebuildReply, KVDynamicStatusReply, MaintenanceBeginReply,
 )
@@ -72,6 +73,35 @@ def test_failed_automatic_operation_latches_failed_even_with_others_open():
     m._begin_maintenance(MaintenanceBeginReply(request_id="auto-kv:i:2", kind="auto-kv"))
     m._resolve_rebuild(_rebuild_reply("auto-kv:i:2", status="failed"))
     assert m.maintenance_state == "failed" and m.rebuild_done.is_set()
+    # A failed latch clears every record, not just the one that failed: an orphaned record
+    # from some other (never-closed) automatic operation must not survive to pin the gate
+    # closed after a recovery/restart (2026-09-12 review round 1).
+    assert m.maintenance_ops == {}
+
+
+def test_begin_maintenance_does_not_resurrect_a_fatal_latch():
+    """A buffered MaintenanceBeginReply that raced a crash must not flip a fatally-latched
+    engine back to "rebuilding" and clear rebuild_done -- the same reason _resolve_rebuild
+    leaves a fatal latch alone (2026-09-12 review round 1, reproduced by the reviewer)."""
+    m = _manager(_Clock())
+    m.fatal_error = "dead"
+    m.maintenance_state = "failed"
+    m.rebuild_done.set()
+    m._begin_maintenance(MaintenanceBeginReply(request_id="auto-kv:i:6", kind="auto-kv"))
+    assert m.maintenance_state == "failed"
+    assert m.rebuild_done.is_set()
+    assert m.maintenance_ops == {}
+
+
+def test_begin_maintenance_is_idempotent_for_an_id_already_open():
+    m = _manager(_Clock())
+    m._begin_maintenance(MaintenanceBeginReply(request_id="auto-kv:i:7", kind="auto-kv", detail="grow"))
+    m._note_progress(CacheProgressReply(request_id="auto-kv:i:7", phase="rebuild:pools"))
+    m._begin_maintenance(MaintenanceBeginReply(request_id="auto-kv:i:7", kind="auto-kv", detail="grow more"))
+    # A duplicate/retried begin only refreshes detail -- it must not reset the clock or phase.
+    assert m.maintenance_ops["auto-kv:i:7"]["phase"] == "rebuild:pools"
+    assert m.maintenance_ops["auto-kv:i:7"]["detail"] == "grow more"
+    assert len(m.maintenance_ops) == 1
 
 
 def test_stale_reply_for_an_unknown_operation_changes_nothing():
@@ -95,3 +125,22 @@ def test_kv_dynamic_status_snapshot_is_kept_for_cache_status():
     m = _manager(_Clock())
     m._note_kv_dynamic(KVDynamicStatusReply(status={"enabled": True, "held": 1}))
     assert m.kv_dynamic_status == {"enabled": True, "held": 1}
+
+
+def test_cache_status_exposes_kv_dynamic_and_open_operations():
+    m = _manager(_Clock())
+    m._begin_maintenance(MaintenanceBeginReply(request_id="auto-kv:i:8", kind="auto-kv"))
+    m._note_kv_dynamic(KVDynamicStatusReply(status={"enabled": True, "held": 3}))
+
+    async def run():
+        prev = api._GLOBAL_STATE
+        api._GLOBAL_STATE = m
+        try:
+            m._create_listener_once = lambda: None
+            return await api.cache_status()
+        finally:
+            api._GLOBAL_STATE = prev
+
+    body = asyncio.run(run())
+    assert body["kv_dynamic"] == {"enabled": True, "held": 3}
+    assert body["maintenance"]["open_operations"] == ["auto-kv:i:8"]
