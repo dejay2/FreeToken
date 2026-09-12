@@ -217,3 +217,30 @@ def test_profile_update_rewrites_its_startup_file(tmp_path: Path) -> None:
     profile_path = tmp_path / "boot-profiles" / f"{created['id']}.ps1"
     assert BootFile(profile_path).load()["Port"] == 2024
     assert BootFile(profile_path).load()["ModelPath"] == r"D:\Models\Updated"
+
+
+def test_a_partial_update_does_not_reintroduce_dials_the_profile_never_set(tmp_path: Path) -> None:
+    boot = tmp_path / "boot-2020.ps1"
+    boot.write_text(render_boot_script(_qwen_settings(), title="Default"), encoding="utf-8")
+    manager = ProfilesManager(tmp_path / "boot-profiles.json", boot_file=boot)
+    created = manager.create("Plain", "saved", {"Port": 2023, "ModelPath": r"D:\Models\Plain"})
+    profile_path = tmp_path / "boot-profiles" / f"{created['id']}.ps1"
+
+    manager.update(created["id"], settings={"Port": 2024})
+
+    text = profile_path.read_text(encoding="utf-8")
+    assert "-Port 2024" in text
+    for flag in ("-KVDynamic", "-KVFloorTokens", "-KVStepTokens", "-KVShrinkIdleMin", "-KVParkTTLHours"):
+        assert flag not in text, f"{flag} was reintroduced by a Port-only update"
+
+    dynamic = manager.create(
+        "Dynamic", "saved",
+        {"Port": 2025, "ModelPath": r"D:\Models\Dynamic", "KVDynamic": True, "KVFloorTokens": 32768},
+    )
+    dynamic_path = tmp_path / "boot-profiles" / f"{dynamic['id']}.ps1"
+
+    manager.update(dynamic["id"], settings={"Port": 2026})
+
+    dynamic_text = dynamic_path.read_text(encoding="utf-8")
+    assert "-Port 2026" in dynamic_text
+    assert "-KVFloorTokens 32768" in dynamic_text

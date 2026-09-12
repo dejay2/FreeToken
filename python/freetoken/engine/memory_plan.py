@@ -740,6 +740,43 @@ def kv_ceiling_issue(
     }
 
 
+def _kv_ceiling_issue_for_geometry(
+    config,
+    *,
+    lru_slots: int,
+    overlap: bool,
+    num_experts: int,
+    cache_per_page: int,
+    page_tokens: int,
+    per_expert: int,
+) -> dict[str, Any] | None:
+    """The wiring between one resolved geometry and :func:`kv_ceiling_issue`.
+
+    Reads ``config.kv_dynamic`` / ``config.kv_floor_tokens`` / ``config.kv_ceiling_tokens``
+    (Task 8's ``EngineConfig`` fields) and returns ``None`` immediately when the pool isn't
+    dynamic or carries no ceiling -- kept separate from :func:`_scenario_geometry` so this one
+    small, config-shaped function is what a test calls, rather than the whole geometry solve.
+    ``slot_floor`` is ``2 * num_experts`` with prefill overlap on, else ``num_experts`` -- the
+    same floor ``lru_slots_after_owned_charge`` charges for the still-streaming layers elsewhere
+    in ``_scenario_geometry``.
+    """
+    if not bool(getattr(config, "kv_dynamic", False)):
+        return None
+    ceiling_tokens = int(getattr(config, "kv_ceiling_tokens", None) or 0)
+    if ceiling_tokens <= 0:
+        return None
+    slot_floor = 2 * int(num_experts) if overlap else int(num_experts)
+    return kv_ceiling_issue(
+        floor_tokens=int(getattr(config, "kv_floor_tokens", 0) or 0),
+        ceiling_tokens=ceiling_tokens,
+        lru_slots=int(lru_slots),
+        slot_floor=slot_floor,
+        cache_per_page=int(cache_per_page),
+        page_tokens=int(page_tokens),
+        per_expert_bytes=int(per_expert),
+    )
+
+
 def _scenario_geometry(
     config,
     *,
@@ -884,21 +921,17 @@ def _scenario_geometry(
             "usable_kv_tokens": int(usable_tokens),
             "prefill_overlap": bool(overlap),
         }
-        if bool(getattr(config, "kv_dynamic", False)):
-            ceiling_tokens = int(getattr(config, "kv_ceiling_tokens", None) or 0)
-            if ceiling_tokens > 0:
-                slot_floor = 2 * num_experts if overlap else num_experts
-                issue = kv_ceiling_issue(
-                    floor_tokens=int(getattr(config, "kv_floor_tokens", 0) or 0),
-                    ceiling_tokens=ceiling_tokens,
-                    lru_slots=int(lru_slots),
-                    slot_floor=slot_floor,
-                    cache_per_page=int(cache_per_page),
-                    page_tokens=int(page_tokens),
-                    per_expert_bytes=int(per_expert),
-                )
-                if issue is not None:
-                    issues.append(issue)
+        issue = _kv_ceiling_issue_for_geometry(
+            config,
+            lru_slots=lru_slots,
+            overlap=overlap,
+            num_experts=num_experts,
+            cache_per_page=cache_per_page,
+            page_tokens=page_tokens,
+            per_expert=per_expert,
+        )
+        if issue is not None:
+            issues.append(issue)
         # Auto slots reserve their solved pages inside the cache policy budget. Explicit slots
         # check only the requested reserve floor; their later residual KV solve does not set
         # aside post-cache reserve/headroom again. Price that actual pool only in physical need.

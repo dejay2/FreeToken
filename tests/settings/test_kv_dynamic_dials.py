@@ -30,6 +30,15 @@ def test_validation_refuses_a_floor_off_the_page_grid():
     assert any(e["field"] == "KVFloorTokens" and "multiple of 64" in e["message"] for e in errors)
 
 
+def test_validation_rechecks_the_pair_when_only_kv_dynamic_is_flipped_on():
+    # A patch that only turns KVDynamic on (no KVFloorTokens/KVCacheTokens of its own) must
+    # still be checked against whatever floor/ceiling the boot file already holds: flipping the
+    # pool on activates that stored pair, it does not introduce a fresh one.
+    context = {"KVFloorTokens": 300_000, "KVCacheTokens": 262_208, "KVDynamic": False}
+    errors = d.validate_settings({"KVDynamic": True}, context=context)
+    assert any(e["field"] == "KVFloorTokens" for e in errors)
+
+
 def test_launch_maps_the_dynamic_pool_and_the_ttl():
     plan = _plan({
         "KVDynamic": True, "KVFloorTokens": 65_536, "KVStepTokens": 32_768, "KVShrinkIdleMin": 10,
@@ -63,3 +72,28 @@ def test_planner_warns_when_the_ceiling_cannot_be_reached():
     assert issue["code"] == "kv_ceiling_unreachable" and "1024" in issue["message"]
     assert kv_ceiling_issue(floor_tokens=65_536, ceiling_tokens=262_144, lru_slots=7200, slot_floor=1024,
                             cache_per_page=KV_PAGE, page_tokens=64, per_expert_bytes=SLOT) is None
+
+
+def test_planner_geometry_wiring_appends_the_ceiling_issue_only_when_dynamic():
+    """The wiring between one resolved geometry and kv_ceiling_issue (memory_plan.py, inside
+    _scenario_geometry's try block, right after the geometry dict is assembled) -- exercised
+    through the small function that does that wiring, not the whole geometry solve, using the
+    same byte constants as the pure-helper test above (num_experts=512, overlap on -> slot
+    floor 1024)."""
+    from types import SimpleNamespace
+
+    from freetoken.engine.memory_plan import _kv_ceiling_issue_for_geometry
+
+    KV_PAGE, SLOT = 13_248 * 64, 2_772_480
+    dynamic_config = SimpleNamespace(kv_dynamic=True, kv_floor_tokens=65_536, kv_ceiling_tokens=262_144)
+    issue = _kv_ceiling_issue_for_geometry(
+        dynamic_config, lru_slots=1524, overlap=True, num_experts=512,
+        cache_per_page=KV_PAGE, page_tokens=64, per_expert=SLOT,
+    )
+    assert issue is not None and issue["code"] == "kv_ceiling_unreachable" and issue["scope"] == "both"
+
+    static_config = SimpleNamespace(kv_dynamic=False, kv_floor_tokens=65_536, kv_ceiling_tokens=262_144)
+    assert _kv_ceiling_issue_for_geometry(
+        static_config, lru_slots=1524, overlap=True, num_experts=512,
+        cache_per_page=KV_PAGE, page_tokens=64, per_expert=SLOT,
+    ) is None

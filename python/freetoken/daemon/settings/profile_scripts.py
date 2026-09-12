@@ -85,8 +85,14 @@ def render_boot_script(
         dial = DIAL_BY_NAME.get(name)
         if dial is None:
             continue
-        if dial.source == "helper" and name not in settings:
-            # Older profiles omit helper-only knobs until a page Save supplies them.
+        if name not in settings:
+            # A dial the caller's settings snapshot never mentions is left out of the
+            # rendered launcher line entirely, not padded with today's dial default: a
+            # profile that never opted into a knob (e.g. the dynamic KV pool dials) must
+            # not start carrying that knob's default the next time it is regenerated from
+            # a partial update. Previously this leniency applied only to helper-only knobs;
+            # widened to every dial after a profile-update review found a Port-only save
+            # baking KVDynamic/KVFloorTokens/... defaults into an otherwise plain profile.
             continue
         value = _setting(settings, name)
         if dial.control == "toggle":

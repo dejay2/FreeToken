@@ -1249,7 +1249,10 @@ def _kv_dynamic_pool_errors(settings: dict[str, Any], context: dict[str, Any] | 
     errors: list[dict[str, Any]] = []
     if not _kv_dynamic_enabled(settings, context):
         return errors
-    if settings.keys() & {"KVFloorTokens", "KVCacheTokens"}:
+    # "KVDynamic" itself counts as touching the pair: flipping the pool on activates whatever
+    # floor/ceiling the boot file already holds, so a patch of exactly {"KVDynamic": True} must
+    # still be checked against them, not just a patch that names KVFloorTokens/KVCacheTokens.
+    if settings.keys() & {"KVFloorTokens", "KVCacheTokens", "KVDynamic"}:
         floor = _read_setting_number(settings, context, "KVFloorTokens")
         ceiling = _read_setting_number(settings, context, "KVCacheTokens")
         if floor is not None and ceiling is not None and ceiling > 0 and floor > ceiling:
