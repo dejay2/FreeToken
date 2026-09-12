@@ -15,7 +15,10 @@ budget (external review of 702543b, 2026-09-12).
 
 from __future__ import annotations
 
+import time
+from collections import deque
 from dataclasses import dataclass
+from typing import Callable, Deque
 
 MIN_STEP_TOKENS = 8_192
 
@@ -124,3 +127,176 @@ class KVDynamicPolicy:
             capped=False,
             reason="shrink",
         )
+
+
+@dataclass
+class HeldRequest:
+    uid: int
+    msg: object
+    need_total: int
+    held_at: float
+
+
+class KVDynamicController:
+    """Decides when the scheduler holds a request for growth and when it shrinks (rules 2, 4, 8).
+
+    The scheduler owns every GPU action; this object only keeps the held FIFO, the same-batch
+    ``uncommitted`` charges, the Timer 1 clock and the operation counter. Torch-free.
+    """
+
+    def __init__(
+        self,
+        policy: KVDynamicPolicy,
+        *,
+        shrink_idle_s: int,
+        instance_id: str,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if shrink_idle_s <= 0:
+            raise ValueError("shrink_idle_s must be positive")
+        self.policy = policy
+        self.shrink_idle_s = int(shrink_idle_s)
+        self.instance_id = str(instance_id)
+        self._clock = clock
+        self.enabled = True
+        self.disabled_reason: str | None = None
+        self.held: Deque[HeldRequest] = deque()
+        self._uncommitted: dict[int, int] = {}
+        self.last_request_finished: float | None = None
+        self._seq = 0
+        self.last_plan: dict | None = None
+
+    # ---- admission (rule 2) ------------------------------------------------------------
+    def decide_admission(
+        self, uid: int, msg: object, *, need_total: int, need_now: int, pool_tokens: int,
+        fits_empty: bool, fits_now: bool,
+    ) -> str:
+        if not self.enabled:
+            return "admit"
+        ceiling_tokens = self.policy.usable_tokens(self.policy.ceiling_pages)
+        if self.held:
+            # Drain barrier: once anyone waits for growth, later arrivals queue behind it so a
+            # stream of small requests can never keep the scheduler busy and starve the big one.
+            self._hold(uid, msg, need_total)
+            return "hold"
+        if need_total > pool_tokens:
+            self._hold(uid, msg, need_total)
+            return "hold"
+        if fits_empty and not fits_now and pool_tokens < ceiling_tokens:
+            # It fits an empty pool but other requests hold the room: wait for them once, then
+            # grow so the pair runs side by side next time.
+            self._hold(uid, msg, need_total)
+            return "hold"
+        return "admit"
+
+    def _hold(self, uid: int, msg: object, need_total: int) -> None:
+        self.held.append(HeldRequest(uid=uid, msg=msg, need_total=need_total, held_at=self._clock()))
+
+    def escalate(self, uid: int, msg: object, need_total: int) -> None:
+        """Rule 2(b): a never-started pending request the prefill manager could not seat."""
+        if self.enabled and all(h.uid != uid for h in self.held):
+            self._hold(uid, msg, need_total)
+
+    # ---- same-batch charging (rule 2, "Same-batch arrivals") ----------------------------
+    def note_uncommitted(self, uid: int, need_now: int) -> None:
+        self._uncommitted[uid] = int(need_now)
+
+    def note_reserved(self, uid: int) -> None:
+        self._uncommitted.pop(uid, None)
+
+    @property
+    def uncommitted_tokens(self) -> int:
+        return sum(self._uncommitted.values())
+
+    def on_abort(self, uid: int) -> None:
+        self._uncommitted.pop(uid, None)
+        self.held = deque(h for h in self.held if h.uid != uid)
+
+    # ---- lifecycle -----------------------------------------------------------------------
+    def on_request_finished(self, now: float | None = None) -> None:
+        self.last_request_finished = self._clock() if now is None else now
+
+    def has_held(self) -> bool:
+        return bool(self.held)
+
+    def pop_held(self) -> HeldRequest | None:
+        return self.held.popleft() if self.held else None
+
+    def plan_idle(
+        self, *, current_pages: int, pool_budget_bytes: int, running_need_tokens: int,
+        now: float | None = None,
+    ) -> KVPlan | None:
+        """The one rebuild (if any) to run at this idle point: the held head's grow first,
+        else Timer 1's shrink. A held grow always wins over an overdue shrink so an arrival
+        after a quiet spell costs one rebuild, never two."""
+        if not self.enabled:
+            return None
+        if self.held:
+            head = self.held[0]
+            reason = "grow-concurrent" if running_need_tokens else "grow"
+            plan = self.policy.plan_grow(
+                current_pages=current_pages, pool_budget_bytes=pool_budget_bytes,
+                need_tokens=head.need_total, running_need_tokens=running_need_tokens, reason=reason,
+            )
+            self._remember(plan)
+            return plan
+        now = self._clock() if now is None else now
+        if (
+            self.last_request_finished is not None
+            and now - self.last_request_finished >= self.shrink_idle_s
+        ):
+            plan = self.policy.plan_shrink(current_pages=current_pages, pool_budget_bytes=pool_budget_bytes)
+            self._remember(plan)
+            return plan
+        return None
+
+    def _remember(self, plan: KVPlan | None) -> None:
+        if plan is not None:
+            self.last_plan = {
+                "reason": plan.reason,
+                "target_tokens": self.policy.usable_tokens(plan.target_pages),
+                "target_slots": plan.target_slots,
+                "capped": plan.capped,
+                "at": self._clock(),
+            }
+
+    def next_deadline_ms(self, *, current_pages: int, now: float | None = None) -> int | None:
+        """Milliseconds until Timer 1 is due, or None when no shrink can be pending."""
+        if not self.enabled or self.last_request_finished is None:
+            return None
+        if current_pages <= self.policy.floor_pages:
+            return None
+        now = self._clock() if now is None else now
+        remaining = self.shrink_idle_s - (now - self.last_request_finished)
+        return max(1, int(remaining * 1000 + 0.999))
+
+    def next_operation_id(self) -> str:
+        self._seq += 1
+        return f"auto-kv:{self.instance_id}:{self._seq}"
+
+    def disable(self, reason: str) -> list[HeldRequest]:
+        """Rule 8 ``failed``: stop planning for the life of the process and hand back the
+        held requests so the scheduler can error-reply them."""
+        self.enabled = False
+        self.disabled_reason = reason
+        held = list(self.held)
+        self.held.clear()
+        self._uncommitted.clear()
+        return held
+
+    def status(self, *, current_pages: int, pool_budget_bytes: int) -> dict:
+        deadline = self.next_deadline_ms(current_pages=current_pages)
+        return {
+            "enabled": self.enabled,
+            "disabled_reason": self.disabled_reason,
+            "floor_tokens": self.policy.usable_tokens(self.policy.floor_pages),
+            "ceiling_tokens": self.policy.usable_tokens(self.policy.ceiling_pages),
+            "step_tokens": self.policy.step_pages * self.policy.page_size,
+            "pool_tokens": self.policy.usable_tokens(current_pages),
+            "pool_budget_bytes": int(pool_budget_bytes),
+            "slots_at_floor": self.policy.slots_for_pages(pool_budget_bytes, self.policy.floor_pages),
+            "held": len(self.held),
+            "uncommitted_tokens": self.uncommitted_tokens,
+            "shrink_in_s": None if deadline is None else round(deadline / 1000, 1),
+            "last_plan": self.last_plan,
+        }
