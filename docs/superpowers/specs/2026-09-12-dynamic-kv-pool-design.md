@@ -1,6 +1,6 @@
 # Dynamic KV pool: grow the conversation memory on demand, shrink it back on a timer
 
-Date: 2026-09-12. Status: approved design (Jay), written by the Fable lead; revised the same day after an external review of commit 8262e14 (seven required changes, all verified against the code and applied below). Target: Qwen3.8-Flash-Next-NVFP4 in the `vllm` WSL distro on the RTX 5090, branch `mtp-upstream-merge`. Linux/WSL launch only; the old Windows launcher is out of scope.
+Date: 2026-09-12. Status: approved design (Jay), written by the Fable lead; revised the same day after two external review rounds (commit 8262e14: seven required changes; commit 702543b: four more), each verified against the code before being applied. Target: Qwen3.8-Flash-Next-NVFP4 in the `vllm` WSL distro on the RTX 5090, branch `mtp-upstream-merge`. Linux/WSL launch only; the old Windows launcher is out of scope.
 
 ## Goal
 
@@ -66,12 +66,22 @@ running decode, no chunked continuation, no held request being admitted.
    - `need_total = len(input_ids) + max_tokens`: the room the request needs in an **empty** pool.
      This sizes a rebuilt pool (a rebuild wipes the tree; the RAM restore re-allocates the whole
      prefix), so it is the right figure for a growth target.
-   - `need_now = extend_len + max_tokens` with `extend_len = len(input_ids) - cached_len` from a
-     read-only `cache_manager.match_req` (no lock): the extra room the request needs **right now**
-     given prefixes already resident. This mirrors `PrefillManager`'s own `estimated_len`
-     (`prefill.py:78-79`) so the controller never disagrees with the admission path about whether a
-     request fits alongside running work. A request sharing a large locked prefix must not trigger a
-     grow that the existing path would have admitted.
+   - `need_now = extend_len + max_tokens` with `extend_len = len(input_ids) - resident_cached_len`:
+     the extra room the request needs **right now** given prefixes already resident on the card.
+     `match_req` must NOT be used for this: it looks up parked prefixes and can call
+     `_restore_parked`, which allocates pages and a GDN slot and copies data back
+     (`scheduler/cache.py:114-205`), so it is a mutating operation whatever locking is skipped.
+     Instead a genuinely non-mutating `CacheManager.probe_admission(input_ids, output_len)` walks
+     the radix tree only (no park lookup, no restore, no lock) and returns
+     `(need_now, to_protect, fits_empty, fits_now)`, where `to_protect` is the page count of the
+     matched prefix that is currently evictable and would become locked on real admission. The
+     real path checks capacity before and after `lock` (`prefill.py:96-99`) precisely because
+     locking removes those pages from `available_size`; the probe reproduces the post-lock answer
+     as `need_now + reserved_size <= available_size - to_protect`. A parked-but-not-resident prefix
+     counts as not cached (its restore would allocate the whole prefix again). Both the probe and
+     `_try_admit` call one pure function `admission_fits(need_now, reserved, available, to_protect)`
+     so there is a single admission formula. A request sharing a large locked prefix must not
+     trigger a grow that the existing path would have admitted.
    Then, in order:
    - If the held FIFO is non-empty: **join it** (arrival order). This is the drain barrier: once
      any request waits for growth, later arrivals queue behind it instead of overtaking it, the
@@ -92,33 +102,34 @@ running decode, no chunked continuation, no held request being admitted.
    arrival. Latency trade-off, stated plainly: a request that today runs alongside another in the
    fixed 262k pool may, while the dynamic pool is small, have to wait behind it once before the
    pool grows. The live run logs every hold with its duration.
-3. **Funding.** Slot delta for a page delta is byte-neutral. Define
-   `slot_equiv(pages) = ceil(pages * kv_bytes_per_page / slot_bytes)` and the invariant
-   `slot_baseline = current_slots + slot_equiv(current_pages - floor_pages)`: the slots the card
-   would hold with the pool at the floor. The authoritative invariant is the **floor budget**:
-   for every geometry the controller produces,
-   `slots * slot_bytes + (pages - floor_pages) * kv_bytes_per_page <= slot_baseline * slot_bytes`.
-   Byte-neutrality holds against that budget, not per transition: because `slot_equiv` rounds each
-   cumulative distance from the floor up to whole slots, one step can release a slot fewer than its
-   bytes (32,768 tokens = 156.6 slots; 131,072 -> 163,840 releases 156 and the resident total rises
-   by about 1.5 MiB, still inside the budget). The rounding slack is bounded by one slot
-   (2.77 MB) and does not accumulate. The policy test asserts the floor-budget inequality on every
-   reachable geometry and that no shrink ever leaves `slots > slot_baseline`; it does not assert
-   `bytes_before >= bytes_after` per step. A plan for `target_pages` sets
-   `target_slots = max(slot_floor, slot_baseline - slot_equiv(target_pages - floor_pages))`, where
-   `slot_floor` is `2 * num_experts` with prefill overlap, else `num_experts` (the floor
-   `step_memory` uses). If the byte-neutral target would go below `slot_floor`, the pool grows only
-   as far as `slot_floor` funds (`capped=True` in the plan, one warning log line) and the request
-   is admitted against that pool: the ordinary admission path then clips or refuses as it does
-   today. `slot_baseline` is recomputed from the live geometry after every rebuild the controller
-   did not issue (a governor `/v1/cache/step`, a manual `/v1/cache/rebuild`) and asserted unchanged
-   after its own, so a governor slot step (-512) lowers the baseline by 512, a governor KV shrink
-   to the floor with slots untouched lowers it by the KV bytes it freed, and a later grow re-funds
-   from slots instead of asking the card for the cushion back. The governor stays the authority on
-   the total; the controller only moves bytes between the two pools.
+3. **Funding.** One authoritative byte budget, owned by the engine and read by both the planner
+   and the validator, so they can never disagree:
+   `pool_budget_bytes = moe_slots * slot_bytes + num_pages * kv_bytes_per_page`, snapshotted
+   after boot and re-snapshotted after every rebuild the controller did not issue (a governor
+   `/v1/cache/step`, a manual `/v1/cache/rebuild`). A governor slot step (-512) lowers it by 512
+   slots' bytes; a governor KV shrink to the floor with slots untouched lowers it by the KV bytes
+   it freed; a later grow is then funded from slots, never by asking the card for the cushion
+   back. The governor stays the authority on the total; the controller only moves bytes between
+   the two pools inside it.
+   A plan for `target_pages` sets
+   `target_slots = max(slot_floor, (pool_budget_bytes - target_pages * kv_bytes_per_page) // slot_bytes)`,
+   where `slot_floor` is `2 * num_experts` with prefill overlap, else `num_experts` (the floor
+   `step_memory` uses). Floor division means every geometry the controller produces satisfies
+   `target_slots * slot_bytes + target_pages * kv_bytes_per_page <= pool_budget_bytes` exactly,
+   with unused slack below one slot (2.77 MB) that never accumulates. Byte-neutrality is defined
+   against this budget, not per transition: one 32,768-token step is 156.6 slots, so a grow that
+   releases 156 slots leaves the resident total about 1.5 MiB higher than before while still inside
+   the budget, and a shrink back to the floor can likewise land a few hundred KiB above the
+   pre-grow total. The policy test asserts the budget inequality on every reachable geometry
+   (all page-aligned pools from floor to ceiling) and that `target_slots` is monotone
+   non-increasing in `target_pages`; it does not assert `bytes_before >= bytes_after` per step.
+   `slot_baseline` in the rest of this document means `target_slots(floor_pages)`.
+   If the budget cannot fund `target_pages` above `slot_floor`, the pool grows only as far as
+   `slot_floor` funds (`capped=True`, one warning log line) and the request is admitted against
+   that pool: the ordinary admission path then clips or refuses as it does today.
 4. **Timer 1: shrink.** When idle and `now - last_request_finished >= shrink_idle_s` and
    `pool > floor`: `prepare_rebuild` (drain pending parks, park every eligible prefix
-   synchronously), then rebuild to `floor_pages` with `slots = slot_baseline`. Prefixes shorter than
+   synchronously), then rebuild to `floor_pages` with `slots = slots_for_pages(floor_pages)`. Prefixes shorter than
    `--kv-park-min-tokens` are lost and re-read; they are cheap. The timer is checked in
    `run_when_idle`, which the I/O mixin calls on every idle poll timeout (`io.py:_wait_from_queue`);
    `idle_poll_timeout_ms` returns `min(next_park_delay_ms, next_park_expiry_ms, time to the next
@@ -133,14 +144,21 @@ running decode, no chunked continuation, no held request being admitted.
    `run_when_idle`) sweeps entries whose family `max(last_used_ns)` is older than `ttl_s` and
    evicts the family with the existing eviction path (`_evict_to_fit`'s family logic), releasing
    pinned RAM. Applies to both `ram` and `ssd` modes; `0` disables. Independent of the dynamic
-   pool switch, including its wake-up: `ParkStore.next_expiry_ms(now_ns)` (oldest family's
-   `last_used_ns + ttl` minus now, `None` when empty or `ttl_s == 0`) is folded into
-   `CacheManager.next_park_delay_ms`, so an idle scheduler with everything already parked still
-   wakes to expire it. Fake-clock test: no incoming messages, dynamic pool on and off, expiry fires.
+   pool switch, including its wake-up: `ParkStore.next_expiry_delay_ms() -> int | None`
+   (oldest family's `last_used_ns + ttl` minus `time.time_ns()`, clamped at 0; `None` when empty
+   or `ttl_s == 0`) is folded into `CacheManager.next_park_delay_ms`, so an idle scheduler with
+   everything already parked still wakes to expire it. Clock contract, stated because the two
+   sides differ today: `ParkedEntry.last_used_ns` and the SSD index use the wall clock
+   (`time.time_ns()`, `st_mtime_ns`), while `park_idle` and `next_park_delay_ms` take
+   `time.monotonic_ns()`. The store therefore does all age arithmetic against its own wall clock
+   and hands the scheduler a **relative** delay; the scheduler never passes its monotonic `now_ns`
+   into the store. Test with two fake clocks whose origins differ by years: a single fake clock
+   starting at zero would hide the bug. Cases: no incoming messages, dynamic pool on and off,
+   expiry fires after 5 h and not after 4 h.
 6. **Governor interplay.** With the dynamic pool on, `step_memory`'s KV rung changes meaning:
    VRAM down, rung 3, idle-only: shrink to `floor_pages` (not `-25 % of initial`), slots
    unchanged: the freed bytes are the cushion the governor asked for, and the controller's
-   recomputed `slot_baseline` drops by the same bytes so the next grow is funded from slots.
+   re-snapshotted `pool_budget_bytes` drops by the same bytes so the next grow is funded from slots.
    VRAM up: the KV rung is a no-op (`step_memory_noop` reports it as exhausted; the controller
    grows on demand). `_initial_num_pages` is set to `floor_pages` so the existing "KV restore
    pending" logic in `step_memory_noop` never fires.
@@ -169,11 +187,23 @@ running decode, no chunked continuation, no held request being admitted.
    an automatic rebuild; the frontend opens the operation through the same `_open_maintenance`
    path, receives the existing progress messages, and closes it on the `CacheRebuildReply` it
    already handles, so `new_user` waits on `rebuild_done` exactly as for a manual rebuild.
-   Coexistence: the scheduler executes one maintenance operation at a time from `_pending_rebuild`;
-   if a manual rebuild or governor step is already queued when the controller wants to plan, the
-   controller yields (plans on the next idle point, after `note_external_geometry`); if the
-   controller's rebuild is executing when a step arrives, the step queues behind it as today.
-   `/v1/cache/status` reports the open operation's id either way.
+   Ownership: today the frontend keeps ONE record, `maintenance_op`, written by `_open_maintenance`
+   at dispatch time, before the message reaches the scheduler (`api_server.py:167-185, 912, 1033`),
+   and cleared by the completion handlers. Reusing it as-is races: the frontend opens manual
+   operation M and sends it; the scheduler starts automatic A before it has received M; `Begin(A)`
+   overwrites M's record; A completes and the gate reopens with M still outstanding and its
+   progress ignored. Required: `maintenance_ops: dict[request_id, record]`. A manual dispatch adds
+   its record at dispatch; an automatic `Begin` adds its own; each completion removes only its own
+   id; `maintenance_state` is `rebuilding` while the dict is non-empty and `rebuild_done` is set
+   only when it empties; `_note_progress` looks the operation up by id; the maintenance watchdog
+   times the oldest record. Automatic ids are unique, not descriptive:
+   `auto-kv:{instance_id}:{seq}` with a scheduler-side counter, and the reason and target go in
+   `detail`. Scheduler side: one operation executes at a time from `_pending_rebuild`; if a manual
+   rebuild or governor step is already queued when the controller wants to plan, the controller
+   yields (plans on the next idle point, after `note_external_geometry`); a step arriving while the
+   controller's rebuild executes queues behind it as today. Regression test: dispatch a manual
+   rebuild, delay its delivery to the scheduler, let an automatic begin and completion arrive, and
+   assert the frontend still reports `rebuilding` with M outstanding and later resolves M normally.
 
 ### Worked example (the daily boot, floor 65,536, ceiling 262,208, step 32,768)
 
@@ -184,7 +214,7 @@ running decode, no chunked continuation, no held request being admitted.
 | Claude Code A, 60k prompt | need_total 92k > pool, idle | rebuild to 98,304, slots -157, admit; about 1 s |
 | A's turn at 95k prompt | need 127k > 98,304, idle between turns | A's 95k already parked (idle 0 ms); rebuild to 131,072; A restores from RAM (about 1.5 s) and reads 5k new tokens |
 | B arrives, 40k, while A decodes at 110k | need_now 72k (no shared prefix) fits empty pool, not available; pool < ceiling | B held with target round_up(142k + 72k + 1) = 229,376; when A's turn ends: rebuild, admit B; A's next turn fits alongside. Small requests arriving meanwhile queue behind B. |
-| Both stop 12:30; 12:40 | Timer 1 | A and B in RAM (about 2.7 GiB of 8); rebuild to 65,536; slots back to baseline; the wake-up comes from the idle poll deadline, not from a new message |
+| Both stop 12:30; 12:40 | Timer 1 | A and B in RAM (about 2.7 GiB of 8); rebuild to 65,536; slots back to about 7,200; the wake-up comes from the idle poll deadline, not from a new message |
 | A resumes at 14:00, 135k | need 167k > pool | rebuild to 196,608, restore 130k from RAM, first token in about 10 s |
 | 300k prompt | need > ceiling, prompt > ceiling | refused `prompt is too long`, unchanged |
 | 240k prompt | need 272k > ceiling | pool grows to the ceiling, max_tokens clipped to 22k |
@@ -199,14 +229,15 @@ running decode, no chunked continuation, no held request being admitted.
 class KVDynamicPolicy:
     floor_pages: int; ceiling_pages: int; step_pages: int
     page_size: int; kv_bytes_per_page: int; slot_bytes: int; slot_floor: int
+    # pool_budget_bytes is passed per call (it changes with external rebuilds), not stored here
 
 @dataclass(frozen=True)
 class KVPlan:
     target_pages: int; target_slots: int; capped: bool; reason: str  # "grow" | "grow-concurrent" | "shrink"
 
-def slots_for_pages(policy, slot_baseline, pages) -> int
-def plan_grow(policy, *, current_pages, slot_baseline, need_tokens, running_need_tokens=0) -> KVPlan | None
-def plan_shrink(policy, *, current_pages, slot_baseline) -> KVPlan | None
+def slots_for_pages(policy, pool_budget_bytes, pages) -> int
+def plan_grow(policy, *, current_pages, pool_budget_bytes, need_tokens, running_need_tokens=0) -> KVPlan | None
+def plan_shrink(policy, *, current_pages, pool_budget_bytes) -> KVPlan | None
 ```
 
 `__post_init__` validates every field positive, `floor_pages <= ceiling_pages`,
@@ -214,22 +245,22 @@ def plan_shrink(policy, *, current_pages, slot_baseline) -> KVPlan | None
 `need_tokens` (or the concurrent sum) or is at the ceiling. The step rounding follows PR #300: at
 least one step, and the `+1` token of breathing room when `need` lands exactly on a rung. Tests:
 `tests/scheduler/test_kv_dynamic_policy.py`, table-driven, including the capped case, the ceiling
-clamp, the concurrent target, and byte-neutrality (`slots_before * slot_bytes + pages_before *
-kv_bytes_per_page >= slots_after * slot_bytes + pages_after * kv_bytes_per_page` on every grow).
+clamp, the concurrent target, and the budget inequality of rule 3 on every page-aligned pool from floor to ceiling (per-step
+byte monotonicity is deliberately not asserted; see rule 3).
 
 ### Scheduler (`scheduler/scheduler.py`)
 
 - `self._kv_dynamic: KVDynamicController | None`, built in `__init__` when
   `config.kv_dynamic` is true, from `type(engine.kv_cache).kv_cost(config)[0]` (bytes per page),
-  `expert_bytes_per_slot(moe.bank_sources, owned)`, `engine.moe_offload_cache.cache_size` as
-  `slot_baseline`, the slot floor from the same expression `step_memory` uses, and the three dials.
+  `expert_bytes_per_slot(moe.bank_sources, owned)`, `engine.pool_budget_bytes`, the slot floor from the same expression `step_memory` uses, and the three dials.
   Refuses (ValueError at boot) without an offload MoE cache, without `supports_runtime_rebuild`,
   and on DSV4 (owned KV tiers). TP > 1 is refused for this batch.
 - `KVDynamicController` (same module as the policy, or a sibling; no torch import) holds the held
-  FIFO, `last_request_finished`, `slot_baseline`, and a `pending_plan`. Methods:
+  FIFO, `last_request_finished`, the last-read `pool_budget_bytes`, an operation sequence counter,
+  and a `pending_plan`. Methods:
   `on_admission(msg, need, pool_tokens, available_tokens, reserved_tokens, running_need) -> "admit" | "held"`,
   `on_idle(now) -> KVPlan | None` (held head first, then Timer 1), `on_request_finished(now)`,
-  `note_external_geometry(slots, pages)` (recomputes `slot_baseline`), `on_abort(uid)`,
+  `note_external_geometry(slots, pages)` (re-reads `pool_budget_bytes` from the engine), `on_abort(uid)`,
   `next_deadline_ms(now) -> int | None`, `status() -> dict`.
 - `_process_one_msg`: the `UserMsg` branch becomes `if not self._queue_for_kv_dynamic(msg):
   self._admit_user_msg(msg)`, with `_admit_user_msg` factored out exactly as PR #300 does.
@@ -246,8 +277,8 @@ kv_bytes_per_page >= slots_after * slot_bytes + pages_after * kv_bytes_per_page`
   string; the wire replies stay as they are. Before executing, send `MaintenanceBeginMsg` (rule 9).
   `blocking` for `receive_msg` must also be false while the FIFO is non-empty.
 - `_execute_pending_operation` and `_execute_pending_step`: after any successful rebuild or step
-  whose request_id does not start with `auto-kv:`, call
-  `controller.note_external_geometry(engine.moe_offload_cache.cache_size, engine.num_pages)`.
+  whose request_id does not start with `auto-kv:`, the engine re-snapshots `pool_budget_bytes`
+  and the scheduler calls `controller.note_external_geometry(...)` so the planner reads it.
 - `rebuild_cache`: the parking snapshot (`prepare_rebuild`) already runs for any `num_pages`
   change when `park_store` is set. No change.
 - Finished requests: both completion paths must report. `_process_batch_result` assigns
@@ -259,10 +290,10 @@ kv_bytes_per_page >= slots_after * slot_bytes + pages_after * kv_bytes_per_page`
   skip Timer 1. `running_need_tokens` for the concurrent rule is
   `sum(len(r.input_ids) + r.output_len)` over the prefill manager's pending list and the decode
   manager's running requests.
-- Logging: one `INFO` line per plan (`KV pool grow 65536 -> 98304 tokens, slots 7140 -> 6810
+- Logging: one `INFO` line per plan (`KV pool grow 65536 -> 98304 tokens, slots 7200 -> 7043
   (held request 42, need 92160)`), one per shrink, one `WARNING` per capped plan.
 - `/v1/cache/status`: add a `kv_dynamic` block: `enabled, floor_tokens, ceiling_tokens,
-  step_tokens, pool_tokens, slot_baseline, held, shrink_in_s, last_plan`. The settings page status
+  step_tokens, pool_tokens, pool_budget_bytes, held, shrink_in_s, last_plan, operation_id`. The settings page status
   bar reads it.
 
 ### Engine (`engine/engine.py`)
@@ -272,11 +303,17 @@ kv_bytes_per_page >= slots_after * slot_bytes + pages_after * kv_bytes_per_page`
   shrink-KV/grow-MoE. New order: if `num_pages is not None and num_pages < self.num_pages`, run
   `_resize_kv_pool` before `moe_offload_cache.rebuild`; otherwise keep today's order. The
   `validate_rebuild` fit check compares final totals against the boot budget; with this order the
-  transient peak is `max(before, after)`. Widen the 4ff86b3 allowance accordingly: a target whose
-  final total is not above the resident total passes even on an over-budget card, provided every
-  shrinking pool is resized before any growing one (the reason the allowance was kept to pure MoE
-  shrinks was exactly the old ordering). The controller's byte-neutral swaps rely on this on a
-  card that booted over budget; on a normal boot they pass the budget check as they are. Test: a CPU test on a recording fake that asserts call order for
+  transient peak is `max(before, after)`. The 4ff86b3 allowance ("no larger than the resident
+  total") is per-transition and would refuse legitimate controller moves on an over-budget card
+  (131,072 -> 163,840 raises the resident total by 1.6 MB; the Timer 1 return to the floor by
+  0.7 MB), so it is NOT the check to widen. Instead the validator and the planner share rule 3's
+  `pool_budget_bytes`: the engine exposes it, and `validate_rebuild` accepts a MoE+KV target whose
+  final total is `<= pool_budget_bytes` when every shrinking pool is resized before any growing
+  one, in addition to the existing boot-budget check. `pool_budget_bytes` is never raised by the
+  controller; only an external rebuild that itself passed validation re-snapshots it. Geometry
+  limits (`num_experts` floor, marlin cap, GDN minimum, positive pages) still apply. Regression test
+  on an over-budget fake account: both transitions above pass; a target above `pool_budget_bytes`
+  is refused; a grow-MoE/shrink-KV request is refused unless ordered shrink-first. Test: a CPU test on a recording fake that asserts call order for
   the four sign combinations (`tests/engine/test_cache_rebuild.py`).
 - `_resolve_auto_moe_cache_size`: unchanged; the launcher passes `--num-tokens floor` and
   `--kv-reserve-tokens floor` when the dynamic pool is on, so the planner already prices the boot
@@ -358,7 +395,7 @@ TP > 1. DSV4. The Windows launcher. Sending to upstream.
 
 ## Live acceptance (on the box, when Jay is not using it)
 
-1. Boot with `KVDynamic` on; ledger shows pool 65,536 and slots about 880 above the previous boot.
+1. Boot with `KVDynamic` on; ledger shows pool 65,536 and slots about 940 above the previous boot (calculated; record the real number).
 2. Short chat (pi, about 7k prompt, 200 tokens): tok/s vs the previous boot's 200-token bench.
 3. Open a 150k `/v1/messages` conversation: log shows one `auto-kv:grow` rebuild, first token
    delay under 5 s beyond prefill, `cached_tokens` non-zero on the next turn (RAM restore hit).
@@ -369,15 +406,22 @@ TP > 1. DSV4. The Windows launcher. Sending to upstream.
 6. Resume the first conversation: restore hit, first token within about 10 s.
 7. Zero failed requests through the whole run; `/health` never leaves `serving` except for the
    sub-second `rebuilding` windows.
-8. Governor squeeze (grab 4 GB on the card) during a grown pool: slots step down, `slot_baseline`
-   follows, a later shrink does not undo the governor's step.
+8. Governor squeeze (grab 4 GB on the card) during a grown pool: slots step down,
+   `pool_budget_bytes` follows, a later shrink does not undo the governor's step.
 9. Starvation: a 150k request arrives while 20 short requests keep coming; the short ones queue
    behind it, the grow happens, all complete in arrival order.
 10. Failure outcomes (CPU tests with the recording fake engine, plus one live forced rejection via
     an impossible target): rejected -> admitted against the old pool; rolled back -> same; failed
     -> held requests get error replies, nothing is scheduled, frontend `failed`.
 11. Automatic rebuild overlapping a governor step and a manual `/v1/cache/rebuild`: one operation
-    at a time, operation ids and `/v1/cache/status` consistent, `slot_baseline` recomputed.
+    at a time, operation ids unique and `/v1/cache/status` consistent, `pool_budget_bytes`
+    re-snapshotted; plus the delayed-delivery race test of rule 9.
+16. Admission probe: zero restores and zero page allocations across a run of probes over locked,
+    evictable, partially shared and parked prefixes; the probe's verdict equals `_try_admit`'s on
+    each.
+17. Over-budget validator: the two transitions named in the engine section pass; a target above the
+    budget is refused.
+18. Two-clock TTL test as in rule 5.
 12. RAM TTL with no traffic at all (dynamic on, then off): the family expires and pinned RAM drops.
 13. Shared-prefix pair: two requests sharing a 100k prefix admitted without a grow when the
     increment fits.
