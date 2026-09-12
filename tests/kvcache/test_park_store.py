@@ -2811,3 +2811,75 @@ def test_ssd_v4_files_and_manifest_are_invalidated_once(tmp_path: Path):
         assert json.loads(manifest.read_text(encoding="utf-8"))["version"] == 5
     finally:
         rebuilt.close()
+
+
+def _ram_store(ttl_s: int, wall_ns) -> ParkStore:
+    store = ParkStore(
+        mode="ram", page_size=4, kv_pool=_qsa_pool(), state_pool=_state_pool(),
+        fingerprint="fp", min_tokens=4, ram_budget_bytes=1 << 30, ssd_dir="/nonexistent",
+        disk_budget_bytes=0, pinned_window_bytes=4096, idle_ms=0, ttl_s=ttl_s,
+    )
+    store._wall_ns = wall_ns  # the test's wall clock; the scheduler's monotonic clock is never used
+    return store
+
+
+def _seed_family(store: ParkStore, key: str, last_used_ns: int) -> None:
+    """Insert one already-published RAM entry directly, bypassing the save worker.
+
+    ``ParkedEntry`` requires ``key``, ``token_ids``, ``token_count``, ``payload_bytes``,
+    ``total_bytes`` and ``last_used_ns``; everything else here takes its natural empty
+    value. ``root_key`` is left at its dataclass default (``""``), which every family-grouping
+    site in park_store.py (``_evict_to_fit``, ``_family_ages``) treats as "root_key or key" --
+    i.e. this entry is its own one-member family/root.
+    """
+    entry = park_module.ParkedEntry(
+        key=key,
+        token_ids=torch.arange(8, dtype=torch.int32),
+        token_count=8,
+        payload_bytes=1024,
+        total_bytes=1024,
+        last_used_ns=last_used_ns,
+    )
+    with store._lock:
+        store._entries[key] = entry
+
+
+def test_ttl_expiry_uses_the_wall_clock_and_two_clocks_with_different_origins():
+    """The store stamps last_used_ns with time.time_ns(); the scheduler's idle loop runs on
+    time.monotonic_ns(). Ages must never mix the two (review of 702543b): a five-hour entry
+    must expire after six wall-clock hours whatever the monotonic clock says."""
+    wall = {"now": 1_700_000_000 * 10**9}          # epoch-based, 2023
+    monotonic_origin = 12_345 * 10**9               # seconds since boot, unrelated
+    store = _ram_store(ttl_s=5 * 3600, wall_ns=lambda: wall["now"])
+    _seed_family(store, "old", last_used_ns=wall["now"])
+    assert store.next_expiry_delay_ms() == 5 * 3600 * 1000
+    wall["now"] += 4 * 3600 * 10**9
+    assert store.sweep_expired() == 0 and store.status()["parked_count"] == 1
+    wall["now"] += 2 * 3600 * 10**9
+    assert store.next_expiry_delay_ms() == 0
+    assert store.sweep_expired() == 1
+    assert store.status()["parked_count"] == 0 and store.status()["expired_evictions"] == 1
+    # A monotonic timestamp handed in by mistake would be years "younger" than any entry:
+    # the API takes no now_ns argument at all, so the mistake cannot be made.
+    assert monotonic_origin < wall["now"]
+
+
+def test_ttl_zero_never_expires_and_reports_no_deadline():
+    wall = {"now": 1_700_000_000 * 10**9}
+    store = _ram_store(ttl_s=0, wall_ns=lambda: wall["now"])
+    _seed_family(store, "k", last_used_ns=wall["now"] - 10**15)
+    assert store.next_expiry_delay_ms() is None
+    assert store.sweep_expired() == 0
+    assert store.status()["ttl_s"] == 0 and store.status()["next_expiry_s"] is None
+
+
+def test_expiry_evicts_the_oldest_family_first_and_skips_pinned_ones():
+    wall = {"now": 1_700_000_000 * 10**9}
+    store = _ram_store(ttl_s=3600, wall_ns=lambda: wall["now"])
+    _seed_family(store, "a", last_used_ns=wall["now"] - 7200 * 10**9)
+    _seed_family(store, "b", last_used_ns=wall["now"] - 100 * 10**9)
+    _seed_family(store, "pinned", last_used_ns=wall["now"] - 7200 * 10**9)
+    store._pins["pinned"] = 1
+    assert store.sweep_expired() == 1
+    assert set(store._entries) == {"b", "pinned"}
+    assert store.next_expiry_delay_ms() == 3500 * 1000
