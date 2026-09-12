@@ -1498,6 +1498,17 @@ class Scheduler(SchedulerIOMixin):
 
     def _queue_maintenance(self, msg) -> None:
         """Hold a step or rebuild for the safe point and tell the API it was received."""
+        if self._engine_failed is not None:
+            # Rule 8 (docs/superpowers/specs/2026-09-12-dynamic-kv-pool-design.md): a maintenance
+            # message already on the socket when the latch fired must not execute against an
+            # engine of unknown state (external review of PR #5, round 3, 2026-09-12). Refuse it
+            # immediately instead of queuing it for a safe point that will never come.
+            error = "server latched failed: cache rebuild failed; server needs a restart"
+            if isinstance(msg, CacheRebuildBackendMsg):
+                self._reply_rebuild(msg.request_id, "failed", error=error)
+            else:
+                self._reply_step(msg.request_id, "failed", error=error)
+            return
         self._pending_rebuild = msg
         self._maintenance_request_id = msg.request_id
         self._note_maintenance_progress("queued", force=True)

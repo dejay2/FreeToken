@@ -11,8 +11,8 @@ import torch
 
 from freetoken.core import SamplingParams
 from freetoken.message import (
-    CacheRebuildBackendMsg, CacheStepBackendMsg, ErrorReplyMsg, KVDynamicStatusMsg,
-    MaintenanceBeginMsg, UserMsg,
+    CacheRebuildBackendMsg, CacheRebuildResultMsg, CacheStepBackendMsg, CacheStepResultMsg,
+    ErrorReplyMsg, KVDynamicStatusMsg, MaintenanceBeginMsg, UserMsg,
 )
 from freetoken.scheduler.cache import AdmissionProbe
 from freetoken.scheduler.kv_dynamic import KVDynamicController, KVDynamicPolicy
@@ -495,3 +495,21 @@ def test_run_when_idle_does_nothing_once_latched():
     s.cache_manager.drain_pending_parks = lambda: (_ for _ in ()).throw(AssertionError("drained"))
     s._engine_failed = "torn down"
     Scheduler.run_when_idle(s)
+
+
+def test_maintenance_arriving_after_the_latch_is_refused_not_queued():
+    """Rule 8: a maintenance message already on the socket when the latch fired must not be
+    queued for a safe point that will never come (external review of PR #5, round 3,
+    2026-09-12)."""
+    s = _shell(probe=None)
+    s.engine.linear_state_pool = None  # _reply_rebuild's geometry readout needs this attribute
+    s._latch_engine_failed("test")
+
+    s._queue_maintenance(CacheRebuildBackendMsg(request_id="m1", moe_cache_size=3000))
+    s._queue_maintenance(CacheStepBackendMsg(request_id="s1", axis="vram", direction="down"))
+
+    assert s._pending_rebuild is None
+    rebuild_replies = [m for m in s.sent if isinstance(m, CacheRebuildResultMsg)]
+    step_replies = [m for m in s.sent if isinstance(m, CacheStepResultMsg)]
+    assert [(m.request_id, m.status) for m in rebuild_replies] == [("m1", "failed")]
+    assert [(m.request_id, m.status) for m in step_replies] == [("s1", "failed")]
