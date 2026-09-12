@@ -15,12 +15,22 @@ budget (external review of 702543b, 2026-09-12).
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Deque
 
+# stdlib logging on purpose: freetoken.utils.init_logger drags torch in through
+# utils/torch_utils, and this module is the torch-free half of the feature.
+logger = logging.getLogger(__name__)
+
 MIN_STEP_TOKENS = 8_192
+# Rule 4 backstop: after this many non-"ok" plans in a row the controller stops proposing
+# shrinks until a request finishes. A rejection is usually an external VRAM grab that will
+# still be there on the next attempt, and a rebuild is destructive (parking flush, graph
+# teardown, API maintenance gate), so retrying it forever is worse than not shrinking.
+MAX_CONSECUTIVE_FAILURES = 3
 
 
 @dataclass(frozen=True)
@@ -170,6 +180,8 @@ class KVDynamicController:
         self.last_request_finished: float | None = None
         self._seq = 0
         self.last_plan: dict | None = None
+        self.consecutive_failures = 0
+        self._backoff_logged = False
 
     # ---- admission (rule 2) ------------------------------------------------------------
     def decide_admission(
@@ -229,6 +241,27 @@ class KVDynamicController:
     # ---- lifecycle -----------------------------------------------------------------------
     def on_request_finished(self, now: float | None = None) -> None:
         self.last_request_finished = self._clock() if now is None else now
+        # Traffic is the signal that the card's situation changed; give the shrink its three
+        # attempts again (a grab that refused the last one may well be gone by now).
+        self.consecutive_failures = 0
+        self._backoff_logged = False
+
+    def note_plan_outcome(self, reason: str, outcome: str, now: float | None = None) -> None:
+        """Rule 8's outcome, fed back so a refused plan is not retried at once.
+
+        Timer 1 is armed by ``last_request_finished`` alone: after a rejected or rolled-back
+        shrink nothing else moves that clock, so ``next_deadline_ms`` would return 1 ms and
+        ``run_when_idle`` would re-plan and re-execute the same destructive rebuild on every
+        idle poll -- milliseconds apart, for as long as the server stayed quiet. Re-arming the
+        timer puts the next attempt one full ``shrink_idle_s`` away, and three refusals in a
+        row stop the attempts until a request finishes.
+        """
+        if outcome == "ok":
+            self.consecutive_failures = 0
+            self._backoff_logged = False
+            return
+        self.last_request_finished = self._clock() if now is None else now
+        self.consecutive_failures += 1
 
     def has_held(self) -> bool:
         return bool(self.held)
@@ -238,11 +271,19 @@ class KVDynamicController:
 
     def plan_idle(
         self, *, current_pages: int, pool_budget_bytes: int, running_need_tokens: int,
-        now: float | None = None,
+        now: float | None = None, allow_shrink: bool = True, remember: bool = True,
     ) -> KVPlan | None:
         """The one rebuild (if any) to run at this idle point: the held head's grow first,
         else Timer 1's shrink. A held grow always wins over an overdue shrink so an arrival
-        after a quiet spell costs one rebuild, never two."""
+        after a quiet spell costs one rebuild, never two.
+
+        ``allow_shrink`` is the caller's answer to "is there a never-admitted request queued?"
+        (spec rule 4: the shrink is skipped then, so one plan can go to the grow target
+        instead of a shrink followed immediately by a grow). ``remember`` is False for the
+        look-ahead the drain loop runs after admitting a held request: that call asks whether
+        the NEXT entry would need another rebuild, and recording it as ``last_plan`` would
+        report a rebuild that never ran.
+        """
         if not self.enabled:
             return None
         if self.held:
@@ -256,15 +297,27 @@ class KVDynamicController:
                 current_pages=current_pages, pool_budget_bytes=pool_budget_bytes,
                 need_tokens=head.need_total, running_need_tokens=running, reason=reason,
             )
-            self._remember(plan)
+            if remember:
+                self._remember(plan)
             return plan
+        if not allow_shrink:
+            return None
         now = self._clock() if now is None else now
         if (
             self.last_request_finished is not None
             and now - self.last_request_finished >= self.shrink_idle_s
         ):
+            if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                if not self._backoff_logged:
+                    logger.warning(
+                        "KV pool shrink suspended after %d refused rebuilds in a row; it will "
+                        "be retried once a request finishes", self.consecutive_failures,
+                    )
+                    self._backoff_logged = True
+                return None
             plan = self.policy.plan_shrink(current_pages=current_pages, pool_budget_bytes=pool_budget_bytes)
-            self._remember(plan)
+            if remember:
+                self._remember(plan)
             return plan
         return None
 
@@ -315,6 +368,7 @@ class KVDynamicController:
             "slots_at_floor": self.policy.slots_for_pages(pool_budget_bytes, self.policy.floor_pages),
             "held": len(self.held),
             "uncommitted_tokens": self.uncommitted_tokens,
+            "consecutive_failures": self.consecutive_failures,
             "shrink_in_s": None if deadline is None else round(deadline / 1000, 1),
             "last_plan": self.last_plan,
         }

@@ -317,12 +317,14 @@ class CacheManager:
         input_len = int(len(input_ids))
         ids = input_ids[:0] if cache_private else input_ids[: max(input_len - 1, 0)]
         m = self.prefix_cache.match_prefix(ids) if input_len > 0 else None
-        # HybridRadixCache.match_prefix returns a HybridMatch with cached_len/node directly; the
-        # plain radix/naive caches wrap their handle in a MatchResult that has neither, so this
-        # falls back to "nothing cached" (the pre-lock answer) for the non-hybrid models the
-        # dynamic KV pool feature does not target (see the brief note at task-4).
-        cached_len = int(getattr(m, "cached_len", 0)) if m is not None else 0
-        node = getattr(m, "node", None)
+        # HybridRadixCache.match_prefix returns a HybridMatch carrying cached_len/node itself;
+        # the plain radix and naive caches return MatchResult(cuda_handle=<handle>), and the
+        # handle is what holds cached_len (and, for RadixCacheHandle, node). Reading them off
+        # the result object alone made every match look empty on those caches, so every
+        # follow-up turn of a non-hybrid model planned a grow it did not need.
+        handle = getattr(m, "cuda_handle", m) if m is not None else None
+        cached_len = int(getattr(handle, "cached_len", 0)) if handle is not None else 0
+        node = getattr(handle, "node", None)
         protect_tokens = self._evictable_tokens_on_path(node) if node is not None else 0
         need_now = (input_len - cached_len) + int(output_len)
         empty_limit = self.num_pages * self.page_size

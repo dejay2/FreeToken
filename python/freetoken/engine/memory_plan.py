@@ -720,6 +720,10 @@ def kv_ceiling_issue(
 ) -> dict[str, Any] | None:
     """Dynamic KV pool: can the slots fund growth from the floor to the ceiling? None when yes.
 
+    Both token figures are USABLE tokens (the dummy page excluded), so their difference is the
+    growth the slots have to fund; ``config.kv_ceiling_tokens`` includes the dummy page and the
+    caller subtracts it before calling in.
+
     Pure arithmetic (no torch, no engine state) so the settings page's planner and its tests
     can call it directly. ``slot_floor`` is the LRU slot count the still-streaming layers need
     left over (``2 * num_experts`` with prefill overlap on, else ``num_experts`` -- the same
@@ -765,10 +769,15 @@ def _kv_ceiling_issue_for_geometry(
     ceiling_tokens = int(getattr(config, "kv_ceiling_tokens", None) or 0)
     if ceiling_tokens <= 0:
         return None
+    # kv_ceiling_tokens is what --num-tokens would be for a fixed pool of that size: it counts
+    # the dummy page. kv_floor_tokens does not. Drop the page here so the helper subtracts two
+    # figures in the same unit (one page, 0.81 MiB of KV in the box's fp8 QSA geometry, would
+    # otherwise show up as growth the slots must fund).
+    usable_ceiling = max(0, ceiling_tokens - int(page_tokens))
     slot_floor = 2 * int(num_experts) if overlap else int(num_experts)
     return kv_ceiling_issue(
         floor_tokens=int(getattr(config, "kv_floor_tokens", 0) or 0),
-        ceiling_tokens=ceiling_tokens,
+        ceiling_tokens=usable_ceiling,
         lru_slots=int(lru_slots),
         slot_floor=slot_floor,
         cache_per_page=int(cache_per_page),

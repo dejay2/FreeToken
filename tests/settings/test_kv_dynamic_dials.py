@@ -97,3 +97,48 @@ def test_planner_geometry_wiring_appends_the_ceiling_issue_only_when_dynamic():
         static_config, lru_slots=1524, overlap=True, num_experts=512,
         cache_per_page=KV_PAGE, page_tokens=64, per_expert=SLOT,
     ) is None
+
+
+def test_the_geometry_wiring_prices_the_ceiling_in_usable_tokens():
+    """Final review minor 1: kv_ceiling_tokens counts the dummy page, kv_floor_tokens does not.
+    The wiring drops the page so the growth the slots must fund is measured in one unit."""
+    from types import SimpleNamespace
+
+    from freetoken.engine.memory_plan import _kv_ceiling_issue_for_geometry
+
+    KV_PAGE, SLOT = 13_248 * 64, 2_772_480
+    # Exactly one page of growth (65,600 - 64 == the floor): one page is 0 slots' worth after
+    # the subtraction, so the slot floor is never in the way.
+    config = SimpleNamespace(kv_dynamic=True, kv_floor_tokens=65_536, kv_ceiling_tokens=65_600)
+    assert _kv_ceiling_issue_for_geometry(
+        config, lru_slots=1024, overlap=True, num_experts=512,
+        cache_per_page=KV_PAGE, page_tokens=64, per_expert=SLOT,
+    ) is None
+
+
+def test_launch_switches_the_pool_off_when_the_floor_reaches_the_models_context():
+    """Final review I4: KVDynamic defaults on for every MoE model, but the engine refuses
+    --kv-dynamic at parse time unless the floor plus one page fits under the ceiling -- and
+    with KVCacheTokens on automatic that ceiling is the model's own context. A 32k-context
+    model would fail to boot on a default nobody typed; the launcher drops the flags instead."""
+    small = {"KVDynamic": True, "KVCacheTokens": 0, "ContextTokens": 32_768}
+    plan = _plan({**small, "KVFloorTokens": 65_536}, max_context=32_768)
+    assert "--kv-dynamic" not in plan.argv and "--kv-floor-tokens" not in plan.argv
+    assert any("Dynamic KV memory switched off" in note and "32768" in note for note in plan.notes)
+    kept = _plan({**small, "KVFloorTokens": 16_384}, max_context=32_768)
+    assert "--kv-dynamic" in kept.argv
+
+
+def test_launch_judges_the_ceiling_against_an_explicit_kv_cache_tokens_first():
+    argv = _plan({"KVDynamic": True, "KVFloorTokens": 65_536, "KVCacheTokens": 65_536},
+                 max_context=262_144).argv
+    assert "--kv-dynamic" not in argv          # floor plus a page is above the explicit ceiling
+
+
+def test_validation_refuses_a_floor_at_the_models_context_when_kv_cache_tokens_is_auto():
+    from freetoken.daemon.settings.model_info import ModelInfo
+
+    model = ModelInfo(path="/models/demo", name="demo", num_experts=512, max_context_tokens=32_768)
+    errors = d.validate_settings({"KVFloorTokens": 65_536, "KVCacheTokens": 0}, model)
+    assert any(e["field"] == "KVFloorTokens" and "longest chat" in e["message"] for e in errors)
+    assert d.validate_settings({"KVFloorTokens": 16_384, "KVCacheTokens": 0}, model) == []

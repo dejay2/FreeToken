@@ -131,3 +131,18 @@ def test_park_idle_sweeps_expired_families():
     cm = _manager(store=store)
     cm.park_idle(now_ns=10**30)
     assert store.swept == 1
+
+
+def test_probe_reads_the_handle_of_a_plain_radix_cache():
+    """Final review I2: the non-hybrid caches return MatchResult(cuda_handle=<handle>), so
+    cached_len/node live on the handle. Reading them off the result made every match look
+    empty and every follow-up turn on such a model plan a grow it did not need."""
+    table = torch.zeros((4, 256), dtype=torch.int32)
+    cm = CacheManager(64, 1, table, "radix")             # no linear_state_pool: plain RadixCache
+    ids = torch.arange(1, 33)
+    pages = cm._allocate(len(ids))
+    cm.prefix_cache.insert_prefix(ids, cm._page_to_token(pages))
+    probe = cm.probe_admission(torch.cat([ids, torch.tensor([99, 100])]), output_len=8, reserved=0)
+    assert probe.cached_len == 32                        # the inserted prefix, not 0
+    assert probe.need_now == 2 + 8
+    assert probe.protect_tokens == 32                    # evictable now, locked on admission

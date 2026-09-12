@@ -189,3 +189,105 @@ def test_an_aborted_capacity_blocked_request_is_not_resurrected():
     s._run_kv_dynamic_idle()
     assert not s._kv_dynamic.has_held()
     assert s.prefill_manager.pending_list == [] and s.prefill_manager.added == []
+
+
+# ---- final review C1: a refused plan must not be retried every millisecond -----------------
+
+def _refusing_shrink_shell(outcome="rejected"):
+    """A grown, quiet shell whose rebuilds always come back with ``outcome``."""
+    clock = _Clock()
+    s = _shell(num_pages=2049, clock=clock, probe=None)
+    s.cache_manager.next_park_delay_ms = lambda: None
+    s._note_request_finished([object()])
+    clock.now += 601                                     # Timer 1 overdue
+    s._execute_pending_rebuild = lambda: (
+        s.executed.append(s._pending_rebuild.num_pages), setattr(s, "_pending_rebuild", None), outcome
+    )[2]
+    return s, clock
+
+
+def test_a_rejected_shrink_rearms_timer1_instead_of_retrying_every_millisecond():
+    s, _ = _refusing_shrink_shell()
+    s._run_kv_dynamic_idle()
+    assert s.executed == [1025]                          # the shrink was attempted once
+    # Without the re-arm the deadline is 1 ms and run_when_idle re-runs the same destructive
+    # rebuild on every idle poll; with it the next attempt is a full shrink_idle_s away.
+    assert s.idle_poll_timeout_ms() == 600_000
+    assert s._kv_dynamic.consecutive_failures == 1
+    s._run_kv_dynamic_idle()                             # same idle point, no second rebuild
+    assert s.executed == [1025]
+
+
+def test_three_refused_shrinks_stop_the_planning_until_a_request_finishes():
+    s, clock = _refusing_shrink_shell()
+    for _ in range(3):
+        s._run_kv_dynamic_idle()
+        clock.now += 601                                 # the re-armed timer comes due again
+    assert s.executed == [1025, 1025, 1025]
+    assert s._kv_dynamic.consecutive_failures == 3
+    s._run_kv_dynamic_idle()
+    assert s.executed == [1025, 1025, 1025]              # fourth attempt suppressed
+    assert s._kv_dynamic.status(current_pages=2049,
+                                pool_budget_bytes=s.engine.pool_budget_bytes)["consecutive_failures"] == 3
+    # Traffic re-arms it: the card's situation has changed.
+    s._note_request_finished([object()])
+    assert s._kv_dynamic.consecutive_failures == 0
+    clock.now += 601
+    s._run_kv_dynamic_idle()
+    assert s.executed == [1025, 1025, 1025, 1025]
+
+
+def test_a_rejected_grow_still_admits_the_head_and_leaves_no_1ms_deadline():
+    s = _shell(probe=AdmissionProbe(need_now=92_000, protect_tokens=0, fits_empty=False,
+                                    fits_now=False, cached_len=0))
+    s.cache_manager.next_park_delay_ms = lambda: None
+    s._queue_for_kv_dynamic(_user(2, 60_000, 32_000))
+    s._execute_pending_rebuild = lambda: (setattr(s, "_pending_rebuild", None), "rejected")[1]
+    s._run_kv_dynamic_idle()
+    assert s.prefill_manager.added == [2] and not s._kv_dynamic.has_held()
+    assert s.idle_poll_timeout_ms() in (None, 600_000)   # never the 1 ms retry storm
+
+
+# ---- final review I1: the same-batch charge must not leak on an early refusal ---------------
+
+def test_a_request_refused_by_the_max_seq_len_clip_releases_its_uncommitted_charge():
+    s = _shell(probe=AdmissionProbe(need_now=7_100, protect_tokens=0, fits_empty=True,
+                                    fits_now=True, cached_len=0))
+    # The engine's own max_seq_len sits below the pool here (the ceiling clip in
+    # _queue_for_kv_dynamic passes, _admit_user_msg's clip then refuses): the one arrangement
+    # that reaches the early return with a charge already on the books.
+    s.engine.max_seq_len = 5_000
+    msg = _user(6, 7_000, 100)
+    assert s._queue_for_kv_dynamic(msg) is False         # admitted, charged
+    assert s._kv_dynamic.uncommitted_tokens == 7_100
+    s._admit_user_msg(msg)                               # refused: max_output_len <= 0
+    assert [m.code for m in s.sent if isinstance(m, ErrorReplyMsg)] == ["context_length_exceeded"]
+    assert s.prefill_manager.added == []
+    assert s._kv_dynamic.uncommitted_tokens == 0         # released, not leaked for the process
+
+
+# ---- final review I3: no shrink while a never-admitted request waits (spec rule 4) ----------
+
+def test_timer1_does_not_shrink_while_a_never_admitted_request_is_queued():
+    clock = _Clock()
+    s = _shell(num_pages=2049, clock=clock, probe=None)
+    pending = PendingReq(11, torch.arange(1, 5_000), SamplingParams(max_tokens=100))
+    pending.blocked_reserved_tokens = 0
+    s.prefill_manager.pending_list.append(pending)
+    s._note_request_finished([object()])
+    clock.now += 601
+    s._execute_pending_rebuild = lambda: (_ for _ in ()).throw(AssertionError("no rebuild"))
+    s._run_kv_dynamic_idle()
+    assert s.executed == [] and s.engine.num_pages == 2049
+
+
+# ---- final review I5: the status debounce survives the shrink countdown --------------------
+
+def test_the_status_debounce_ignores_the_shrink_countdown():
+    clock = _Clock()
+    s = _shell(num_pages=2049, clock=clock, probe=None)
+    s._note_request_finished([object()])
+    s._send_kv_dynamic_status()
+    clock.now += 0.3
+    s._send_kv_dynamic_status()
+    assert len([m for m in s.sent if isinstance(m, KVDynamicStatusMsg)]) == 1

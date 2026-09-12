@@ -910,6 +910,9 @@ class Scheduler(SchedulerIOMixin):
                 ]
             )
             self._drop_raw_picture(msg)
+            # Neither early return here reaches add_one_req, so the admission pass will never
+            # charge (and therefore never release) this request's same-batch estimate.
+            self._drop_uncommitted(msg.uid)
             return
         if has_raw_picture:
             try:
@@ -921,6 +924,7 @@ class Scheduler(SchedulerIOMixin):
                 self.send_result(
                     [ErrorReplyMsg(uid=msg.uid, error=f"could not encode picture: {exc}")]
                 )
+                self._drop_uncommitted(msg.uid)
                 return
         if msg.sampling_params.max_tokens > max_output_len:
             msg.sampling_params.max_tokens = max_output_len
@@ -928,6 +932,16 @@ class Scheduler(SchedulerIOMixin):
                 f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
             )
         self.prefill_manager.add_one_req(msg)
+
+    def _drop_uncommitted(self, uid: int) -> None:
+        """Release the same-batch charge _queue_for_kv_dynamic put on a request that never
+        reached add_one_req. The admission pass clears it through ``on_reserved`` for every
+        request it seats; a request refused before the prefill manager ever sees it has no
+        such event, and the estimate would then sit in ``uncommitted_tokens`` for the life of
+        the process, shrinking the room every later probe believes it has."""
+        controller = getattr(self, "_kv_dynamic", None)
+        if controller is not None:
+            controller.note_reserved(uid)
 
     @staticmethod
     def _drop_raw_picture(msg: UserMsg) -> None:
@@ -1030,7 +1044,15 @@ class Scheduler(SchedulerIOMixin):
         probe = self.cache_manager.probe_admission(
             msg.input_ids, msg.sampling_params.max_tokens,
             reserved=self.decode_manager.inflight_tokens + c.uncommitted_tokens,
-            cache_private=msg.mm_embeds is not None or msg.mm_pixel_values is not None,
+            # Exactly add_one_req's predicate: a request the prefill manager will treat as
+            # cache-private must be probed as cache-private, or the probe credits it with a
+            # prefix hit the real admission will not take.
+            cache_private=(
+                msg.mm_embeds is not None
+                or msg.mm_pixel_values is not None
+                or msg.mm_image_grid_thw is not None
+                or msg.mm_token_type_ids is not None
+            ),
         )
         verdict = c.decide_admission(
             msg.uid, msg, need_total=need_total, need_now=probe.need_now, pool_tokens=pool_tokens,
@@ -1083,6 +1105,11 @@ class Scheduler(SchedulerIOMixin):
         plan = c.plan_idle(
             current_pages=self.engine.num_pages, pool_budget_bytes=self.engine.pool_budget_bytes,
             running_need_tokens=self._running_need_tokens(),
+            # Rule 4: never shrink with a never-admitted request queued. It owns no pages, so
+            # the rebuild would be safe, but it is about to need room -- the shrink would be
+            # undone by a grow on the very next idle point (two destructive rebuilds for one
+            # arrival). Skipping it lets rule 2(b)'s escalation put one plan on the grow target.
+            allow_shrink=not self.prefill_manager.pending_list,
         )
         outcome = "ok"
         if plan is not None:
@@ -1105,6 +1132,10 @@ class Scheduler(SchedulerIOMixin):
                 # then admitted against THAT pool and the ordinary clip/refuse applies.
                 logger.warning_rank0("KV pool grow capped: slots at their floor %d", c.policy.slot_floor)
             outcome = self._execute_pending_rebuild()
+            # Rule 8's outcome goes back to the controller: a "rejected" or rolled-back plan
+            # must re-arm Timer 1, or the next idle poll (1 ms later) would re-run the same
+            # refused rebuild forever.
+            c.note_plan_outcome(plan.reason, outcome)
         if outcome == "failed":
             # Rule 8: the engine is not known to be usable and the frontend latches failed.
             # Admitting anything now would schedule work on a torn-down engine.
@@ -1129,6 +1160,9 @@ class Scheduler(SchedulerIOMixin):
             if c.has_held() and c.plan_idle(
                 current_pages=self.engine.num_pages, pool_budget_bytes=self.engine.pool_budget_bytes,
                 running_need_tokens=self._running_need_tokens(),
+                # A look-ahead, not a decision: it must not overwrite last_plan with a rebuild
+                # this idle point never runs (the status block reports the executed plan).
+                remember=False,
             ) is not None:
                 break  # the next one needs another rebuild: next idle point
             head = c.pop_held()
@@ -1148,9 +1182,14 @@ class Scheduler(SchedulerIOMixin):
         if c is None:
             return
         status = c.status(current_pages=self.engine.num_pages, pool_budget_bytes=self.engine.pool_budget_bytes)
-        if status != self._kv_dynamic_last_status:
+        # shrink_in_s is a 0.1 s countdown: it differs on nearly every call while Timer 1 is
+        # armed, so comparing the whole dict defeated the debounce entirely (~10 messages a
+        # second with a request pending). Compare everything else; the countdown still rides
+        # in the payload the page shows.
+        compared = {key: value for key, value in status.items() if key != "shrink_in_s"}
+        if compared != self._kv_dynamic_last_status:
             self.send_result([KVDynamicStatusMsg(status=status)])
-            self._kv_dynamic_last_status = status
+            self._kv_dynamic_last_status = compared
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         self._idle_wait_logged = False

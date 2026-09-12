@@ -1004,6 +1004,11 @@ def parse_args(
         floor = kwargs["kv_floor_tokens"]
         if floor % page:
             parser.error(f"--kv-floor-tokens {floor} must be a multiple of the page size {page}")
+        step = kwargs["kv_step_tokens"]
+        if step % page:
+            # KVDynamicPolicy stores step_pages = kv_step_tokens // page; an unaligned step
+            # would silently serve a smaller rung than the one asked for.
+            parser.error(f"--kv-step-tokens {step} must be a multiple of the page size {page}")
         if floor + page > ceiling:
             parser.error(
                 f"--kv-floor-tokens {floor} must not exceed the ceiling {ceiling - page}"

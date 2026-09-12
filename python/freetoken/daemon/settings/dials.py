@@ -1198,7 +1198,7 @@ def validate_settings(
                 settings, model, context, failed={error["field"] for error in errors}
             )
         )
-        errors.extend(_kv_dynamic_pool_errors(settings, context))
+        errors.extend(_kv_dynamic_pool_errors(settings, model, context))
     return errors
 
 
@@ -1235,10 +1235,13 @@ def _kv_dynamic_enabled(settings: dict[str, Any], context: dict[str, Any] | None
         return False
 
 
-def _kv_dynamic_pool_errors(settings: dict[str, Any], context: dict[str, Any] | None) -> list[dict[str, Any]]:
+def _kv_dynamic_pool_errors(
+    settings: dict[str, Any], model: ModelInfo | None, context: dict[str, Any] | None
+) -> list[dict[str, Any]]:
     """Cross-field checks for the dynamic KV pool dials, mirroring the engine's own refusals
-    (a floor above the ceiling, a step under 8192, a floor off the 64-token page grid) so the
-    user is told at save time instead of at boot. The engine only refuses these in conjunction
+    (a floor above the ceiling -- or, with KV cache tokens on automatic, at or above the model's
+    own context -- a step under 8192, a floor off the 64-token page grid) so the user is told at
+    save time instead of at boot. The engine only refuses these in conjunction
     with ``--kv-dynamic``, so these checks apply only while the resolved ``KVDynamic`` is on.
 
     Also runs only when the patch touches one of the dials in play, the same restraint
@@ -1255,10 +1258,22 @@ def _kv_dynamic_pool_errors(settings: dict[str, Any], context: dict[str, Any] | 
     if settings.keys() & {"KVFloorTokens", "KVCacheTokens", "KVDynamic"}:
         floor = _read_setting_number(settings, context, "KVFloorTokens")
         ceiling = _read_setting_number(settings, context, "KVCacheTokens")
+        model_context = int(getattr(model, "max_context_tokens", None) or 0) if model else 0
         if floor is not None and ceiling is not None and ceiling > 0 and floor > ceiling:
             errors.append({
                 "field": "KVFloorTokens",
                 "message": f"Smallest KV memory {floor} must not exceed KV cache tokens {ceiling}",
+            })
+        elif floor is not None and not ceiling and model_context and floor >= model_context:
+            # KVCacheTokens 0 means "auto": the engine then takes the model's own context as
+            # the ceiling and refuses --kv-dynamic outright when the floor reaches it. Say so
+            # here instead of letting the boot fail on a default the user never typed.
+            errors.append({
+                "field": "KVFloorTokens",
+                "message": (
+                    f"Smallest KV memory {floor} must be below this model's longest chat "
+                    f"{model_context} (KV cache tokens is on automatic)"
+                ),
             })
     if "KVFloorTokens" in settings:
         floor = _read_setting_number(settings, context, "KVFloorTokens")

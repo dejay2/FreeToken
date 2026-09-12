@@ -387,9 +387,16 @@ class PrefillManager:
                 break  # We cannot add more requests
         self.pending_list = chunked_list + remaining
         if self.on_capacity_blocked is not None and adder.capacity_blocked:
+            # Membership by uid, never by `in`: PendingReq is a dataclass whose __eq__ compares
+            # its input_ids TENSOR, so `pending in list` raises "Boolean value of Tensor ... is
+            # ambiguous" as soon as the identity shortcut misses (any other entry ahead of it).
+            # uids are unique within the pending list, so this is the same test.
+            waiting = {pending.uid for pending in self.pending_list}
+            known = {pending.uid for pending in self._capacity_blocked}
             for pending in adder.capacity_blocked:
-                if pending in self.pending_list and pending not in self._capacity_blocked:
+                if pending.uid in waiting and pending.uid not in known:
                     self._capacity_blocked.append(pending)
+                    known.add(pending.uid)
                     self.on_capacity_blocked(pending)
         if len(reqs) == 0:
             return None
@@ -414,11 +421,13 @@ class PrefillManager:
         rejected or aborted) is dropped silently; it is no longer this list's business.
         """
         blocked, self._capacity_blocked = self._capacity_blocked, []
-        still_waiting: List[PendingReq] = []
-        for pending in blocked:
-            if pending in self.pending_list:
-                self.pending_list.remove(pending)
-                still_waiting.append(pending)
+        # By uid, not by `in`/`remove`: see the note in _admit_next_batch -- comparing
+        # PendingReq objects compares their input_ids tensors.
+        waiting = {pending.uid for pending in self.pending_list}
+        still_waiting: List[PendingReq] = [p for p in blocked if p.uid in waiting]
+        if still_waiting:
+            taken = {pending.uid for pending in still_waiting}
+            self.pending_list = [p for p in self.pending_list if p.uid not in taken]
         return still_waiting
 
     def abort_req(self, uid: int) -> Req | None:

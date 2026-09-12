@@ -70,6 +70,9 @@ def test_dynamic_with_a_page_aligned_floor_works(tmp_path):
     ["--kv-park-ttl-s", "-1"],
     ["--kv-dynamic", "--num-pages", "4096"],
     ["--kv-dynamic", "--kv-floor-tokens", "70000"],
+    # The policy stores step_pages = kv_step_tokens // page; an unaligned step would silently
+    # serve a smaller rung than the one asked for (final review, minor 7).
+    ["--kv-dynamic", "--kv-step-tokens", "10000"],
 ])
 def test_bad_dynamic_flags_are_refused(tmp_path, extra):
     with pytest.raises(SystemExit):
