@@ -422,6 +422,7 @@ def _forward_prefix_msg(m, tokenize_manager, send_backend, send_frontend) -> boo
         return False
 
     input_ids = None
+    prefix_tokens = m.prefix_tokens
     if m.action == "register":
         if m.text is None:
             send_frontend.put(
@@ -443,6 +444,10 @@ def _forward_prefix_msg(m, tokenize_manager, send_backend, send_frontend) -> boo
         )
         try:
             input_ids = tokenize_manager.tokenize([tokenize_msg])[0]
+            if m.prefix_scope == "system":
+                if prefix_tokens is not None:
+                    raise ValueError("choose system scope or explicit prefix_tokens, not both")
+                prefix_tokens = tokenize_manager.system_prefix_tokens(tokenize_msg, input_ids)
         except Exception as exc:  # noqa: BLE001 -- isolate one bad preset
             send_frontend.put(
                 PrefixCacheReply(
@@ -471,7 +476,7 @@ def _forward_prefix_msg(m, tokenize_manager, send_backend, send_frontend) -> boo
             action=m.action,
             name=m.name,
             input_ids=input_ids,
-            prefix_tokens=m.prefix_tokens,
+            prefix_tokens=prefix_tokens,
             ttl_seconds=m.ttl_seconds,
             max_retained_bytes=m.max_retained_bytes,
         )

@@ -365,7 +365,41 @@ assert.equal(element('cache-format').value,'anthropic');
 assert.equal(element('cache-prefix').value,'');
 assert.deepEqual(cacheRegistration().request,request);
 assert.equal(requests.length,0,'Selecting a request never registers or generates implicitly');
-assert.match(element('cache-message').textContent,/whole request|full request/i);
+assert.match(element('cache-message').textContent,/system prompt/i);
+assert.equal(cacheRegistration().prefix_scope,'system');
+""")
+
+
+def test_selected_prompt_shows_system_and_tools_separately_from_user_text():
+    _run_fit_script(r"""
+const request={model:'pi',messages:[{role:'system',content:[{type:'text',text:'<rules>\nAll instructions'}]},
+  {role:'user',content:'hi'}],tools:[{type:'function',function:{name:'read',parameters:{type:'object'}}}]};
+element('cache-ttl').value='300';
+applyRecentPrompt({id:'0123456789abcdef0123456789abcdef',format:'openai',request});
+assert.match(element('cache-system-preview').textContent, /<rules>\nAll instructions/);
+assert.match(element('cache-tools-preview').textContent, /read/);
+assert.equal(element('cache-scope').value,'system');
+assert.deepEqual(cacheRegistration().request,request);
+assert.equal(cacheRegistration().prefix_tokens,undefined);
+element('cache-scope').value='request';
+assert.equal(cacheRegistration().prefix_scope,undefined);
+applyRecentPrompt({id:'0123456789abcdef0123456789abcdef',format:'openai',request:{messages:[{role:'user',content:'hi'}]}});
+assert.equal(element('cache-scope').value,'request');
+assert.match(element('cache-system-preview').textContent,/No leading system/i);
+""")
+
+
+def test_old_model_server_cannot_silently_register_system_scope_as_whole_request():
+    _run_fit_script(r"""
+(async()=>{
+  element('cache-ttl').value='300';
+  applyRecentPrompt({id:'0123456789abcdef0123456789abcdef',format:'openai',
+    request:{messages:[{role:'system',content:'rules'},{role:'user',content:'hi'}]}});
+  cacheUI.data={prefixes:[]};
+  await registerPrompt();
+  assert.equal(requests.length,0);
+  assert.match(element('cache-message').textContent,/Update and restart/);
+})().catch(error=>{console.error(error);process.exitCode=1;});
 """)
 
 

@@ -59,6 +59,20 @@ def test_api_server_registers_prefix_routes():
     assert any(path == "/v1/cache/prefixes/settings" and "PUT" in methods for path, methods in paths)
 
 
+def test_system_scope_is_forwarded_and_cannot_be_combined_with_manual_tokens():
+    state = _State()
+    body = {'name':'system', 'format':'openai', 'prefix_scope':'system', 'request':{
+        'model':'local-model', 'messages':[{'role':'system','content':'rules'},
+            {'role':'user','content':'hi'}]}}
+    client = _client(state)
+    assert client.post('/v1/cache/prefixes', json=body).status_code == 200
+    assert state.sent[0].prefix_scope == 'system'
+    assert state.sent[0].text[-1]['content'] == 'hi'
+    assert client.get('/v1/cache/prefixes').json()['result']['system_scope_supported'] is True
+    assert client.post('/v1/cache/prefixes', json=body | {'prefix_tokens':64}).status_code == 400
+    assert [msg.action for msg in state.sent] == ['register', 'list']
+
+
 def test_openai_registration_preserves_later_system_message_and_tool_schema():
     state = _State({"status": "ok", "result": {"name": "agent-base", "aligned_tokens": 64}})
     client = _client(state)

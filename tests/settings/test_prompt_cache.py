@@ -63,6 +63,15 @@ def test_registration_preserves_request_template_and_errors(bridge):
     assert calls == [("POST", "/v1/cache/prefixes", body)]
 
 
+def test_system_scope_survives_the_helper(bridge):
+    client, calls, _ = bridge
+    body = registration()
+    body.pop('prefix_tokens')
+    body['prefix_scope'] = 'system'
+    assert client.post('/api/prompt-cache/prefixes', json=body).status_code == 200
+    assert calls[0][2] == body
+
+
 @pytest.mark.parametrize("method,path,upstream,body", [
     ("GET", "/prefixes", "/v1/cache/prefixes", None),
     ("GET", "/models", "/v1/models", None),

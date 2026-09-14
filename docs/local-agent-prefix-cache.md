@@ -23,10 +23,10 @@ Open `http://127.0.0.1:2031` and choose **Prompt cache**. With the model server 
    preparations, followers, restores and GPU/RAM/SSD residency in the list.
 3. Paste your shared instructions and a test task, or switch to **Full request JSON**
    for the exact OpenAI/Anthropic messages, tools and template settings your agents use.
-   The simple editor uses the running model with thinking disabled. Set **Shared prefix
-   tokens** inside the common instructions, before variable text. Blank requests the
-   entire rendered request for identical replays; it does not automatically find the
-   system-prompt boundary.
+   The simple editor uses the running model with thinking disabled. Choose **System prompt
+   + tools** to find the boundary before user text automatically. **Whole request / manual
+   boundary** lets you set an explicit token cut; blank requests the entire rendered
+   request for identical replays.
 
 The per-prompt GPU preference duration and shared retention budget apply immediately;
 they do not require Save or restart. Both are best-effort preferences, not reserved
@@ -35,10 +35,13 @@ stay in the current page during refresh errors, but are not saved across page re
 The test displays model text and tool calls; it does not execute tools.
 
 **Recent requests** lists up to 50 accepted text requests from `/v1/chat/completions`
-and `/v1/messages` from the past hour. Choose **Use prompt** to load the original JSON,
-including tools and template options, into the editor. It resets the shared-token field
-to whole-request caching; set an explicit boundary before variable task text when sharing
-only the common instructions. Selection itself does not register or generate anything.
+and `/v1/messages` from the past hour. Rows preview the latest user message, so a row
+saying "hi" can also contain a large system prompt. Choose **View prompt** to read the
+complete leading system instructions and expand the tool definitions. The original JSON,
+including template options, remains available under **Full request JSON**. Selection
+defaults to **System prompt + tools** when leading instructions exist and clears any old
+manual boundary. Choose a cache name and **Register prompt** to save the preset.
+Selection itself does not register or generate anything.
 
 Collection begins when the updated model server starts. Snapshots stay in local RAM,
 with a 16 MiB payload budget and a 4 MiB limit per request; older entries are evicted,
@@ -73,6 +76,15 @@ cached boundary always leaves at least one prompt token for normal generation. I
 rendered prompt is page aligned, its final page stays private. A prompt too short to leave
 both a whole cached page and a generation tail is rejected. `requested_tokens` reports the
 original count for each alias; `prefix_tokens` reports its actual shared boundary.
+
+Alternatively, pass `prefix_scope: "system"` instead of `prefix_tokens`. The tokenizer
+uses the original template, normalized tools and thinking options to find a prefix before
+the first user text. It includes leading system/developer instructions and tools rendered
+before that text. Page alignment may leave some final instruction tokens outside the cache.
+The full original request remains the registration input. A template that cannot expose
+a reliable boundary, or a request without leading instructions, returns a validation error
+instead of guessing. Later conversation instructions are excluded. This option requires
+an updated model server; the UI checks support before registering.
 
 This example creates a registration file from two otherwise identical requests with different
 tasks. Run it in the FreeToken Python environment, passing the served tokenizer's exact local
@@ -144,7 +156,7 @@ before retrying. Re-registering the same name and tokens is idempotent.
 
 | Method and path | Action |
 | --- | --- |
-| `POST /v1/cache/prefixes` | Register `{name, format, request, prefix_tokens?, ttl_seconds?}`. `format` is `openai` or `anthropic`. |
+| `POST /v1/cache/prefixes` | Register `{name, format, request, prefix_tokens?, prefix_scope?, ttl_seconds?}`. `format` is `openai` or `anthropic`. Use `prefix_scope: "system"` or an explicit token cut. |
 | `GET /v1/cache/prefixes` | List aliases, actual unique resident pages/snapshots and registry totals. |
 | `GET /v1/cache/prefixes/{name}` | Inspect aligned length, GPU/parked tokens, preparation work and last failure. |
 | `POST /v1/cache/prefixes/{name}/warm` | Queue one preparation or restore for the exact checkpoint. |

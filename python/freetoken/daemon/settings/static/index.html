@@ -141,6 +141,7 @@
     .cache-recent-row p { overflow-wrap: anywhere; }
     .cache-recent-row .button { flex: 0 0 auto; }
     .cache-recent-preview { font-size: .9rem; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    .cache-prompt-preview { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 300px; overflow: auto; font: inherit; font-size: .85rem; }
     @media (max-width: 800px) { .cache-layout { grid-template-columns: minmax(0, 1fr); } }
     @media (max-width: 440px) { .cache-fields { grid-template-columns: minmax(0, 1fr); gap: 0; } }
     input:disabled, select:disabled { opacity: .55; }
@@ -331,7 +332,7 @@
       <p class="small" id="cache-connection" role="status">Connecting to the model server…</p>
       <dl class="cache-summary" id="cache-summary"><div><dt>Registered prompts</dt><dd>—</dd></div></dl>
       <section class="panel" id="cache-recent" aria-labelledby="cache-recent-title">
-        <div class="panel-head"><div><h3 id="cache-recent-title">Recent requests</h3><p class="small">Pick a request received by this server to load its exact prompt, tools and template options.</p></div><div class="actions"><button class="button small" id="cache-recent-pause" type="button" disabled>Pause collection</button><button class="button small" id="cache-recent-clear" type="button" disabled>Clear list</button></div></div>
+        <div class="panel-head"><div><h3 id="cache-recent-title">Recent requests</h3><p class="small">Each row previews the user’s message. Choose View prompt to see its system instructions and tools, then cache the shared part.</p></div><div class="actions"><button class="button small" id="cache-recent-pause" type="button" disabled>Pause collection</button><button class="button small" id="cache-recent-clear" type="button" disabled>Clear list</button></div></div>
         <p class="small cache-feedback" id="cache-recent-status" role="status">Loading recent requests…</p>
         <div id="cache-recent-list"><p class="empty">Requests will appear here after they reach the server.</p></div>
         <p class="small">Shows text requests from OpenAI chat completions and Anthropic messages. Private and image requests are excluded. Collection uses local RAM; restarting the model server clears the list.</p>
@@ -350,9 +351,14 @@
                 <div class="cache-field"><label for="cache-task">Test task</label><input id="cache-task" type="text" value="Reply with only CACHE_OK." aria-describedby="cache-model-note"><p class="small" id="cache-model-note">Uses the running model with thinking disabled. Use request JSON to match your agent’s template and tools exactly.</p></div>
               </div>
               <div id="cache-advanced" hidden>
+                <section aria-labelledby="cache-system-title"><h4 id="cache-system-title">System prompt</h4><pre class="cache-prompt-preview" id="cache-system-preview"></pre></section>
+                <details><summary id="cache-tools-title">Tool definitions</summary><pre class="cache-prompt-preview" id="cache-tools-preview"></pre></details>
+                <details><summary>Full request JSON</summary>
                 <div class="cache-field"><label for="cache-format">Request format</label><select id="cache-format"><option value="openai">OpenAI chat completions</option><option value="anthropic">Anthropic messages</option></select></div>
                 <div class="cache-field"><label for="cache-request">Request JSON</label><textarea id="cache-request" rows="12" placeholder='{"model":"your-model","messages":[…]}' spellcheck="false" aria-describedby="cache-json-note"></textarea><p class="small" id="cache-json-note">Paste the full request body, including messages, tools and template options. Registration preserves these inputs.</p></div>
+                </details>
               </div>
+              <div class="cache-field"><label for="cache-scope">What to cache</label><select id="cache-scope"><option value="system">System prompt + tools</option><option value="request" selected>Whole request / manual boundary</option></select><p class="small">System prompt + tools finds the shared prefix before the first user message. Your task and conversation are excluded from this shared preset.</p></div>
               <div class="cache-fields">
                 <div class="cache-field"><label for="cache-prefix">Shared prefix tokens</label><input id="cache-prefix" type="number" min="1" step="1" value="512" placeholder="Whole rendered request" aria-describedby="cache-boundary-note"></div>
                 <div class="cache-field"><label for="cache-ttl">Prefer on GPU for (seconds)</label><input id="cache-ttl" type="number" min="0" max="86400" step="1" value="300" required></div>
@@ -1369,7 +1375,8 @@
       const ttl = Number($('cache-ttl').value);
       if ($('cache-ttl').value === '' || !Number.isFinite(ttl) || ttl < 0 || ttl > 86400) throw new Error('GPU preference must be between 0 and 86,400 seconds.');
       const prefix = $('cache-prefix').value.trim();
-      if (prefix && (!Number.isSafeInteger(Number(prefix)) || Number(prefix) < 1)) throw new Error('Shared prefix tokens must be a positive whole number, or blank for the full request.');
+      const systemScope = $('cache-scope').value === 'system';
+      if (!systemScope && prefix && (!Number.isSafeInteger(Number(prefix)) || Number(prefix) < 1)) throw new Error('Shared prefix tokens must be a positive whole number, or blank for the full request.');
       let request, format;
       if ($('cache-mode').value === 'json') {
         format = $('cache-format').value;
@@ -1384,13 +1391,48 @@
           max_tokens:64, temperature:0, chat_template_kwargs:{enable_thinking:false, thinking_mode:'disabled'}};
       }
       const registration = {name, format, request, ttl_seconds:ttl};
-      if (prefix) registration.prefix_tokens = Number(prefix);
+      if (systemScope) registration.prefix_scope = 'system';
+      else if (prefix) registration.prefix_tokens = Number(prefix);
       return registration;
     }
     function cacheMode() {
       const advanced = $('cache-mode').value === 'json';
       $('cache-simple').hidden = advanced;
       $('cache-advanced').hidden = !advanced;
+      if (advanced) renderCachePrompt();
+    }
+    function cachePromptParts(request) {
+      const text = content => typeof content === 'string' ? content : Array.isArray(content)
+        ? content.filter(part => part && typeof part.text === 'string').map(part => part.text).join('\n\n') : '';
+      const system = [];
+      if (text(request.system)) system.push(text(request.system));
+      for (const message of Array.isArray(request.messages) ? request.messages : []) {
+        if (!message || !['system','developer'].includes(message.role)) break;
+        if (text(message.content)) system.push(text(message.content));
+      }
+      return {system:system.join('\n\n'), tools:Array.isArray(request.tools) ? request.tools : []};
+    }
+    function renderCachePrompt() {
+      try {
+        const request = JSON.parse($('cache-request').value);
+        if (!request || Array.isArray(request) || typeof request !== 'object') throw new Error();
+        const parts = cachePromptParts(request);
+        $('cache-system-preview').textContent = parts.system || 'No leading system prompt in this request.';
+        $('cache-tools-title').textContent = `Tool definitions (${parts.tools.length})`;
+        $('cache-tools-preview').textContent = parts.tools.length ? JSON.stringify(parts.tools, null, 2) : 'No tools in this request.';
+      } catch (_) {
+        $('cache-system-preview').textContent = 'Enter valid request JSON to view its system prompt.';
+        $('cache-tools-title').textContent = 'Tool definitions';
+        $('cache-tools-preview').textContent = '';
+      }
+    }
+    function cacheScope() {
+      const system = $('cache-scope').value === 'system';
+      $('cache-prefix').disabled = system;
+      $('cache-prefix').placeholder = system ? 'Automatic system boundary' : 'Whole rendered request';
+      $('cache-boundary-note').textContent = system
+        ? 'The model’s template determines the boundary, including tools before the user text. The server rounds down to complete cache pages.'
+        : 'Choose a token boundary inside the shared instructions. Blank caches the whole request for identical replays. The server rounds down to complete pages and leaves a private tail.';
     }
     function renderPromptCaches(data) {
       const entries = data.prefixes;
@@ -1445,7 +1487,10 @@
     }
     async function registerPrompt(test = false) {
       let registration;
-      try { registration = cacheRegistration(); } catch (error) { cacheMessage(error.message, true); return; }
+      try {
+        registration = cacheRegistration();
+        if (registration.prefix_scope === 'system' && !cacheUI.data?.system_scope_supported) throw new Error('Update and restart the model server to use automatic system-prompt caching. Your prompt remains loaded.');
+      } catch (error) { cacheMessage(error.message, true); return; }
       const agents = Number($('cache-agents').value);
       if (test && ![1,2,4,8].includes(agents)) { cacheMessage('Choose 1, 2, 4 or 8 agents.', true); return; }
       await cacheAction(async () => {
@@ -1475,8 +1520,11 @@
       });
     }
     $('cache-mode').addEventListener('change', cacheMode);
+    $('cache-request').addEventListener('input', renderCachePrompt);
+    $('cache-scope').addEventListener('change', cacheScope);
     $('cache-refresh').addEventListener('click', loadPromptCache);
     $('cache-example').addEventListener('click', () => {
+      $('cache-scope').value = 'request'; cacheScope();
       $('cache-mode').value = 'simple'; cacheMode();
       $('cache-name').value = `test-${Date.now().toString(36)}`;
       $('cache-prompt').value = 'You are a concise test assistant. Follow the user task exactly.\n' + Array.from({length:80}, (_, i) => `Reference ${i + 1}: Shared instructions stay identical across agents. Each agent reads its own task after this reference material.`).join('\n');
@@ -1519,7 +1567,7 @@
       $('cache-recent-list').innerHTML = data.prompts.length ? data.prompts.map(prompt => {
         const date = new Date(prompt.received_at);
         const stamp = Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString();
-        return `<article class="cache-recent-row"><div><p class="cache-recent-preview">${escapeHtml(prompt.preview)}</p><p class="small">${escapeHtml(stamp)} · ${escapeHtml(prompt.model)} · ${escapeHtml(prompt.format === 'anthropic' ? 'Anthropic' : 'OpenAI')} · ${fmt(prompt.message_count)} messages</p></div><button class="button small" type="button" data-recent-prompt="${escapeHtml(prompt.id)}">Use prompt</button></article>`;
+        return `<article class="cache-recent-row"><div><p class="cache-recent-preview">${escapeHtml(prompt.preview)}</p><p class="small">${escapeHtml(stamp)} · ${escapeHtml(prompt.model)} · ${escapeHtml(prompt.format === 'anthropic' ? 'Anthropic' : 'OpenAI')} · ${fmt(prompt.message_count)} messages</p></div><button class="button small" type="button" data-recent-prompt="${escapeHtml(prompt.id)}">View prompt</button></article>`;
       }).join('') : `<p class="empty">${data.enabled ? 'No recent requests yet. Send a request from your agent or run a test below, then refresh.' : 'No recent requests. Resume collection to capture new prompts.'}</p>`;
       cacheControls();
     }
@@ -1548,11 +1596,15 @@
       $('cache-name').value = `recent-${prompt.id.slice(0,12)}`;
       // An earlier form's boundary says nothing about a different request.
       $('cache-prefix').value = '';
+      $('cache-scope').value = cachePromptParts(prompt.request).system ? 'system' : 'request';
+      cacheScope();
       $('cache-results').hidden = true;
       cacheMode();
-      cacheMessage('Request loaded for whole request caching. Set Shared prefix tokens before changing task text if you want to share only the instructions, then choose Register prompt.');
+      cacheMessage($('cache-scope').value === 'system'
+        ? 'System prompt and tools loaded below. Choose a cache name, then Register prompt to share these instructions across different tasks.'
+        : 'No leading system prompt was sent. You can cache the whole request or choose a manual token boundary.');
       $('cache-editor-title').scrollIntoView?.({block:'start'});
-      $('cache-request').focus?.({preventScroll:true});
+      $('cache-scope').focus?.({preventScroll:true});
     }
     async function useRecentPrompt(id) {
       await cacheAction(async () => { const body = await cacheCall(`/recent/${encodeURIComponent(id)}`); applyRecentPrompt(body.result); });

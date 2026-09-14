@@ -29,6 +29,7 @@ class CacheRequest(BaseModel):
 class Registration(CacheRequest):
     name: str = Field(pattern=NAME_PATTERN)
     prefix_tokens: int | None = Field(default=None, ge=0)
+    prefix_scope: Literal["system"] | None = None
     ttl_seconds: float = Field(default=300, ge=0, le=86400, allow_inf_nan=False)
 
 
