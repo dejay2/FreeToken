@@ -15,8 +15,12 @@ part of the design.
 The registration request accepts an ordinary OpenAI or Anthropic payload. The server renders
 and tokenizes it through the same path as generation. `prefix_tokens` selects a prefix of that
 rendered request and is rounded down to a whole cache page. Put the cut before variable task
-text. Omitting the cut selects the entire rendered request, including chat delimiters and the
-generation header; that is suitable only when later requests really share those tokens.
+text. Omitting the cut requests the entire rendered prompt, including chat delimiters and the
+generation header; that is suitable only when later requests really share those tokens. The
+cached boundary always leaves at least one prompt token for normal generation. If the entire
+rendered prompt is page aligned, its final page stays private. A prompt too short to leave
+both a whole cached page and a generation tail is rejected. `requested_tokens` reports the
+original count for each alias; `prefix_tokens` reports its actual shared boundary.
 
 This example creates a registration file from two otherwise identical requests with different
 tasks. Run it in the FreeToken Python environment, passing the served tokenizer's exact local
@@ -118,7 +122,8 @@ for each admitted hybrid request. Normal usage reporting remains opt-in with
   new versioned name or delete the old one first.
 - The requested prefix must include one whole page, leave context for the agent's continuation,
   and fit the current KV pool with at least one page left. The unaligned tail is processed per
-  request. A 25,000-token prefix with 64-token pages shares 24,960 tokens and leaves 40.
+  request. A 25,000-token prompt with 64-token pages shares 24,960 tokens and leaves 40. An
+  exactly 24,960-token prompt shares 24,896 tokens and processes its final 64 tokens per agent.
 - Preference TTL defaults to 300 seconds and accepts 0–86,400 seconds. It applies to the shared
   entry's GPU preference, not to alias lifetime; the most recent registration sets that entry's
   TTL. A warm/use refreshes the preference. Zero disables lasting retention.
@@ -137,6 +142,8 @@ for each admitted hybrid request. Normal usage reporting remains opt-in with
   preparation allows that bounded job to drain. Cancelling one waiting agent removes only its
   own request. If preparation is rejected, waiting requests return to ordinary admission once.
 - Picture/private requests cannot be registered or routed through this shared preparation path.
+- Expected tokenization or chat-template validation failures return HTTP 400 (`invalid`),
+  including rejected role ordering. Unexpected worker errors remain HTTP 500 (`failed`).
 
 Register a skill as a complete ordered prefix such as `base + coding role + review skill`.
 That preset can reuse its base checkpoint, but a separately cached skill cannot be inserted

@@ -388,3 +388,37 @@ async def test_backend_death_resolves_prefix_waiters_as_failed():
     result = await task
     assert result == {"status": "failed", "result": {}, "error": "scheduler exited"}
     assert manager.prefix_futures == {}
+
+
+def test_registration_template_rejection_is_reported_as_http_bad_request():
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+    from freetoken.tokenizer.server import _forward_prefix_msg
+    from freetoken.tokenizer.tokenize import TokenizeManager
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+        unk_token="[UNK]",
+        chat_template=("{% if messages[0]['role'] != 'user' %}"
+                       "{{ raise_exception('A user message must come first') }}{% endif %}"
+                       "{{ messages[0]['content'] }}"),
+    )
+    manager = TokenizeManager(tokenizer)
+    state = _State()
+
+    async def dispatch(msg, timeout=30.0):
+        replies = []
+        backend = SimpleNamespace(put=lambda msg: pytest.fail("invalid preset reached scheduler"))
+        frontend = SimpleNamespace(put=replies.append)
+        assert _forward_prefix_msg(msg, manager, backend, frontend)
+        reply, = replies
+        assert reply.request_id == msg.request_id
+        return {"status": reply.status, "result": reply.result, "error": reply.error}
+
+    state.dispatch_prefix = dispatch
+    response = _register(_client(state), request={
+        "model": "local-model", "messages": [{"role": "assistant", "content": "bad order"}],
+    })
+    assert response.status_code == 400
+    assert response.json()["status"] == "invalid"
+    assert "A user message must come first" in response.json()["error"]

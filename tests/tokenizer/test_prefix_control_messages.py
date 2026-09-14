@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 import torch
+from jinja2 import TemplateError
 
 import freetoken.message as message
 from freetoken.message import BaseBackendMsg, BaseFrontendMsg, BaseTokenizerMsg
@@ -153,7 +154,12 @@ def test_non_registration_actions_pass_through_without_tokenization(action: str)
     assert forwarded.input_ids is None
 
 
-def test_tokenizer_failure_returns_a_correlated_failed_reply():
+@pytest.mark.parametrize("error, status", [
+    (ValueError("template rejected roles"), "invalid"),
+    (TemplateError("template rejected roles"), "invalid"),
+    (RuntimeError("encoder worker broke"), "failed"),
+])
+def test_tokenizer_failure_returns_a_correlated_classified_reply(error, status):
     PrefixCacheMsg, _, _, PrefixCacheReply = _types()
     backend, frontend = _Queue(), _Queue()
     msg = PrefixCacheMsg(
@@ -164,7 +170,7 @@ def test_tokenizer_failure_returns_a_correlated_failed_reply():
     )
 
     assert tokenizer_server._forward_prefix_msg(
-        msg, _TokenizeManager(error=ValueError("template rejected roles")), backend, frontend
+        msg, _TokenizeManager(error=error), backend, frontend
     )
 
     assert backend.items == []
@@ -172,9 +178,9 @@ def test_tokenizer_failure_returns_a_correlated_failed_reply():
     reply = frontend.items[0]
     assert isinstance(reply, PrefixCacheReply)
     assert reply.request_id == "broken-1"
-    assert reply.status == "failed"
+    assert reply.status == status
     assert reply.result == {}
-    assert "template rejected roles" in reply.error
+    assert str(error) in reply.error
 
 
 def test_empty_registration_returns_correlated_invalid_reply():

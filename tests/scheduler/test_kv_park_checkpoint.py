@@ -41,8 +41,10 @@ def test_named_prefix_restores_exact_endpoint_without_a_second_forward(tmp_path,
     co = PrefixCoordinator(cm, lambda p: pm.pending_list.append(p), max_seq_len=table.shape[1],
                            kv_bytes_per_token=kv.unit_bytes()[0], state_bytes=pool.bytes_per_slot())
     pm.prefix_coordinator = co
+    # Keep the exact checkpoint under test while leaving normal generation a tail.
     msg = PrefixCacheBackendMsg("register", "register", "base",
-                               input_ids=torch.arange(length, dtype=torch.int32))
+                               input_ids=torch.arange(length + 1, dtype=torch.int32),
+                               prefix_tokens=length)
     try:
         assert co.command(msg)["status"] == "ok"
         assert co.command(PrefixCacheBackendMsg("warm", "warm", "base"))["status"] == "warming"

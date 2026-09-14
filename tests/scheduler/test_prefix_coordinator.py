@@ -334,7 +334,7 @@ def test_table_blocked_arrival_cannot_block_preparation_continuation(setup):
 
 def test_yielding_preparation_reserves_capacity_for_its_unfinished_tokens(setup):
     co, pm, cm, *_ = setup
-    register(co, ids=torch.arange(112, dtype=torch.int32))
+    register(co, ids=torch.arange(113, dtype=torch.int32), length=112)
     co.command(command("warm", "base"))
     first = pm.schedule_next_batch(8)
     cm.allocate_paged(first.reqs)
@@ -517,3 +517,52 @@ def test_dynamic_arrival_charge_is_released_when_prefix_job_holds_follower(setup
     agents = pm.schedule_next_batch(128)
     assert {r.uid for r in agents.reqs} == {1, 2}
     cm.check_integrity()
+
+
+@pytest.mark.parametrize("requested", [None, 16])
+def test_full_page_aligned_prompt_coalesces_with_a_private_final_page(setup, requested):
+    co, pm, cm, tm, pool = setup
+    ids = torch.arange(16, dtype=torch.int32)
+    result = register(co, ids=ids, length=requested)
+    assert result["status"] == "ok"
+    assert result["result"]["requested_tokens"] == 16
+    assert result["result"]["prefix_tokens"] == 12
+    for uid in range(4):
+        assert co.route(PendingReq(uid, ids.clone(), SamplingParams(max_tokens=2)))
+    assert len(pm.pending_list) == 1
+    assert finish_prefix(setup) == 1
+    batch = pm.schedule_next_batch(128)
+    assert {req.uid for req in batch.reqs} == {0, 1, 2, 3}
+    assert all(not req.prefill_only and req.cached_len == 12 and req.extend_len == 4
+               for req in batch.reqs)
+    rows = [tm.page_table[req.table_idx, :12] for req in batch.reqs]
+    assert all(torch.equal(rows[0], row) for row in rows[1:])
+    assert len({req.linear_slot_idx for req in batch.reqs}) == 4
+    assert co.command(command("get", "base"))["result"]["preparations"] == 1
+    cm.check_integrity()
+
+
+def test_single_page_prompt_cannot_leave_a_cache_page_and_generation_tail(setup):
+    co, pm, *_ = setup
+    result = register(co, ids=torch.arange(4, dtype=torch.int32))
+    assert result["status"] == "invalid"
+    assert "tail" in result["error"]
+    assert not pm.pending_list and not co.names and co.source_bytes == 0
+
+
+def test_aliases_report_their_own_requested_lengths_through_update_and_delete(setup):
+    co, pm, *_ = setup
+    a = register(co, "a", length=9)["result"]
+    b = register(co, "b", length=11)["result"]
+    assert a["id"] == b["id"] and a["prefix_tokens"] == b["prefix_tokens"] == 8
+    assert b["requested_tokens"] == 11
+    assert co.command(command("get", "a"))["result"]["requested_tokens"] == 9
+    assert co.command(command("get", "b"))["result"]["requested_tokens"] == 11
+    assert register(co, "a", length=10)["result"]["requested_tokens"] == 10
+    listing = co.command(command("list"))["result"]
+    assert {p["name"]: p["requested_tokens"] for p in listing["prefixes"]} == {"a": 10, "b": 11}
+    assert listing["source_bytes"] == 8 * 4
+    co.command(command("delete", "a"))
+    assert co.command(command("get", "b"))["result"]["requested_tokens"] == 11
+    assert register(co, "a", length=9)["result"]["requested_tokens"] == 9
+    assert co.command(command("list"))["result"]["source_bytes"] == 8 * 4

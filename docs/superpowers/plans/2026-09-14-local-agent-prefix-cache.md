@@ -209,3 +209,33 @@ PATH=/home/jay/projects/FreeToken/.venv/bin:$PATH PYTHONPATH="$PWD/python" \
   The 108 failures comprise the same 107 CPU pinned-memory failures and existing Linux CLI
   default expectation described above. The initial parking timing failure did not recur in
   either complete rerun; it is still disclosed rather than hidden by the passing reruns.
+
+
+### PR #6 review corrections
+
+Three review findings were reproduced against `1191a69` before changing production code:
+
+- Full, page-aligned rendered prompts now retain a non-empty generation tail. Registration
+  clamps the requested cut before page alignment, leaving the final page private when needed.
+  A prompt that cannot leave both a cached page and a tail is rejected clearly. Regression
+  cases cover both omitted and explicit full-length cuts, one preparation for four matching
+  agents, shared attention pages and separate recurrent state.
+- The original requested length is stored per alias. Register/get/list, updating one alias,
+  deleting and re-registering it all preserve the other alias's metadata and one shared source.
+- Expected `ValueError` and Jinja `TemplateError` exceptions return `invalid` (HTTP 400).
+  Unexpected encoder failures remain `failed` (HTTP 500). A real Transformers/Jinja renderer
+  exercises the HTTP route with rejected role ordering, alongside correlated worker replies.
+
+The regressions failed for the reviewed causes before the fixes and pass afterward. The
+focused prefix/API/transport and dynamic-pool suite now has **150 passing tests**; the feature
+adds **64 tests** compared with target `8d3b5c3`. Compilation and `git diff --check` pass.
+Live Qwen3.8 Flash correctness and performance on the RTX 5090 remain a merge requirement;
+this update does not deploy or restart the server.
+
+Final review-update validation, using the same broad command above:
+**1,557 passed, 108 failed, 13 skipped**. The failure-ID set exactly matches the recorded
+unchanged `8d3b5c3` baseline (**1,493 passed, 108 failed, 13 skipped**): zero additional
+failures and 64 additional passes. The focused suite has 150 passes and the checkpoint suite
+has 19 passes. The RAM/SSD fixtures now include explicit prompt tails while preserving their
+original checkpoint sizes and all byte-restoration assertions. Independent inspection found
+no further defects in the three fixes.

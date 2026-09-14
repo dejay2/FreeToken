@@ -11,6 +11,7 @@ from urllib.parse import unquote_to_bytes, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, url2pathname
 
 import torch
+from jinja2 import TemplateError
 from freetoken.core import SamplingParams
 from freetoken.message import (
     AbortBackendMsg,
@@ -446,7 +447,7 @@ def _forward_prefix_msg(m, tokenize_manager, send_backend, send_frontend) -> boo
             send_frontend.put(
                 PrefixCacheReply(
                     request_id=m.request_id,
-                    status="failed",
+                    status="invalid" if isinstance(exc, (ValueError, TemplateError)) else "failed",
                     result={},
                     error=f"could not encode prefix registration: {exc}",
                 )

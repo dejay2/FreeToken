@@ -25,9 +25,9 @@ from .utils import PendingReq
 class PrefixEntry:
     key: str
     tokens: torch.Tensor
-    requested_tokens: int
     ttl: float
-    names: set[str] = field(default_factory=set)
+    # Requested lengths belong to aliases; aligned source tokens belong to the entry.
+    names: dict[str, int] = field(default_factory=dict)
     waiters: dict[int, PendingReq] = field(default_factory=dict)
     handoffs: set[int] = field(default_factory=set)
     job_uid: int | None = None
@@ -116,7 +116,7 @@ class PrefixCoordinator:
                 return self._reply("warming", self._describe(entry, msg.name))
             if msg.action == "delete":
                 del self.names[msg.name]
-                entry.names.remove(msg.name)
+                del entry.names[msg.name]
                 if not entry.names:
                     entry.expires_at = 0
                     self._release_if_unused(entry)
@@ -142,7 +142,12 @@ class PrefixCoordinator:
         requested = len(ids) if msg.prefix_tokens is None else msg.prefix_tokens
         if type(requested) is not int or not 0 < requested <= len(ids):
             raise ValueError("prefix_tokens must select a non-empty prefix of the rendered request")
-        length = requested // self.cm.page_size * self.cm.page_size
+        # Generation needs a non-empty prompt extension to produce its first logits.
+        # If the whole rendered prompt is aligned, keep its final page private;
+        # the coalesced checkpoint must be consumable by that same request.
+        length = min(requested, len(ids) - 1) // self.cm.page_size * self.cm.page_size
+        if length < self.cm.page_size:
+            raise ValueError("registration must leave a prompt tail after at least one whole cache page")
         if not self.cm.page_size <= length < self.max_seq_len:
             raise ValueError("aligned prefix must be at least one page and leave context for a request tail")
         if length + self.cm.page_size > self.cm.num_pages * self.cm.page_size:
@@ -161,10 +166,10 @@ class PrefixCoordinator:
                 return self._reply("busy", error="Prefix preparation limit reached; let orphaned jobs finish")
             if self.source_bytes + length * 4 > self.MAX_SOURCE_BYTES:
                 return self._reply("busy", error="Prefix source-token budget reached")
-            entry = PrefixEntry(key, tokens.clone(), requested, float(ttl))
+            entry = PrefixEntry(key, tokens.clone(), float(ttl))
             self.entries[key] = entry
         entry.ttl = float(ttl)
-        entry.names.add(msg.name)
+        entry.names[msg.name] = requested
         self.names[msg.name] = key
         return self._reply(result=self._describe(entry, msg.name))
 
@@ -183,7 +188,7 @@ class PrefixCoordinator:
             parked = self.cm.park_store.lookup(entry.tokens, min_len=len(entry.tokens),
                                                max_len=len(entry.tokens), touch=False)
         return {"name": name, "id": entry.key, "prefix_tokens": len(entry.tokens),
-                "requested_tokens": entry.requested_tokens, "alignment": self.cm.page_size,
+                "requested_tokens": entry.names[name], "alignment": self.cm.page_size,
                 "state": state, "gpu_cached_tokens": match.cached_len,
                 "retained": entry.lease is not None, "ttl_seconds": entry.ttl,
                 "waiting_requests": len(entry.waiters), "preparations": entry.preparations,
