@@ -127,9 +127,11 @@ for each admitted hybrid request. Normal usage reporting remains opt-in with
   references. Registry references yield under KV/state pressure at admission and allocation;
   active request references remain protected. A full request table or exhausted token budget
   does not erase retention. Under insufficient capacity, sharing is best effort and work can be repeated.
-- A pool rebuild releases registry handles before replacing pools. Source tokens survive and
-  readiness is looked up again. Model/server restarts discard aliases; re-register them. This
-  first version does not persist the registry. Existing SSD checkpoints retain their usual
+- A pool rebuild, including `--kv-dynamic` growth or shrink, releases registry handles before
+  replacing pools. Source tokens survive and readiness is looked up again. Registration uses
+  the current pool and context limits, refreshed after successful resizing. A failed rebuild
+  terminates waiting agents and refuses further prefix commands until the server restarts.
+  Model/server restarts discard aliases; re-register them. This first version does not persist the registry. Existing SSD checkpoints retain their usual
   model/layout fingerprint and checksum rules.
 - Deleting an alias does not wipe a checkpoint other requests can reuse. Deleting during
   preparation allows that bounded job to drain. Cancelling one waiting agent removes only its

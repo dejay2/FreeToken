@@ -24,6 +24,10 @@ from freetoken.message import (
     CacheStepMsg,
     CacheStepReply,
     CacheStepResultMsg,
+    KVDynamicStatusMsg,
+    KVDynamicStatusReply,
+    MaintenanceBeginMsg,
+    MaintenanceBeginReply,
     RoutingStatsMsg,
     RoutingStatsResultMsg,
 )
@@ -69,7 +73,7 @@ def test_every_control_shape_is_counted():
     for t in (
         CacheRebuildMsg, CacheRebuildResultMsg, CacheStepMsg, CacheStepResultMsg,
         CacheResidencyMsg, CacheResidencyResultMsg, RoutingStatsMsg, RoutingStatsResultMsg,
-        CacheProgressMsg,
+        CacheProgressMsg, MaintenanceBeginMsg, KVDynamicStatusMsg,
     ):
         assert t in _CONTROL_MSG_TYPES, t.__name__
 
@@ -119,4 +123,20 @@ def test_progress_msg_forwards_to_frontend():
     m = CacheProgressMsg(request_id="op-1", phase="waiting", detail="drained 1 prefill")
     out = _forward(m)
     assert isinstance(out, CacheProgressReply)
+    _same_fields(m, out)
+
+
+def test_maintenance_begin_msg_forwards_to_frontend():
+    """The scheduler began an operation on its own (dynamic KV pool): the API opens its own
+    maintenance_ops record for it, same as an API-dispatched rebuild/step."""
+    m = MaintenanceBeginMsg(request_id="auto-kv:i:1", kind="auto-kv", detail="grow")
+    out = _forward(m)
+    assert isinstance(out, MaintenanceBeginReply)
+    _same_fields(m, out)
+
+
+def test_kv_dynamic_status_msg_forwards_to_frontend():
+    m = KVDynamicStatusMsg(status={"enabled": True, "held": 2})
+    out = _forward(m)
+    assert isinstance(out, KVDynamicStatusReply)
     _same_fields(m, out)

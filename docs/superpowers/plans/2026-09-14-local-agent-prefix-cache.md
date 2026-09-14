@@ -165,3 +165,47 @@ PATH=/home/jay/projects/FreeToken/.venv/bin:$PATH PYTHONPATH="$PWD/python" \
 The implementation is reviewable on the isolated feature branch. GPU kernel correctness,
 real-model output parity, TTFT improvements and throughput remain live acceptance work. This
 CPU-validated implementation does not claim those measurements or restart the user's engine.
+
+
+### Draft PR integration with the current target branch
+
+Integrated `origin/mtp-upstream-merge` at `8d3b5c3` (dynamic KV pool) before publishing the
+feature branch. Both features retain their admission hooks, idle timers and rebuild guards.
+Three integration regressions were reproduced before their fixes:
+
+- A failed rebuild now answers prefix-held agents exactly once, drops CPU ownership without
+  unlocking torn-down device pools, and rejects late prefix-control messages.
+- Successful pool resizing refreshes the registry's current context limit. Registration still
+  requires the prefix to fit today's pool; a warm command does not request dynamic growth.
+- Moving a cold agent into the shared preparation's waiters clears its provisional dynamic
+  admission charge. Later agents can join that preparation, and private tails are reserved on
+  actual admission. The regression seats two agents together where duplicate cold estimates
+  would otherwise put the second into the dynamic controller's held FIFO.
+
+Focused prefix/API/transport and dynamic-pool tests: **143 passed**. There are now **57 added
+feature tests**, including the three integration regressions. Python compilation and
+`git diff --check` pass. GPU acceptance remains outstanding; the server has not been deployed
+or restarted.
+
+A broad comparison also exposed a timing-sensitive existing parking test:
+`test_idle_park_frees_only_after_the_copy_and_restore_is_byte_identical`. Its assertion assumes
+that the copy has not completed before `park_idle` returns, although `_park_candidate` drains
+completed copies immediately. It passed in isolation on both branches. Forcing the copy to
+complete before `ParkStore.offer` returns reproduced the same assertion on unchanged `8d3b5c3`.
+The test was left unchanged; this timing sensitivity is disclosed in the PR.
+
+Final merged-head comparison (same CPU environment and commands):
+
+```bash
+PATH=/home/jay/projects/FreeToken/.venv/bin:$PATH PYTHONPATH="$PWD/python" \
+  /home/jay/projects/FreeToken/.venv/bin/python -m pytest -q \
+  tests/scheduler tests/server tests/tokenizer tests/kvcache \
+  tests/engine/test_kv_dynamic_engine.py tests/engine/test_spec_rearm_after_rebuild.py
+```
+
+- Feature: **1,550 passed, 108 failed, 13 skipped**.
+- Unchanged target `8d3b5c3`: **1,493 passed, 108 failed, 13 skipped**.
+- Exact failure-ID sets match: **zero additional failures**, **57 additional passes**.
+  The 108 failures comprise the same 107 CPU pinned-memory failures and existing Linux CLI
+  default expectation described above. The initial parking timing failure did not recur in
+  either complete rerun; it is still disclosed rather than hidden by the passing reruns.

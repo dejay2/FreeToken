@@ -44,6 +44,7 @@ class _FakeState:
         self.maintenance_state = maintenance_state
         self.fatal_error = fatal_error
         self.last_rebuild = None
+        self.maintenance_ops: dict = {}
         self._loop = None
         self._send_impl = send_impl
         self.monotonic = lambda: 1000.0
@@ -303,7 +304,8 @@ def test_cache_rebuild_timeout_keeps_gate_closed():
         sent.append(msg)
 
     state = SimpleNamespace(
-        maintenance_state="serving", rebuild_futures={}, last_rebuild=None, send_one=send_one
+        maintenance_state="serving", rebuild_futures={}, last_rebuild=None, send_one=send_one,
+        maintenance_ops={}, fatal_error=None,
     )
     api_server._GLOBAL_STATE = state
     try:
@@ -332,7 +334,8 @@ def test_cache_rebuild_send_failure_rolls_back_gate():
         raise RuntimeError("zmq down")
 
     state = SimpleNamespace(
-        maintenance_state="serving", rebuild_futures={}, last_rebuild=None, send_one=boom
+        maintenance_state="serving", rebuild_futures={}, last_rebuild=None, send_one=boom,
+        maintenance_ops={}, fatal_error=None, monotonic=lambda: 1000.0,
     )
     api_server._GLOBAL_STATE = state
     try:

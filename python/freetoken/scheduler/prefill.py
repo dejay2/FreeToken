@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, Callable, List, Tuple
 
 import torch
 from freetoken import diag
@@ -50,6 +50,18 @@ class PrefillAdder:
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
     blocked_by_cache: bool = field(default=False, init=False)
+    # Dynamic KV pool hooks (scheduler/kv_dynamic.py). Both None = today's behaviour.
+    on_reserved: Callable[[int], None] | None = None
+    capacity_blocked: List[PendingReq] = field(default_factory=list)
+
+    def _note_capacity_blocked(self, req: PendingReq) -> None:
+        """Record a never-started request this pass could not seat, with the room the requests
+        that DID hold the pool were using. The dynamic KV controller needs that figure to size a
+        grow the blocked request can run BESIDE (spec rule 2, concurrent target): by the time it
+        escalates at the idle point those requests have finished and reserved_size is 0, so the
+        number has to be captured here, at the moment the block happened."""
+        req.blocked_reserved_tokens = self.reserved_size
+        self.capacity_blocked.append(req)
 
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
@@ -97,12 +109,20 @@ class PrefillAdder:
             logger.warning_rank0(reason)
             return None
 
-        if estimated_len + self.reserved_size > self.cache_manager.available_size:
+        from .cache import admission_fits
+
+        if not admission_fits(need_now=estimated_len, reserved=self.reserved_size,
+                              available=self.cache_manager.available_size, protect_tokens=0):
             self.blocked_by_cache = True
+            if req.chunked_req is None:
+                self._note_capacity_blocked(req)
             return None
         self.cache_manager.lock(handle)
-        if estimated_len + self.reserved_size > self.cache_manager.available_size:
+        if not admission_fits(need_now=estimated_len, reserved=self.reserved_size,
+                              available=self.cache_manager.available_size, protect_tokens=0):
             self.blocked_by_cache = True
+            if req.chunked_req is None:
+                self._note_capacity_blocked(req)
             return self.cache_manager.unlock(handle)
 
         # Second currency (hybrid GDN): reserve 1 live + 2 ping-pong state slots; evict tree
@@ -207,6 +227,8 @@ class PrefillAdder:
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
         self.reserved_size += remain_len + pending_req.output_len
+        if self.on_reserved is not None:
+            self.on_reserved(pending_req.uid)
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
@@ -287,6 +309,10 @@ class PrefillManager:
     pending_list: List[PendingReq] = field(default_factory=list)
     rejected: List[Tuple[int, str]] = field(default_factory=list)
     prefix_coordinator: PrefixCoordinator | None = None
+    # Dynamic KV pool hooks (scheduler/kv_dynamic.py). Both None = today's behaviour.
+    on_reserved: Callable[[int], None] | None = None
+    on_capacity_blocked: Callable[[PendingReq], None] | None = None
+    _capacity_blocked: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
         pending = PendingReq(
@@ -307,7 +333,16 @@ class PrefillManager:
         # shape; the ids never change while a request waits for a cache-generation change.
         pending.park_keys = None
         pending.park_probe_generation = None
-        if self.prefix_coordinator is None or not self.prefix_coordinator.route(pending):
+        # Set by _note_capacity_blocked; declared here so every pending request carries the
+        # attribute whether or not an admission pass has ever blocked it.
+        pending.blocked_reserved_tokens = 0
+        if self.prefix_coordinator is not None and self.prefix_coordinator.route(pending):
+            # The shared preparation now owns runnable admission. Drop the dynamic
+            # controller's provisional charge for this cold prompt so later followers
+            # can join it. Each private tail is reserved when it returns to admission.
+            if self.on_reserved is not None:
+                self.on_reserved(pending.uid)
+        else:
             self.pending_list.append(pending)
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
@@ -339,6 +374,7 @@ class PrefillManager:
             ),
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            on_reserved=self.on_reserved,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
@@ -404,6 +440,18 @@ class PrefillManager:
         ordinary_chunks = [p for p in chunked_list if not p.prefill_only]
         preparation_chunks = [p for p in chunked_list if p.prefill_only]
         self.pending_list = ordinary_chunks + remaining + preparation_chunks + self.pending_list
+        if self.on_capacity_blocked is not None and adder.capacity_blocked:
+            # Membership by uid, never by `in`: PendingReq is a dataclass whose __eq__ compares
+            # its input_ids TENSOR, so `pending in list` raises "Boolean value of Tensor ... is
+            # ambiguous" as soon as the identity shortcut misses (any other entry ahead of it).
+            # uids are unique within the pending list, so this is the same test.
+            waiting = {pending.uid for pending in self.pending_list}
+            known = {pending.uid for pending in self._capacity_blocked}
+            for pending in adder.capacity_blocked:
+                if pending.uid in waiting and pending.uid not in known:
+                    self._capacity_blocked.append(pending)
+                    known.add(pending.uid)
+                    self.on_capacity_blocked(pending)
         if len(reqs) == 0:
             return None
         batch = Batch(reqs=reqs, phase="prefill")
@@ -415,6 +463,26 @@ class PrefillManager:
     def pop_rejections(self) -> List[Tuple[int, str]]:
         rejected, self.rejected = self.rejected, []
         return rejected
+
+    def pop_capacity_blocked(self) -> List[PendingReq]:
+        """Never-started requests still waiting for capacity; removed from pending_list so the
+        dynamic controller can hold them (rule 2(b)). Empty unless a hook is installed.
+
+        Filtered at POP time, not only where the entries are collected: a request blocked on one
+        admission pass is very often admitted on the next, and handing it back afterwards would
+        let the controller hold a RUNNING request and re-append it to the pending list -- a
+        second full response for one request. Anything that has left the pending list (admitted,
+        rejected or aborted) is dropped silently; it is no longer this list's business.
+        """
+        blocked, self._capacity_blocked = self._capacity_blocked, []
+        # By uid, not by `in`/`remove`: see the note in _admit_next_batch -- comparing
+        # PendingReq objects compares their input_ids tensors.
+        waiting = {pending.uid for pending in self.pending_list}
+        still_waiting: List[PendingReq] = [p for p in blocked if p.uid in waiting]
+        if still_waiting:
+            taken = {pending.uid for pending in still_waiting}
+            self.pending_list = [p for p in self.pending_list if p.uid not in taken]
+        return still_waiting
 
     def abort_req(self, uid: int) -> Req | None:
         if self.prefix_coordinator is not None:

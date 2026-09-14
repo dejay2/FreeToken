@@ -407,7 +407,7 @@ def test_scheduler_gives_decode_a_turn_after_a_preparation_quantum():
     prefill = Batch([prepared], "prefill")
     calls = []
     stub = SimpleNamespace(
-        _last_batch_was_prefix_preparation=True, prefill_budget=32,
+        _last_batch_was_prefix_preparation=True, prefill_budget=32, _engine_failed=None,
         prefill_manager=SimpleNamespace(schedule_next_batch=lambda budget: calls.append("prefill") or prefill),
         decode_manager=SimpleNamespace(schedule_next_batch=lambda: calls.append("decode") or decode),
         _prepare_batch=lambda batch: batch, _report_prompt_admissions=lambda batch: None,
@@ -426,3 +426,94 @@ def test_supported_registry_is_explicit_and_source_budget_is_enforced(setup):
     assert register(co)["status"] == "unsupported"
     assert not co.route(pending(1))
     assert not pm.pending_list
+
+
+def test_failed_rebuild_replies_to_prefix_waiters_without_touching_dead_pools(setup, monkeypatch):
+    from freetoken.message import ErrorReplyMsg, PrefixCacheBackendMsg, PrefixCacheResultMsg
+    from freetoken.scheduler.scheduler import Scheduler
+
+    co, pm, cm, tm, pool = setup
+    register(co)
+    co.command(command("warm", "base"))
+    finish_prefix(setup)
+    assert co.entries[co.names["base"]].lease is not None
+    register(co, "cold", ids=torch.arange(18, dtype=torch.int32) + 100)
+    follower = pending(7)
+    follower.input_ids[:16] += 100
+    assert co.route(follower)
+    assert pm.pending_list[0].uid < 0
+
+    sched = Scheduler.__new__(Scheduler)
+    sched.prefix_coordinator, sched.prefill_manager = co, pm
+    sched.decode_manager = pm.decode_manager
+    sent = []
+    sched.send_result = sent.extend
+    monkeypatch.setattr(cm, "unlock", lambda *args: pytest.fail("touched torn-down cache"))
+    sched._latch_engine_failed("test teardown failure")
+    errors = [m for m in sent if isinstance(m, ErrorReplyMsg)]
+    assert [m.uid for m in errors] == [7]
+    assert errors[0].code == "server_error"
+    assert not pm.pending_list and not co.jobs
+    assert all(not e.waiters and not e.handoffs and e.lease is None for e in co.entries.values())
+
+    # A control message already past the frontend gate must receive a failure too.
+    monkeypatch.setattr(co, "command", lambda *args: pytest.fail("inspected torn-down cache"))
+    sched._process_one_msg(PrefixCacheBackendMsg(request_id="late", action="list"))
+    assert isinstance(sent[-1], PrefixCacheResultMsg) and sent[-1].status == "failed"
+    sched._latch_engine_failed("again")
+    assert len([m for m in sent if isinstance(m, ErrorReplyMsg)]) == 1
+
+
+def test_pool_growth_updates_prefix_registration_limit(setup, monkeypatch):
+    from freetoken.scheduler.scheduler import Scheduler
+
+    co, pm, cm, tm, pool = setup
+    ids = torch.arange(164, dtype=torch.int32)
+    assert register(co, "large", ids=ids)["status"] == "invalid"
+    sched = Scheduler.__new__(Scheduler)
+    sched.prefix_coordinator, sched.prefill_manager = co, pm
+    sched.decode_manager, sched.cache_manager, sched.table_manager = pm.decode_manager, cm, tm
+    sched.device = torch.device("cpu")
+    sched.config = SimpleNamespace(tp_info=SimpleNamespace(size=1), max_extend_tokens=128)
+    sched.engine = SimpleNamespace(
+        rebuild_runtime_cache=lambda **kw: None, num_pages=64, max_seq_len=256,
+        page_table=torch.zeros(6, 256, dtype=torch.int32),
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+    sched.rebuild_cache(num_pages=64)
+    assert register(co, "large", ids=ids)["status"] == "ok"
+    cm.check_integrity()
+
+
+def test_dynamic_arrival_charge_is_released_when_prefix_job_holds_follower(setup):
+    from freetoken.message import UserMsg
+    from freetoken.scheduler.kv_dynamic import KVDynamicController, KVDynamicPolicy
+    from freetoken.scheduler.scheduler import Scheduler
+
+    co, pm, cm, tm, pool = setup
+    register(co)
+    sched = Scheduler.__new__(Scheduler)
+    sched.prefix_coordinator, sched.prefill_manager = co, pm
+    sched.decode_manager, sched.cache_manager = pm.decode_manager, cm
+    sched.config = SimpleNamespace(page_size=4, kv_ceiling_tokens=16_388)
+    sched.engine = SimpleNamespace(num_pages=33, max_seq_len=128, pool_budget_bytes=1 << 20)
+    sched._kv_dynamic = KVDynamicController(
+        KVDynamicPolicy(floor_pages=33, ceiling_pages=4097, step_pages=2048,
+                        page_size=4, kv_bytes_per_page=32, slot_bytes=1, slot_floor=1),
+        shrink_idle_s=600, instance_id="prefix-test",
+    )
+    pm.on_reserved = sched._kv_dynamic.note_reserved
+    sched.send_result = lambda messages: None
+    for uid in (1, 2):
+        # Cold estimates total 134 tokens, but one shared 16-token prefix plus two
+        # private tails/output allowances needs only 118 of the 128-token pool.
+        sched._process_one_msg(UserMsg(uid=uid, input_ids=pending(uid).input_ids,
+                                      sampling_params=SamplingParams(max_tokens=50)))
+    assert set(co.entries[co.names["base"]].waiters) == {1, 2}
+    assert not sched._kv_dynamic.has_held()
+    assert sched._kv_dynamic.uncommitted_tokens == 0
+    assert len(pm.pending_list) == 1 and pm.pending_list[0].prefill_only
+    finish_prefix(setup)
+    agents = pm.schedule_next_batch(128)
+    assert {r.uid for r in agents.reqs} == {1, 2}
+    cm.check_integrity()

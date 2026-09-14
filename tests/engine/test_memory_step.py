@@ -109,6 +109,8 @@ class FakeEngine:
     residency_report = Engine.residency_report
     _move_layer = Engine._move_layer
     _stash_vram_ledger_inputs = Engine._stash_vram_ledger_inputs
+    _kv_dynamic_active = Engine._kv_dynamic_active
+    _kv_rung_floor_pages = Engine._kv_rung_floor_pages
 
 
 def test_step_memory_ram_axis_returns_not_built_once_the_card_is_full():
@@ -544,3 +546,46 @@ def test_a_pure_moe_shrink_is_the_only_rebuild_that_may_skip_the_budget():
         {"layer_moves": [(3, "gpu_owned")]},  # a full layer of VRAM
     ):
         assert not Engine._is_pure_moe_shrink(**{**base, **change}), change
+
+
+# ----- dynamic KV pool integration (Task 7: 2026-09-12) -----
+
+
+def test_vram_down_kv_rung_shrinks_to_the_dynamic_floor_when_the_dynamic_pool_is_on():
+    eng = FakeEngine(num_layers=2, num_experts=4, cache_size=8, owned_layers=(), num_pages=400)
+    eng.config.kv_dynamic = True
+    eng.kv_dynamic_floor_pages = 100
+    # slots already at the floor (num_experts=4, overlap False) so rung 3 is reached
+    eng.moe_offload_cache.rebuild(4)
+    eng.config.moe_cache_size = 4
+    res = eng.step_memory("vram", "down", is_idle=True)
+    assert res["applied"] == "kv" and eng.num_pages == 100  # not the old 300 (-25 %)
+
+
+def test_vram_up_kv_rung_is_a_noop_under_the_dynamic_pool():
+    eng = FakeEngine(num_layers=3, num_experts=4, cache_size=4, owned_layers=(0, 1), num_pages=50)
+    eng.config.kv_dynamic = True
+    eng.kv_dynamic_floor_pages = 50
+    eng._initial_num_pages = 100
+    assert eng.step_memory_noop("vram", "up")["exhausted"] is True
+    # With dynamic off, the same state should return None (legacy restore pending)
+    eng.config.kv_dynamic = False
+    assert eng.step_memory_noop("vram", "up") is None
+
+
+def test_vram_up_kv_rung_restores_when_dynamic_is_on_but_the_floor_is_unset():
+    eng = FakeEngine(num_layers=3, num_experts=4, cache_size=4, owned_layers=(0, 1), num_pages=50)
+    eng.config.kv_dynamic = True
+    eng.kv_dynamic_floor_pages = None  # dynamic mode on but floor unset -> legacy behavior
+    eng._initial_num_pages = 100
+    assert eng.step_memory_noop("vram", "up") is None  # legacy restore pending
+
+
+def test_vram_down_slot_rung_reports_at_floor_when_kv_is_already_at_the_dynamic_floor():
+    eng = FakeEngine(num_layers=2, num_experts=4, cache_size=8, owned_layers=(), num_pages=100)
+    eng.config.kv_dynamic = True
+    eng.kv_dynamic_floor_pages = 100
+    # slots at 8, one rung above floor (floor = 4). After shrink to floor (4),
+    # KV can't shrink further (already at dynamic floor), so at_floor=True.
+    res = eng.step_memory("vram", "down", is_idle=True)
+    assert res["applied"] == "slots" and res["moe_cache_size"] == 4 and res["at_floor"] is True

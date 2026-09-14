@@ -880,6 +880,9 @@ class ProcessManager:
             "uptimeS": stats.get("uptime_s", stats.get("uptimeS", 0)) or 0,
             "geometry": _camelize(geometry),
             "parking": _camelize(parking),
+            # Left snake_case (not camelized like geometry/parking): the settings page renders
+            # these keys verbatim, matching /v1/cache/status's own field names (Task 9).
+            "kv_dynamic": cache.get("kv_dynamic"),
             "vramUsedMb": int(vram / (1024 * 1024)) if isinstance(vram, (int, float)) else 0,
             "vramTotalMb": int(total_vram / (1024 * 1024)) if isinstance(total_vram, (int, float)) else 0,
             "gpuUtilPercent": int(util) if isinstance(util, (int, float)) else 0,

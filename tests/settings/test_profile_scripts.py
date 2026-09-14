@@ -18,6 +18,11 @@ def _qwen_settings() -> dict[str, object]:
         "Port": 2020,
         "ContextTokens": 262144,
         "KVCacheTokens": 262144,
+        "KVDynamic": True,
+        "KVFloorTokens": 65536,
+        "KVStepTokens": 32768,
+        "KVShrinkIdleMin": 10,
+        "KVParkTTLHours": 5,
         "MaxRunningRequests": 4,
         "MoECacheSize": 4188,
         "GpuOwnedLayers": "auto:3",
@@ -64,6 +69,11 @@ def _dense_settings() -> dict[str, object]:
         "Port": 2022,
         "ContextTokens": 131072,
         "KVCacheTokens": 0,
+        "KVDynamic": True,
+        "KVFloorTokens": 65536,
+        "KVStepTokens": 32768,
+        "KVShrinkIdleMin": 10,
+        "KVParkTTLHours": 5,
         "MaxRunningRequests": 2,
         "MoECacheSize": 0,
         "GpuOwnedLayers": "",
@@ -207,3 +217,30 @@ def test_profile_update_rewrites_its_startup_file(tmp_path: Path) -> None:
     profile_path = tmp_path / "boot-profiles" / f"{created['id']}.ps1"
     assert BootFile(profile_path).load()["Port"] == 2024
     assert BootFile(profile_path).load()["ModelPath"] == r"D:\Models\Updated"
+
+
+def test_a_partial_update_does_not_reintroduce_dials_the_profile_never_set(tmp_path: Path) -> None:
+    boot = tmp_path / "boot-2020.ps1"
+    boot.write_text(render_boot_script(_qwen_settings(), title="Default"), encoding="utf-8")
+    manager = ProfilesManager(tmp_path / "boot-profiles.json", boot_file=boot)
+    created = manager.create("Plain", "saved", {"Port": 2023, "ModelPath": r"D:\Models\Plain"})
+    profile_path = tmp_path / "boot-profiles" / f"{created['id']}.ps1"
+
+    manager.update(created["id"], settings={"Port": 2024})
+
+    text = profile_path.read_text(encoding="utf-8")
+    assert "-Port 2024" in text
+    for flag in ("-KVDynamic", "-KVFloorTokens", "-KVStepTokens", "-KVShrinkIdleMin", "-KVParkTTLHours"):
+        assert flag not in text, f"{flag} was reintroduced by a Port-only update"
+
+    dynamic = manager.create(
+        "Dynamic", "saved",
+        {"Port": 2025, "ModelPath": r"D:\Models\Dynamic", "KVDynamic": True, "KVFloorTokens": 32768},
+    )
+    dynamic_path = tmp_path / "boot-profiles" / f"{dynamic['id']}.ps1"
+
+    manager.update(dynamic["id"], settings={"Port": 2026})
+
+    dynamic_text = dynamic_path.read_text(encoding="utf-8")
+    assert "-Port 2026" in dynamic_text
+    assert "-KVFloorTokens 32768" in dynamic_text

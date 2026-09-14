@@ -191,9 +191,14 @@ class ProfilesManager:
             raise ProfileValidationError([{"field": "name", "message": "Profile name is required"}])
         if description is not None and not isinstance(description, str):
             raise ProfileValidationError([{"field": "description", "message": "Description must be text"}])
-        next_settings = dict(profile.get("settings") or {}) if settings is None else settings
-        if not isinstance(next_settings, dict):
+        if settings is not None and not isinstance(settings, dict):
             raise ProfileValidationError([{"field": "settings", "message": "must be an object"}])
+        # A patch merges onto the profile's own stored settings rather than replacing them
+        # wholesale: a caller updating only Port must not silently drop (or re-baseline to
+        # today's dial defaults, e.g. the dynamic-KV-pool dials) every key it never mentioned.
+        next_settings = dict(profile.get("settings") or {})
+        if settings is not None:
+            next_settings.update(settings)
         errors = validate_settings(next_settings, ceilings_only=True)
         if errors:
             raise ProfileValidationError(errors)

@@ -108,6 +108,21 @@ class CacheProgressReply(BaseFrontendMsg):
 
 
 @dataclass
+class MaintenanceBeginReply(BaseFrontendMsg):
+    # detokenizer worker -> api server: see MaintenanceBeginMsg. Own record in
+    # FrontendManager.maintenance_ops, separate from any API-dispatched operation.
+    request_id: str
+    kind: str
+    detail: str | None = None
+
+
+@dataclass
+class KVDynamicStatusReply(BaseFrontendMsg):
+    # detokenizer worker -> api server: see KVDynamicStatusMsg.
+    status: dict
+
+
+@dataclass
 class CacheResidencyReply(BaseFrontendMsg):
     # detokenizer worker -> api server: result of a GET /v1/cache/residency request.
     request_id: str

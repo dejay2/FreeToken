@@ -384,6 +384,13 @@ class DSV4PagedKVCache(BaseKVCachePool):
         extra_fixed_bytes: int = 0, extra_note: str = "",
         num_swa_pages: int | None = None, shrink_only: bool = False, **targets,
     ) -> None:
+        """Full override of the base template (DSV4's window/full anchor pricing does not fit
+        the generic ``kv_cost`` shape) -- it does NOT call ``super()`` and does not accept or
+        honour ``pool_budget_bytes`` / ``budget_swap`` (silently absorbed into ``**targets``).
+        This is deliberate, not an oversight: the dynamic KV pool does not support DSV4's owned
+        KV tiers (window anchor + full anchor priced together), so the scheduler refuses
+        ``--kv-dynamic`` on DSV4 outright (Task 10) and no caller of this override can ever
+        pass a budget swap in practice."""
         from freetoken.engine.cache_budget import net_cache_budget_bytes
         from freetoken.utils import mem_GB
 

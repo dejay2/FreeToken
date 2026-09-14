@@ -373,6 +373,18 @@ class PrefixCoordinator:
     def before_rebuild(self):
         self.release_preferences()
 
+    def engine_failed(self, reason):
+        """Detach waiters without touching pools that a failed teardown invalidated."""
+        waiters = []
+        for entry in self.entries.values():
+            waiters.extend(entry.waiters.values())
+            entry.waiters.clear()
+            entry.handoffs.clear()
+            entry.lease, entry.expires_at = None, 0
+            entry.job_uid, entry.error = None, reason
+        self.jobs.clear()
+        return waiters
+
     def next_delay_ms(self):
         deadlines = [e.expires_at for e in self.entries.values() if e.lease and not e.handoffs]
         return max(1, math.ceil((min(deadlines) - self.clock()) * 1000)) if deadlines else None

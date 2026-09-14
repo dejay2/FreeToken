@@ -31,7 +31,7 @@ from .memory_fit import EstimateUnavailable, MemoryFitService, SettingsValidatio
 from .process_manager import LifecycleError, ProcessManager
 from .profiles_manager import ProfileError, ProfileValidationError, ProfilesManager
 
-HELPER_VERSION = "1.4.0"
+HELPER_VERSION = "1.5.0"
 
 
 class SettingsBody(BaseModel):
@@ -465,6 +465,9 @@ def create_app(
                     "disabled": bool(parking.get("disabled", False)),
                     "lastError": parking.get("lastError"),
                 },
+                # Passed through as-is (snake_case, per /v1/cache/status): null when the pool
+                # is not dynamic, else the scheduler's status dict the page tile reads directly.
+                "kv_dynamic": server.get("kv_dynamic"),
             },
             "gpu": {
                 "vramUsedMb": int(server.get("vramUsedMb", 0) or 0),
