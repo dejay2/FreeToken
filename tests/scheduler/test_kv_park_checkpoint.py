@@ -28,6 +28,71 @@ from freetoken.scheduler.table import TableManager
 PAGE = 4
 
 
+@pytest.mark.parametrize("mode,length", [("ram", 16), ("ssd", 4096)])
+def test_named_prefix_restores_exact_endpoint_without_a_second_forward(tmp_path, mode, length):
+    from freetoken.message import PrefixCacheBackendMsg
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import PrefillManager
+    from freetoken.scheduler.prefixes import PrefixCoordinator
+
+    cm, kv, pool, table = _manager(tmp_path, mode=mode, num_pages=length // PAGE + 4)
+    tm = TableManager(4, table)
+    pm = PrefillManager(cm, tm, DecodeManager(PAGE))
+    co = PrefixCoordinator(cm, lambda p: pm.pending_list.append(p), max_seq_len=table.shape[1],
+                           kv_bytes_per_token=kv.unit_bytes()[0], state_bytes=pool.bytes_per_slot())
+    pm.prefix_coordinator = co
+    msg = PrefixCacheBackendMsg("register", "register", "base",
+                               input_ids=torch.arange(length, dtype=torch.int32))
+    try:
+        assert co.command(msg)["status"] == "ok"
+        assert co.command(PrefixCacheBackendMsg("warm", "warm", "base"))["status"] == "warming"
+        batch = pm.schedule_next_batch(length)
+        req = batch.reqs[0]
+        cm.allocate_paged(batch.reqs)
+        bases = table[req.table_idx, :length:PAGE]
+        _fill(_page_views(kv, bases), seed=7)
+        _fill(pool.slot_byte_views(req.linear_slot_idx), seed=19)
+        expected_kv = _raw(_page_views(kv, bases))
+        expected_state = _raw(pool.slot_byte_views(req.linear_slot_idx))
+        req.complete_one()
+        co.drained_chunk(req)
+        with cm.lazy_free_region():
+            cm.cache_req(req, finished=True)
+            tm.free(req.table_idx)
+            req.table_idx = -1
+            co.completed(req)
+        cm.park_store.flush()
+        stats_before = cm.park_store.status()
+        result = co.command(PrefixCacheBackendMsg("get", "get", "base"))["result"]
+        assert result["parked_tokens"] == length
+        stats_after = cm.park_store.status()
+        assert (stats_before["hits"], stats_before["misses"]) == (stats_after["hits"], stats_after["misses"])
+        co.before_rebuild()
+        cm.prepare_rebuild()
+        cm.rebuild(cm.num_pages, table)
+        for view in _page_views(kv, torch.arange(cm.num_pages, dtype=torch.int32) * PAGE):
+            view.zero_()
+        for slot in range(pool.num_slots):
+            for view in pool.slot_byte_views(slot):
+                view.zero_()
+        assert co.command(PrefixCacheBackendMsg("get", "get", "base"))["result"]["state"] == "evicted"
+        assert co.command(PrefixCacheBackendMsg("warm", "warm", "base"))["status"] == "warming"
+        assert pm.schedule_next_batch(length) is None  # full restore, zero new forward
+        match = cm.prefix_cache.match_prefix(msg.input_ids)
+        assert match.cached_len == length
+        got_kv = _raw(_page_views(kv, match.kv_indices[::PAGE]))
+        got_state = _raw(pool.slot_byte_views(match.mamba_value))
+        assert all(torch.equal(a, b) for a, b in zip(expected_kv, got_kv, strict=True))
+        assert all(torch.equal(a, b) for a, b in zip(expected_state, got_state, strict=True))
+        result = co.command(PrefixCacheBackendMsg("get", "get", "base"))["result"]
+        assert result["preparations"] == 1 and result["restored_tokens"] == length
+        assert result["forwarded_tokens"] == length
+        cm.check_integrity()
+    finally:
+        co.release_preferences()
+        cm.close()
+
+
 @pytest.fixture(autouse=True)
 def _tp(monkeypatch):
     from freetoken.distributed.info import DistributedInfo

@@ -1862,6 +1862,7 @@ class ParkStore:
         max_len: int | None = None,
         *,
         keys: list[str] | None = None,
+        touch: bool = True,
     ) -> ParkedEntry | None:
         with self._lock:
             tokens = _tokens_cpu(input_ids)
@@ -1884,7 +1885,8 @@ class ParkStore:
                     continue
                 if not torch.equal(entry.token_ids, tokens[:token_count]):
                     self._drop_entry(key)
-                    self._misses += 1
+                    if touch:
+                        self._misses += 1
                     return None
                 # Every committed endpoint is independently resumable: an ordinary finish, a
                 # scheduler-saved prompt checkpoint or a zero-KV shorter checkpoint, each with
@@ -1897,10 +1899,12 @@ class ParkStore:
                 ):
                     self._drop_entry(key)
                     continue
-                entry.last_used_ns = time.time_ns()
-                self._hits += 1
+                if touch:
+                    entry.last_used_ns = time.time_ns()
+                    self._hits += 1
                 return entry
-            self._misses += 1
+            if touch:
+                self._misses += 1
             return None
 
     # ---- restore -----------------------------------------------------------------------

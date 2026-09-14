@@ -32,6 +32,8 @@ from freetoken.message import (
     CacheStepMsg,
     CacheStepReply,
     PrefillProgressReply,
+    PrefixCacheMsg,
+    PrefixCacheReply,
     RoutingStatsMsg,
     RoutingStatsReply,
     TokenizeMsg,
@@ -60,6 +62,7 @@ from .anthropic_api import register_anthropic_routes
 from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
 from .openai_api import register_openai_routes
+from .prefix_api import register_prefix_routes
 from . import request_ring
 from .access_log_filter import install_polling_access_log_filter
 from .request_logger import init as init_request_logging, log_request
@@ -206,6 +209,10 @@ def _fail_open_waiters(state: Any, message: str) -> None:
         fut = state.routing_futures.pop(request_id, None)
         if fut is not None and not fut.done():
             fut.set_result({"stats": {}, "error": message})
+    for request_id in list(getattr(state, "prefix_futures", {})):
+        fut = state.prefix_futures.pop(request_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result({"status": "failed", "result": {}, "error": message})
 
 
 def _reply_matches_open_operation(state: Any, request_id: str) -> bool:
@@ -248,6 +255,8 @@ class FrontendManager:
     # Read-only MoE routing-stats round trip (GET /v1/cache/routing). Same correlation
     # scheme as rebuild_futures, but it never touches the maintenance gate.
     routing_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
+    # Correlated named-prefix commands. Every terminal path removes its future.
+    prefix_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
     # Lifecycle gate. Starts "loading" (uvicorn binds before weights finish; the three
     # API adapters 503 until this flips) -> "serving" once all workers ack ready ->
     # "rebuilding"/"failed" for runtime cache rebuilds.
@@ -477,6 +486,9 @@ class FrontendManager:
                 if fut is not None and not fut.done():
                     fut.set_result({"stats": msg.stats, "error": msg.error})
                 continue
+            if isinstance(msg, PrefixCacheReply):
+                self._resolve_prefix(msg)
+                continue
             for msg in _unwrap_msg(msg):
                 # Global accounting follows actual admitted/sampled work even after the HTTP
                 # client disconnects and abort_user removes its ack queue. Delivery to a live
@@ -584,6 +596,28 @@ class FrontendManager:
         if msg.status == "ok" and isinstance(msg.residency, dict):
             self._residency_cache = msg.residency
             self._residency_time = time.monotonic()
+
+    def _resolve_prefix(self, msg: PrefixCacheReply) -> None:
+        fut = self.prefix_futures.pop(msg.request_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(
+                {"status": msg.status, "result": msg.result, "error": msg.error}
+            )
+
+    async def dispatch_prefix(
+        self, msg: PrefixCacheMsg, timeout: float = 30.0
+    ) -> dict[str, Any]:
+        if msg.request_id in self.prefix_futures:
+            raise ValueError(f"duplicate prefix request id {msg.request_id!r}")
+        fut = asyncio.get_running_loop().create_future()
+        self.prefix_futures[msg.request_id] = fut
+        try:
+            await self.send_one(msg)
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            pending = self.prefix_futures.pop(msg.request_id, None)
+            if pending is not None and not pending.done():
+                pending.cancel()
 
     def fail_pending_rebuilds(self, message: str) -> None:
         """Resolve every in-flight rebuild waiter as failed. Called from the supervisor thread
@@ -810,6 +844,7 @@ app = FastAPI(title="FreeToken API Server", version=__version__, lifespan=lifesp
 register_openai_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_anthropic_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_responses_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
+register_prefix_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_control_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_accounting_routes(app, get_global_state)
 

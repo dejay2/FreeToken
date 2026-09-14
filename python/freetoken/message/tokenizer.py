@@ -203,6 +203,36 @@ class RoutingStatsResultMsg(BaseTokenizerMsg):
 
 
 @dataclass
+class PrefixCacheMsg(BaseTokenizerMsg):
+    """API -> tokenizer prefix-preset command.
+
+    Only ``register`` carries rendering inputs. Other actions use the same
+    correlated shape and pass through without invoking the tokenizer.
+    """
+
+    request_id: str
+    action: str
+    name: str = ""
+    text: str | List[Dict[str, Any]] | None = None
+    tools: List[Dict[str, Any]] | None = None
+    chat_template_kwargs: Dict[str, Any] | None = None
+    preserve_system_order: bool = False
+    prefix_tokens: int | None = None
+    ttl_seconds: float = 300.0
+    max_retained_bytes: int | None = None
+
+
+@dataclass
+class PrefixCacheResultMsg(BaseTokenizerMsg):
+    """Scheduler -> tokenizer terminal result for one preset command."""
+
+    request_id: str
+    status: str
+    result: Dict[str, Any]
+    error: str | None = None
+
+
+@dataclass
 class ErrorReplyMsg(BaseTokenizerMsg):
     # scheduler -> tokenizer/detokenizer worker -> frontend: a request the scheduler cannot
     # serve (e.g. its prompt exceeds the KV budget). The worker translates it into a terminal

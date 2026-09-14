@@ -71,6 +71,9 @@ class Req:
     # Logical/cache addressing continues to use the scalar lengths above.
     mrope_position_ids: torch.Tensor | None = None
     mrope_position_delta: int = 0
+    # Scheduler-internal exact-prefix preparation: forward input, publish state, emit nothing.
+    prefill_only: bool = False
+    prefix_key: str | None = None
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
@@ -126,7 +129,8 @@ class Req:
         forward wrote become the cached prefix, exactly as for a one-token step."""
         assert n >= 1
         self.cached_len = self.device_len
-        self.device_len += n
+        if not self.prefill_only:
+            self.device_len += n
 
     def append_host(self, tokens: torch.Tensor) -> None:
         """Append a step's sampled tokens; already generic over the run's width."""
@@ -138,7 +142,7 @@ class Req:
 
     @property
     def can_decode(self) -> bool:
-        return self.remain_len > 0
+        return not self.prefill_only and self.remain_len > 0
 
     def __repr__(self) -> str:
         return (
@@ -204,6 +208,10 @@ class Batch:
     @property
     def is_prefill(self) -> bool:
         return self.phase == "prefill"
+
+    @property
+    def prefill_only(self) -> bool:
+        return bool(self.reqs) and all(req.prefill_only for req in self.reqs)
 
     @property
     def is_decode(self) -> bool:

@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from .cache import CacheManager
     from .decode import DecodeManager
     from .table import TableManager
+    from .prefixes import PrefixCoordinator
 
 logger = init_logger(__name__)
 
@@ -48,6 +49,7 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
+    blocked_by_cache: bool = field(default=False, init=False)
 
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
@@ -71,7 +73,11 @@ class PrefillAdder:
         req.admission_error = None
 
         # TODO: consider host cache match case
-        mr = self.cache_manager.match_req(req)
+        mr = getattr(req, "preparation_match", None)
+        if mr is None:
+            mr = self.cache_manager.match_req(req)
+        else:
+            del req.preparation_match
         handle = mr.cuda_handle
         cached_len = handle.cached_len
         # TODO: better estimate policy
@@ -92,9 +98,11 @@ class PrefillAdder:
             return None
 
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
+            self.blocked_by_cache = True
             return None
         self.cache_manager.lock(handle)
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
+            self.blocked_by_cache = True
             return self.cache_manager.unlock(handle)
 
         # Second currency (hybrid GDN): reserve 1 live + 2 ping-pong state slots; evict tree
@@ -104,6 +112,7 @@ class PrefillAdder:
             if pool.num_free_slots < 3:
                 self.cache_manager.ensure_mamba_slots(3)
             if pool.num_free_slots < 3:
+                self.blocked_by_cache = True
                 return self.cache_manager.unlock(handle)
 
         # Third currency (SWA): refuse admission unless the swa pool can seat this request's first
@@ -214,6 +223,8 @@ class PrefillAdder:
             cache_private=pending_req.cache_private,
             mrope_position_ids=pending_req.mrope_position_ids,
             mrope_position_delta=pending_req.mrope_position_delta,
+            prefill_only=pending_req.prefill_only,
+            prefix_key=pending_req.prefix_key,
         )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
@@ -225,6 +236,7 @@ class PrefillAdder:
         return req
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
+        self.blocked_by_cache = False
         if self.token_budget <= 0:
             return None
 
@@ -274,6 +286,7 @@ class PrefillManager:
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
     rejected: List[Tuple[int, str]] = field(default_factory=list)
+    prefix_coordinator: PrefixCoordinator | None = None
 
     def add_one_req(self, req: UserMsg) -> None:
         pending = PendingReq(
@@ -294,7 +307,8 @@ class PrefillManager:
         # shape; the ids never change while a request waits for a cache-generation change.
         pending.park_keys = None
         pending.park_probe_generation = None
-        self.pending_list.append(pending)
+        if self.prefix_coordinator is None or not self.prefix_coordinator.route(pending):
+            self.pending_list.append(pending)
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:
@@ -317,7 +331,12 @@ class PrefillManager:
             self.cache_manager.drain_pending_parks()
         adder = PrefillAdder(
             token_budget=prefill_budget,
-            reserved_size=self.decode_manager.inflight_tokens,
+            # Preparation yields between chunks. Keep its unallocated future pages
+            # reserved while another request is admitted, or both can overcommit the pool.
+            reserved_size=self.decode_manager.inflight_tokens + sum(
+                p.input_len - p.chunked_req.cached_len
+                for p in self.pending_list if p.prefill_only and p.chunked_req is not None
+            ),
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
         )
@@ -330,15 +349,36 @@ class PrefillManager:
         log_new_tokens = 0
         log_cached_tokens = 0
         remaining: List[PendingReq] = []
-        for index, pending_req in enumerate(self.pending_list):
+        pending_list, self.pending_list = self.pending_list, []
+        for index, pending_req in enumerate(pending_list):
+            # Preparation never shares a batch with user generation. New waiters released
+            # by a restored hit land on self.pending_list and are considered next pass.
+            if reqs and (pending_req.prefill_only or reqs[0].prefill_only):
+                remaining.extend(pending_list[index:])
+                break
+            coordinator = self.prefix_coordinator
+            if coordinator is not None and coordinator.before_admit(pending_req):
+                continue
             is_continuation = pending_req.chunked_req is not None
-            if req := adder.try_add_one(pending_req):
+            req = adder.try_add_one(pending_req)
+            if (req is None and adder.blocked_by_cache and coordinator is not None
+                    and coordinator.release_preferences()):
+                # Preference leases must never make a request wait forever for capacity.
+                pending_req.admission_generation = None
+                if coordinator.before_admit(pending_req):
+                    continue
+                req = adder.try_add_one(pending_req)
+            if req is not None:
+                if req.prefill_only and coordinator is not None:
+                    coordinator.prepared_chunk(req)
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
                     pending_req.chunked_req = req
                     chunked_list.append(pending_req)
                 reqs.append(req)
-                if not is_continuation:
+                if not is_continuation and not req.prefill_only:
+                    if coordinator is not None:
+                        coordinator.admitted(req.uid)
                     # Record the COMPLETE prompt length and the prefix-cache hit on the
                     # first chunk. The scheduler publishes them only after _prepare_batch
                     # succeeds; continuation chunks must never publish them again.
@@ -353,9 +393,17 @@ class PrefillManager:
                 if reason is not None:
                     self.rejected.append((pending_req.uid, reason))
                     continue
-                remaining = self.pending_list[index:]
+                # A yielding preparation already owns resources needed to finish. A
+                # blocked new arrival must not prevent that continuation from running.
+                if not reqs and any(p.prefill_only and p.chunked_req is not None
+                                    for p in pending_list[index + 1:]):
+                    remaining.append(pending_req)
+                    continue
+                remaining.extend(pending_list[index:])
                 break  # We cannot add more requests
-        self.pending_list = chunked_list + remaining
+        ordinary_chunks = [p for p in chunked_list if not p.prefill_only]
+        preparation_chunks = [p for p in chunked_list if p.prefill_only]
+        self.pending_list = ordinary_chunks + remaining + preparation_chunks + self.pending_list
         if len(reqs) == 0:
             return None
         batch = Batch(reqs=reqs, phase="prefill")
@@ -369,6 +417,8 @@ class PrefillManager:
         return rejected
 
     def abort_req(self, uid: int) -> Req | None:
+        if self.prefix_coordinator is not None:
+            self.prefix_coordinator.cancel_waiter(uid)
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
                 self.pending_list.pop(i)

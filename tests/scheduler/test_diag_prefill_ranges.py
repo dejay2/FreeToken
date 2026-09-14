@@ -81,6 +81,7 @@ class _DrainReq:
     def __init__(self, uid: int) -> None:
         self.uid = uid
         self.aborted = False
+        self.prefill_only = False
         self.table_idx = 0
 
 

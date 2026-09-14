@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from .utils import deserialize_type, serialize_type
 
@@ -121,4 +121,14 @@ class RoutingStatsReply(BaseFrontendMsg):
     # detokenizer worker -> api server: result of a /v1/cache/routing request.
     request_id: str
     stats: dict
+    error: str | None = None
+
+
+@dataclass
+class PrefixCacheReply(BaseFrontendMsg):
+    """Tokenizer -> API terminal result for one prefix-preset command."""
+
+    request_id: str
+    status: str
+    result: Dict[str, Any]
     error: str | None = None
