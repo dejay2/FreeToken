@@ -147,7 +147,7 @@ def test_page_has_tabs_info_buttons_sliders_and_browse() -> None:
     source = _source()
 
     assert 'role="tablist"' in page
-    tabs = ("model-chats", "memory-experts", "memory-governor", "mtp", "pictures", "server-advanced")
+    tabs = ("model-chats", "prompt-cache", "memory-experts", "memory-governor", "mtp", "pictures", "server-advanced")
     assert [match.group(1) for match in re.finditer(r'<button[^>]+data-tab="([^"]+)"', page)] == list(tabs)
     # Plain-language help, effect chips, sliders and folder browsing are all driven by the
     # metadata the settings route sends; the page only needs the generic hooks.
@@ -298,6 +298,59 @@ def _fit_response() -> dict:
                         "kind": "allocation", "source": "fixture", "scenario": "both"}],
         "issues": [], "assumptions": ["Synthetic values, not measurements."], "suggestion": None,
     }
+
+
+def test_prompt_cache_form_preserves_exact_advanced_request_and_shared_boundary():
+    _run_fit_script(r"""
+element('cache-mode').value = 'json';
+element('cache-format').value = 'anthropic';
+element('cache-name').value = 'agent-test';
+element('cache-prefix').value = '512';
+element('cache-ttl').value = '300';
+const raw = {model:'served', system:'instructions', messages:[{role:'user',content:'test'}],
+  tools:[{name:'lookup',input_schema:{type:'object'}}], thinking:{type:'disabled'}, max_tokens:10};
+element('cache-request').value = JSON.stringify(raw);
+assert.deepEqual(cacheRegistration(), {name:'agent-test', format:'anthropic', request:raw,
+  prefix_tokens:512, ttl_seconds:300});
+element('cache-prefix').value = '';
+assert.equal(Object.hasOwn(cacheRegistration(), 'prefix_tokens'), false);
+element('cache-request').value = '[]';
+assert.throws(cacheRegistration, /JSON object/);
+element('cache-mode').value = 'simple';
+element('cache-prompt').value = 'Shared text';
+element('cache-task').value = 'A private task';
+cacheUI.model = 'served';
+assert.deepEqual(cacheRegistration().request.messages, [
+  {role:'system',content:'Shared text'}, {role:'user',content:'A private task'}]);
+element('cache-prefix').value = '1.5';
+assert.throws(cacheRegistration, /whole number/);
+""")
+
+
+def test_prompt_cache_rejects_bad_success_and_preserves_form_on_failure():
+    _run_fit_script(r"""
+(async () => {
+  element('cache-prompt').value = 'Keep my draft';
+  global.fetch = async () => ({ok:true, status:200, json:async()=>({status:'ok',result:{}})});
+  await loadPromptCache();
+  assert.equal(cacheUI.connected, false);
+  assert.match(element('cache-connection').textContent, /invalid|unexpected/i);
+  global.fetch = async () => ({ok:false,status:400,json:async()=>({error:'prefix exceeds pool'})});
+  await cacheAction(async()=>{await cacheCall('/prefixes', 'POST', {});});
+  assert.match(element('cache-message').textContent, /prefix exceeds pool/);
+  assert.equal(element('cache-prompt').value, 'Keep my draft');
+  assert.equal(cacheUI.busy, false);
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+
+
+def test_prompt_cache_treats_queued_warming_as_success():
+    _run_fit_script(r"""
+(async () => {
+  global.fetch = async () => ({ok:true,status:202,json:async()=>({status:'warming',result:{state:'warming'}})});
+  assert.equal((await cacheCall('/prefixes/agent/warm', 'POST')).status, 'warming');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
 
 
 def test_malformed_success_never_saves_or_launches_and_allows_explicit_override() -> None:

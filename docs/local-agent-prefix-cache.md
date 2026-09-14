@@ -10,6 +10,39 @@ Initial support is text QSA/GDN models, hybrid radix caching and `TP=1`. The con
 uses one local FreeToken server, its GPU, local RAM and local SSD; multi-server sharing is not
 part of the design.
 
+## Try it from the settings page
+
+Open `http://127.0.0.1:2031` and choose **Prompt cache**. With the model server ready:
+
+1. Choose **Load test example**, then **Register & test**. The default sends two
+   identical requests, each limited to 64 output tokens, and reports their answers,
+   elapsed times and cached input tokens. Select 1, 2, 4 or 8 agents to change the test;
+   requests above the server's concurrency limit queue normally.
+2. Use **Register prompt** to register without generating, **Warm** to prepare a
+   registered cache, and **Delete** to remove an alias. Watch shared token counts,
+   preparations, followers, restores and GPU/RAM/SSD residency in the list.
+3. Paste your shared instructions and a test task, or switch to **Full request JSON**
+   for the exact OpenAI/Anthropic messages, tools and template settings your agents use.
+   The simple editor uses the running model with thinking disabled. Set **Shared prefix
+   tokens** inside the common instructions, before variable text. Blank requests the
+   entire rendered request for identical replays; it does not automatically find the
+   system-prompt boundary.
+
+The per-prompt GPU preference duration and shared retention budget apply immediately;
+they do not require Save or restart. Both are best-effort preferences, not reserved
+VRAM. Names and live retention changes are lost on a model-server restart. Prompt drafts
+stay in the current page during refresh errors, but are not saved across page reloads.
+The test displays model text and tool calls; it does not execute tools.
+
+The current pool and parking mode are shown under **RAM, SSD and larger prompts**.
+Parking settings and **Smallest KV memory** remain under **Model & chats** and require
+a model-server restart when changed. Registration itself cannot grow a dynamic KV pool.
+Deleting an alias does not flush pages held by other aliases or active requests.
+
+The settings helper forwards only these cache controls, model/status reads and bounded
+test generation to its local server. Updating this UI needs a settings-helper restart;
+it does not require reloading an already compatible model server.
+
 ## Register the exact common prefix
 
 The registration request accepts an ordinary OpenAI or Anthropic payload. The server renders

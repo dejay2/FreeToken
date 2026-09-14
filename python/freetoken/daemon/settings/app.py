@@ -29,6 +29,7 @@ from .download import DownloadManager, create_download_router
 from .model_info import ModelInfo, read_model
 from .memory_fit import EstimateUnavailable, MemoryFitService, SettingsValidationError, prepare_settings
 from .process_manager import LifecycleError, ProcessManager
+from .prompt_cache import create_prompt_cache_router
 from .profiles_manager import ProfileError, ProfileValidationError, ProfilesManager
 
 HELPER_VERSION = "1.5.0"
@@ -218,6 +219,7 @@ def create_app(
     )
     app.state.started_monotonic = started
     app.include_router(create_download_router(models_dir=model_root, manager=download_manager))
+    app.include_router(create_prompt_cache_router(lambda: process_manager.port))
 
     def refresh_model_roots() -> None:
         nonlocal model_root, download_root

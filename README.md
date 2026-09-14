@@ -126,6 +126,10 @@ agent clients continue sending complete requests. A skill preset includes the ba
 preceding text in their original order. GPU leases expire or yield under memory pressure, and
 the existing local RAM/SSD parking store can retain complete checkpoints.
 
+The local settings page at `http://127.0.0.1:2031` has a **Prompt cache** tab for registration,
+warming, deletion, retention budgets and 1/2/4/8-agent replay tests. Choose **Load test example**,
+then **Register & test** to check reuse from the browser.
+
 See [setup, API examples and limits](docs/local-agent-prefix-cache.md). The CPU ownership and
 transport tests cover this path; real-model GPU correctness and latency still require live
 validation. `scripts/bench/agent_prefix_live.py` compares cold fanout and warm reuse for 1/2/4/8
