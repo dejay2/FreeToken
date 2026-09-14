@@ -21,6 +21,8 @@ class PendingReq:
     cache_private: bool = False
     mrope_position_ids: torch.Tensor | None = None
     mrope_position_delta: int = 0
+    prefill_only: bool = False
+    prefix_key: str | None = None
 
     @property
     def input_len(self) -> int:

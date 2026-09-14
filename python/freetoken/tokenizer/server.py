@@ -11,6 +11,8 @@ from urllib.parse import unquote_to_bytes, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, url2pathname
 
 import torch
+from jinja2 import TemplateError
+from freetoken.core import SamplingParams
 from freetoken.message import (
     AbortBackendMsg,
     AbortMsg,
@@ -45,6 +47,10 @@ from freetoken.message import (
     PromptAdmittedMsg,
     PrefillProgressMsg,
     PrefillProgressReply,
+    PrefixCacheBackendMsg,
+    PrefixCacheMsg,
+    PrefixCacheReply,
+    PrefixCacheResultMsg,
     RoutingStatsBackendMsg,
     RoutingStatsMsg,
     RoutingStatsReply,
@@ -393,9 +399,84 @@ _CONTROL_MSG_TYPES = (
     KVDynamicStatusMsg,
     MaintenanceBeginMsg,
     PromptAdmittedMsg,
+    PrefixCacheMsg,
+    PrefixCacheResultMsg,
     RoutingStatsMsg,
     RoutingStatsResultMsg,
 )
+
+
+def _forward_prefix_msg(m, tokenize_manager, send_backend, send_frontend) -> bool:
+    """Render a registration or pass a correlated prefix command/result through."""
+    if isinstance(m, PrefixCacheResultMsg):
+        send_frontend.put(
+            PrefixCacheReply(
+                request_id=m.request_id,
+                status=m.status,
+                result=m.result,
+                error=m.error,
+            )
+        )
+        return True
+    if not isinstance(m, PrefixCacheMsg):
+        return False
+
+    input_ids = None
+    if m.action == "register":
+        if m.text is None:
+            send_frontend.put(
+                PrefixCacheReply(
+                    request_id=m.request_id,
+                    status="invalid",
+                    result={},
+                    error="registration requires a tokenizable request",
+                )
+            )
+            return True
+        tokenize_msg = TokenizeMsg(
+            uid=0,
+            text=m.text,
+            sampling_params=SamplingParams(),
+            chat_template_kwargs=m.chat_template_kwargs,
+            tools=m.tools,
+            preserve_system_order=m.preserve_system_order,
+        )
+        try:
+            input_ids = tokenize_manager.tokenize([tokenize_msg])[0]
+        except Exception as exc:  # noqa: BLE001 -- isolate one bad preset
+            send_frontend.put(
+                PrefixCacheReply(
+                    request_id=m.request_id,
+                    status="invalid" if isinstance(exc, (ValueError, TemplateError)) else "failed",
+                    result={},
+                    error=f"could not encode prefix registration: {exc}",
+                )
+            )
+            return True
+        if input_ids.numel() == 0:
+            send_frontend.put(
+                PrefixCacheReply(
+                    request_id=m.request_id,
+                    status="invalid",
+                    result={},
+                    error="prefix registration must contain at least one token",
+                )
+            )
+            return True
+        input_ids = input_ids.detach().to(device="cpu", dtype=torch.int32).contiguous()
+
+    send_backend.put(
+        PrefixCacheBackendMsg(
+            request_id=m.request_id,
+            action=m.action,
+            name=m.name,
+            input_ids=input_ids,
+            prefix_tokens=m.prefix_tokens,
+            ttl_seconds=m.ttl_seconds,
+            max_retained_bytes=m.max_retained_bytes,
+        )
+    )
+    return True
 
 
 def _forward_control_msg(m, send_backend, send_frontend) -> bool:
@@ -532,7 +613,10 @@ def tokenize_worker(
             # CacheStepMsg / CacheResidencyMsg / RoutingStatsMsg (api -> scheduler) and
             # status/result replies (scheduler -> api).
             for m in pending_msg:
-                _forward_control_msg(m, send_backend, send_frontend)
+                if not _forward_prefix_msg(
+                    m, tokenize_manager, send_backend, send_frontend
+                ):
+                    _forward_control_msg(m, send_backend, send_frontend)
             n_control = sum(isinstance(m, _CONTROL_MSG_TYPES) for m in pending_msg)
             assert (
                 len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) + n_control

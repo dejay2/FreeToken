@@ -113,6 +113,25 @@ Qwen3.8-Flash-Next has a 47.7 GiB n-gram (PLE) lookup table. Choose where it liv
 
 The launcher script `start-qwen38-flash-next-mmap-windows.ps1` defaults to `--ple-backend mmap`.
 
+### Reusable local agent prefixes
+
+Agents using one FreeToken server can register a shared prompt prefix. The first matching
+requests wait for one preparation, then share its attention pages and copy its checkpoint into
+separate recurrent state slots. Preparation produces no answer. This initial implementation
+supports text QSA/GDN models with hybrid radix caching on one GPU (`TP=1`).
+
+`/v1/cache/prefixes` provides registration, status, explicit warming, deletion and retention
+settings. Presets use exact tokens from the normal OpenAI/Anthropic rendering path; existing
+agent clients continue sending complete requests. A skill preset includes the base prompt and
+preceding text in their original order. GPU leases expire or yield under memory pressure, and
+the existing local RAM/SSD parking store can retain complete checkpoints.
+
+See [setup, API examples and limits](docs/local-agent-prefix-cache.md). The CPU ownership and
+transport tests cover this path; real-model GPU correctness and latency still require live
+validation. `scripts/bench/agent_prefix_live.py` compares cold fanout and warm reuse for 1/2/4/8
+agents without clearing server caches. This is a local feature; multi-server sharing is outside
+the project's scope for these presets.
+
 ### Dynamic KV pool
 
 `--kv-dynamic` boots with a small KV pool (default 65,536 tokens) and spends the saved VRAM on

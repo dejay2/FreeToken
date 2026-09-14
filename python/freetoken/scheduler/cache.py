@@ -89,6 +89,7 @@ class CacheManager:
         self._park_generation = int(getattr(park_store, "generation", 0))
         self._pending_parks = []
         self._temporary_lease_depth = 0
+        self.release_prefix_preferences = None
         if park_store is not None:
             bind_change_callback = getattr(park_store, "bind_change_callback", None)
             if bind_change_callback is not None:
@@ -256,7 +257,7 @@ class CacheManager:
         ids = (
             req.input_ids[:0]
             if getattr(req, "cache_private", False) or req.mm_embeds is not None
-            else req.input_ids[: input_len - 1]
+            else req.input_ids[: input_len if getattr(req, "prefill_only", False) else input_len - 1]
         )
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
@@ -504,6 +505,9 @@ class CacheManager:
         """Free GDN state slots until >= ``n`` are available by tombstoning LRU tree snapshots
         (evict_mamba), returning their slots + any freed KV to the pools."""
         self.drain_pending_parks()
+        if (self.mamba_available_size < n and not self._temporary_lease_depth
+                and self.release_prefix_preferences is not None):
+            self.release_prefix_preferences()
         while self.linear_state_pool.num_free_slots < n:
             if self._park_lru():
                 self.drain_pending_parks()
@@ -1195,6 +1199,12 @@ class CacheManager:
     def _allocate(self, needed_pages: int) -> torch.Tensor:
         if self.park_store is not None:
             self.drain_pending_parks()
+        # A management warm may acquire preferences AFTER request admission reserved its
+        # future capacity. Revoke those references here too, before actual allocation;
+        # request-owned references remain protected by their independent tree locks.
+        if (needed_pages * self.page_size > self.available_size and not self._temporary_lease_depth
+                and self.release_prefix_preferences is not None):
+            self.release_prefix_preferences()
         if (
             needed_pages > len(self.free_slots)
             and self.is_hybrid

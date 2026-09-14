@@ -2705,11 +2705,13 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        prepare_only = batch.prefill_only
+        assert not any(r.prefill_only for r in batch.reqs) or (prepare_only and batch.is_prefill)
         # Integrated speculation feeds its draft head the same (hidden, embeddings) pair the
         # observer captures, so a spec-enabled boot takes the capture path too -- but only for
         # the ordinary forwards it still runs (prefill, and the decode fallback); the
         # speculative step itself goes through speculative_decode_batch.
-        wants_capture = self.mtp_shadow_observer is not None or self.spec_draft is not None
+        wants_capture = not prepare_only and (self.mtp_shadow_observer is not None or self.spec_draft is not None)
         mtp_capture = self._capture_decode_graph(batch) if wants_capture else None
         if mtp_capture is not None:
             logits = mtp_capture[0]
@@ -2728,6 +2730,17 @@ class Engine:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
+
+        if prepare_only:
+            for req in batch.reqs:
+                req.complete_one()
+            # Keep the normal drain/event barrier, without sampling, draft priming or an
+            # output token-pool write. Only the scheduler consumes these empty placeholders.
+            tokens_gpu = torch.empty(0, dtype=torch.int32, device=self.device)
+            tokens_cpu = torch.empty(0, dtype=torch.int32)
+            copy_done_event = torch.cuda.Event()
+            copy_done_event.record(self.stream)
+            return ForwardOutput(tokens_gpu, tokens_cpu, copy_done_event)
 
         observer_capture = (
             self.mtp_shadow_observer.prepare_capture(batch, mtp_capture)

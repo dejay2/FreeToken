@@ -88,3 +88,16 @@ class RoutingStatsBackendMsg(BaseBackendMsg):
 
     request_id: str
     reset: bool = False  # zero the histogram after reading, to window the next workload
+
+
+@dataclass
+class PrefixCacheBackendMsg(BaseBackendMsg):
+    """Tokenizer worker -> scheduler prefix-preset command."""
+
+    request_id: str
+    action: str
+    name: str = ""
+    input_ids: torch.Tensor | None = None
+    prefix_tokens: int | None = None
+    ttl_seconds: float = 300.0
+    max_retained_bytes: int | None = None

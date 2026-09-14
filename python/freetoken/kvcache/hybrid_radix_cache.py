@@ -82,11 +82,11 @@ class HybridRadixCache:
         self.mamba_protected = 0
 
     # ---------------------------------------------------------------- match / insert
-    def match_prefix(self, input_ids: torch.Tensor) -> HybridMatch:
+    def match_prefix(self, input_ids: torch.Tensor, *, touch: bool = True) -> HybridMatch:
         """Match the token prefix, then truncate the reusable length to the deepest node on
         the path that still owns a LIVE snapshot (a continuation can only resume the GDN
         recurrence from a checkpointed boundary)."""
-        node, _ = self._walk(input_ids)
+        node, _ = self._walk(input_ids, touch=touch)
         # walk up to the deepest node whose END boundary has a live snapshot
         cur, end_len = node, self._path_len(node)
         while not cur.is_root():
@@ -352,7 +352,7 @@ class HybridRadixCache:
             stack.extend(n.children.values())
         return out
 
-    def _walk(self, input_ids: torch.Tensor) -> Tuple[RadixTreeNode, int]:
+    def _walk(self, input_ids: torch.Tensor, *, touch: bool = True) -> Tuple[RadixTreeNode, int]:
         prefix_len, total = 0, len(input_ids)
         node = self.root
         tic = time.monotonic_ns()
@@ -364,10 +364,15 @@ class HybridRadixCache:
             match_len = align_down(node.get_match_len(input_ids[prefix_len:]), self.page_size)
             prefix_len += match_len
             if match_len != node.length:
+                if not touch:
+                    # No endpoint state exists inside this edge. Inspection can return
+                    # its parent without splitting the tree or changing eviction recency.
+                    return node.parent, prefix_len - match_len
                 node = node.split_at(match_len)
                 node.timestamp = tic
                 return node, prefix_len
-            node.timestamp = tic
+            if touch:
+                node.timestamp = tic
         return node, prefix_len
 
 

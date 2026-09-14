@@ -39,6 +39,8 @@ from freetoken.message import (
     MaintenanceBeginMsg,
     PromptAdmittedMsg,
     PrefillProgressMsg,
+    PrefixCacheBackendMsg,
+    PrefixCacheResultMsg,
     RoutingStatsBackendMsg,
     RoutingStatsResultMsg,
     UserMsg,
@@ -56,6 +58,7 @@ from .config import SchedulerConfig, pin_kv_park_model_path
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
+from .prefixes import PrefixCoordinator
 from .status import SchedulerStatusReporter
 from .table import TableManager
 
@@ -151,6 +154,18 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
+        from freetoken.kvcache.qsa_pool import QSAKVCache
+        from freetoken.kvcache.cache_status import compute_cache_unit_bytes
+
+        units = compute_cache_unit_bytes(self.engine)
+        self.prefix_coordinator = PrefixCoordinator(
+            self.cache_manager, lambda pending: self.prefill_manager.pending_list.append(pending),
+            max_seq_len=self.engine.max_seq_len,
+            kv_bytes_per_token=units["kv_bytes_per_token"],
+            state_bytes=units["mamba_bytes_per_slot"],
+            supported=config.tp_info.size == 1 and isinstance(self.engine.kv_cache, QSAKVCache),
+        )
+        self.prefill_manager.prefix_coordinator = self.prefix_coordinator
         self._kv_dynamic = self._make_kv_dynamic(config) if config.kv_dynamic else None
         self._kv_dynamic_last_status = None
         if self._kv_dynamic is not None:
@@ -262,6 +277,8 @@ class Scheduler(SchedulerIOMixin):
             if self._kv_dynamic is None
             else self._kv_dynamic.next_deadline_ms(current_pages=self.engine.num_pages),
         ]
+        if coordinator := getattr(self, "prefix_coordinator", None):
+            delays.append(coordinator.next_delay_ms())
         live = [d for d in delays if d is not None]
         return min(live) if live else None
 
@@ -273,6 +290,8 @@ class Scheduler(SchedulerIOMixin):
             # pools a failed teardown left in an unknown state -- and the controller is
             # disabled, so its idle plan is a no-op anyway. Wait for the restart, do nothing.
             return
+        if coordinator := getattr(self, "prefix_coordinator", None):
+            coordinator.expire()
         if not self._idle_wait_logged:
             logger.info_rank0("Scheduler is idle, waiting for new reqs...")
             self._idle_wait_logged = True
@@ -312,6 +331,8 @@ class Scheduler(SchedulerIOMixin):
         torch.cuda.synchronize(self.device)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
+        if not is_moe_only and (coordinator := getattr(self, "prefix_coordinator", None)):
+            coordinator.before_rebuild()
         # The old pools are the only source for parking. Snapshot eligible prefixes before the
         # engine reallocates them, then rebuild the radix tree against the new page table below.
         if (
@@ -333,6 +354,8 @@ class Scheduler(SchedulerIOMixin):
             # (num_swa_pages) reallocates the SWA/window token pool, leaving stale slot ids in the
             # radix tree. Rebuild the prefix cache + reclaim the resized free-lists.
             self.cache_manager.rebuild(self.engine.num_pages, self.engine.page_table)
+            if coordinator := getattr(self, "prefix_coordinator", None):
+                coordinator.max_seq_len = self.engine.max_seq_len
             if num_pages is not None:
                 # token_pool is sized to the page table; only a KV-page resize reallocates it.
                 # A mamba-only rebuild leaves the page table untouched, so skip this (else it
@@ -561,6 +584,8 @@ class Scheduler(SchedulerIOMixin):
         self.engine.flush_routing_stats()
 
     def shutdown(self) -> None:
+        if coordinator := getattr(self, "prefix_coordinator", None):
+            coordinator.release_preferences()
         self.cache_manager.close()
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
@@ -585,6 +610,8 @@ class Scheduler(SchedulerIOMixin):
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
+                if req.prefill_only:
+                    self.prefix_coordinator.drained_chunk(req)
                 if isinstance(req, ChunkedReq):
                     # Don't cache intermediate chunks; the full prompt is cached once when the
                     # final chunk is processed. Caching here snapshots a handle the next chunk
@@ -602,6 +629,13 @@ class Scheduler(SchedulerIOMixin):
                     self.decode_manager.remove_req(req)
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
+                    continue
+                if req.prefill_only:
+                    # This drain barrier proves the complete endpoint's live GDN state is
+                    # settled. Donate it exactly once; intermediate chunks never publish.
+                    req.mamba_last_track_seqlen = None
+                    self._free_req_resources(req)
+                    self.prefix_coordinator.completed(req)
                     continue
                 if req in self.finished_reqs:
                     # Overlap scheduling launched one more decode step for a request that
@@ -645,7 +679,7 @@ class Scheduler(SchedulerIOMixin):
                 batch,
                 reply,
                 # One token per scheduled request, as ever, plus whatever a wider step added.
-                generated_tokens=len(batch.reqs)
+                generated_tokens=sum(not req.prefill_only for req in batch.reqs)
                 + sum(len(m.next_tokens) - 1 for m in reply),
             )
 
@@ -1242,6 +1276,10 @@ class Scheduler(SchedulerIOMixin):
             "the server needs a restart", reason,
         )
         uids: list[int] = []
+        if coordinator := getattr(self, "prefix_coordinator", None):
+            for req in coordinator.engine_failed(reason):
+                self._release_request_tensors(req)
+                uids.append(req.uid)
         pending = getattr(self.prefill_manager, "pending_list", None)
         if pending:
             for req in list(pending):
@@ -1291,7 +1329,7 @@ class Scheduler(SchedulerIOMixin):
                     uid=uid, error="cache rebuild failed; server needs a restart",
                     code="server_error",
                 )
-                for uid in uids
+                for uid in dict.fromkeys(uids) if uid >= 0
             ])
         self._send_kv_dynamic_status()
 
@@ -1311,8 +1349,17 @@ class Scheduler(SchedulerIOMixin):
                 self._process_one_msg(msg)
         elif isinstance(msg, ExitMsg):
             raise KeyboardInterrupt
+        elif isinstance(msg, PrefixCacheBackendMsg):
+            result = (
+                {"status": "failed", "result": {}, "error": "cache rebuild failed; server needs a restart"}
+                if self._engine_failed is not None else self.prefix_coordinator.command(msg)
+            )
+            self.send_result([PrefixCacheResultMsg(request_id=msg.request_id, **result)])
         elif isinstance(msg, UserMsg):
             logger.debug_rank0("Received user msg: %s", msg)
+            if msg.uid < 0:
+                self.send_result([ErrorReplyMsg(uid=msg.uid, error="Negative request IDs are reserved")])
+                return
             tombstones = getattr(self, "_abort_tombstones", None)
             if tombstones is not None and msg.uid in tombstones:
                 tombstones.pop(msg.uid, None)
@@ -1340,6 +1387,8 @@ class Scheduler(SchedulerIOMixin):
             if not self._queue_for_kv_dynamic(msg):
                 self._admit_user_msg(msg)
         elif isinstance(msg, AbortBackendMsg):
+            if msg.uid < 0:
+                return  # prefix jobs are scheduler-owned, never client cancellation targets
             logger.debug_rank0("Aborting request %d", msg.uid)
             # Rule 7: drop a held request from the FIFO (and its uncommitted charge) before
             # the tombstone bookkeeping, so the drain barrier does not keep a cancelled
@@ -2475,14 +2524,22 @@ class Scheduler(SchedulerIOMixin):
             # restarts the server. Before the managers on purpose: schedule_next_batch mutates
             # them (it seats pending requests and allocates pages).
             return None
-        # TODO: support other policies: e.g. DECODE first
-        batch = (
+        # One preparation quantum must not monopolize an active agent's decoding.
+        batch = None
+        if getattr(self, "_last_batch_was_prefix_preparation", False):
+            batch = self.decode_manager.schedule_next_batch()
+        batch = batch or (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
             or self.decode_manager.schedule_next_batch()
         )
         pop_rejections = getattr(self.prefill_manager, "pop_rejections", None)
         if pop_rejections is not None:
             rejections = pop_rejections()
+            if coordinator := getattr(self, "prefix_coordinator", None):
+                rejections = [(uid, reason) for uid, reason in rejections
+                              if not coordinator.failed(uid, reason)]
+                for uid, _ in rejections:
+                    coordinator.cancel_waiter(uid)
             if rejections:
                 self.send_result(
                     [
@@ -2499,6 +2556,7 @@ class Scheduler(SchedulerIOMixin):
         with diag.region("diag.prefill_batch" if batch.is_prefill else None):
             forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
+        self._last_batch_was_prefix_preparation = getattr(batch, "prefill_only", False)
         return forward_input
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
@@ -2535,7 +2593,8 @@ class Scheduler(SchedulerIOMixin):
             "diag.prefill_forward" if batch.is_prefill else "diag.plain_decode_step"
         ):
             forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        if not batch.prefill_only:
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
