@@ -65,6 +65,7 @@ from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
 from .openai_api import register_openai_routes
 from .prefix_api import register_prefix_routes
+from .recent_prompts import register_recent_prompt_routes
 from . import request_ring
 from .access_log_filter import install_polling_access_log_filter
 from .request_logger import init as init_request_logging, log_request
@@ -902,6 +903,7 @@ register_openai_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_anthropic_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_responses_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_prefix_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
+register_recent_prompt_routes(app)
 register_control_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_accounting_routes(app, get_global_state)
 
