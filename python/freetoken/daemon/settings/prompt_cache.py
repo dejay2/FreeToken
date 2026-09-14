@@ -14,7 +14,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 from fastapi import APIRouter, Path
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 from starlette.concurrency import run_in_threadpool
 
 NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
@@ -34,6 +34,10 @@ class Registration(CacheRequest):
 
 class Retention(BaseModel):
     max_retained_bytes: int = Field(ge=0)
+
+
+class RecentCapture(BaseModel):
+    enabled: StrictBool
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -71,7 +75,7 @@ def _forward(port: int, method: str, path: str, payload: dict | None, timeout: f
                 raise ValueError("expected an object")
         except (ValueError, UnicodeDecodeError):
             return _error(502, "The local server did not return a JSON response. Check its version and logs.")
-        return JSONResponse(body, status_code=code)
+        return JSONResponse(body, status_code=code, headers={"Cache-Control": "no-store"})
     except (TimeoutError, socket.timeout):
         return _error(504, "The local server timed out. Work may still be running; refresh before trying again.")
     except (URLError, OSError):
@@ -91,6 +95,22 @@ def create_prompt_cache_router(server_port: Callable[[], int]) -> APIRouter:
     @router.get("/models")
     async def models():
         return await forward("GET", "/v1/models", timeout=5)
+
+    @router.get("/recent")
+    async def recent():
+        return await forward("GET", "/v1/cache/recent", timeout=5)
+
+    @router.delete("/recent")
+    async def clear_recent():
+        return await forward("DELETE", "/v1/cache/recent", timeout=5)
+
+    @router.put("/recent/settings")
+    async def configure_recent(body: RecentCapture):
+        return await forward("PUT", "/v1/cache/recent/settings", body.model_dump(), timeout=5)
+
+    @router.get("/recent/{id}")
+    async def recent_prompt(id: str = Path(pattern=r"^[a-f0-9]{32}$")):
+        return await forward("GET", f"/v1/cache/recent/{id}", timeout=5)
 
     @router.get("/status")
     async def cache_status():

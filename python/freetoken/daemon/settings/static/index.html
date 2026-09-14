@@ -134,6 +134,13 @@
     .cache-results pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; font: .82rem/1.5 ui-monospace, monospace; max-height: 180px; overflow-y: auto; }
     #cache-request { font: .82rem/1.5 ui-monospace, monospace; }
     #cache-retention-form { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 16px; }
+    #cache-recent { margin-bottom: 20px; }
+    #cache-recent-list { max-height: 280px; overflow: auto; }
+    .cache-recent-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; border-top: 1px solid var(--line); }
+    .cache-recent-row > div { min-width: 0; }
+    .cache-recent-row p { overflow-wrap: anywhere; }
+    .cache-recent-row .button { flex: 0 0 auto; }
+    .cache-recent-preview { font-size: .9rem; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
     @media (max-width: 800px) { .cache-layout { grid-template-columns: minmax(0, 1fr); } }
     @media (max-width: 440px) { .cache-fields { grid-template-columns: minmax(0, 1fr); gap: 0; } }
     input:disabled, select:disabled { opacity: .55; }
@@ -323,6 +330,12 @@
       <div class="panel-head"><div><h2>Prompt cache</h2><p class="small">Prepare shared instructions once for agents using this local server. Changes here apply immediately.</p></div><button class="button small" id="cache-refresh" type="button">Refresh caches</button></div>
       <p class="small" id="cache-connection" role="status">Connecting to the model server…</p>
       <dl class="cache-summary" id="cache-summary"><div><dt>Registered prompts</dt><dd>—</dd></div></dl>
+      <section class="panel" id="cache-recent" aria-labelledby="cache-recent-title">
+        <div class="panel-head"><div><h3 id="cache-recent-title">Recent requests</h3><p class="small">Pick a request received by this server to load its exact prompt, tools and template options.</p></div><div class="actions"><button class="button small" id="cache-recent-pause" type="button" disabled>Pause collection</button><button class="button small" id="cache-recent-clear" type="button" disabled>Clear list</button></div></div>
+        <p class="small cache-feedback" id="cache-recent-status" role="status">Loading recent requests…</p>
+        <div id="cache-recent-list"><p class="empty">Requests will appear here after they reach the server.</p></div>
+        <p class="small">Shows text requests from OpenAI chat completions and Anthropic messages. Private and image requests are excluded. Collection uses local RAM; restarting the model server clears the list.</p>
+      </section>
       <div class="cache-layout">
         <section class="panel" aria-labelledby="cache-editor-title">
           <div class="panel-head"><h3 id="cache-editor-title">Register a prompt</h3><button class="button small" id="cache-example" type="button">Load test example</button></div>
@@ -1322,6 +1335,7 @@
 
     /* ---------- prompt cache (live controls, separate from launch settings) ---------- */
     const cacheUI = {busy:false, loading:null, connected:false, model:null, data:null, budgetDirty:false, signature:null};
+    const recentUI = {loading:null, connected:false, data:null, signature:null};
     const cacheBytes = value => `${fmt(Number(value || 0) / 1048576)} MiB`;
     function cacheMessage(message, bad = false) {
       $('cache-message').textContent = message;
@@ -1334,6 +1348,8 @@
       $('cache-budget-apply').disabled = cacheUI.busy || !cacheUI.connected;
       $('cache-budget').disabled = cacheUI.busy;
       $('cache-list').querySelectorAll('button').forEach(button => { button.disabled = cacheUI.busy || !cacheUI.connected || button.dataset.warming === 'true'; });
+      $('cache-recent-pause').disabled = $('cache-recent-clear').disabled = cacheUI.busy || !recentUI.connected;
+      $('cache-recent-list').querySelectorAll('button').forEach(button => { button.disabled = cacheUI.busy || !recentUI.connected; });
     }
     async function cacheCall(path, method = 'GET', payload) {
       const options = {method};
@@ -1416,7 +1432,7 @@
           $('cache-connection').textContent = error.message || 'Could not connect to the local model server.';
           $('cache-list').innerHTML = '<p class="empty">Cache state is unavailable. Your prompt draft is kept on this page. Refresh when the server is ready.</p>';
           $('cache-summary').innerHTML = '<div><dt>Cache status</dt><dd>Unavailable</dd></div>';
-        } finally { cacheUI.loading = null; cacheControls(); }
+        } finally { cacheUI.loading = null; cacheControls(); loadRecentPrompts(); }
       })();
       return cacheUI.loading;
     }
@@ -1494,6 +1510,68 @@
         cacheMessage('GPU retention budget applied to the running server.');
       });
     });
+
+    function renderRecentPrompts() {
+      const data = recentUI.data;
+      $('cache-recent-pause').textContent = data.enabled ? 'Pause collection' : 'Resume collection';
+      $('cache-recent-pause').setAttribute('aria-pressed', String(!data.enabled));
+      $('cache-recent-status').textContent = `${data.enabled ? 'Collecting' : 'Collection paused'} · latest ${data.capacity} requests from the past ${fmt(data.ttl_seconds / 60)} minutes · ${cacheBytes(data.stored_bytes)} / ${cacheBytes(data.max_bytes)}${data.skipped_count ? ` · ${fmt(data.skipped_count)} oversized request(s) skipped` : ''}`;
+      $('cache-recent-list').innerHTML = data.prompts.length ? data.prompts.map(prompt => {
+        const date = new Date(prompt.received_at);
+        const stamp = Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString();
+        return `<article class="cache-recent-row"><div><p class="cache-recent-preview">${escapeHtml(prompt.preview)}</p><p class="small">${escapeHtml(stamp)} · ${escapeHtml(prompt.model)} · ${escapeHtml(prompt.format === 'anthropic' ? 'Anthropic' : 'OpenAI')} · ${fmt(prompt.message_count)} messages</p></div><button class="button small" type="button" data-recent-prompt="${escapeHtml(prompt.id)}">Use prompt</button></article>`;
+      }).join('') : `<p class="empty">${data.enabled ? 'No recent requests yet. Send a request from your agent or run a test below, then refresh.' : 'No recent requests. Resume collection to capture new prompts.'}</p>`;
+      cacheControls();
+    }
+    async function loadRecentPrompts() {
+      if (recentUI.loading) return recentUI.loading;
+      recentUI.loading = (async () => {
+        try {
+          const body = await cacheCall('/recent');
+          if (body.status !== 'ok' || !Array.isArray(body.result?.prompts) || typeof body.result.enabled !== 'boolean' || body.result.prompts.some(prompt => !prompt || typeof prompt.id !== 'string' || !/^[a-f0-9]{32}$/.test(prompt.id))) throw new Error('The server returned an invalid recent-request list.');
+          recentUI.data = body.result; recentUI.connected = true;
+          const signature = JSON.stringify(body.result);
+          if (signature !== recentUI.signature) { renderRecentPrompts(); recentUI.signature = signature; }
+        } catch (error) {
+          recentUI.connected = false; recentUI.signature = null;
+          $('cache-recent-status').textContent = `Recent requests unavailable. ${error.message}`;
+          $('cache-recent-list').innerHTML = '<p class="empty">Collection needs a model server with recent-request support. Update and restart the model server to begin collecting.</p>';
+        } finally { recentUI.loading = null; cacheControls(); }
+      })();
+      return recentUI.loading;
+    }
+    function applyRecentPrompt(prompt) {
+      if (!prompt || typeof prompt.id !== 'string' || !/^[a-f0-9]{32}$/.test(prompt.id) || !['openai','anthropic'].includes(prompt.format) || !prompt.request || typeof prompt.request !== 'object' || Array.isArray(prompt.request)) throw new Error('The saved request is invalid. Refresh the list.');
+      $('cache-mode').value = 'json';
+      $('cache-format').value = prompt.format;
+      $('cache-request').value = JSON.stringify(prompt.request, null, 2);
+      $('cache-name').value = `recent-${prompt.id.slice(0,12)}`;
+      // An earlier form's boundary says nothing about a different request.
+      $('cache-prefix').value = '';
+      $('cache-results').hidden = true;
+      cacheMode();
+      cacheMessage('Request loaded for whole request caching. Set Shared prefix tokens before changing task text if you want to share only the instructions, then choose Register prompt.');
+      $('cache-editor-title').scrollIntoView?.({block:'start'});
+      $('cache-request').focus?.({preventScroll:true});
+    }
+    async function useRecentPrompt(id) {
+      await cacheAction(async () => { const body = await cacheCall(`/recent/${encodeURIComponent(id)}`); applyRecentPrompt(body.result); });
+    }
+    $('cache-recent-list').addEventListener('click', event => {
+      const button = event.target.closest('[data-recent-prompt]');
+      if (button && !button.disabled) useRecentPrompt(button.dataset.recentPrompt);
+    });
+    $('cache-recent-clear').addEventListener('click', () => cacheAction(async () => {
+      await cacheCall('/recent', 'DELETE');
+      cacheMessage('Recent requests cleared. Registered caches are unchanged.');
+      await loadRecentPrompts();
+    }));
+    $('cache-recent-pause').addEventListener('click', () => cacheAction(async () => {
+      const enabled = !recentUI.data.enabled;
+      await cacheCall('/recent/settings', 'PUT', {enabled});
+      cacheMessage(enabled ? 'Collecting new requests.' : 'Collection paused. Existing recent requests remain until they expire or you clear the list.');
+      await loadRecentPrompts();
+    }));
 
     /* ---------- wiring ---------- */
     $('save').addEventListener('click', () => saveSettings());

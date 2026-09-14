@@ -353,6 +353,50 @@ def test_prompt_cache_treats_queued_warming_as_success():
 """)
 
 
+def test_recent_prompt_selection_preserves_payload_and_resets_old_boundary():
+    _run_fit_script(r"""
+const request = {model:'agent-model',system:'shared',messages:[{role:'user',content:'task'}],
+  tools:[{name:'read',input_schema:{type:'object'}}],thinking:{type:'disabled'},max_tokens:42};
+element('cache-prefix').value='24960';
+element('cache-ttl').value='300';
+applyRecentPrompt({id:'0123456789abcdef0123456789abcdef',format:'anthropic',request});
+assert.equal(element('cache-mode').value,'json');
+assert.equal(element('cache-format').value,'anthropic');
+assert.equal(element('cache-prefix').value,'');
+assert.deepEqual(cacheRegistration().request,request);
+assert.equal(requests.length,0,'Selecting a request never registers or generates implicitly');
+assert.match(element('cache-message').textContent,/whole request|full request/i);
+""")
+
+
+def test_recent_prompt_list_escapes_content_and_expired_selection_keeps_draft():
+    _run_fit_script(r"""
+(async()=>{
+  recentUI.data={enabled:true,capacity:50,stored_bytes:123,max_bytes:16777216,ttl_seconds:3600,skipped_count:0,
+    prompts:[{id:'0123456789abcdef0123456789abcdef',format:'openai',model:'local',preview:'<img src=x onerror=alert(1)>',message_count:2,received_at:'2026-09-14T12:00:00Z'}]};
+  renderRecentPrompts();
+  assert.equal(element('cache-recent-list').innerHTML.includes('<img'),false);
+  assert.match(element('cache-recent-list').innerHTML,/&lt;img/);
+  element('cache-request').value='keep draft';
+  global.fetch=async()=>({ok:false,status:404,json:async()=>({error:'This request has expired or was cleared.'})});
+  await useRecentPrompt('0123456789abcdef0123456789abcdef');
+  assert.equal(element('cache-request').value,'keep draft');
+  assert.match(element('cache-message').textContent,/expired/);
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+
+
+def test_malformed_recent_selection_keeps_every_editor_field():
+    _run_fit_script(r"""
+const fields=['cache-mode','cache-format','cache-request','cache-name','cache-prefix'];
+fields.forEach(id=>{element(id).value='existing '+id});
+for(const id of [undefined,42,'bad/id']) {
+  assert.throws(()=>applyRecentPrompt({id,format:'openai',request:{messages:[]}}),/invalid/i);
+  fields.forEach(id=>assert.equal(element(id).value,'existing '+id));
+}
+""")
+
+
 def test_malformed_success_never_saves_or_launches_and_allows_explicit_override() -> None:
     script = r"""
 (async () => {

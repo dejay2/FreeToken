@@ -34,6 +34,25 @@ VRAM. Names and live retention changes are lost on a model-server restart. Promp
 stay in the current page during refresh errors, but are not saved across page reloads.
 The test displays model text and tool calls; it does not execute tools.
 
+**Recent requests** lists up to 50 accepted text requests from `/v1/chat/completions`
+and `/v1/messages` from the past hour. Choose **Use prompt** to load the original JSON,
+including tools and template options, into the editor. It resets the shared-token field
+to whole-request caching; set an explicit boundary before variable task text when sharing
+only the common instructions. Selection itself does not register or generate anything.
+
+Collection begins when the updated model server starts. Snapshots stay in local RAM,
+with a 16 MiB payload budget and a 4 MiB limit per request; older entries are evicted,
+and oversized requests are skipped. Private and image requests are excluded. The list
+contains request previews and loads full content only when selected. **Pause collection**
+stops new snapshots, and **Clear list** removes existing snapshots without deleting named
+caches. Pause lasts for this model-server process; restarting clears the list and resumes
+collection. Requests sent before this feature was installed cannot be recovered here.
+
+The management API exposes `GET/DELETE /v1/cache/recent`, `GET /v1/cache/recent/{id}` and
+`PUT /v1/cache/recent/settings` with `{"enabled": false}` to pause. These use the same
+local access model as the existing cache controls. They are available through the settings
+helper under `/api/prompt-cache/recent` as well.
+
 The current pool and parking mode are shown under **RAM, SSD and larger prompts**.
 Parking settings and **Smallest KV memory** remain under **Model & chats** and require
 a model-server restart when changed. Registration itself cannot grow a dynamic KV pool.
