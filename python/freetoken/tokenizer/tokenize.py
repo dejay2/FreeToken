@@ -4,6 +4,8 @@ import importlib.util
 import json
 import os
 import threading
+import uuid
+from dataclasses import replace
 from types import ModuleType
 from typing import Any, List
 
@@ -88,6 +90,39 @@ class TokenizeManager:
             self._sanitize_effort(msg.chat_template_kwargs or {}),
             msg.preserve_system_order,
         )
+
+    def system_prefix_tokens(self, msg: TokenizeMsg, input_ids: torch.Tensor) -> int:
+        """Find a conservative shared boundary before the first user text.
+
+        Probe the same template with only the leading instructions and a marked
+        user turn. Comparing rendered text and token IDs fails closed for templates
+        that reorder history or transform the marker. The original request remains
+        authoritative; neither probe text nor its assistant suffix is registered.
+        """
+        leading = []
+        for item in msg.text if isinstance(msg.text, list) else []:
+            if item.get("role") not in {"system", "developer"}:
+                break
+            leading.append(item)
+        if not leading:
+            raise ValueError("No leading system prompt to cache. Choose whole request or a manual token boundary.")
+        marker = "FREETOKEN_BOUNDARY_" + uuid.uuid4().hex
+        probe = replace(msg, text=leading + [{"role": "user", "content": marker}])
+        rendered = self.render_prompt(probe)
+        if rendered.count(marker) != 1:
+            raise ValueError("This template does not expose a reliable system boundary. Choose a manual token boundary.")
+        prefix = rendered.split(marker, 1)[0]
+        if not self.render_prompt(msg).startswith(prefix):
+            raise ValueError("This template changes the system prefix with conversation history. Choose a manual token boundary.")
+        # Use exactly the chat encoding policy from tokenize(), including DSV4.
+        prefix_ids = self.tokenizer.encode(prefix, return_tensors="pt",
+                                          add_special_tokens=self._dsv4_encoder is not None).view(-1)
+        length = min(prefix_ids.numel(), input_ids.numel())
+        mismatches = (prefix_ids[:length] != input_ids[:length]).nonzero()
+        boundary = int(mismatches[0].item()) if mismatches.numel() else length
+        if boundary == 0:
+            raise ValueError("The template has no reusable system prefix. Choose a manual token boundary.")
+        return boundary
 
     def _render(
         self,

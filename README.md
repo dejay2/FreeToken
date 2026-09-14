@@ -129,8 +129,10 @@ the existing local RAM/SSD parking store can retain complete checkpoints.
 The local settings page at `http://127.0.0.1:2031` has a **Prompt cache** tab for registration,
 warming, deletion, retention budgets and 1/2/4/8-agent replay tests. Choose **Load test example**,
 then **Register & test** to check reuse from the browser.
-Its **Recent requests** list can load a real OpenAI or Anthropic request into the cache editor,
-with the original prompt, tools and template options. Collection stays in bounded local RAM.
+Its **Recent requests** list previews user messages. Choose **View prompt** to read the full
+system prompt and tools, then **System prompt + tools** to cache the instructions across
+different tasks. The original request and template options are preserved. Collection stays
+in bounded local RAM.
 
 See [setup, API examples and limits](docs/local-agent-prefix-cache.md). The CPU ownership and
 transport tests cover this path; real-model GPU correctness and latency still require live

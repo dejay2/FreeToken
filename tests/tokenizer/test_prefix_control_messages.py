@@ -128,6 +128,27 @@ def test_registration_uses_ordinary_tokenizer_and_forwards_exact_int32_ids():
     assert forwarded.input_ids.tolist() == [11, 22, 33, 44]
 
 
+def test_system_scope_uses_computed_boundary_with_original_full_ids():
+    PrefixCacheMsg, _, _, _ = _types()
+    backend, frontend = _Queue(), _Queue()
+    manager = _TokenizeManager()
+    seen = []
+    def boundary(msg, ids):
+        seen.append((msg, ids.tolist()))
+        return 2
+    manager.system_prefix_tokens = boundary
+    msg = PrefixCacheMsg(request_id='system-1', action='register', name='base',
+                         text=[{'role':'system','content':'rules'}, {'role':'user','content':'hi'}],
+                         prefix_scope='system')
+    decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+    assert decoded.prefix_scope == 'system'
+    assert tokenizer_server._forward_prefix_msg(decoded, manager, backend, frontend)
+    assert not frontend.items
+    assert seen[0][0].text == msg.text
+    assert backend.items[0].input_ids.tolist() == [11,22,33,44]
+    assert backend.items[0].prefix_tokens == 2
+
+
 @pytest.mark.parametrize("action", ["list", "get", "warm", "delete", "configure"])
 def test_non_registration_actions_pass_through_without_tokenization(action: str):
     PrefixCacheMsg, PrefixCacheBackendMsg, _, _ = _types()

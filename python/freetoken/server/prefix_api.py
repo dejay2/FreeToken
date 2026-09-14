@@ -31,6 +31,7 @@ class PrefixRegistrationRequest(BaseModel):
     format: Literal["openai", "anthropic"]
     request: dict[str, Any]
     prefix_tokens: int | None = Field(default=None, ge=0)
+    prefix_scope: Literal["system"] | None = None
     ttl_seconds: float = Field(default=300.0, ge=0)
 
 
@@ -72,6 +73,8 @@ def _registration_spec(
     model_sampling: dict[str, Any],
 ):
     raw = req.request
+    if req.prefix_scope is not None and req.prefix_tokens is not None:
+        raise ValueError("choose system scope or explicit prefix_tokens, not both")
     if raw.get("cache_private") or raw.get("private"):
         raise ValueError("private requests cannot be registered as shared prefixes")
     if _request_has_images(raw):
@@ -135,6 +138,8 @@ async def _dispatch(state: Any, msg: PrefixCacheMsg, *, success_status: int | No
             },
             status_code=503,
         )
+    if msg.action == "list" and result.get("status") == "ok":
+        result = {**result, "result": {**(result.get("result") or {}), "system_scope_supported": True}}
     return _response(result, success_status=success_status)
 
 
@@ -168,6 +173,7 @@ def register_prefix_routes(
                 chat_template_kwargs=spec.chat_template_kwargs,
                 preserve_system_order=spec.preserve_system_order,
                 prefix_tokens=req.prefix_tokens,
+                prefix_scope=req.prefix_scope,
                 ttl_seconds=req.ttl_seconds,
             ),
         )

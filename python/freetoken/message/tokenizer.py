@@ -239,6 +239,7 @@ class PrefixCacheMsg(BaseTokenizerMsg):
     chat_template_kwargs: Dict[str, Any] | None = None
     preserve_system_order: bool = False
     prefix_tokens: int | None = None
+    prefix_scope: str | None = None
     ttl_seconds: float = 300.0
     max_retained_bytes: int | None = None
 
