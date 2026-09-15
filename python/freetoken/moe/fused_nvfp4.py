@@ -324,6 +324,8 @@ def fused_experts_nvfp4(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
+    *,
+    use_triton_alignment: bool = False,
 ) -> torch.Tensor:
     """Prefill inline-NVFP4 MoE. ``topk_ids`` index rows of the bank tensors in
     ``[0, num_experts)``: full-layer banks with position == expert id (the
@@ -335,7 +337,13 @@ def fused_experts_nvfp4(
     dev, dt = hidden_states.device, hidden_states.dtype
     cfg = _prefill_config(M)
 
-    sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
+    align = moe_align_block_size
+    if use_triton_alignment:
+        # Slot IDs span the entire cache (thousands of rows), beyond the
+        # installed sgl grouping kernel's working expert range. The Triton
+        # implementation supports this extent without changing GEMM arithmetic.
+        from freetoken.kernel.triton.moe_align import moe_align_block_size as align
+    sorted_ids, expert_ids, ntpp = align(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
     tw = topk_weights.reshape(-1).contiguous()
     num_valid = topk_ids.numel()
 

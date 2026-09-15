@@ -35,6 +35,7 @@ def test_small_nvfp4_tail_uses_slot_banks_with_prefill_kernel(monkeypatch):
         assert routes.tolist() == [[5, 7], [7, 5]]
         assert kwargs['views'] is banks
         assert kwargs['n'] == 12 and kwargs['is_prefill'] is True
+        assert kwargs['slot_prefill'] is True
         events.append('prefill-gemm')
         return h + 1
     monkeypatch.setattr(layer, '_expert_gemm', gemm)
@@ -122,3 +123,34 @@ def test_prefill_lookup_handles_production_size_query_without_query_squared_dedu
     cache.ensure_experts(0,ids2,prefill=True)
     assert cache.num_indices.item()==0
     torch.testing.assert_close(ids2,ids,rtol=0,atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
+@pytest.mark.parametrize("hidden,intermediate", [(256, 128), (2560, 640)])
+def test_sparse_prefill_gemm_with_production_slot_extent(monkeypatch, hidden, intermediate):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from tests.moe import test_nvfp4_backends as fixture
+    if try_get_tp_info() is None:set_tp_info(rank=0,size=1)
+    monkeypatch.setattr(fixture,'E',512)
+    monkeypatch.setattr(fixture,'H',hidden)
+    monkeypatch.setattr(fixture,'I',intermediate)
+    source=fixture._make_native_sources(torch.device('cuda'))
+    cache=OffloadMoeCache(num_layers=2,num_experts=512,cache_size=7279,
+                         device=torch.device('cuda'),quant_format='nvfp4')
+    cache.set_bank_sources(source)
+    layer=moe.OffloadMoELayer(0,512,10,fixture.H,fixture.I);layer.offload_cache=cache
+    h=torch.randn(59,fixture.H,device='cuda',dtype=torch.bfloat16)/4
+    ids=torch.randint(0,512,(59,10),device='cuda',dtype=torch.int32)
+    w=torch.ones(59,10,device='cuda')/10
+    # Fill high slot IDs so grouping must handle the real cache extent.
+    cache.usage[:6000]=100;cache.step.fill_(100)
+    monkeypatch.setattr(moe,'_SMALL_PREFILL_ROWS',64)
+    actual=layer._prefill_routed(h.clone(),w,ids.clone())
+    torch.cuda.synchronize()
+    monkeypatch.setattr(moe,'_SMALL_PREFILL_ROWS',0)
+    expected=layer._prefill_routed(h.clone(),w,ids.clone())
+    torch.testing.assert_close(actual,expected,rtol=0,atol=0)
+    monkeypatch.setattr(moe,'_SMALL_PREFILL_ROWS',64)
+    repeat=layer._prefill_routed(h.clone(),w,ids.clone())
+    torch.testing.assert_close(repeat,expected,rtol=0,atol=0)

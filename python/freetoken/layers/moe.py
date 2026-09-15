@@ -896,7 +896,7 @@ class OffloadMoELayer(MoELayer):
             return self._expert_gemm(
                 cache, hidden_states, topk_weights, topk_ids,
                 views=cache.bank_views(), n=cache.cache_size,
-                alphas=None, is_prefill=True,
+                alphas=None, is_prefill=True, slot_prefill=True,
             )
         if cache.quant_format == "exl3":
             from freetoken.moe.fused_exl3 import require_exl3_gpu_only
@@ -985,6 +985,7 @@ class OffloadMoELayer(MoELayer):
         n: int | None,
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
+        slot_prefill: bool = False,
     ) -> torch.Tensor:
         fmt = cache.quant_format
         if fmt == "exl3":
@@ -1065,6 +1066,7 @@ class OffloadMoELayer(MoELayer):
                     self.apply_router_weight_on_input,
                     act_alpha,
                     act_limit,
+                    use_triton_alignment=slot_prefill,
                 )
             # Marlin-style int32 wide-load GEMV (arithmetic dequant, no HW cvt).
             # Bit-identical to the byte-at-a-time path; lifts gate/up BW ~43%->51%
