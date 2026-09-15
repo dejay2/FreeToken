@@ -18,7 +18,8 @@ def test_small_nvfp4_tail_uses_slot_banks_with_prefill_kernel(monkeypatch):
     hidden = torch.ones(2, 16)
     events = []
     banks = (torch.arange(12),)
-    def ensure(layer_id, routes):
+    def ensure(layer_id, routes, *, prefill=False):
+        assert prefill is True
         events.append('ensure')
         routes.add_(4)  # slot IDs deliberately differ from expert IDs
     cache = SimpleNamespace(
@@ -93,3 +94,31 @@ def test_sparse_prefill_falls_back_before_touching_slots(monkeypatch, condition)
     rows=65 if condition=='large' else 2
     layer._prefill_routed(torch.ones(rows,16),torch.ones(rows,2),torch.zeros(rows,2,dtype=torch.int32))
     assert events==['full','copy']
+
+
+def test_nvfp4_stays_on_prefill_kernel_without_false_refusal_warning(monkeypatch, caplog):
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    layer=moe.OffloadMoELayer(0, 8, 2, 16, 32)
+    layer.offload_cache=SimpleNamespace(quant_format='nvfp4',decode_target='gpu')
+    monkeypatch.setattr(moe,'_SMALL_PREFILL_ROWS',64)
+    monkeypatch.setattr(moe,'_small_prefill_refused',set())
+    assert layer._small_prefill_moves_like_decode(59) is False
+    assert not caplog.records
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
+def test_prefill_lookup_handles_production_size_query_without_query_squared_dedup():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    cache=OffloadMoeCache(num_layers=2,num_experts=512,cache_size=7435,
+                         device=torch.device('cuda'),quant_format='nvfp4')
+    raw=(torch.arange(590,device='cuda',dtype=torch.int32)%512).reshape(59,10)
+    ids=raw.clone()
+    cache.ensure_experts(0,ids,prefill=True)
+    assert cache.num_indices.item()==512
+    torch.testing.assert_close(cache.id_of_slot[ids.long()],raw,rtol=0,atol=0)
+    ids2=raw.clone()
+    cache.ensure_experts(0,ids2,prefill=True)
+    assert cache.num_indices.item()==0
+    torch.testing.assert_close(ids2,ids,rtol=0,atol=0)

@@ -1413,8 +1413,8 @@ class OffloadMoeCache:
         ids = expert_ids.reshape(-1).long()
         self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
 
-    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
-        from freetoken.moe.offload_kernels import ensure_experts
+    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor, *, prefill: bool = False) -> None:
+        from freetoken.moe.offload_kernels import ensure_experts, ensure_experts_hybrid
 
         self._reject_gpu_owned(layer_id, "ensure_experts")
         # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
@@ -1422,7 +1422,14 @@ class OffloadMoeCache:
         self._note_decode_routing(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
-        ensure_experts(self, layer_id, expert_ids)
+        if prefill:
+            # The decode lookup deduplicates in query space (K x K). A short
+            # prefill can still have hundreds of routes. The existing bounded
+            # expert-domain lookup avoids that compiler/register explosion;
+            # fetching up to every expert means there is no CPU overflow.
+            ensure_experts_hybrid(self, layer_id, expert_ids, self.num_experts)
+        else:
+            ensure_experts(self, layer_id, expert_ids)
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.

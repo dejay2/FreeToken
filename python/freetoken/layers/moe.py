@@ -605,6 +605,10 @@ class OffloadMoELayer(MoELayer):
         if cache is None:
             return False
         fmt = getattr(cache, "quant_format", None)
+        if fmt == "nvfp4":
+            # _prefill_routed handles selective movement while preserving this
+            # format's prefill kernel. It must never use decode arithmetic.
+            return False
         if fmt not in _MOVEMENT_ONLY_FORMATS:
             return _refuse_small_prefill(fmt)
         # The cpu/hybrid decode target sizes its C++ scratch and pinned IO sets once, from
@@ -887,7 +891,7 @@ class OffloadMoELayer(MoELayer):
             and not cache.is_gpu_owned_layer(self.layer_id)
             and cache.cache_size >= min(self.num_experts, topk_ids.numel())
         ):
-            cache.ensure_experts(self.layer_id, topk_ids)
+            cache.ensure_experts(self.layer_id, topk_ids, prefill=True)
             cache.copy_missing()
             return self._expert_gemm(
                 cache, hidden_states, topk_weights, topk_ids,
