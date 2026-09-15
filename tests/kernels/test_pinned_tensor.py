@@ -145,3 +145,28 @@ def test_host_bank_pin_registers_and_translates():
         assert dev == bank.addr
     else:
         assert dev != 0
+
+
+@pytest.mark.parametrize("backing", ["mmap", "cuda"])
+def test_host_bank_gpu_copy_and_repeated_release(backing):
+    """Real CUDA registration/deletion and source lifetime, including an outstanding view."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    import gc
+    import weakref
+    from freetoken.moe.host_banks import HostBank
+
+    for _ in range(3):
+        bank = HostBank((16 << 20,), torch.uint8, backing=backing)
+        bank.tensor.fill_(37)
+        bank.pin()
+        owner = weakref.ref(bank._buf if backing == "mmap" else bank._raw)
+        alias = bank.tensor[4096:8192]
+        copied = alias.to("cuda", non_blocking=True)
+        torch.cuda.synchronize()
+        assert torch.equal(copied.cpu(), torch.full_like(alias, 37))
+        bank.free()
+        assert torch.equal(alias, torch.full_like(alias, 37))
+        del alias
+        gc.collect()
+        assert owner() is None

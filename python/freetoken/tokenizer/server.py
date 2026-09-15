@@ -553,6 +553,7 @@ def _forward_control_msg(m, send_backend, send_frontend) -> bool:
                 layers=m.layers,
                 vram_free_bytes=m.vram_free_bytes,
                 error=m.error,
+                cache_pools=getattr(m, "cache_pools", None),
                 exhausted=bool(getattr(m, "exhausted", False)),
             )
         )

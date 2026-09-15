@@ -91,6 +91,9 @@ class CacheStepReply(BaseFrontendMsg):
     error: str | None = None
     exhausted: bool = False  # see CacheStepResultMsg
 
+    # Authoritative pool geometry after this step; absent from older workers.
+    cache_pools: dict | None = None
+
 
 @dataclass
 class PrefillProgressReply(BaseFrontendMsg):

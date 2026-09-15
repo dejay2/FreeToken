@@ -53,7 +53,6 @@ def read_free_vram_bytes(environ: Mapping[str, str] | None = None) -> int:
 
 _last_win_ram: tuple[float, int] | None = None
 _last_win_ram_lock = threading.Lock()
-_fallback_logged = False
 
 
 def _read_proc_meminfo_available() -> int:
@@ -81,16 +80,23 @@ def _powershell_candidates() -> list[str]:
     return out
 
 
-def read_free_windows_ram_bytes() -> int:
+def _is_wsl() -> bool:
+    return bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")) or (
+        hasattr(os, "uname") and "microsoft" in os.uname().release.lower()
+    )
+
+
+def read_free_windows_ram_bytes(*, force_refresh: bool = False) -> int | None:
     """Read free physical RAM in bytes.
 
     Uses powershell.exe -NoProfile -Command "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"
-    (reported in KB, cached for 2s, 3s timeout). Falls back to /proc/meminfo MemAvailable with a logged note.
+    (reported in KB, cached for 2s, 3s timeout). None means unavailable; the caller
+    must distinguish a native Linux host from missing Windows interop on WSL.
     """
-    global _last_win_ram, _fallback_logged
+    global _last_win_ram
     now = time.monotonic()
     with _last_win_ram_lock:
-        if _last_win_ram is not None and (now - _last_win_ram[0]) < 2.0:
+        if not force_refresh and _last_win_ram is not None and (now - _last_win_ram[0]) < 2.0:
             return _last_win_ram[1]
 
     for exe in _powershell_candidates():
@@ -110,23 +116,18 @@ def read_free_windows_ram_bytes() -> int:
         except Exception:  # noqa: BLE001
             continue
         if proc.returncode == 0 and proc.stdout.strip():
-            kb = int(proc.stdout.strip())
+            try:
+                kb = int(proc.stdout.strip())
+            except ValueError:
+                continue
+            if kb < 0:
+                continue
             free_bytes = kb * 1024
             with _last_win_ram_lock:
                 _last_win_ram = (now, free_bytes)
             return free_bytes
 
-    if not _fallback_logged:
-        logger.info("Windows RAM interop unavailable, falling back to /proc/meminfo MemAvailable")
-        _fallback_logged = True
-
-    try:
-        free_bytes = _read_proc_meminfo_available()
-        with _last_win_ram_lock:
-            _last_win_ram = (now, free_bytes)
-        return free_bytes
-    except Exception as exc:
-        raise RuntimeError(f"failed to read free RAM from both PowerShell and /proc/meminfo: {exc}") from exc
+    return None
 
 
 class GovernorPolicy:
@@ -185,19 +186,21 @@ class GovernorPolicy:
         last_actions: Any = None,
         allow_down: bool = True,
         exhausted_up: Collection[str] = (),
+        axes: Collection[str] = ("vram", "ram"),
     ) -> list[Action]:
         """Decide next action(s) based on current free memory and timing.
 
         ``exhausted_up`` names axes whose last recall reply said nothing is left to recall;
         an up step there is neither chosen nor stamped (a phantom "up" stamp would put the
         next real down inside the post-up grace), while the high-memory hold keeps running
-        so the first recall after the axis is cleared is still immediate.
+        so the first recall after the axis is cleared is still immediate. ``axes`` lets
+        the loop decide RAM only after any VRAM rebuild and fresh memory probes.
         """
         state = last_actions if isinstance(last_actions, dict) else self._state
         ram_tight = free_ram < self.ram_cushion
         actions: list[Action] = []
 
-        for axis in ("vram", "ram"):
+        for axis in axes:
             free = free_vram if axis == "vram" else free_ram
             cushion = self.vram_cushion if axis == "vram" else self.ram_cushion
             rungs_before_up = (
@@ -300,6 +303,10 @@ class GovernorLoop(threading.Thread):
         self.last_layers: dict[str, int] = {"owned": 0, "pinned": 0, "disk": 0, "parked": 0}
         self.last_free_vram: int | None = None
         self.last_free_ram: int | None = None
+        self.last_free_windows_ram: int | None = None
+        self.last_free_linux_ram: int | None = None
+        self.ram_source: str | None = None
+        self.ram_probe_error: str | None = None
         self._serving_since: float | None = None
         self.last_moe_cache_size: int | None = None
         self.last_num_pages: int | None = None
@@ -354,14 +361,10 @@ class GovernorLoop(threading.Thread):
             logger.debug("governor failed to probe VRAM: %s", exc)
             return
 
-        try:
-            free_ram = read_free_windows_ram_bytes()
-        except Exception as exc:
-            logger.debug("governor failed to probe RAM: %s", exc)
+        free_ram = self._probe_ram()
+        if free_ram is None:
             return
-
         self.last_free_vram = free_vram
-        self.last_free_ram = free_ram
 
         now = time.monotonic()
         # The model's expert-bank size is stable for a boot, but query it periodically so a
@@ -373,14 +376,72 @@ class GovernorLoop(threading.Thread):
             # Do not charge the residency HTTP round trip to the policy's step interval.
             now = time.monotonic()
 
-        actions = self.policy.decide(
-            now, free_vram, free_ram, allow_down=not settling, exhausted_up=self._up_exhausted
-        )
-        for action in actions:
-            self._execute_action(action, free_vram, free_ram)
-            # The POST blocks for the whole rebuild; the interval and the flap window count
-            # from its completion, not from when the step was chosen.
-            self.policy.note_step_done(action.axis, time.monotonic())
+        # A VRAM step can consume or release host RAM. Decide the RAM axis afterwards,
+        # using fresh host AND guest readings instead of executing a pre-rebuild recall.
+        stepped = False
+        for axis in ("vram", "ram"):
+            if stepped:
+                if not self.enabled:
+                    return
+                free_ram = self._probe_ram(force_refresh=True)
+                if free_ram is None:
+                    return
+                try:
+                    free_vram = read_free_vram_bytes()
+                except Exception as exc:
+                    logger.debug("governor failed to probe VRAM after step: %s", exc)
+                    return
+                self.last_free_vram = free_vram
+                now = time.monotonic()
+            actions = self.policy.decide(
+                now, free_vram, free_ram, allow_down=not settling,
+                exhausted_up=self._up_exhausted, axes=(axis,),
+            )
+            for action in actions:
+                self._execute_action(action, free_vram, free_ram)
+                # The POST blocks for the whole rebuild; intervals count from completion.
+                self.policy.note_step_done(action.axis, time.monotonic())
+                stepped = True
+
+    def _probe_ram(self, *, force_refresh: bool = False) -> int | None:
+        # Windows headroom protects the whole host; MemAvailable also respects WSL's
+        # own ceiling. A Windows-only reading can authorize recalls into an almost-full VM.
+        self.last_free_windows_ram = None
+        self.last_free_linux_ram = None
+        self.last_free_ram = None
+        self.ram_source = None
+        try:
+            native_windows = os.name == "nt"
+            wsl = not native_windows and _is_wsl()
+            if native_windows or wsl:
+                self.last_free_windows_ram = read_free_windows_ram_bytes(force_refresh=force_refresh)
+            if not native_windows:
+                self.last_free_linux_ram = _read_proc_meminfo_available()
+            if native_windows:
+                if self.last_free_windows_ram is None:
+                    raise RuntimeError("Windows physical RAM probe unavailable")
+                free_ram = self.last_free_windows_ram
+                self.ram_source = "windows"
+            elif wsl:
+                if self.last_free_windows_ram is None:
+                    raise RuntimeError("Windows physical RAM probe unavailable on WSL")
+                free_ram = min(self.last_free_windows_ram, self.last_free_linux_ram)
+                self.ram_source = "min(windows,linux)"
+            else:
+                free_ram = self.last_free_linux_ram
+                self.ram_source = "linux"
+        except Exception as exc:
+            self.ram_probe_error = str(exc)
+            # Unobserved time cannot satisfy a continuous high-memory hold. In particular,
+            # a successful next tick must not immediately recall after a long probe outage.
+            for axis_state in self.policy._state.values():
+                axis_state["high_since"] = None
+            logger.debug("governor failed to probe RAM: %s", exc)
+            return
+        self.ram_probe_error = None
+
+        self.last_free_ram = free_ram
+        return free_ram
 
     def _execute_action(self, action: Action, free_vram: int, free_ram: int) -> None:
         url = f"http://127.0.0.1:{self.http_port}/v1/cache/step"
@@ -563,5 +624,13 @@ class GovernorLoop(threading.Thread):
             "layers": dict(self.last_layers),
             "free_vram_gb": free_vram_gb,
             "free_ram_gb": free_ram_gb,
+            "free_windows_ram_gb": (
+                round(self.last_free_windows_ram / GIB, 2) if self.last_free_windows_ram is not None else None
+            ),
+            "free_linux_ram_gb": (
+                round(self.last_free_linux_ram / GIB, 2) if self.last_free_linux_ram is not None else None
+            ),
+            "ram_source": self.ram_source,
+            "ram_probe_error": self.ram_probe_error,
             "up_exhausted": sorted(self._up_exhausted),
         }

@@ -1610,6 +1610,8 @@ class Scheduler(SchedulerIOMixin):
         result: dict | None = None,
         error: str | None = None,
     ) -> None:
+        from freetoken.kvcache.cache_status import compute_cache_pools
+
         res = result or {}
         report = self.engine.residency_report() if status == "ok" else {}
         self.send_result(
@@ -1625,6 +1627,7 @@ class Scheduler(SchedulerIOMixin):
                              "parked": len(report.get("ram_parked") or [])} if report else None),
                     vram_free_bytes=int(res.get("vram_free_bytes", 0) or 0),
                     error=error or res.get("reason"),
+                    cache_pools=compute_cache_pools(self.engine) if status == "ok" else None,
                     exhausted=bool(res.get("exhausted", False)),
                 )
             ]

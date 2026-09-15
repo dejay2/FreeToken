@@ -602,6 +602,28 @@ class FrontendManager:
             )
         if not _reply_matches_open_operation(self, msg.request_id):
             return
+        # Apply the snapshot on the correlated reply path, including when the HTTP
+        # waiter has timed out. An old residency poll must never override this geometry.
+        operation = self.maintenance_ops.get(msg.request_id)
+        if msg.status == "ok" and operation and not operation.get("expired") and not self.fatal_error:
+            pools = getattr(msg, "cache_pools", None)
+            if isinstance(pools, dict):
+                self.cache_pools = {**(self.cache_pools or {}), **pools}
+                # cache_geometry gives these last-rebuild fields precedence over pools.
+                # Refresh them together so a previous manual rebuild cannot mask a step.
+                latest = dict(self.last_rebuild or {})
+                for pool_key, result_key in (
+                    ("moe_cache_size", "moe_cache_size"), ("num_pages", "num_pages"),
+                    ("num_mamba_slots", "mamba_slots"), ("num_swa_pages", "num_swa_pages"),
+                ):
+                    if pool_key in pools:
+                        latest[result_key] = pools[pool_key]
+                self.last_rebuild = latest
+            elif msg.moe_cache_size:
+                # Older workers still report the slot count, but cannot refresh owned IDs.
+                self.last_rebuild = {**(self.last_rebuild or {}), "moe_cache_size": msg.moe_cache_size}
+            self._residency_cache = None
+            self._residency_time = 0.0
         _close_maintenance(self, msg.request_id, failed=(msg.status == "failed"))
 
     def _note_progress(self, msg: CacheProgressReply) -> None:

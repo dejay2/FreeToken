@@ -162,6 +162,15 @@ class FakeDiskEngine:
     def step_memory(self, *args, **kwargs):
         return Engine.step_memory(self, *args, **kwargs)
 
+    def step_memory_noop(self, *args, **kwargs):
+        return Engine.step_memory_noop(self, *args, **kwargs)
+
+    def _kv_dynamic_active(self):
+        return Engine._kv_dynamic_active(self)
+
+    def _report_maintenance_progress(self, *args, **kwargs):
+        return Engine._report_maintenance_progress(self, *args, **kwargs)
+
     def _move_layer(self, layer_id: int, target: str):
         return Engine._move_layer(self, layer_id, target)
 
@@ -511,6 +520,7 @@ def test_gpu_decode_step_with_disk_layer(tmp_path: Path):
     layer.activation = "silu"
     layer.apply_router_weight_on_input = False
     layer.top_k = 2
+    layer.offload_cache = cache
 
     hidden = torch.randn(1, H, dtype=torch.bfloat16, device=dev)
     weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32, device=dev)
@@ -518,7 +528,7 @@ def test_gpu_decode_step_with_disk_layer(tmp_path: Path):
 
     out = layer._decode_routed(hidden, weights, topk_ids)
     assert out.shape == hidden.shape
-    assert out.device == dev
+    assert out.device == hidden.device
 
 
 # --------------------------------------------------------------------------------------
@@ -854,3 +864,65 @@ def test_ram_ladder_parks_then_spills_then_recalls_then_unparks_end_to_end(tmp_p
             assert torch.equal(_t(eng.moe_offload_cache.bank_sources[n][lid]), originals[lid][n])
     r = eng.step_memory(axis="ram", direction="up")
     assert r["applied"] is None
+
+
+@pytest.mark.parametrize("target", ["disk", "gpu_owned"])
+def test_move_releases_registered_startup_banks_after_rebinding(tmp_path, monkeypatch, target):
+    import gc
+    import weakref
+    from freetoken.kernel import pinned
+    from freetoken.moe import host_banks as hb
+
+    calls = []
+    monkeypatch.setattr(pinned, "host_register", lambda addr, size: None)
+    eng = FakeDiskEngine(num_layers=3, model_dir=tmp_path / "model", disk_dir=tmp_path / "disk")
+    owners = {name: HostBank(eng.shapes[name], eng.dtypes[name], backing="mmap") for name in eng.bank_schema}
+    buffers = [weakref.ref(bank._buf) for bank in owners.values()]
+    old_addresses = {bank.addr for bank in owners.values()}
+    def unregister(addr):
+        # No cache source may still point to the allocation being unregistered.
+        assert all(t[1].data_ptr() not in old_addresses for t in eng.moe_offload_cache.bank_sources.values())
+        calls.append(addr)
+    monkeypatch.setattr(pinned, "host_unregister", unregister)
+    for bank in owners.values():
+        bank.tensor.fill_(3)
+        bank.pin()
+    eng.moe_offload_cache.rebind_layer(1, "pinned", {name: bank.tensor for name, bank in owners.items()})
+    eng.expert_disk_copy.write_layer(1, {n: eng.moe_offload_cache.bank_sources[n][1] for n in eng.bank_schema})
+    assert not eng._host_banks  # exactly the startup loader path, no runtime registry yet
+    eng._move_layer(1, target)
+    gc.collect()
+    assert set(calls) == old_addresses
+    assert all(ref() is None for ref in buffers)
+    assert all(bank.tensor is None for bank in owners.values())
+    assert 1 not in eng._host_banks
+    assert not any(addr in hb._REGISTERED_BANKS for addr in old_addresses)
+
+
+@pytest.mark.parametrize("next_target", ["disk", "pinned"])
+def test_failed_startup_unregister_is_retried_before_noop_or_recall(tmp_path, monkeypatch, next_target):
+    from freetoken.kernel import pinned
+
+    monkeypatch.setattr(pinned, "host_register", lambda addr, size: None)
+    eng = FakeDiskEngine(num_layers=3, model_dir=tmp_path / "model", disk_dir=tmp_path / "disk")
+    bank = HostBank(eng.shapes["gate_up"], eng.dtypes["gate_up"], backing="mmap")
+    bank.tensor.fill_(5)
+    bank.pin()
+    sources = {n: eng.moe_offload_cache.bank_sources[n][1] for n in eng.bank_schema}
+    sources["gate_up"] = bank.tensor
+    eng.moe_offload_cache.rebind_layer(1, "pinned", sources)
+    eng.expert_disk_copy.write_layer(1, sources)
+    def fail(addr):
+        raise RuntimeError("unregister failed")
+    monkeypatch.setattr(pinned, "host_unregister", fail)
+    with pytest.raises(RuntimeError, match="unregister failed"):
+        eng._move_layer(1, "disk")
+    assert eng.moe_offload_cache.layer_residency[1] == "disk"
+    assert bank.tensor is not None and eng._host_banks[1]["gate_up"] is bank
+    # Neither a no-op retry nor allocating the recalled bank can bypass cleanup.
+    with pytest.raises(RuntimeError, match="unregister failed"):
+        eng._move_layer(1, next_target)
+    monkeypatch.setattr(pinned, "host_unregister", lambda addr: None)
+    eng._move_layer(1, next_target)
+    assert bank.tensor is None
+    assert eng.moe_offload_cache.layer_residency[1] == next_target

@@ -12,7 +12,9 @@ contiguous cache) paths both rely on:
   bank, bypassing the page cache, with many concurrent ``preadv`` on one fd (scales to the
   device's queue-depth ceiling even for a single file).
 
-The mmaps are held for the process lifetime (the banks live as long as the offload cache).
+Registered banks retain an explicit owner until the engine claims them. At a synchronized
+layer move the owner unregisters the old bank; remaining CPU tensor views keep the mmap alive
+until their last reference is released.
 """
 
 from __future__ import annotations
@@ -66,8 +68,36 @@ class HostResidency(str, Enum):
 
 _DEFAULT_CHUNK = 8 << 20
 
-# Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
-_LIVE_BUFFERS: list[mmap.mmap] = []
+# Pinning outlives the loader's HostBank objects. The engine takes these owners along with
+# the returned tensors, rather than leaking registered mappings for the process lifetime.
+_REGISTERED_BANKS: dict[int, "HostBank"] = {}
+
+
+def claim_host_banks(sources: dict[str, list[torch.Tensor]]) -> dict[int, dict[str, "HostBank"]]:
+    """Transfer registered mmap owners to the engine, including padded FTW tensor views.
+
+    Validate the entire claim before removing any registry entries. An allocation shared
+    across independently movable layers cannot be released when just one layer moves.
+    """
+    claimed: dict[int, dict[str, HostBank]] = {}
+    owner_layers: dict[int, int] = {}
+    for name, tensors in sources.items():
+        for layer_id, tensor in enumerate(tensors):
+            if tensor.is_cuda or not tensor.numel():
+                continue
+            lo = tensor.data_ptr()
+            extent = 1 + sum((n - 1) * s for n, s in zip(tensor.shape, tensor.stride()))
+            hi = lo + extent * tensor.element_size()
+            for addr, bank in _REGISTERED_BANKS.items():
+                if addr <= lo and hi <= addr + bank.nbytes:
+                    previous = owner_layers.setdefault(addr, layer_id)
+                    if previous != layer_id:
+                        raise ValueError("registered host allocation spans multiple layers")
+                    claimed.setdefault(layer_id, {})[name] = bank
+                    break
+    for addr in owner_layers:
+        del _REGISTERED_BANKS[addr]
+    return claimed
 
 def _env_born_pinned() -> bool | None:
     """``FREETOKEN_BANK_CUDA_ALLOC`` tri-state: unset -> ``None`` (default applies), else the parsed boolean."""
@@ -125,7 +155,6 @@ class HostBank:
         else:
             self._raw = None
             self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
-            _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
         self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
@@ -168,6 +197,7 @@ class HostBank:
                 f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB"
             ) from exc
         self._pinned = True
+        _REGISTERED_BANKS[self.addr] = self
 
     def release(self) -> None:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
@@ -178,20 +208,29 @@ class HostBank:
         self._buf.madvise(mmap.MADV_DONTNEED)
 
     def free(self) -> None:
-        """Drop references to the underlying buffer and tensors.
+        """Release ownership after GPU readers have stopped and cache pointers are rebound.
 
-        For born-pinned (cudaHostAlloc) banks, dropping tensor, _buf, and the raw
-        pinned tensor allows the PyTorch storage deleter to run cudaFreeHost.
-        mmap-backed banks keep release() semantics (MADV_DONTNEED).
+        Unregister before dropping references; on failure retain the allocation for retry.
+        Never close or discard mmap contents while another CPU tensor view can still exist.
+        Those views retain the backing through the buffer protocol. CUDA-allocated banks
+        similarly run their cudaFreeHost storage deleter only when the last view is gone.
         """
-        if getattr(self, "_backing", None) == "cuda":
-            self.tensor = None
-            self._buf = None
-            self._raw = None
-            self.addr = 0
+        if self._buf is None:
+            return
+        if self._backing == "mmap" and self._pinned:
+            from freetoken.kernel.pinned import host_unregister
+
+            host_unregister(self.addr)
             self._pinned = False
-        else:
-            self.release()
+        if self._locked:
+            _os_unlock(self.addr, len(self._buf))
+            self._locked = False
+        _REGISTERED_BANKS.pop(self.addr, None)
+        self.tensor = None
+        self._buf = None
+        self._raw = None
+        self.addr = 0
+        self._pinned = False
 
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
@@ -213,6 +252,15 @@ class HostBank:
 
 _os_locked_total = 0  # bytes locked so far; the OS lock ceiling is a per-process quota
 _os_lock_failed = False  # sticky: once over quota, later (bigger-total) locks fail too
+
+
+def _os_unlock(addr: int, nbytes: int) -> None:
+    global _os_locked_total
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.munlock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes)):
+        err = ctypes.get_errno()
+        raise OSError(err, f"munlock failed: {os.strerror(err)}")
+    _os_locked_total = max(0, _os_locked_total - nbytes)
 
 
 def _os_lock(addr: int, nbytes: int) -> None:
@@ -332,7 +380,9 @@ class _ResidencyPlan:
     def __init__(self, labels: list[str], device=None, expert_quant: str | None = None):
         self.labels = list(labels)
         self.applied = False
-        self.has_unpinned = any(r != HostResidency.PINNED.value for r in labels)
+        self.has_unpinned = any(
+            r in (HostResidency.LOCKED.value, HostResidency.PAGEABLE.value) for r in labels
+        )
         self.actual: dict[int, str] = {}
         # GPU_OWNED layers are resolved once here so alloc_layer_banks can consult the plan
         # ambiently, exactly like pin_banks/PinPipeline consult it for LOCKED.

@@ -15,6 +15,13 @@ from freetoken.daemon.settings.governor import GIB, Action, GovernorLoop, Govern
 from freetoken.daemon.settings.process_manager import ProcessManager
 
 
+@pytest.fixture(autouse=True)
+def _ample_linux_ram(monkeypatch):
+    # Existing loop tests model WSL and isolate policy/HTTP behavior from the test host.
+    monkeypatch.setattr(governor, "_is_wsl", lambda: True)
+    monkeypatch.setattr(governor, "_read_proc_meminfo_available", lambda: 80 * GIB)
+
+
 class _FakeServer:
     """Answers POST /v1/cache/step from a scripted list of (http_status, body) replies."""
 
@@ -153,7 +160,7 @@ def test_tick_restamps_the_axis_when_the_post_returns(monkeypatch):
     clock = {"t": 100.0}
     monkeypatch.setattr(governor.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(governor, "read_free_vram_bytes", lambda environ=None: GIB)
-    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda: 8 * GIB)
+    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda **_kwargs: 8 * GIB)
 
     class _SlowServer(_FakeServer):
         def urlopen(self, req, timeout=None):
@@ -314,7 +321,7 @@ def test_boot_settle_window_drops_down_steps_but_not_up_steps(monkeypatch):
     server = _FakeServer([])
     loop = _loop(monkeypatch, server)
     monkeypatch.setattr(governor, "read_free_vram_bytes", lambda: int(2.5 * GIB))  # card: no step either way
-    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda: 1 * GIB)  # below the 4 GiB cushion
+    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda **_kwargs: 1 * GIB)  # below the 4 GiB cushion
     executed: list[Action] = []
     monkeypatch.setattr(loop, "_execute_action", lambda a, fv, fr: executed.append(a))
     monkeypatch.setattr(loop, "_query_residency", lambda: None)
@@ -335,7 +342,7 @@ def test_boot_settle_window_drops_down_steps_but_not_up_steps(monkeypatch):
     loop2 = _loop(monkeypatch, server)
     monkeypatch.setattr(loop2, "_execute_action", lambda a, fv, fr: executed.append(a))
     monkeypatch.setattr(loop2, "_query_residency", lambda: None)
-    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda: 40 * GIB)
+    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda **_kwargs: 40 * GIB)
     monkeypatch.setattr(governor, "read_free_vram_bytes", lambda: 12 * GIB)
     clock["t"] = 5000.0
     loop2._tick()
@@ -358,7 +365,7 @@ def _idle_loop(monkeypatch, server, clock, *, free_ram=40 * GIB, free_vram=int(2
     loop = _loop(monkeypatch, server)
     monkeypatch.setattr(governor.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(governor, "read_free_vram_bytes", lambda: free_vram)
-    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda: free_ram)
+    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda **_kwargs: free_ram)
     monkeypatch.setattr(loop, "_query_residency", lambda: None)
     return loop
 
@@ -396,13 +403,13 @@ def test_an_applied_spill_makes_the_axis_askable_again(monkeypatch):
     _run(loop, clock, loop.policy.up_hold + 4)
     assert [r["direction"] for r in server.requests] == ["up"] and loop._up_exhausted == {"ram"}
     # Pressure: RAM drops below the cushion, the down step applies and clears the verdict.
-    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda: 1 * GIB)
+    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda **_kwargs: 1 * GIB)
     _run(loop, clock, 6.0)
     assert [r["direction"] for r in server.requests] == ["up", "down"]
     assert loop._up_exhausted == set()
     # Memory back: after the hold (doubled, because the cushion tripped inside the post-up
     # grace) the recall is asked, then the next no-op is remembered again.
-    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda: 40 * GIB)
+    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda **_kwargs: 40 * GIB)
     _run(loop, clock, 2 * loop.policy.up_hold + 20)
     assert [r["direction"] for r in server.requests] == ["up", "down", "up", "up"]
     assert loop._up_exhausted == {"ram"}
@@ -576,3 +583,125 @@ def test_non_success_step_defaults_do_not_change_geometry_or_re_arm_exhaustion(m
         assert loop.last_moe_cache_size == 6144
         assert loop.last_layers == {"owned": 0, "pinned": 48, "disk": 0, "parked": 0}
         assert error in loop.last_action
+
+
+@pytest.mark.parametrize("windows_gib,linux_gib", [(20, 1), (1, 20)])
+def test_ram_pressure_in_either_host_or_guest_prevents_recall(monkeypatch, windows_gib, linux_gib):
+    clock = {"t": 1000.0}
+    server = _FakeServer([(200, {"status": "ok", "applied": "pinned->disk"})] * 50)
+    loop = _idle_loop(monkeypatch, server, clock, free_ram=windows_gib * GIB)
+    monkeypatch.setattr(governor, "_read_proc_meminfo_available", lambda: linux_gib * GIB)
+    loop._serving_since = 0.0
+    _run(loop, clock, loop.policy.up_hold + 10)
+    assert server.requests
+    assert all(r["axis"] == "ram" and r["direction"] == "down" and r["ram_tight"] for r in server.requests)
+    status = loop.status()
+    assert status["free_ram_gb"] == 1.0
+    assert status["free_windows_ram_gb"] == windows_gib
+    assert status["free_linux_ram_gb"] == linux_gib
+    assert status["ram_source"] == "min(windows,linux)"
+
+
+def test_failed_guest_probe_blocks_actions_and_restarts_recall_hold(monkeypatch):
+    clock = {"t": 1000.0}
+    server = _FakeServer([_exhausted_reply()])
+    loop = _idle_loop(monkeypatch, server, clock)
+    loop._tick()  # start observing high memory
+
+    def failed():
+        raise OSError("meminfo unavailable")
+
+    monkeypatch.setattr(governor, "_read_proc_meminfo_available", failed)
+    _run(loop, clock, loop.policy.up_hold + 2)
+    assert server.requests == []
+    assert loop.status()["free_ram_gb"] == 0.0
+    assert loop.status()["free_linux_ram_gb"] is None
+    assert "meminfo unavailable" in loop.status()["ram_probe_error"]
+    monkeypatch.setattr(governor, "_read_proc_meminfo_available", lambda: 40 * GIB)
+    loop._tick()
+    assert server.requests == [], "an unobserved hold does not authorize an immediate recall"
+    _run(loop, clock, loop.policy.up_hold + 2)
+    assert len(server.requests) == 1
+    assert loop.status()["ram_probe_error"] is None
+
+
+@pytest.mark.parametrize("windows_ram", [None, GIB])
+def test_native_linux_uses_only_memavailable(monkeypatch, windows_ram):
+    clock = {"t": 1000.0}
+    server = _FakeServer([_exhausted_reply()])
+    loop = _idle_loop(monkeypatch, server, clock)
+    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda **_kwargs: windows_ram)
+    monkeypatch.setattr(governor, "_is_wsl", lambda: False)
+    monkeypatch.setattr(governor, "_read_proc_meminfo_available", lambda: 12 * GIB)
+    _run(loop, clock, loop.policy.up_hold + 2)
+    assert len(server.requests) == 1
+    assert loop.status()["free_ram_gb"] == 12.0
+    assert loop.status()["free_windows_ram_gb"] is None
+    assert loop.status()["ram_source"] == "linux"
+
+
+def test_wsl_windows_probe_failure_does_not_authorize_recall(monkeypatch):
+    clock = {"t": 1000.0}
+    server = _FakeServer([_exhausted_reply()])
+    loop = _idle_loop(monkeypatch, server, clock)
+    monkeypatch.setattr(governor, "read_free_windows_ram_bytes", lambda **_kwargs: None)
+    monkeypatch.setattr(governor, "_is_wsl", lambda: True, raising=False)
+    _run(loop, clock, loop.policy.up_hold + 2)
+    assert server.requests == []
+    assert loop.status()["ram_probe_error"]
+
+
+@pytest.mark.parametrize("after_first_step", [3 * GIB, None])
+def test_second_action_rechecks_ram_after_vram_rebuild(monkeypatch, after_first_step):
+    clock = {"t": 1000.0}
+    memory = {"linux": 8 * GIB, "vram": int(2.5 * GIB)}
+
+    def linux_available():
+        if memory["linux"] is None:
+            raise OSError("meminfo unavailable after rebuild")
+        return memory["linux"]
+
+    class _MemoryChangingServer(_FakeServer):
+        def urlopen(self, req, timeout=None):
+            result = super().urlopen(req, timeout)
+            memory["linux"] = after_first_step
+            return result
+
+    server = _MemoryChangingServer([(200, {"status": "ok", "applied": "gpu_owned->pinned"})] * 3)
+    loop = _idle_loop(monkeypatch, server, clock, free_ram=20 * GIB)
+    monkeypatch.setattr(governor, "_read_proc_meminfo_available", linux_available)
+    monkeypatch.setattr(governor, "read_free_vram_bytes", lambda: memory["vram"])
+    loop._serving_since = 0.0
+    loop._tick()  # RAM high hold starts; neither axis has an action yet.
+    clock["t"] += loop.policy.up_hold + 1
+    memory["vram"] = GIB
+    loop._tick()  # VRAM down consumes the RAM that the initial recall decision counted.
+    expected = [("vram", "down")]
+    if after_first_step is not None:
+        # The second axis must use current pressure, without a phantom recall/grace stamp.
+        expected.append(("ram", "down"))
+    assert [(r["axis"], r["direction"]) for r in server.requests] == expected
+
+
+@pytest.mark.parametrize("windows_ram", [12 * GIB, None])
+def test_native_windows_uses_host_probe_without_proc_meminfo(monkeypatch, windows_ram):
+    clock = {"t": 1000.0}
+    server = _FakeServer([_exhausted_reply()])
+    loop = _idle_loop(monkeypatch, server, clock, free_ram=windows_ram)
+    monkeypatch.setattr(governor, "os", SimpleNamespace(name="nt"))
+
+    def no_proc():
+        raise FileNotFoundError("native Windows has no /proc/meminfo")
+
+    monkeypatch.setattr(governor, "_read_proc_meminfo_available", no_proc)
+    _run(loop, clock, loop.policy.up_hold + 2)
+    if windows_ram is None:
+        assert server.requests == []
+        assert loop.status()["ram_probe_error"]
+    else:
+        assert len(server.requests) == 1
+        assert loop.status()["free_ram_gb"] == 12.0
+        assert loop.status()["free_windows_ram_gb"] == 12.0
+        assert loop.status()["free_linux_ram_gb"] is None
+        assert loop.status()["ram_source"] == "windows"
+        assert loop.status()["ram_probe_error"] is None

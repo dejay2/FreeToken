@@ -145,3 +145,104 @@ def test_compute_cache_pools_reports_zero_without_owned_layers():
     )
 
     assert compute_cache_pools(engine)["gpu_owned_reserved_bytes"] == 0
+
+
+def test_governor_step_refreshes_geometry_through_real_reply_transport():
+    import asyncio
+    import torch
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.server.api_server import FrontendManager, dispatch_step
+    from freetoken.tokenizer.server import _forward_control_msg
+
+    async def run():
+        seed = _state(list(range(8)))
+        seed.config.served_model_name = "m"
+        seed.config.kv_park = "off"
+        seed.config.kv_dtype = "fp8"
+        seed.config.model_config.has_swa_attention = False
+        manager = FrontendManager(config=seed.config, send_tokenizer=None,
+                                  recv_tokenizer=None, maintenance_state="serving")
+        manager.cache_pools = seed.cache_pools
+        manager.unit_bytes = seed.unit_bytes
+        manager.last_rebuild = {"status": "ok", "moe_cache_size": 3450,
+                                "num_pages": 100, "mamba_slots": 12}
+        manager._residency_cache = {"owned": 8, "moe_cache_size": 3450}
+        row = torch.zeros(4, 8, dtype=torch.float16)
+        engine = SimpleNamespace(
+            config=seed.config, num_pages=250, linear_state_pool=SimpleNamespace(num_slots=17),
+            moe_offload_cache=SimpleNamespace(cache_size=1402, gpu_owned_layer_ids=set(range(13)),
+                                             resident_banks={i: (row,) for i in range(13)}),
+            residency_report=lambda: {"owned": 13, "pinned": 30, "disk": 5},
+        )
+        scheduler = SimpleNamespace(engine=engine)
+        frontend = SimpleNamespace(put=manager._resolve_step)
+        scheduler.send_result = lambda messages: [
+            _forward_control_msg(message, None, frontend) for message in messages
+        ]
+
+        async def send_one(message):
+            Scheduler._reply_step(scheduler, message.request_id, "ok",
+                                  {"applied": "pinned->gpu_owned", "layer": 12,
+                                   "moe_cache_size": 1402})
+
+        manager.send_one = send_one
+        reply = await dispatch_step(manager, axis="ram", direction="down")
+        assert reply["status"] == "ok"
+        geometry = cache_geometry(manager)
+        assert geometry["moe_cache_size"] == 1402
+        assert geometry["num_pages"] == 250
+        assert geometry["num_mamba_slots"] == 16
+        assert geometry["gpu_owned_layers"] == list(range(13))
+        assert geometry["gpu_owned_reserved_bytes"] == 13 * row.numel() * row.element_size()
+        assert manager._residency_cache is None
+
+    asyncio.run(run())
+
+
+def test_stale_step_does_not_replace_newer_rebuild_geometry():
+    from freetoken.message import CacheStepReply
+    from freetoken.server.api_server import FrontendManager, _open_maintenance
+
+    seed = _state([1, 2])
+    seed.config.served_model_name = "m"
+    seed.config.kv_park = "off"
+    seed.config.kv_dtype = "fp8"
+    manager = FrontendManager(config=seed.config, send_tokenizer=None,
+                              recv_tokenizer=None, maintenance_state="serving")
+    manager.cache_pools = seed.cache_pools
+    manager.last_rebuild = {"moe_cache_size": 4000}
+    _open_maintenance(manager, "new-rebuild", "rebuild")
+    manager._resolve_step(CacheStepReply(
+        request_id="old-step", status="ok", moe_cache_size=1000,
+        cache_pools={"moe_cache_size": 1000, "gpu_owned_layers": [3]},
+    ))
+    assert cache_geometry(manager)["moe_cache_size"] == 4000
+    assert manager.cache_pools["gpu_owned_layers"] == [1, 2]
+
+
+def test_completed_step_updates_without_http_waiter_and_ignores_late_duplicates():
+    from freetoken.message import CacheRebuildReply, CacheResidencyReply, CacheStepReply
+    from freetoken.server.api_server import FrontendManager, _open_maintenance
+
+    seed = _state([0])
+    seed.config.served_model_name = "m"
+    seed.config.kv_park = "off"
+    seed.config.kv_dtype = "fp8"
+    manager = FrontendManager(config=seed.config, send_tokenizer=None,
+                              recv_tokenizer=None, maintenance_state="serving")
+    manager.cache_pools = seed.cache_pools
+    _open_maintenance(manager, "timed-out-http", "step")
+    step = CacheStepReply(request_id="timed-out-http", status="ok", moe_cache_size=2000,
+                          cache_pools={"moe_cache_size": 2000, "gpu_owned_layers": [0, 1],
+                                       "gpu_owned_reserved_bytes": 123})
+    manager._resolve_step(step)
+    assert cache_geometry(manager)["moe_cache_size"] == 2000
+    _open_maintenance(manager, "new-rebuild", "rebuild")
+    manager._resolve_rebuild(CacheRebuildReply(request_id="new-rebuild", status="ok",
+                                              moe_cache_size=3000, num_pages=200))
+    manager._resolve_residency(CacheResidencyReply(
+        request_id="old-poll", status="ok", residency={"moe_cache_size": 1000, "owned": 1},
+    ))
+    manager._resolve_step(step)
+    assert cache_geometry(manager)["moe_cache_size"] == 3000
+    assert cache_geometry(manager)["num_pages"] == 200

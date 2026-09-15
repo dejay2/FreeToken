@@ -381,3 +381,27 @@ def test_exhausted_up_axes_are_neither_chosen_nor_stamped():
     assert [(a.axis, a.direction) for a in actions] == [("vram", "up")]
     actions = policy.decide(191.0, high_vram, high_ram)
     assert [(a.axis, a.direction) for a in actions] == [("vram", "up"), ("ram", "up")]
+
+
+@pytest.mark.parametrize("stdout", ["", "not a number", "-1"])
+def test_windows_probe_failure_is_distinct_from_linux_availability(monkeypatch, stdout):
+    from types import SimpleNamespace
+    from freetoken.daemon.settings import governor
+
+    monkeypatch.setattr(governor, "_last_win_ram", None)
+    monkeypatch.setattr(governor, "_powershell_candidates", lambda: ["powershell.exe"])
+    monkeypatch.setattr(governor.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout=stdout))
+    monkeypatch.setattr(governor, "_read_proc_meminfo_available", lambda: 40 * governor.GIB)
+    assert governor.read_free_windows_ram_bytes() is None
+
+
+def test_windows_probe_can_refresh_after_a_rebuild_despite_two_second_cache(monkeypatch):
+    from types import SimpleNamespace
+    from freetoken.daemon.settings import governor
+
+    monkeypatch.setattr(governor.time, "monotonic", lambda: 1000.0)
+    monkeypatch.setattr(governor, "_last_win_ram", (1000.0, 20 * governor.GIB))
+    monkeypatch.setattr(governor, "_powershell_candidates", lambda: ["powershell.exe"])
+    monkeypatch.setattr(governor.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="1048576"))
+    assert governor.read_free_windows_ram_bytes() == 20 * governor.GIB
+    assert governor.read_free_windows_ram_bytes(force_refresh=True) == governor.GIB

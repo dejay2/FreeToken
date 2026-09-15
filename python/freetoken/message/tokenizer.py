@@ -152,6 +152,9 @@ class CacheStepResultMsg(BaseTokenizerMsg):
     # recalled / promoted): the governor stops re-asking until residency or pressure changes.
     exhausted: bool = False
 
+    # Authoritative pool geometry after this step; absent from older workers.
+    cache_pools: dict | None = None
+
 
 @dataclass
 class PrefillProgressMsg(BaseTokenizerMsg):

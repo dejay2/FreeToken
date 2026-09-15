@@ -1166,6 +1166,9 @@ class Engine:
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
+        from freetoken.moe.host_banks import claim_host_banks
+
+        self._host_banks = claim_host_banks(cache.bank_sources)
 
         enable_disk_copy = getattr(config, "moe_disk_copy", None)
         if enable_disk_copy is None:
@@ -1390,14 +1393,28 @@ class Engine:
         Updates self._gpu_owned_layer_ids, self._ram_spilled_layers, and _stash_vram_ledger_inputs.
         """
         assert self.moe_offload_cache is not None, "no MoE offload cache to move layer in"
-        from freetoken.moe.host_banks import GpuOwnedBank, HostBank, HostResidency
+        from freetoken.moe.host_banks import HostBank, HostResidency, claim_host_banks
 
         current_residency = self.moe_offload_cache.layer_residency[layer_id]
-        if current_residency == target:
-            return
-
         if not hasattr(self, "_host_banks"):
             self._host_banks = {}
+        # Custom cache factories can install source banks after engine construction.
+        # Claim their registration owners before replacing any tensor references too.
+        for lid, banks in claim_host_banks(self.moe_offload_cache.bank_sources).items():
+            self._host_banks.setdefault(lid, {}).update(banks)
+
+        def release_old_banks() -> None:
+            if layer_id in self._host_banks:
+                for bank in {id(b): b for b in self._host_banks[layer_id].values()}.values():
+                    bank.free()
+                del self._host_banks[layer_id]
+
+        # A previous unregister can fail after rebinding. Retry before even a no-op,
+        # and before a recall could overwrite the retained registration owners.
+        if current_residency != HostResidency.PINNED.value:
+            release_old_banks()
+        if current_residency == target:
+            return
         if not hasattr(self, "_ram_spilled_layers"):
             self._ram_spilled_layers = []
 
@@ -1419,12 +1436,6 @@ class Engine:
             if self.moe_offload_cache.prefill_overlap:
                 self.moe_offload_cache.set_prefill_overlap(False)
                 self._prefill_overlap_suspended = True
-
-            if layer_id in self._host_banks:
-                for b in self._host_banks[layer_id].values():
-                    if hasattr(b, "free"):
-                        b.free()
-                del self._host_banks[layer_id]
 
             self.moe_offload_cache.rebind_layer(layer_id, HostResidency.DISK.value, None)
             self._gpu_owned_layer_ids = self.moe_offload_cache.gpu_owned_layer_ids
@@ -1523,12 +1534,6 @@ class Engine:
                     dev_t.copy_(old_t)
                     new_banks[name] = dev_t
 
-                if layer_id in self._host_banks:
-                    for b in self._host_banks[layer_id].values():
-                        if hasattr(b, "free"):
-                            b.free()
-                    del self._host_banks[layer_id]
-
             self.moe_offload_cache.rebind_layer(layer_id, HostResidency.GPU_OWNED.value, new_banks)
             self._gpu_owned_layer_ids = self.moe_offload_cache.gpu_owned_layer_ids
             _resume_prefill_overlap_if_clear(self)
@@ -1538,6 +1543,11 @@ class Engine:
                 demoted.remove(layer_id)
         else:
             raise NotImplementedError(f"unsupported target residency {target!r}")
+        if target != HostResidency.PINNED.value and layer_id in self._host_banks:
+            # The rebuild has synchronized GPU readers. Rebind pointer tables first,
+            # then unregister/drop the old allocation, including startup mmap banks.
+            # Keep owners available for diagnosis/retry if unregister raises.
+            release_old_banks()
         if target != HostResidency.GPU_OWNED.value:
             parked = getattr(self, "_ram_parked_layers", None)
             if parked and layer_id in parked:
