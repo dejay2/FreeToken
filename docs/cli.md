@@ -107,6 +107,32 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
 
+### Image input
+
+Experimental. Needs a vision-capable checkpoint (Qwen VL, Qwen3.5/3.6, Qwen4, Gemma4, GLM5-next, Muse-Glimmer or MiniMax-M3); a request carrying images is
+rejected otherwise. Images are accepted on all three protocols (OpenAI `image_url`,
+Anthropic `image` blocks, Responses `input_image`) as an http(s) URL or base64. Images inside a tool
+result (an Anthropic `tool_result` block from Claude Code's Read, a Responses `function_call_output`
+from Codex's view_image) are moved to the user turn that follows the tool message, as vLLM does,
+because chat templates render tool messages as plain text.
+Qwen4 keeps its existing opt-in: set `FREETOKEN_LOAD_VISION=1` to serve pictures.
+An explicit `FREETOKEN_LOAD_VISION=0` disables picture input for every family.
+Qwen4 retains `FREETOKEN_VISION_EXECUTION` and `FREETOKEN_VISION_WEIGHTS` (including `mmap`) for its tower.
+With the pinned torchvision 0.26 dependency, the Muse-Glimmer image processor substitutes bicubic resize for Lanczos; exact reference image preprocessing is therefore not guaranteed.
+`GET /v1/stats` reports what the server accepts as `model.input_modalities` (`["text"]` or `["text", "image"]`),
+so a client can gate its attachment controls without reading the checkpoint config.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--text-model-only` | off | Serve a multimodal checkpoint text-only: no encoder tower is built (its VRAM goes to the KV/expert pools) and every multimodal input is rejected. Same as `--mm-disable` with every encoder kind |
+| `--mm-disable` | none | Encoder towers to leave unbuilt (`vision`, `audio`); every input they would serve is rejected |
+| `--mm-encoder-weights` | host | Where supported encoder block weights live. `host` streams them from pinned host banks; `gpu` keeps them resident. Qwen4 uses its existing vision execution/backing environment settings |
+| `--image-min-tokens`, `--image-max-tokens` | processor defaults | Per-image token budget: the image processor resizes every image to take between these many tokens, converted to the family's own units (Qwen VL: one token per 32x32 pixels of the resized image, defaults 64 to 16384). Only families with dynamic resolution honor them |
+| `--mm-processor-kwargs` | none | JSON object of extra keyword arguments for the checkpoint's image processor call, for family-specific knobs (Qwen VL: `{"size": {"longest_edge": 1048576}}`); applied after the token budget |
+| `--mm-embed-cache-device` | cpu | Where encoded image embeddings live between prefill chunks. `cpu` keeps them out of the VRAM budget; `cuda` skips the copy back |
+| `--allowed-media-domains` | any | Comma-separated hostname allowlist for image URLs; requests for other domains are rejected with a 400. Empty allows any domain |
+| `--allowed-local-media-path` | off | Directory `file://` image refs and local paths may be read from; unset rejects local files |
+
 ## ft shell
 
 ```bash
@@ -126,7 +152,7 @@ ft ctl [--base-url http://127.0.0.1:1919] [--timeout 10] [--json] <subcommand>
 | Subcommand | Endpoint | Purpose |
 |---|---|---|
 | `health` | `GET /health` | Server status, model, load progress |
-| `stats` | `GET /v1/stats` | Throughput, latency, VRAM, pool occupancy |
+| `stats` | `GET /v1/stats` | Throughput, latency, VRAM, pool occupancy, accepted input modalities |
 | `generate [prompt] [--max-tokens N] [--ignore-eos]` | `POST /generate` | Raw completion smoke test (no chat template) |
 | `cache` | `GET /v1/cache/status` | Cache pool table |
 | `cache --moe N \| --kv N \| --mamba N \| --swa N [--wait 300]` | `POST /v1/cache/rebuild` | Live pool resizing without a restart (`k`/`m` suffixes; `--kv`/`--swa` in tokens) |
@@ -149,6 +175,10 @@ Discovers the served model via `/v1/models`, writes the agent's provider
 config, installs the agent CLI if missing, then launches it. Cloud API keys
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) are cleared from the child
 environment so the agent cannot silently fall back to a paid endpoint.
+When `/v1/stats` reports `image` among `model.input_modalities`, the written
+config declares the model image-capable, which Codex, OpenCode, OpenClaw and
+dsh require before their image tools and attachments send anything; Claude
+Code and Hermes need no declaration.
 
 | Flag | Meaning |
 |---|---|

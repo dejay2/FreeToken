@@ -1,6 +1,7 @@
 from typing import Tuple
 
 import torch
+import torch.nn.functional as F
 
 from .base import BaseOP
 
@@ -168,3 +169,14 @@ class RMSNormFused(BaseOP):
             return self.rmsnorm(x, self.weight, self.eps), x
         self.fused_add_rmsnorm(x, residual, self.weight, self.eps)
         return x, residual
+
+class LayerNorm(BaseOP):
+    """LayerNorm with bias on torch's fused kernel; the decoders use the RMSNorm family."""
+
+    def __init__(self, size: int, eps: float) -> None:
+        self.eps = eps
+        self.weight = torch.empty(size)
+        self.bias = torch.empty(size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(x, (x.shape[-1],), self.weight, self.bias, self.eps)

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+import torch
 
 from freetoken.layers import (
     BaseOP,
@@ -18,6 +20,7 @@ if TYPE_CHECKING:
     import torch
 
     from freetoken.core import Batch
+    from freetoken.message import MMItem
 
     from .config import ModelConfig
 
@@ -39,6 +42,38 @@ class BaseLLMModel(ABC, BaseOP):
 
     def reset_cuda_graph(self) -> None:
         pass
+
+
+@runtime_checkable
+class SupportsMultimodal(Protocol):
+    """What the engine asks of a model that serves multimodal items; the text forward takes its token embeddings from embed_input_ids."""
+
+    def encode(self, item: MMItem) -> torch.Tensor:
+        """``[item.num_tokens, D]`` soft tokens for one item of any modality the family serves, on the model device."""
+        ...
+
+    def place_encoder_weights(self, mode: str) -> None:
+        """Every encoder tower's weights: ``gpu`` resident or ``host`` streamed from pinned banks."""
+        ...
+
+
+def embed_input_ids(
+    embed_tokens, input_ids: torch.Tensor, batch: Batch, *, image_token_id: int | None = None
+) -> torch.Tensor:
+    """Token embeddings of the batch; on a chunk with multimodal rows, batch.mm_embeds' leading columns replace the rows batch.mm_rows."""
+    if batch.mm_embeds is None:
+        return embed_tokens.forward(input_ids)
+    rows = getattr(batch, "mm_rows", None)
+    if rows is None:
+        if image_token_id is None:
+            raise ValueError("precomputed image embeddings need rows or an image token id")
+        rows = (input_ids == image_token_id).nonzero().flatten()
+        if rows.numel() != batch.mm_embeds.shape[0]:
+            raise ValueError("image placeholder rows do not match precomputed embeddings")
+    # multimodal rows carry content pad ids above the vocab: clamp for the lookup, the copy overwrites those rows
+    x = embed_tokens.forward(input_ids.clamp(max=embed_tokens.num_embeddings - 1))
+    x.index_copy_(0, rows, batch.mm_embeds[:, : x.shape[1]].to(x.dtype))
+    return x
 
 
 class GatedMLP(BaseOP):

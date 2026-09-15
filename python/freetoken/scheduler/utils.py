@@ -23,6 +23,9 @@ class PendingReq:
     mrope_position_delta: int = 0
     prefill_only: bool = False
     prefix_key: str | None = None
+    mm_items: list | None = None
+    mrope_positions_full: torch.Tensor | None = None
+    mrope_delta: int = 0
 
     @property
     def input_len(self) -> int:

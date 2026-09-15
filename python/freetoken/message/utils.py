@@ -12,7 +12,6 @@ _TYPE_KEY = "__type__"
 # reading it as a serialized class -- without this, a request could crash the tokenizer worker.
 _RAW_DICT_KEY = "__raw_dict__"
 
-
 def _serialize_any(value: Any) -> Any:
     if isinstance(value, dict):
         encoded = {k: _serialize_any(v) for k, v in value.items()}
@@ -36,7 +35,7 @@ def serialize_type(self) -> Dict:
         serialized["__type__"] = "Tensor"
         # Byte views support every torch dtype, including bfloat16, which NumPy
         # does not represent directly on every supported version.
-        serialized["buffer"] = tensor.view(torch.uint8).numpy().tobytes()
+        serialized["buffer"] = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
         serialized["dtype"] = str(tensor.dtype)
         serialized["shape"] = list(tensor.shape)
         return serialized

@@ -6,9 +6,9 @@ from .gguf import (
     load_q4_0_expert_sources,
     parse_gguf_config,
 )
-from .model import Gemma4ForCausalLM
+from .model import Gemma4ForCausalLM, Gemma4ForConditionalGeneration, Gemma4UnifiedForConditionalGeneration
 from .moe import Gemma4Router
-from .vision import Gemma4MultimodalEmbedder, Gemma4VisionModel
+from .vision import Gemma4MultimodalEmbedder, Gemma4UnifiedVisionEmbedder, Gemma4VisionModel
 from .weight import (
     iter_weights,
     iter_weights_parallel,
@@ -17,6 +17,9 @@ from .weight import (
 )
 
 __all__ = [
+    "Gemma4ForConditionalGeneration",
+    "Gemma4UnifiedForConditionalGeneration",
+    "Gemma4UnifiedVisionEmbedder",
     "Gemma4Attention",
     "Gemma4ForCausalLM",
     "Gemma4MultimodalEmbedder",

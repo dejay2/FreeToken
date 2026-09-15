@@ -29,6 +29,7 @@ import re
 from typing import Iterator
 
 import torch
+from freetoken.models.vision_weight import require_dense_vision_weight
 from freetoken.distributed import get_tp_info
 from freetoken.models.glm_moe_dsa.weight import _ShardReader, _quant_fp8_per_row
 from freetoken.models.loader import drop_page_cache
@@ -312,12 +313,19 @@ def _iter_dsa_layer(reader, layer: int, attn_fp8: bool) -> Iterator[tuple[str, t
         yield f"{dst}.indexer.{part}", reader.get(f"{src}.indexer.{part}").to(dtype)
 
 
+def _iter_vision(reader, weight_map: dict) -> Iterator[tuple[str, torch.Tensor]]:
+    for name in weight_map:
+        if name.startswith("model.visual."):
+            yield "visual." + name[len("model.visual.") :], require_dense_vision_weight(name, reader.get(name)).to(torch.bfloat16)
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     assert not include_moe_experts, (
         "GLM-5.3 stores routed experts as NVFP4 and only supports the offload backend; "
@@ -415,6 +423,8 @@ def iter_weights(
             yield "lm_head.weight_scale", scale
         else:
             yield "lm_head.weight", head.to(torch.bfloat16)
+        if include_vision:
+            yield from _iter_vision(reader, weight_map)
     finally:
         reader.close()
 

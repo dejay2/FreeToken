@@ -9,14 +9,49 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
+class EncoderSpec:
+    kind: str
+    config_key: str
+    modalities: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ModelSpec:
     module: str
     model_cls: str
     parse_config: str = "parse_config"
     iter_weights: str = "iter_weights"
+    mm_processor: str | None = None
+    encoders: tuple[EncoderSpec, ...] = ()
 
+
+_QWEN_VL_PROCESSOR = "freetoken.mm.processors.qwen_vl:QwenVLMMProcessor"
+_QWEN_VL_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+_GLM5_NEXT_PROCESSOR = "freetoken.mm.processors.glm5_next:Glm5NextMMProcessor"
+_GLM5_NEXT_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+_GEMMA4_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4MMProcessor"
+_GEMMA4_UNIFIED_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4UnifiedMMProcessor"
+_GEMMA4_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+_MUSE_GLIMMER_PROCESSOR = "freetoken.mm.processors.muse_glimmer:MuseGlimmerMMProcessor"
+_MUSE_GLIMMER_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+_MINIMAX_M3_PROCESSOR = "freetoken.mm.processors.minimax_m3:MiniMaxM3MMProcessor"
+_MINIMAX_M3_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 
 _MODEL_REGISTRY: dict[str, ModelSpec] = {
+    "Qwen3_5MoeForCausalLM": ModelSpec("freetoken.models.qwen3_5_moe", "Qwen3_5MoeForCausalLM"),
+    "Qwen3_5ForCausalLM": ModelSpec("freetoken.models.qwen3_5_moe", "Qwen3_5ForCausalLM"),
+    "Qwen3VLMoeForConditionalGeneration": ModelSpec(
+        "freetoken.models.qwen3_vl",
+        "Qwen3VLMoeForConditionalGeneration",
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
+    ),
+    "Qwen3VLForConditionalGeneration": ModelSpec(
+        "freetoken.models.qwen3_vl",
+        "Qwen3VLForConditionalGeneration",
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
+    ),
     "LlamaForCausalLM": ModelSpec(
         "freetoken.models.llama",
         "LlamaForCausalLM",
@@ -43,7 +78,9 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     # sigmoid/bias-routed NVFP4 experts + MXFP8 shared expert, swigluoai activation.
     "MiniMaxM3SparseForConditionalGeneration": ModelSpec(
         "freetoken.models.minimax_m3",
-        "MiniMaxM3ForCausalLM",
+        "MiniMaxM3ForConditionalGeneration",
+        mm_processor=_MINIMAX_M3_PROCESSOR,
+        encoders=_MINIMAX_M3_ENCODERS,
     ),
     # Text-only sibling (the text_config's own architectures entry).
     "MiniMaxM3SparseForCausalLM": ModelSpec(
@@ -56,7 +93,9 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     ),
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe",
-        "Qwen3_5MoEForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
     ),
     # Qwen3.8-Flash-Next (model_type qwen4_exp): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.); served text-only. 36 GDN + 12 QSA
@@ -64,14 +103,18 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     # n-gram embedding layer, 512 NVFP4 routed experts top-10 + a gated shared expert.
     "Qwen4ExpForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen4_exp",
-        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the
     # loader handles the compressed-tensors NVFP4 layout.
     "Qwen3_5ForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe",
-        "Qwen3_5MoEForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
     ),
     # Muse-Glimmer-30B (model_type muse_glimmer): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.); served text-only. Dense gated GQA
@@ -80,7 +123,9 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     # W4A16 on every text Linear.
     "MuseGlimmerForConditionalGeneration": ModelSpec(
         "freetoken.models.muse_glimmer",
-        "MuseGlimmerForCausalLM",
+        "MuseGlimmerForConditionalGeneration",
+        mm_processor=_MUSE_GLIMMER_PROCESSOR,
+        encoders=_MUSE_GLIMMER_ENCODERS,
     ),
     "MistralForCausalLM": ModelSpec(
         "freetoken.models.mistral",
@@ -92,7 +137,9 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     ),
     "Gemma4ForConditionalGeneration": ModelSpec(
         "freetoken.models.gemma4",
-        "Gemma4ForCausalLM",
+        "Gemma4ForConditionalGeneration",
+        mm_processor=_GEMMA4_PROCESSOR,
+        encoders=_GEMMA4_ENCODERS,
     ),
     "Gemma4ForCausalLM": ModelSpec(
         "freetoken.models.gemma4",
@@ -102,7 +149,9 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     # Same decoder as gemma4; the dense feed-forward is selected via config.is_moe.
     "Gemma4UnifiedForConditionalGeneration": ModelSpec(
         "freetoken.models.gemma4",
-        "Gemma4ForCausalLM",
+        "Gemma4UnifiedForConditionalGeneration",
+        mm_processor=_GEMMA4_UNIFIED_PROCESSOR,
+        encoders=_GEMMA4_ENCODERS,
     ),
     "Gemma4UnifiedForCausalLM": ModelSpec(
         "freetoken.models.gemma4",
@@ -136,7 +185,9 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     # in text_config, weights under model.language_model.), served text-only.
     "Glm5NextForConditionalGeneration": ModelSpec(
         "freetoken.models.glm5_next",
-        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        mm_processor=_GLM5_NEXT_PROCESSOR,
+        encoders=_GLM5_NEXT_ENCODERS,
     ),
     # Text-only sibling (the text_config's own architectures entry).
     "Glm5NextForCausalLM": ModelSpec(

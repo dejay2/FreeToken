@@ -164,6 +164,7 @@ def iter_weights(
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the dense (non-expert) weights, prefix-stripped and fused to the model's buffers.
 
@@ -184,7 +185,7 @@ def iter_weights(
         return
 
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
-    include_vision = vision_load_enabled()
+    include_vision = include_vision and vision_load_enabled()
     stream_vision = include_vision and vision_execution_mode() == "layer-stream"
     # ``mmap``: install the picture tensors as zero-copy views over a read-only mapping
     # of their shard extent instead of reading 856 MiB into process RAM. ``None`` means
@@ -224,6 +225,10 @@ def iter_weights(
                 else:
                     source = vision_file if name.startswith("visual.") else engine_file
                     tensor = source.get_tensor(raw_name)
+                if name.startswith("visual."):
+                    from freetoken.models.vision_weight import require_dense_vision_weight
+
+                    require_dense_vision_weight(name, tensor)
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
@@ -572,7 +577,7 @@ class MmapPleStorage:
             "PrefetchVirtualMemory failed for %d PLE rows (error %d); falling back to "
             "thread-fanned page faults for the rest of this process",
             n,
-            ctypes.get_last_error(),
+            getattr(ctypes, "get_last_error", lambda: 0)(),
         )
         return False
 
@@ -1182,7 +1187,7 @@ class MmapVisionWeights:
             "PrefetchVirtualMemory failed for the %d-byte picture extent (error %d); "
             "the encode's own copies will fault the pages in for the rest of this process",
             self.mapped_bytes,
-            ctypes.get_last_error(),
+            getattr(ctypes, "get_last_error", lambda: 0)(),
         )
         return False
 

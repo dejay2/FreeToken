@@ -162,10 +162,15 @@ class Qwen4ExpModel(BaseOP):
     def _forward_state(
         self, input_ids: torch.Tensor, batch: Batch, *, capture_inputs: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        inputs_embeds = self.embed_tokens.forward(input_ids)
-        inputs_embeds = self._merge_multimodal(
-            input_ids, inputs_embeds, getattr(batch, "mm_embeds", None)
-        )
+        if getattr(batch, "mm_rows", None) is not None:
+            from freetoken.models.blocks import embed_input_ids
+
+            inputs_embeds = embed_input_ids(self.embed_tokens, input_ids, batch)
+        else:
+            inputs_embeds = self.embed_tokens.forward(input_ids)
+            inputs_embeds = self._merge_multimodal(
+                input_ids, inputs_embeds, getattr(batch, "mm_embeds", None)
+            )
         hidden = inputs_embeds.repeat(1, self.hc_count)
         captured_inputs = inputs_embeds if capture_inputs else None
         del inputs_embeds
@@ -321,6 +326,24 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             image_grid_thw.to(device=language_device),
         )
 
+    def place_encoder_weights(self, mode: str) -> None:
+        """Keep the legacy execution/backing controls authoritative for this tower.
+
+        The loader has already placed mmap views on CPU for layer-stream execution;
+        rebinding or pinning them here would defeat that ownership and its prefetch.
+        """
+        if mode not in ("gpu", "host"):
+            raise ValueError(f"unknown vision weight placement {mode!r}")
+        if not hasattr(self, "visual"):
+            raise RuntimeError("Qwen4-Exp picture weights are not loaded")
+
+    def encode(self, item) -> torch.Tensor:
+        if item.modality != "image":
+            raise ValueError(f"unsupported Qwen4 modality {item.modality!r}")
+        self.prefetch_picture_weights()
+        grid = torch.as_tensor([item.grid_thw], dtype=torch.long)
+        return self.encode_images(item.feature, grid)
+
     def prepare_cuda_graph_capture(self, batch: Batch) -> None:
         if self._mmap_ple:
             self.model.prepare_mmap_ple_graph_capture(batch)
@@ -427,6 +450,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 "per_head_vocab_sizes": emb.ngram_heads_vocab_sizes.tolist(),
                 "per_head_offsets": emb.ngram_heads_offsets.tolist(),
                 "eos_token_id": args.ngram_boundary_token_id,
+                "image_token_id": args.image_token_id,
             }
             disk_table = DiskRowTable(
                 resolve_row_source(folder),
@@ -479,3 +503,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
 
 __all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]
+
+
+class Qwen4ExpForConditionalGeneration(Qwen4ExpForCausalLM):
+    """Image-serving wrapper retaining the mmap-capable local tower."""

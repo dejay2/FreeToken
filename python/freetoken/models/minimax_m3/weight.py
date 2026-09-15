@@ -33,6 +33,7 @@ from typing import Iterator
 
 import safetensors
 import torch
+from freetoken.models.vision_weight import require_dense_vision_weight
 from freetoken.distributed import get_tp_info
 from freetoken.models.loader import drop_page_cache
 from freetoken.models.nvfp4_banks import (
@@ -144,12 +145,33 @@ def _emit_fused(
     )
 
 
+_VISION_ATTN = "vision_tower.vision_model.encoder.layers.{}.self_attn"
+
+
+def _iter_vision(reader: _ShardReader, weight_map: dict, num_layers: int) -> Iterator[tuple[str, torch.Tensor]]:
+    """The tower under its checkpoint names with q/k/v fused, the projector and patch-merge MLP under the tower prefix; all bf16 (the patch embedding is stored fp32)."""
+    for name in weight_map:
+        if name.startswith(("vision_tower.", "multi_modal_projector.", "patch_merge_mlp.")) and any(tag in name for tag in ("scale", "packed", "trellis", "qweight", "qzeros")):
+            raise NotImplementedError(f"Quantized vision weight {name!r} is unsupported")
+        if name.startswith(("multi_modal_projector.", "patch_merge_mlp.")):
+            yield "vision_tower." + name, require_dense_vision_weight(name, reader.get(name)).to(torch.bfloat16)
+        elif name.startswith("vision_tower.") and ".self_attn." not in name:
+            yield name, require_dense_vision_weight(name, reader.get(name)).to(torch.bfloat16)
+    for layer in range(num_layers):
+        attn = _VISION_ATTN.format(layer)
+        for kind in ("weight", "bias"):
+            parts = [require_dense_vision_weight(f"{attn}.{proj}.{kind}", reader.get(f"{attn}.{proj}.{kind}")) for proj in ("q_proj", "k_proj", "v_proj")]
+            yield f"{attn}.qkv.{kind}", torch.cat(parts, dim=0).to(torch.bfloat16)
+            yield f"{attn}.out_proj.{kind}", require_dense_vision_weight(f"{attn}.out_proj.{kind}", reader.get(f"{attn}.out_proj.{kind}")).to(torch.bfloat16)
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     assert not include_moe_experts, (
         "MiniMax-M3 stores routed experts as NVFP4 and only supports the offload MoE "
@@ -244,6 +266,8 @@ def iter_weights(
         yield "model.embed_tokens.weight", reader.get("language_model.model.embed_tokens.weight")
         yield "model.norm.weight", reader.get("language_model.model.norm.weight")
         yield "lm_head.weight", reader.get("language_model.lm_head.weight")
+        if include_vision and config.vision_config is not None:
+            yield from _iter_vision(reader, weight_map, config.vision_config.num_layers)
     finally:
         reader.close()
 

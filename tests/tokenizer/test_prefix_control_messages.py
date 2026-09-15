@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -28,7 +29,7 @@ class _TokenizeManager:
         self.messages.extend(messages)
         if self.error is not None:
             raise self.error
-        return [torch.tensor([11, 22, 33, 44], dtype=torch.int32)]
+        return [SimpleNamespace(input_ids=torch.tensor([11, 22, 33, 44], dtype=torch.int32))]
 
 
 def _types():
@@ -208,7 +209,7 @@ def test_empty_registration_returns_correlated_invalid_reply():
     PrefixCacheMsg, _, _, PrefixCacheReply = _types()
     backend, frontend = _Queue(), _Queue()
     manager = _TokenizeManager()
-    manager.tokenize = lambda messages: [torch.empty(0, dtype=torch.int32)]
+    manager.tokenize = lambda messages: [SimpleNamespace(input_ids=torch.empty(0, dtype=torch.int32))]
 
     assert tokenizer_server._forward_prefix_msg(
         PrefixCacheMsg(request_id="empty-1", action="register", name="empty", text=""),

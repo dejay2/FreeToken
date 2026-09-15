@@ -10,7 +10,7 @@ from __future__ import annotations
 
 
 import torch
-from freetoken.layers import BaseOP, swiglu_clamp_and_mul
+from freetoken.layers import BaseOP, LinearReplicated, swiglu_clamp_and_mul
 from freetoken.utils import nvtx_annotate
 
 from .attention import _make_proj
@@ -23,10 +23,15 @@ class Glm5NextGatedMLP(BaseOP):
         intermediate_size: int,
         quant: str = "none",
         swiglu_limit: float | None = None,
+        *,
+        has_bias: bool = False,
     ):
-        self.gate_proj = _make_proj(quant, hidden_size, intermediate_size)
-        self.up_proj = _make_proj(quant, hidden_size, intermediate_size)
-        self.down_proj = _make_proj(quant, intermediate_size, hidden_size)
+        if has_bias and quant != "none":
+            raise NotImplementedError("quantized vision MLP with bias is unsupported")
+        make_proj = (lambda quant, ins, outs: LinearReplicated(ins, outs, has_bias=True)) if has_bias else _make_proj
+        self.gate_proj = make_proj(quant, hidden_size, intermediate_size)
+        self.up_proj = make_proj(quant, hidden_size, intermediate_size)
+        self.down_proj = make_proj(quant, intermediate_size, hidden_size)
         self.swiglu_limit = swiglu_limit
 
     @nvtx_annotate("MLP")

@@ -87,6 +87,7 @@ class TokenizeMsg(BaseTokenizerMsg):
     tools: List[Dict[str, Any]] | None = None
     preserve_system_order: bool = False
 
+    images: List[bytes] | None = None
 
 @dataclass
 class AbortMsg(BaseTokenizerMsg):

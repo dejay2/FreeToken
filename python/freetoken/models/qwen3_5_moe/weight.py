@@ -170,7 +170,7 @@ def _try_fuse(
     return None
 
 
-def iter_weights(
+def _iter_text_weights(
     model_path: str,
     device: torch.device,
     *,
@@ -1100,3 +1100,10 @@ __all__ = [
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",
 ]
+
+
+def iter_weights(model_path, device, *, include_moe_experts, include_non_moe, include_vision=True):
+    yield from _iter_text_weights(model_path, device, include_moe_experts=include_moe_experts, include_non_moe=include_non_moe)
+    if include_vision and include_non_moe:
+        from freetoken.models.qwen3_vl.weight import iter_vision_weights
+        yield from iter_vision_weights(model_path, device)

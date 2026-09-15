@@ -10,7 +10,7 @@ Contracts shared across modules (do not rename):
 """
 
 from .config import parse_config
-from .model import Qwen4ExpForCausalLM
+from .model import Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration
 from .weight import (
     iter_weights,
     load_nvfp4_expert_sources,

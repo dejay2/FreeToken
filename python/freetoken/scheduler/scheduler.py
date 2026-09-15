@@ -57,6 +57,7 @@ from .cache import CacheManager
 from .config import SchedulerConfig, pin_kv_park_model_path
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
+from .mm import cut_image_spans, plan_mm_batch
 from .prefill import ChunkedReq, PrefillManager
 from .prefixes import PrefixCoordinator
 from .status import SchedulerStatusReporter
@@ -151,8 +152,13 @@ class Scheduler(SchedulerIOMixin):
         if self.engine.mtp_shadow_observer is not None:
             self.engine.mtp_shadow_observer.bind_cache_manager(self.cache_manager)
         self.decode_manager = DecodeManager(config.page_size)
+        self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            encoder_cache=self.engine.encoder_cache,
+            keep_images_whole=self._bidirectional_mm,
         )
         from freetoken.kvcache.qsa_pool import QSAKVCache
         from freetoken.kvcache.cache_status import compute_cache_unit_bytes
@@ -230,6 +236,8 @@ class Scheduler(SchedulerIOMixin):
         self.config = config
         self._last_park_status = None
         self._idle_wait_logged = False
+        self._model_is_mrope = config.model_config.model_is_mrope
+        self._warned_cut_image = False
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
@@ -1002,6 +1010,7 @@ class Scheduler(SchedulerIOMixin):
         msg.mm_pixel_values = None
         msg.mm_image_grid_thw = None
         msg.mm_token_type_ids = None
+        msg.mm_items = None
 
     # ---- dynamic KV pool (spec 2026-09-12) ----------------------------------------------
 
@@ -1378,6 +1387,9 @@ class Scheduler(SchedulerIOMixin):
                 )])
                 self._drop_raw_picture(msg)
                 return
+            if msg.mm_items and self.engine.encoder_cache is None:
+                self.send_result([ErrorReplyMsg(uid=msg.uid, error="image input is not supported by this server")])
+                return
             # Rule 2: with the dynamic KV pool on, the clip and the fit are judged against
             # the CEILING, not today's pool, and a request that needs more room than the pool
             # holds is held here instead of being admitted into a pool that cannot take it.
@@ -1519,6 +1531,9 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        cache = getattr(getattr(self, "engine", None), "encoder_cache", None)
+        if req.mm_items and cache is not None:
+            cache.release(req.uid, [item.hash for item in req.mm_items])
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -1988,6 +2003,10 @@ class Scheduler(SchedulerIOMixin):
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
         batch.rope_positions = _make_rope_positions(batch, self.device)
+        if getattr(self, "_model_is_mrope", False):
+            batch.mrope_positions = _make_mrope_positions(batch, self.device)
+            if batch.rope_positions is None:
+                batch.rope_positions = batch.mrope_positions
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
@@ -2487,37 +2506,53 @@ class Scheduler(SchedulerIOMixin):
             policy.record_cycle_ms(1e3 * (time.perf_counter() - started))
 
     def _gather_multimodal(self, batch: Batch) -> None:
-        """Gather only the picture feature rows used by this prefill step.
-
-        ``PendingReq`` owns the complete feature tensor across continuation steps. Each
-        scheduled ``Req`` temporarily receives that tensor, then releases its reference
-        after this method copies the rows whose image placeholders fall in
-        ``[cached_len, device_len)``. ``cache_private`` remains authoritative after the
-        reference is cleared, so no picture KV can enter the shared prefix cache.
-        """
-        image_token_id = self.config.model_config.image_token_id
+        """Plan new encoder jobs and retain legacy embeddings in the same scatter order."""
+        rows = []
+        if any(getattr(req, "mm_items", None) for req in batch.reqs):
+            jobs, plan, rows, block_ends = plan_mm_batch(batch.padded_reqs, self.engine.encoder_cache)
+            if plan:
+                batch.mm_encoder_jobs = jobs
+                batch.mm_gather_plan = plan
+                batch.mm_block_ends = torch.tensor(
+                    block_ends, dtype=torch.int32, pin_memory=self.device.type == "cuda"
+                ).to(self.device, non_blocking=True)
+            if getattr(self, "_bidirectional_mm", False) and not self._warned_cut_image and (cut := cut_image_spans(batch.padded_reqs)):
+                lo, hi = cut[0]
+                self._warned_cut_image = True
+                logger.warning_rank0(
+                    f"an image of {hi - lo} tokens does not fit one prefill chunk "
+                    f"(--max-extend-tokens {self.prefill_budget}, or the sliding-window pool's share of it): "
+                    "its earlier rows attend within the first part only"
+                )
         parts = []
+        offset = 0
         for req in batch.reqs:
             features = req.mm_embeds
-            if features is None:
-                continue
-            try:
-                if image_token_id is None:
-                    raise ValueError("picture features were supplied without a picture token id")
-                ids = req.input_ids
-                feature_start = int((ids[: req.cached_len] == image_token_id).sum().item())
-                feature_stop = int((ids[: req.device_len] == image_token_id).sum().item())
-                if feature_stop > features.shape[0]:
-                    raise ValueError(
-                        f"picture feature slice ends at {feature_stop}, but only "
-                        f"{features.shape[0]} rows exist"
-                    )
-                if feature_stop > feature_start:
-                    parts.append(features[feature_start:feature_stop])
-            finally:
-                req.mm_embeds = None
+            if features is not None:
+                try:
+                    image_token_id = self.config.model_config.image_token_id
+                    if image_token_id is None:
+                        raise ValueError("picture features were supplied without a picture token id")
+                    ids = req.input_ids
+                    feature_start = int((ids[: req.cached_len] == image_token_id).sum().item())
+                    feature_stop = int((ids[: req.device_len] == image_token_id).sum().item())
+                    if feature_stop > features.shape[0]:
+                        raise ValueError(
+                            f"picture feature slice ends at {feature_stop}, but only {features.shape[0]} rows exist"
+                        )
+                    if feature_stop > feature_start:
+                        parts.append(features[feature_start:feature_stop])
+                        local_rows = (ids[req.cached_len:req.device_len] == image_token_id).nonzero().flatten()
+                        rows.extend(offset + int(row) for row in local_rows)
+                finally:
+                    req.mm_embeds = None
+            offset += req.extend_len
         if parts:
             batch.mm_embeds = torch.cat(parts, dim=0)
+        if rows:
+            batch.mm_rows = torch.tensor(
+                rows, dtype=torch.int64, pin_memory=self.device.type == "cuda"
+            ).to(self.device, non_blocking=True)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         if self._engine_failed is not None:
@@ -2602,9 +2637,31 @@ class Scheduler(SchedulerIOMixin):
         return forward_output
 
 
+def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor:
+    """[3, N] rope rows: an image request's prompt tokens use their precomputed columns, everything else is sequence index + per-request delta."""
+    needed = sum(r.extend_len for r in batch.padded_reqs)
+    host = torch.empty((3, needed), dtype=torch.int32, pin_memory=device.type == "cuda")
+    offset = 0
+    for req in batch.padded_reqs:
+        length = req.extend_len
+        out = host[:, offset : offset + length]
+        full = req.mrope_positions_full
+        if full is not None and req.device_len <= full.shape[1]:
+            out.copy_(full[:, req.cached_len : req.device_len])
+        else:
+            row = torch.arange(
+                req.cached_len + req.mrope_delta,
+                req.device_len + req.mrope_delta,
+                dtype=torch.int32,
+            )
+            out.copy_(row.unsqueeze(0).expand(3, -1))
+        offset += length
+    return host.to(device, non_blocking=True)
+
+
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
     needed_size = sum(r.extend_len for r in batch.padded_reqs)
-    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
+    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=device.type == "cuda")
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
@@ -2651,7 +2708,7 @@ def _make_rope_positions(batch: Batch, device: torch.device) -> torch.Tensor | N
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
+    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=device.type == "cuda")
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
@@ -2667,13 +2724,13 @@ def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
     output budget writes to the token pool's -1 discard column, as it always has.
     """
     mapping_list = [req.table_idx for req in batch.reqs for _ in range(batch.emit_width)]
-    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
+    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=device.type == "cuda")
     write_list = [
         (req.device_len + i if req.remain_len > i else -1)
         for req in batch.reqs
         for i in range(batch.emit_width)
     ]
-    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
+    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=device.type == "cuda")
     return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
 
 
@@ -2987,6 +3044,6 @@ def _make_spec_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
             position = req.cached_len + 1 + i
             mapping_list.append(req.table_idx)
             write_list.append(position if position < req.max_device_len else -1)
-    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
-    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
+    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=device.type == "cuda")
+    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=device.type == "cuda")
     return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)

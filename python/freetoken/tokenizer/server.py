@@ -59,6 +59,7 @@ from freetoken.message import (
     UserMsg,
     UserReply,
 )
+from freetoken.mm.config import MultimodalConfig
 from freetoken.utils import (
     ZmqPullQueue,
     ZmqPushQueue,
@@ -136,27 +137,19 @@ def _send_generation_replies(
 
 def _tokenize_requests(
     tokenize_manager: Any,
-    multimodal_processor: Any,
     messages: List[TokenizeMsg],
     logger: Any,
-) -> tuple[
-    List[TokenizeMsg],
-    List[torch.Tensor],
-    List[dict[str, torch.Tensor] | None],
-    List[UserReply],
-]:
+) -> tuple[List[UserMsg], List[UserReply]]:
     """Tokenize independently, returning backend work plus terminal frontend errors.
 
     Successful tokenization deliberately emits no prompt-token reply: accounting starts
     only when the scheduler later confirms first-prefill admission.
     """
-    ok_msgs: List[TokenizeMsg] = []
-    ok_tensors: List[torch.Tensor] = []
-    ok_multimodal: List[dict[str, torch.Tensor] | None] = []
+    backend: List[UserMsg] = []
     errors: List[UserReply] = []
     for msg in messages:
         try:
-            tokens, multimodal = multimodal_processor.encode(msg, tokenize_manager)
+            user_msg = tokenize_manager.tokenize([msg])[0]
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
             logger.warning(f"tokenization failed for request {msg.uid}: {exc!r}")
             errors.append(
@@ -170,7 +163,7 @@ def _tokenize_requests(
             continue
         # A zero-token prompt would trip the scheduler's input_len > 0 invariant and
         # crash the worker; reject it here as a terminal error instead.
-        if tokens.numel() == 0:
+        if user_msg.input_ids.numel() == 0:
             errors.append(
                 UserReply(
                     uid=msg.uid,
@@ -180,10 +173,8 @@ def _tokenize_requests(
                 )
             )
             continue
-        ok_msgs.append(msg)
-        ok_tensors.append(tokens)
-        ok_multimodal.append(multimodal)
-    return ok_msgs, ok_tensors, ok_multimodal, errors
+        backend.append(user_msg)
+    return backend, errors
 
 
 _MAX_IMAGE_BYTES = 64 * 1024 * 1024
@@ -342,7 +333,8 @@ class _MultimodalProcessor:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
         sources = _message_image_sources(msg.text)
         if not sources:
-            return tokenize_manager.tokenize([msg])[0], None
+            result = tokenize_manager.tokenize([msg])[0]
+            return getattr(result, "input_ids", result), None
 
         if self.processor is None:
             from transformers import AutoProcessor
@@ -443,7 +435,7 @@ def _forward_prefix_msg(m, tokenize_manager, send_backend, send_frontend) -> boo
             preserve_system_order=m.preserve_system_order,
         )
         try:
-            input_ids = tokenize_manager.tokenize([tokenize_msg])[0]
+            input_ids = tokenize_manager.tokenize([tokenize_msg])[0].input_ids
             if m.prefix_scope == "system":
                 if prefix_tokens is not None:
                     raise ValueError("choose system scope or explicit prefix_tokens, not both")
@@ -582,6 +574,7 @@ def tokenize_worker(
     tokenizer_id: int = -1,
     model_source: str = "huggingface",
     ack_queue: mp.Queue[str] | None = None,
+    mm: MultimodalConfig | None = None,
 ) -> None:
     send_backend = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
     send_frontend = ZmqPushQueue(frontend_addr, create=False, encoder=BaseFrontendMsg.encoder)
@@ -593,8 +586,9 @@ def tokenize_worker(
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer)
-    multimodal_processor = _MultimodalProcessor(tokenizer_path)
+    from freetoken.mm.processor import get_mm_processor
+
+    tokenize_manager = TokenizeManager(tokenizer, get_mm_processor(tokenizer_path, mm))
     detokenize_manager = DetokenizeManager(
         tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
     )
@@ -654,31 +648,13 @@ def tokenize_worker(
                 # Tokenize per-message so a single un-renderable request (e.g. a chat template
                 # that rejects the message layout) becomes a terminal error reply for THAT uid
                 # instead of an uncaught exception that kills the worker and bricks the server.
-                ok_msgs, ok_tensors, ok_multimodal, errors = _tokenize_requests(
-                    tokenize_manager, multimodal_processor, tokenize_msg, logger
-                )
+                backend, errors = _tokenize_requests(tokenize_manager, tokenize_msg, logger)
                 if errors:
                     send_frontend.put(
                         errors[0] if len(errors) == 1 else BatchFrontendMsg(data=errors)
                     )
-                if ok_msgs:
-                    backend = []
-                    for msg, tokens, mm in zip(
-                        ok_msgs, ok_tensors, ok_multimodal, strict=True
-                    ):
-                        backend.append(
-                            UserMsg(
-                                uid=msg.uid,
-                                input_ids=tokens,
-                                sampling_params=msg.sampling_params,
-                                mm_pixel_values=(mm or {}).get("pixel_values"),
-                                mm_image_grid_thw=(mm or {}).get("image_grid_thw"),
-                                mm_token_type_ids=(mm or {}).get("mm_token_type_ids"),
-                            )
-                        )
-                    send_backend.put(
-                        backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend)
-                    )
+                if backend:
+                    send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
             if len(abort_msg) > 0:
                 batch_output = BatchBackendMsg(
                     data=[AbortBackendMsg(uid=msg.uid) for msg in abort_msg]

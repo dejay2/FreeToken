@@ -33,6 +33,7 @@ def _stack():
     decode = DecodeManager(page_size=1)
     prefill = PrefillManager(cache, table, decode)
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.device = torch.device("cpu")
     scheduler.config = SimpleNamespace(
         model_config=SimpleNamespace(image_token_id=IMAGE_TOKEN)
     )

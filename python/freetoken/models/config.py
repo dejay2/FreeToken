@@ -157,6 +157,8 @@ class RotaryConfig:
     max_position: int
     base: float
     scaling: Dict[str, Any] | None
+    mrope_section: list | None = None
+    mrope_layout: str = "contiguous"
 
 
 @dataclass(frozen=True)
@@ -422,6 +424,10 @@ class ModelConfig:
         return self.num_layers - self.first_k_dense_replace
 
     @property
+    def model_is_mrope(self) -> bool:
+        return any(getattr(getattr(g, "rotary_config", None), "mrope_section", None) is not None for g in self.attention_groups)
+
+    @property
     def is_multimodal(self) -> bool:
         return self.vision_config is not None
 
@@ -567,3 +573,7 @@ class ModelConfig:
             for group in self.kv_cache_group_specs()
             if group.num_layers > 0
         ]
+
+
+def mrope_layout_from_rope_params(params):
+    return "interleaved_glm" if params.get("mrope_interleaved_glm") else "interleaved" if params.get("mrope_interleaved") else "contiguous"

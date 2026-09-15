@@ -30,6 +30,7 @@ class FakeState:
         reasoning_parser: str | None = None,
     ) -> None:
         self.config = SimpleNamespace(
+            mm=SimpleNamespace(text_model_only=False, disabled_encoders=frozenset()),
             model_path="/models/unit-model",
             served_model_name="unit-model",
             tool_call_parser=tool_call_parser,
@@ -179,7 +180,7 @@ def test_chat_picture_parts_stay_structured_for_the_tokenizer():
     content = chat_request_to_genspec(req, {}).messages[0]["content"]
 
     assert content == [
-        {"type": "image_url", "image_url": {"url": source}},
+        {"type": "image", "freetoken_ref": {"kind": "url", "data": source}},
         {"type": "text", "text": "describe"},
     ]
 
