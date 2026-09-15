@@ -30,7 +30,8 @@ Open `http://127.0.0.1:2031` and choose **Prompt cache**. With the model server 
 
 The per-prompt GPU preference duration and shared retention budget apply immediately;
 they do not require Save or restart. Both are best-effort preferences, not reserved
-VRAM. Names and live retention changes are lost on a model-server restart. Prompt drafts
+VRAM. Registered request definitions and the retention budget are saved locally per model. On restart,
+the server re-registers and warms them without generating an answer. Prompt drafts
 stay in the current page during refresh errors, but are not saved across page reloads.
 The test displays model text and tool calls; it does not execute tools.
 
@@ -200,7 +201,7 @@ for each admitted hybrid request. Normal usage reporting remains opt-in with
   replacing pools. Source tokens survive and readiness is looked up again. Registration uses
   the current pool and context limits, refreshed after successful resizing. A failed rebuild
   terminates waiting agents and refuses further prefix commands until the server restarts.
-  Model/server restarts discard aliases; re-register them. This first version does not persist the registry. Existing SSD checkpoints retain their usual
+  Model/server restarts rebuild aliases from saved definitions and warm them. Existing SSD checkpoints retain their usual
   model/layout fingerprint and checksum rules.
 - Deleting an alias does not wipe a checkpoint other requests can reuse. Deleting during
   preparation allows that bounded job to drain. Cancelling one waiting agent removes only its
@@ -239,3 +240,30 @@ its own aliases. `FREETOKEN_API_KEY` supplies a bearer header for an authenticat
 the acceptance check rather than being reported as successful sharing. Failed answer markers or
 missing first-token timing leave the report incomplete; lower latency alone does not establish
 correct model output.
+
+## Startup warming and small prompt tails
+
+Successful registrations save their original request JSON (including the example task, tools
+and template options) in a private model-scoped file under
+`$XDG_STATE_HOME/freetoken/prefixes`, or `~/.local/state/freetoken/prefixes`. Files are
+limited to 64 entries / 16 MiB total / 4 MiB per registration. Delete removes the saved
+definition too. Recent requests are still RAM-only. Set `FREETOKEN_PREFIX_STORE_DIR` to
+another directory, or an empty string to disable persistence. Independent servers sharing
+a model should use separate directories. Saved registrations are re-tokenized at startup;
+no GPU tensors or old token IDs are loaded from disk.
+
+The API can accept traffic while startup warming proceeds. The settings page and
+`GET /v1/cache/prefixes` report persistence and startup state, including per-prompt errors.
+A prefix larger than the startup KV pool cannot be warmed: increase the pool floor or
+remove that saved definition. Retention remains best-effort; warming more prefixes than
+the budget holds does not make them all permanently GPU-resident.
+
+For Triton NVFP4 on the GPU, `FREETOKEN_MOE_SMALL_PREFILL_ROWS=64` enables selective
+expert loading for prompt batches with at most 64 new token rows in total. It reuses the
+GPU expert cache and fetches only missing routed experts, then runs the original prefill
+GEMM. CPU/hybrid/disk expert layers and larger batches retain the full-layer path. The
+option defaults to off; enable it in the model server environment before startup. Mixed
+GPU-owned/offloaded layers and layer-ahead expert prefetch retain the existing movement path.
+Prompt-cache hits still need tail processing and answer generation, so warming cannot
+guarantee zero latency. The followers counter counts waiters for preparation, not warm hits;
+response cached-input-token usage is the evidence of reuse.

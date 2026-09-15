@@ -373,7 +373,8 @@
         </section>
         <section class="panel" aria-labelledby="cache-library-title">
           <div class="panel-head"><h3 id="cache-library-title">Registered prompts</h3></div>
-          <p class="small">Agents match the same leading tokens automatically. Cache names and retention changes last until the server restarts.</p>
+          <p class="small">Agents match the same leading tokens automatically. Registered request definitions are saved locally for this model and warmed after restart. Delete removes the saved definition too.</p>
+          <p class="small" id="cache-startup-note"></p>
           <div id="cache-list"><p class="empty">Loading caches…</p></div>
           <form id="cache-retention-form">
             <div class="cache-field"><label for="cache-budget">GPU retention budget (MiB)</label><div class="path-row"><input id="cache-budget" type="number" min="0" step="any" required placeholder="Loading…"><button class="button small" id="cache-budget-apply" type="submit">Apply budget</button></div><p class="small">A shared preference budget, not reserved memory. Zero removes the preference. Entries can still be evicted under pressure.</p></div>
@@ -1436,6 +1437,13 @@
     }
     function renderPromptCaches(data) {
       const entries = data.prefixes;
+      const persistence = data.persistence;
+      const startupErrors = Object.entries(persistence?.startup?.errors || {}).map(([name, error]) => `${name}: ${error}`);
+      $('cache-startup-note').textContent = persistence?.error
+        ? `Saved prompts unavailable: ${persistence.error}`
+        : persistence?.enabled
+          ? `${persistence.saved_names.length} saved for restart · Startup: ${persistence.startup.state}${startupErrors.length ? ' · ' + startupErrors.join('; ') : ''}`
+          : 'Saving prompts is unavailable or disabled on this server; registrations last until restart.';
       $('cache-summary').innerHTML = [
         ['Registered prompts', fmt(entries.length)],
         ['Shared GPU state', cacheBytes(Number(data.gpu_attention_bytes || 0) + Number(data.gpu_snapshot_bytes || 0))],
@@ -1448,7 +1456,7 @@
           <p class="small">${fmt(entry.prefix_tokens)} shared tokens · ${fmt(entry.gpu_cached_tokens)} on GPU${entry.parked_tokens ? ` · ${fmt(entry.parked_tokens)} in ${escapeHtml(String(entry.parking_backend || 'parking').toUpperCase())}` : ''}<br>${fmt(entry.preparations)} preparations · ${fmt(entry.followers)} followers · ${fmt(entry.restores)} restores</p>
           ${entry.error ? `<p class="error">${escapeHtml(entry.error)}</p>` : ''}
           <div class="actions"><button class="button small" type="button" data-cache-warm="${escapeHtml(entry.name)}" data-warming="${entry.state === 'warming'}">${entry.state === 'warming' ? 'Warming…' : 'Warm'}</button><button class="button small danger" type="button" data-cache-delete="${escapeHtml(entry.name)}">Delete</button></div>
-          <details><summary>Cache details</summary><p>Requested ${fmt(entry.requested_tokens)} tokens; aligned to ${fmt(entry.alignment)}-token pages. GPU preference: ${entry.retained ? 'active' : 'inactive'}; ${fmt(entry.ttl_seconds)} seconds. Waiting requests: ${fmt(entry.waiting_requests)}.</p><p>Restored tokens: ${fmt(entry.restored_tokens)} · Forwarded tokens: ${fmt(entry.forwarded_tokens)}.</p><p>Checkpoint ID: ${escapeHtml(entry.id)}</p></details></article>`;
+          <details><summary>Cache details</summary><p>Requested ${fmt(entry.requested_tokens)} tokens; aligned to ${fmt(entry.alignment)}-token pages. GPU preference: ${entry.retained ? 'active' : 'inactive'}; ${fmt(entry.ttl_seconds)} seconds. Waiting requests: ${fmt(entry.waiting_requests)}.</p><p>Followers counts requests waiting for preparation, not already-warm hits. Check response cached input tokens for reuse.</p><p>Restored tokens: ${fmt(entry.restored_tokens)} · Forwarded tokens: ${fmt(entry.forwarded_tokens)}.</p><p>Checkpoint ID: ${escapeHtml(entry.id)}</p></details></article>`;
       }).join('') : '<p class="empty">No prompts registered yet. Load the test example, then choose Register &amp; test to try two agents.</p>';
       cacheControls();
     }

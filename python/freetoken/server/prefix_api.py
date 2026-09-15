@@ -148,6 +148,10 @@ def register_prefix_routes(
     get_state: Callable[[], Any],
     get_model_sampling: Callable[[], dict[str, Any]],
 ) -> None:
+    from .prefix_startup import PrefixStartup
+
+    startup = PrefixStartup(get_state, get_model_sampling)
+    app.state.prefix_startup = startup
     async def ready_state():
         state = get_state()
         gate = await _maintenance_gate(state)
@@ -158,48 +162,29 @@ def register_prefix_routes(
         state, gate = await ready_state()
         if gate is not None:
             return gate
-        try:
-            spec = _registration_spec(req, state, get_model_sampling())
-        except ValueError as exc:
-            return _response({"status": "invalid", "result": {}, "error": str(exc)})
-        return await _dispatch(
-            state,
-            PrefixCacheMsg(
-                request_id=str(uuid.uuid4()),
-                action="register",
-                name=req.name,
-                text=spec.messages,
-                tools=spec.template_tools,
-                chat_template_kwargs=spec.chat_template_kwargs,
-                preserve_system_order=spec.preserve_system_order,
-                prefix_tokens=req.prefix_tokens,
-                prefix_scope=req.prefix_scope,
-                ttl_seconds=req.ttl_seconds,
-            ),
-        )
+        return await startup.register(req)
 
     @app.get("/v1/cache/prefixes")
     async def list_prefixes():
         state, gate = await ready_state()
         if gate is not None:
             return gate
-        return await _dispatch(
+        response = await _dispatch(
             state, PrefixCacheMsg(request_id=str(uuid.uuid4()), action="list")
         )
+        if response.status_code == 200:
+            import json
+            body = json.loads(response.body)
+            body['result']['persistence'] = startup.metadata()
+            return _response(body)
+        return response
 
     @app.put("/v1/cache/prefixes/settings")
     async def configure_prefixes(req: PrefixSettingsRequest):
         state, gate = await ready_state()
         if gate is not None:
             return gate
-        return await _dispatch(
-            state,
-            PrefixCacheMsg(
-                request_id=str(uuid.uuid4()),
-                action="configure",
-                max_retained_bytes=req.max_retained_bytes,
-            ),
-        )
+        return await startup.configure(req.max_retained_bytes)
 
     @app.get("/v1/cache/prefixes/{name}")
     async def get_prefix(name: str):
@@ -227,7 +212,4 @@ def register_prefix_routes(
         state, gate = await ready_state()
         if gate is not None:
             return gate
-        return await _dispatch(
-            state,
-            PrefixCacheMsg(request_id=str(uuid.uuid4()), action="delete", name=name),
-        )
+        return await startup.delete(name)

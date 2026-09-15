@@ -870,8 +870,15 @@ class FrontendManager:
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
-    yield
+async def lifespan(application: FastAPI):
+    startup = getattr(application.state, "prefix_startup", None)
+    warm_task = asyncio.create_task(startup.restore()) if startup is not None else None
+    try:
+        yield
+    finally:
+        if warm_task is not None:
+            warm_task.cancel()
+            await asyncio.gather(warm_task, return_exceptions=True)
     # Orderly shutdown (uvicorn traps SIGINT/SIGTERM and runs this on the way out). Flag it
     # BEFORE tearing anything down so the backend supervisor treats the workers' ensuing
     # exit as expected rather than a crash — no spurious ERROR / "failed" latch during stop.

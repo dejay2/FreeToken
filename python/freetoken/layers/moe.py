@@ -870,6 +870,30 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        # A cached prompt can leave only a few rows. Fetch their routed experts
+        # through the slot cache, but KEEP the Triton prefill kernel: its decode
+        # kernel has different arithmetic. All six NVFP4 banks include their
+        # per-row scales, so remapped slot IDs are sufficient.
+        if (
+            cache.quant_format == "nvfp4"
+            and 0 < hidden_states.shape[0] <= _SMALL_PREFILL_ROWS
+            and cache.decode_target == "gpu"
+            # Owned layers can pre-issue a whole-layer overlap copy for their
+            # neighbour. Don't mix that pipeline with sparse slot writes.
+            and not getattr(cache, "gpu_owned_layer_ids", ())
+            and not _prefetch.PREFETCH.enabled
+            and not cache.is_cpu_layer(self.layer_id)
+            and not cache.is_disk_layer(self.layer_id)
+            and not cache.is_gpu_owned_layer(self.layer_id)
+            and cache.cache_size >= min(self.num_experts, topk_ids.numel())
+        ):
+            cache.ensure_experts(self.layer_id, topk_ids)
+            cache.copy_missing()
+            return self._expert_gemm(
+                cache, hidden_states, topk_weights, topk_ids,
+                views=cache.bank_views(), n=cache.cache_size,
+                alphas=None, is_prefill=True,
+            )
         if cache.quant_format == "exl3":
             from freetoken.moe.fused_exl3 import require_exl3_gpu_only
 
