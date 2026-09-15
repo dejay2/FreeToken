@@ -255,13 +255,16 @@ no GPU tensors or old token IDs are loaded from disk.
 The API can accept traffic while startup warming proceeds. The settings page and
 `GET /v1/cache/prefixes` report persistence and startup state, including per-prompt errors.
 A prefix larger than the startup KV pool cannot be warmed: increase the pool floor or
-remove that saved definition. Retention remains best-effort; warming more prefixes than
+remove that saved definition. Size the startup floor for the prefix plus the usual
+reply token allowance too: a first-request pool resize can otherwise add latency even
+after warming. Retention remains best-effort; warming more prefixes than
 the budget holds does not make them all permanently GPU-resident.
 
 For Triton NVFP4 on the GPU, `FREETOKEN_MOE_SMALL_PREFILL_ROWS=64` enables selective
 expert loading for prompt batches with at most 64 new token rows in total. It reuses the
 GPU expert cache and fetches only missing routed experts, then runs the original prefill
-GEMM. CPU/hybrid/disk expert layers and larger batches retain the full-layer path. The
+GEMM. Sparse slot routing uses Triton token grouping because the installed sgl
+grouping kernel does not handle production-sized slot indices. CPU/hybrid/disk expert layers and larger batches retain the full-layer path. The
 option defaults to off; enable it in the model server environment before startup. Mixed
 GPU-owned/offloaded layers and layer-ahead expert prefetch retain the existing movement path.
 Prompt-cache hits still need tail processing and answer generation, so warming cannot

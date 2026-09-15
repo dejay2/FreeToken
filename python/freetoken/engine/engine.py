@@ -573,9 +573,20 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+        warmup_lengths = []
         if config.attention_backend.split(",")[0] == "triton":
-            # Prefill runs on the first comma part; warm its autotune cache.
-            self._warmup_prefill()
+            warmup_lengths.extend((80, 128))
+        from freetoken.layers.moe import _SMALL_PREFILL_ROWS
+        if (
+            _SMALL_PREFILL_ROWS > 0
+            and self.moe_offload_cache is not None
+            and self.moe_offload_cache.quant_format == "nvfp4"
+        ):
+            # Decode graph capture and long saved-prefix warming do not execute
+            # the short-tail prefill kernels. Compile/load those before serving.
+            warmup_lengths.append(_SMALL_PREFILL_ROWS)
+        if warmup_lengths:
+            self._warmup_prefill(lengths=warmup_lengths)
         # Heavy private state is deliberately last: target weights, trusted pools, graphs, and
         # warmup are complete before the opt-in observer gets any memory.
         if self._mtp_shadow_config.enabled:
@@ -2861,7 +2872,7 @@ class Engine:
         return SpecForwardOutput(decision, next_tokens_gpu, hidden)
 
     @torch.inference_mode()
-    def _warmup_prefill(self) -> None:
+    def _warmup_prefill(self, *, lengths: Sequence[int] = (80, 128)) -> None:
         """Compile the Triton prefill path before the first real request.
 
         Decode CUDA graph capture warms the decode path, but the first prefill
@@ -2872,10 +2883,7 @@ class Engine:
         if self.max_seq_len < 2:
             return
 
-        warmup_lens = [min(80, self.max_seq_len)]
-        if self.max_seq_len >= 128:
-            warmup_lens.append(128)
-        warmup_lens = sorted({length for length in warmup_lens if length >= 2})
+        warmup_lens = sorted({min(length, self.max_seq_len) for length in lengths if length >= 2})
         if not warmup_lens:
             return
 
@@ -2898,6 +2906,7 @@ class Engine:
                     sampling_params=None,  # type: ignore[arg-type]
                     cache_handle=None,  # type: ignore[arg-type]
                 )
+                warm_req.linear_slot_idx = self.dummy_req.linear_slot_idx
                 batch = Batch(reqs=[warm_req], phase="prefill")
                 batch.padded_reqs = batch.reqs
                 batch.input_ids = torch.zeros(length, dtype=torch.int32, device=self.device)
