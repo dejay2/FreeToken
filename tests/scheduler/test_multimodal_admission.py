@@ -233,11 +233,13 @@ def test_prefill_marks_picture_request_private_then_releases_soft_embeddings_aft
         input_ids=message.input_ids,
         cached_len=0,
         device_len=len(message.input_ids),
+        extend_len=len(message.input_ids),
         mm_embeds=pending.mm_embeds,
         cache_private=True,
     )
     batch = SimpleNamespace(reqs=[request], mm_embeds=None)
     scheduler = Scheduler.__new__(Scheduler)
+    scheduler.device = torch.device("cpu")
     scheduler.config = SimpleNamespace(
         model_config=SimpleNamespace(image_token_id=IMAGE_TOKEN)
     )

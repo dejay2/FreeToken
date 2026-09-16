@@ -251,3 +251,26 @@ def test_post_terminal_overlap_step_is_dropped():
     assert [m for m in sent if isinstance(m, DetokenizeMsg)] == terminal  # no 2nd msg
     assert req.output_len == output_len_before                           # no append
     cm.check_integrity()
+
+
+def test_image_cache_claim_is_released_at_inflight_drain():
+    from freetoken.message import MMItem
+    from freetoken.mm.encoder_cache import EncoderCache
+
+    pool, cm, tm, dm, _, _, stub = _setup()
+    req = _launch_req(pool, cm, tm, torch.arange(1, 13, dtype=torch.int32), track_seqlen=8)
+    req.mm_items = [MMItem(modality="image", hash=7, pad_value=7, offsets=[[1, 3]])]
+    cache = EncoderCache()
+    cache.register(7, UID, 2)
+    cache.put(7, torch.ones(2, 8))
+    stub.engine = SimpleNamespace(encoder_cache=cache)
+    batch = Batch(reqs=[req], phase="prefill")
+    dm.filter_reqs(batch.reqs)
+    stub._last_data = _as_last_data(batch)
+
+    Scheduler._process_one_msg(stub, AbortBackendMsg(uid=UID))
+    assert cache.has(7)
+    Scheduler._process_last_data(stub, stub._last_data)
+    assert not cache.has(7)
+    Scheduler._free_req_resources(stub, req)
+    assert cache.stats() == (0, 0)

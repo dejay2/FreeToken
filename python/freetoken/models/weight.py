@@ -365,6 +365,7 @@ def load_weight(
     device: torch.device,
     *,
     include_moe_experts: bool = True,
+    include_vision: bool | None = None,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     # FTW checkpoint: dense weights are stored post-iter_weights, so we replay them
     # model-agnostically instead of re-running the per-model reader. Which tensors exist is
@@ -383,7 +384,7 @@ def load_weight(
         # stack. Vision is opt-in (default OFF, see vision_load_enabled): when it is off the
         # model never builds the tower, so replaying those tensors would trip load_state_dict's
         # strict unexpected-key check. Skip them here to match the model the engine built.
-        skip_vision = not vision_load_enabled()
+        skip_vision = not (vision_load_enabled() if include_vision is None else include_vision)
         if not skip_vision and vision_weights_backing() == "mmap":
             # This reader replays post-iter_weights tensors and never reaches the per-model
             # one that builds the mapping, so there is nothing to map. An optimization is
@@ -395,6 +396,10 @@ def load_weight(
         for name, tensor in iter_ftw_weights(model_path):
             if skip_vision and name.startswith(VISION_KEY_PREFIXES):
                 continue
+            if name.startswith(VISION_KEY_PREFIXES):
+                from freetoken.models.vision_weight import require_dense_vision_weight
+
+                require_dense_vision_weight(name, tensor)
             yield name, tensor
         return
 
@@ -405,6 +410,7 @@ def load_weight(
         device,
         include_moe_experts=include_moe_experts,
         include_non_moe=True,
+        **({"include_vision": True if include_vision is None else include_vision} if spec.encoders else {}),
     )
 
 

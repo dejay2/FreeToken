@@ -9,6 +9,7 @@ from .backend import (
     PrefixCacheBackendMsg,
     RoutingStatsBackendMsg,
     UserMsg,
+    MMItem,
 )
 from .frontend import (
     BaseFrontendMsg,
@@ -66,6 +67,7 @@ __all__ = [
     "RoutingStatsBackendMsg",
     "ExitMsg",
     "UserMsg",
+    "MMItem",
     "BaseTokenizerMsg",
     "BatchTokenizerMsg",
     "CacheRebuildMsg",

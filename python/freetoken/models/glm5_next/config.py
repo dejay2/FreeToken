@@ -31,6 +31,7 @@ gets slower).
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Any
 
 from freetoken.models.config import (
@@ -49,6 +50,47 @@ from .args import load_args
 # slice stays bf16, see kda.py); mlp covers dense MLPs, shared expert, lm_head.
 _ATTN_FP8 = os.getenv("FREETOKEN_GLM5_ATTN_FP8", "0") != "0"
 _MLP_FP8 = os.getenv("FREETOKEN_GLM5_MLP_FP8", "0") != "0"
+
+
+@dataclass(frozen=True)
+class VisionConfig:
+    hidden_size: int
+    depth: int
+    num_heads: int
+    intermediate_size: int
+    projection_intermediate_size: int
+    out_hidden_size: int
+    in_channels: int
+    patch_size: int
+    temporal_patch_size: int
+    spatial_merge_size: int
+    rms_norm_eps: float
+    swiglu_limit: float
+    attention_bias: bool
+
+
+def parse_vision_config(hf_config: Any) -> VisionConfig | None:
+    """None when the config carries no vision section, which is how a text-only engine asks for no tower."""
+    vc = getattr(hf_config, "vision_config", None)
+    if vc is None:
+        return None
+    if vc.hidden_act != "silu":
+        raise NotImplementedError(f"glm5_next vision tower activation {vc.hidden_act!r}; only silu is implemented")
+    return VisionConfig(
+        hidden_size=vc.hidden_size,
+        depth=vc.depth,
+        num_heads=vc.num_heads,
+        intermediate_size=vc.intermediate_size,
+        projection_intermediate_size=vc.projection_intermediate_size,
+        out_hidden_size=vc.out_hidden_size,
+        in_channels=vc.in_channels,
+        patch_size=vc.patch_size,
+        temporal_patch_size=vc.temporal_patch_size,
+        spatial_merge_size=vc.spatial_merge_size,
+        rms_norm_eps=vc.rms_norm_eps,
+        swiglu_limit=vc.swiglu_limit,
+        attention_bias=bool(vc.attention_bias),
+    )
 
 
 def _dsa_on(args, dsa_layer_ids) -> bool:
@@ -189,7 +231,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attn_quant="fp8_pertensor" if _ATTN_FP8 else "none",
         dense_quant="fp8_pertensor" if _MLP_FP8 else "none",
         lm_head_quant="fp8_pertensor" if _MLP_FP8 else "none",
-        vision_config=None,  # text-only milestone; model.visual.* weights are dropped
+        vision_config=parse_vision_config(hf_config),
         image_token_id=getattr(hf_config, "image_token_id", None),
         glm5_args=args,
     )

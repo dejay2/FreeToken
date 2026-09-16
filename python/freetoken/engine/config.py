@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import copy
 import math
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Mapping
 
 import torch
 from freetoken.distributed import DistributedInfo
-from freetoken.models.register import _load_attr, get_model_spec
+from freetoken.mm.config import ENCODER_SECTIONS, MultimodalConfig
+from freetoken.models.register import EncoderSpec, ModelSpec, _load_attr, get_model_spec
 from freetoken.moe.exl3_ops import DEFAULT_EXL3_EXPERT_OP
 from freetoken.utils import cached_load_hf_config
 
@@ -441,6 +443,8 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
+    mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     @cached_property
     def spec_decode(self) -> SpecDecodeConfig:
@@ -459,10 +463,39 @@ class EngineConfig:
         return cached_load_hf_config(self.model_path)
 
     @cached_property
+    def model_spec(self) -> ModelSpec:
+        return get_model_spec(self.hf_config.architectures[0])
+
+    @cached_property
+    def active_encoders(self) -> tuple[EncoderSpec, ...]:
+        """The encoder towers this process builds: the family registers them, the checkpoint config carries their section, --mm-disable did not name them."""
+        if "FREETOKEN_LOAD_VISION" in os.environ or self.model_spec.module == "freetoken.models.qwen4_exp":
+            from freetoken.models.config import vision_load_enabled
+
+            if not vision_load_enabled():
+                return ()
+        return tuple(
+            e
+            for e in self.model_spec.encoders
+            if getattr(self.hf_config, e.config_key, None) is not None
+            and e.kind not in self.mm.disabled_encoders
+        )
+
+    @cached_property
+    def served_modalities(self) -> frozenset[str]:
+        """Modalities this process accepts."""
+        return frozenset(m for e in self.active_encoders for m in e.modalities)
+
+    @cached_property
     def model_config(self) -> ModelConfig:
-        spec = get_model_spec(self.hf_config.architectures[0])
-        parse_config = _load_attr(spec.module, spec.parse_config)
-        return parse_config(self.hf_config)
+        # the parser sees no section for a tower this process does not build (for the vision tower that also means 1-D rope)
+        hf_config = copy.copy(self.hf_config)
+        built = {e.config_key for e in self.active_encoders}
+        for key in set(ENCODER_SECTIONS) | {e.config_key for e in self.model_spec.encoders}:
+            if key not in built:
+                setattr(hf_config, key, None)
+        spec = self.model_spec
+        return _load_attr(spec.module, spec.parse_config)(hf_config)
 
     @property
     def max_seq_len(self) -> int:

@@ -15,10 +15,11 @@ from freetoken.layers import (
     VocabParallelEmbedding,
     silu_and_mul,
 )
-from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.blocks import BaseLLMModel, embed_input_ids
 from freetoken.utils import nvtx_annotate
 
 from .attention import MuseGlimmerAttention
+from .vision import MuseGlimmerVisionModel
 from freetoken.models.quant_linear import make_col_merged, make_replicated
 
 if TYPE_CHECKING:
@@ -80,6 +81,21 @@ class MuseGlimmerDecoderLayer(BaseOP):
         return residual + h
 
 
+class _NormedEmbedding:
+    """embed_tokens followed by the weightless norm as one lookup for embed_input_ids, so image rows (already normed by the tower) scatter in after it like in the reference."""
+
+    def __init__(self, embed_tokens: VocabParallelEmbedding, embed_norm: GemmaRMSNorm):
+        self.embed_tokens = embed_tokens
+        self.embed_norm = embed_norm
+
+    @property
+    def num_embeddings(self) -> int:
+        return self.embed_tokens.num_embeddings
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_norm.forward(self.embed_tokens.forward(input_ids))
+
+
 class MuseGlimmerModel(BaseOP):
     def __init__(self, config: ModelConfig):
         self.embed_tokens = VocabParallelEmbedding(
@@ -92,6 +108,7 @@ class MuseGlimmerModel(BaseOP):
         self.embed_norm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, with_scale=False
         )
+        self._normed_embedding = _NormedEmbedding(self.embed_tokens, self.embed_norm)
         self.layers = OPList(
             [MuseGlimmerDecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
         )
@@ -100,7 +117,7 @@ class MuseGlimmerModel(BaseOP):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embed_norm.forward(self.embed_tokens.forward(input_ids))
+        x = embed_input_ids(self._normed_embedding, input_ids, get_global_ctx().batch)
         for layer in self.layers.op_list:
             x = layer.forward(x)
         return self.norm.forward(x)
@@ -131,4 +148,17 @@ class MuseGlimmerForCausalLM(BaseLLMModel):
         return logits
 
 
-__all__ = ["MuseGlimmerForCausalLM"]
+class MuseGlimmerForConditionalGeneration(MuseGlimmerForCausalLM):
+    def __init__(self, config: ModelConfig):
+        super().__init__(config)
+        if config.is_multimodal:
+            self.vision_tower = MuseGlimmerVisionModel(config.vision_config)
+
+    def place_encoder_weights(self, mode: str) -> None:
+        self.vision_tower.place_weights(mode)
+
+    def encode(self, item: MMItem) -> torch.Tensor:
+        return self.vision_tower.forward(item.feature, [item.grid_thw])
+
+
+__all__ = ["MuseGlimmerForCausalLM", "MuseGlimmerForConditionalGeneration"]

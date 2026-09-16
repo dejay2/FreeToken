@@ -51,9 +51,9 @@ def test_system_prefix_is_reusable_across_tasks_and_preserves_inputs(pairs):
     manager = TokenizeManager(Tokenizer(pairs=pairs))
     first, second = message('hi'), message('A different task with a long private tail')
     before = deepcopy(first)
-    ids = manager.tokenize([first])[0]
+    ids = manager.tokenize([first])[0].input_ids
     boundary = manager.system_prefix_tokens(first, ids)
-    other_ids = manager.tokenize([second])[0]
+    other_ids = manager.tokenize([second])[0].input_ids
     assert boundary == manager.system_prefix_tokens(second, other_ids)
     assert torch.equal(ids[:boundary], other_ids[:boundary])
     visible_prefix = manager.render_prompt(first).split('hi<assistant>')[0]
@@ -66,7 +66,7 @@ def test_ambiguous_templates_refuse_automatic_scope(mode):
     manager = TokenizeManager(Tokenizer(mode=mode))
     msg = message()
     with pytest.raises(ValueError, match='boundary|template'):
-        manager.system_prefix_tokens(msg, manager.tokenize([msg])[0])
+        manager.system_prefix_tokens(msg, manager.tokenize([msg])[0].input_ids)
 
 
 def test_no_leading_system_does_not_capture_later_system_or_task():
@@ -74,13 +74,13 @@ def test_no_leading_system_does_not_capture_later_system_or_task():
     msg = message()
     msg.text = [{'role':'user','content':'private'}, {'role':'system','content':'late rules'}]
     with pytest.raises(ValueError, match='leading system'):
-        manager.system_prefix_tokens(msg, manager.tokenize([msg])[0])
+        manager.system_prefix_tokens(msg, manager.tokenize([msg])[0].input_ids)
 
 
 def test_template_that_moves_private_text_before_marker_is_rejected():
     manager = TokenizeManager(Tokenizer())
     msg = message()
-    original = manager.tokenize([msg])[0]
+    original = manager.tokenize([msg])[0].input_ids
     manager.render_prompt = lambda probe: ('original prefix ' if probe is msg else 'different prefix ') + probe.text[-1]['content']
     with pytest.raises(ValueError, match='boundary|template'):
         manager.system_prefix_tokens(msg, original)
@@ -91,4 +91,4 @@ def test_later_system_hoisting_does_not_accidentally_become_shared():
     msg = message()
     msg.text = [msg.text[0], msg.text[-1], {'role':'system','content':'Private later update'}]
     with pytest.raises(ValueError, match='conversation history'):
-        manager.system_prefix_tokens(msg, manager.tokenize([msg])[0])
+        manager.system_prefix_tokens(msg, manager.tokenize([msg])[0].input_ids)

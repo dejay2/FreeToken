@@ -1429,6 +1429,8 @@ def test_a_false_prefetch_return_warns_once_and_stops_trying(
 ):
     source, _picture, _shard = picture_source
     calls = []
+    # This tests the Windows-only failure path; Linux otherwise succeeds via madvise.
+    monkeypatch.setattr(type(source), "_advise_windows", lambda self: False)
 
     def fake(_process, count, _entries, _flags):
         calls.append(count)

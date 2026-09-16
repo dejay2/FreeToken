@@ -105,7 +105,12 @@ def _hf_config(quantization_config: dict | None = None) -> RawConfigShim:
         "architectures": ["Glm5NextForConditionalGeneration"],
         "model_type": "glm5_next",
         "text_config": _text_config(),
-        "vision_config": {"model_type": "glm5_next_vision", "depth": 24},
+        "vision_config": {
+            "model_type": "glm5_next_vision", "depth": 24, "hidden_size": 1024, "num_heads": 16, "intermediate_size": 4096,
+            "projection_intermediate_size": 10240, "out_hidden_size": 4096, "in_channels": 3, "patch_size": 14,
+            "temporal_patch_size": 2, "spatial_merge_size": 2, "rms_norm_eps": 1e-5, "swiglu_limit": 10.0,
+            "attention_bias": True, "hidden_act": "silu",
+        },
         "image_token_id": 154854,
     }
     if quantization_config is not None:
@@ -209,8 +214,8 @@ def test_moe_and_scalars():
     # Checkpoint-faithful default; the FREETOKEN_GLM5_*_FP8 env flags opt into
     # the W8A16 fp8 load.
     assert (cfg.attn_quant, cfg.dense_quant, cfg.lm_head_quant) == ("none",) * 3
-    # Text-only serving: the vision tower is never built.
-    assert cfg.vision_config is None
+    # The native vision config is available to the encoder.
+    assert cfg.vision_config is not None
 
 
 def test_args_alias_folding_and_nope():
@@ -238,7 +243,7 @@ def test_registry_resolves_glm5_next():
 
     spec = get_model_spec("Glm5NextForConditionalGeneration")
     assert spec.module == "freetoken.models.glm5_next"
-    assert spec.model_cls == "Glm5NextForCausalLM"
+    assert spec.model_cls == "Glm5NextForConditionalGeneration"
     assert get_model_spec("Glm5NextForCausalLM").module == spec.module
 
 

@@ -7,7 +7,7 @@ from freetoken.attention.base import AttnType
 
 # State-dict key prefixes for the (optional) vision stack. Used both to drop the vision
 # config (so the tower is never built) and to skip the matching tensors in the FTW reader.
-VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "visual.")
+VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "visual.", "vision_embedder.")
 _VISION_TRUE = {"1", "true", "yes", "on"}
 _VISION_EXECUTION_MODES = {"gpu", "layer-stream"}
 _VISION_WEIGHTS_BACKINGS = {"ram", "mmap"}
@@ -157,6 +157,8 @@ class RotaryConfig:
     max_position: int
     base: float
     scaling: Dict[str, Any] | None
+    mrope_section: list | None = None
+    mrope_layout: str = "contiguous"
 
 
 @dataclass(frozen=True)
@@ -229,6 +231,7 @@ class SWAAttentionGroupConfig(BaseAttentionGroupConfig):
     head_dim: int
     rotary_config: RotaryConfig
     sliding_window: int
+    bidirectional_mm_blocks: bool = False
 
 
 @dataclass(frozen=True)
@@ -422,6 +425,10 @@ class ModelConfig:
         return self.num_layers - self.first_k_dense_replace
 
     @property
+    def model_is_mrope(self) -> bool:
+        return any(getattr(getattr(g, "rotary_config", None), "mrope_section", None) is not None for g in self.attention_groups)
+
+    @property
     def is_multimodal(self) -> bool:
         return self.vision_config is not None
 
@@ -567,3 +574,7 @@ class ModelConfig:
             for group in self.kv_cache_group_specs()
             if group.num_layers > 0
         ]
+
+
+def mrope_layout_from_rope_params(params):
+    return "interleaved_glm" if params.get("mrope_interleaved_glm") else "interleaved" if params.get("mrope_interleaved") else "contiguous"

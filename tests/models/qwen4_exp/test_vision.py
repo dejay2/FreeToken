@@ -503,3 +503,43 @@ def test_picture_feature_count_must_equal_placeholder_count(feature_rows: int):
 
     with pytest.raises(ValueError, match="picture-token slots.*picture features"):
         model._merge_multimodal(input_ids, hidden, features)
+
+
+def test_mm_item_adapter_uses_existing_tower_and_preserves_placement():
+    from freetoken.message import MMItem
+
+    model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    model.visual = Qwen4VisionModel(_config())
+    for weight in model.visual.state_dict().values():
+        weight.uniform_(-0.02, 0.02)
+    model.model = SimpleNamespace(embed_tokens=SimpleNamespace(weight=torch.empty(1)))
+    model._vision_execution = "gpu"
+    grid = torch.tensor([[1, 4, 4]])
+    pixels = torch.randn(16, 24)
+    item = MMItem("image", 1, 100, [[0, 4]], feature=pixels, model_specific_data={"grid_thw": (1, 4, 4)})
+    pointers = {key: value.data_ptr() for key, value in model.visual.state_dict().items()}
+    model.place_encoder_weights("host")
+    assert model._vision_execution == "gpu"
+    assert pointers == {key: value.data_ptr() for key, value in model.visual.state_dict().items()}
+    torch.testing.assert_close(model.encode(item), model.encode_images(pixels, grid))
+
+
+def test_mm_item_adapter_prefetches_and_keeps_layer_stream_execution():
+    from freetoken.message import MMItem
+
+    calls = []
+    expected = torch.randn(4, 24)
+    model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    model.visual = SimpleNamespace(
+        prefetch_weights=lambda: calls.append("prefetch"),
+        forward_layer_streamed=lambda pixels, grid, device: calls.append((pixels, grid, device)) or expected,
+    )
+    model.model = SimpleNamespace(embed_tokens=SimpleNamespace(weight=torch.empty(1)))
+    model._vision_execution = "layer-stream"
+    item = MMItem("image", 1, 100, [[0, 4]], feature=torch.zeros(16, 24), model_specific_data={"grid_thw": (1, 4, 4)})
+    model.place_encoder_weights("gpu")
+    assert model.encode(item) is expected
+    assert calls[0] == "prefetch"
+    assert calls[1][0] is item.feature
+    assert calls[1][1].tolist() == [[1, 4, 4]]
+    assert model._vision_execution == "layer-stream"

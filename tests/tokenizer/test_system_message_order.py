@@ -107,7 +107,7 @@ def test_appended_counter_keeps_old_prompt_checkpoint_prefix(tokenizer):
     ])
     manager = TokenizeManager(tokenizer)
     first_msg, second_msg = as_msg(first), as_msg(second)
-    old, new = manager.tokenize([first_msg, second_msg])
+    old, new = [m.input_ids for m in manager.tokenize([first_msg, second_msg])]
     checkpoint = (len(old) - 1) // 64 * 64
     assert checkpoint > 1000
     assert new[:checkpoint].tolist() == old[:checkpoint].tolist()

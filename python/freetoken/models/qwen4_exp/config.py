@@ -61,6 +61,7 @@ class Qwen4ExpArgs:
     index_head_dim: int
     index_budget: int
     index_ratio: int
+    image_token_id: int | None = None
 
     @property
     def index_topk_blocks(self) -> int:
@@ -273,12 +274,21 @@ def parse_config(hf_config: Any) -> ModelConfig:
         if layer_types[lid] != "linear_attention":
             raise ValueError(f"PLE must sit on a linear_attention layer, got layer {lid}")
 
+    mrope_half = rotary_dim // 2
+    mrope_section = rope_params.get("mrope_section") or (
+        (mrope_half + 2) // 3,
+        (mrope_half + 1) // 3,
+        mrope_half // 3,
+    )
+    vision_config = _parse_vision_config(hf_config)
     full_rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=rotary_dim,
         max_position=text.max_position_embeddings,
         base=rope_theta,
         scaling=rope_scaling,
+        mrope_section=list(mrope_section) if vision_config is not None else None,
+        mrope_layout="interleaved" if rope_params.get("mrope_interleaved", True) else "contiguous",
     )
     full_group = FullAttentionGroupConfig(
         name="full",
@@ -317,12 +327,6 @@ def parse_config(hf_config: Any) -> ModelConfig:
     if isinstance(eos_token_id, (list, tuple)):
         eos_token_id = eos_token_id[0]
 
-    mrope_half = rotary_dim // 2
-    mrope_section = rope_params.get("mrope_section") or (
-        (mrope_half + 2) // 3,
-        (mrope_half + 1) // 3,
-        mrope_half // 3,
-    )
     qwen4_args = Qwen4ExpArgs(
         hidden_size=text.hidden_size,
         hc_count=int(text.hc_count),
@@ -343,6 +347,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_head_dim=int(text.indexer_head_dim),
         index_budget=int(text.indexer_budget),
         index_ratio=int(text.indexer_compress_ratio),
+        image_token_id=getattr(hf_config, "image_token_id", None),
     )
 
     return ModelConfig(
@@ -370,7 +375,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen4_exp"),
         architectures=getattr(hf_config, "architectures", ["Qwen4ExpForConditionalGeneration"]),
-        vision_config=_parse_vision_config(hf_config),
+        vision_config=vision_config,
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
