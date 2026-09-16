@@ -7,7 +7,7 @@ from freetoken.attention.base import AttnType
 
 # State-dict key prefixes for the (optional) vision stack. Used both to drop the vision
 # config (so the tower is never built) and to skip the matching tensors in the FTW reader.
-VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "visual.")
+VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "visual.", "vision_embedder.")
 _VISION_TRUE = {"1", "true", "yes", "on"}
 _VISION_EXECUTION_MODES = {"gpu", "layer-stream"}
 _VISION_WEIGHTS_BACKINGS = {"ram", "mmap"}

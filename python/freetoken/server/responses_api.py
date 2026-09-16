@@ -285,7 +285,13 @@ def _convert_input_item(item: dict[str, Any]) -> list[dict[str, Any]]:
         ]
     if itype == "function_call_output":
         output = item.get("output")
-        content = _input_content(output) if isinstance(output, list) else _stringify(output)
+        # Tool results may be arbitrary JSON arrays. Only decode arrays made
+        # entirely of supported content blocks; preserve all other arrays as JSON.
+        is_content_blocks = isinstance(output, list) and bool(output) and all(
+            isinstance(part, dict) and part.get("type") in ("input_text", "output_text", "text", "input_image")
+            for part in output
+        )
+        content = _input_content(output) if is_content_blocks else _stringify(output)
         tool_msg = {"role": "tool", "tool_call_id": item.get("call_id", ""), "content": content}
         if isinstance(content, str):
             return [tool_msg]

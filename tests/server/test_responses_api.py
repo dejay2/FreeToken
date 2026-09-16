@@ -967,3 +967,26 @@ def test_convert_function_call_output_text_list_stays_a_plain_tool_message():
     spec = RP.convert_responses_to_genspec(req, {})
     assert [m["role"] for m in spec.messages] == ["user", "assistant", "tool"]
     assert spec.messages[2]["content"] == "ab"
+
+
+def test_function_call_output_preserves_json_object_arrays():
+    output = [{"path": "app.py", "line": 17}]
+    messages = RP._convert_input_item({"type": "function_call_output", "call_id": "c1", "output": output})
+    assert messages == [{"role": "tool", "tool_call_id": "c1", "content": json.dumps(output)}]
+
+
+def test_function_call_output_preserves_json_scalar_arrays():
+    for output in ([1, 2, 3], [True, None, "text"], []):
+        messages = RP._convert_input_item({"type": "function_call_output", "call_id": "c1", "output": output})
+        assert messages == [{"role": "tool", "tool_call_id": "c1", "content": json.dumps(output)}]
+
+
+def test_function_call_output_preserves_unknown_or_mixed_blocks():
+    for output in (
+        [{"type": "input_text", "text": "found"}, {"path": "app.py", "line": 17}],
+        [{"type": "input_image", "image_url": "data:image/png;base64,aGk="}, {"type": "result", "count": 3}],
+        [{"text": "label", "path": "app.py"}],
+        [{"type": "input_text", "text": "found"}, 3],
+    ):
+        messages = RP._convert_input_item({"type": "function_call_output", "call_id": "c1", "output": output})
+        assert messages == [{"role": "tool", "tool_call_id": "c1", "content": json.dumps(output)}]

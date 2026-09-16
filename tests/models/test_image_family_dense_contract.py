@@ -80,3 +80,51 @@ def test_gemma_legacy_preprocessed_image_adapter(unified):
     output = cls.encode_images(model, pixels, positions)
     assert calls == [True]
     torch.testing.assert_close(output, pixels.reshape(-1, 4) * 2)
+
+
+@pytest.mark.parametrize('include_vision', [True, False])
+def test_gemma_unified_ftw_strict_load_with_vision_enabled_or_disabled(tmp_path, monkeypatch, include_vision):
+    from types import SimpleNamespace
+    from freetoken.checkpoint.ftw import FTWWriter
+    from freetoken.models.gemma4.config import UnifiedVisionConfig
+    from freetoken.models.gemma4.model import Gemma4ForCausalLM, Gemma4UnifiedForConditionalGeneration
+    from freetoken.models.weight import load_weight
+
+    # Keep the real Unified vision constructor and strict loader; a tiny text
+    # parameter avoids allocating an unrelated language model for this IO test.
+    def tiny_text_init(self, config):
+        self.text_weight = torch.empty(2)
+    monkeypatch.setattr(Gemma4ForCausalLM, '__init__', tiny_text_init)
+    monkeypatch.setenv('FREETOKEN_VISION_WEIGHTS', 'ram')
+    vc = UnifiedVisionConfig(hidden_size=16, patch_dim=48, posemb_size=8,
+        layer_norm_eps=1e-5, rms_norm_eps=1e-6, text_hidden_size=32)
+    source = Gemma4UnifiedForConditionalGeneration(SimpleNamespace(is_multimodal=True, vision_config=vc))
+    weights = source.state_dict()
+    assert any(key.startswith('vision_embedder.') for key in weights)
+    writer = FTWWriter(str(tmp_path))
+    for key, tensor in weights.items():
+        tensor.fill_(0.25)
+        writer.add_tensor(key, tensor)
+    writer.finalize({})
+
+    target = Gemma4UnifiedForConditionalGeneration(SimpleNamespace(
+        is_multimodal=include_vision, vision_config=vc if include_vision else None))
+    loaded = dict(load_weight(str(tmp_path), torch.device('cpu'), include_vision=include_vision))
+    target.load_state_dict(loaded)
+    assert not loaded
+    assert set(target.state_dict()) == (set(weights) if include_vision else {'text_weight'})
+    assert all(torch.equal(tensor, weights[key]) for key, tensor in target.state_dict().items())
+
+
+@pytest.mark.parametrize('prefix', ['visual.', 'vision_tower.', 'embed_vision.', 'vision_embedder.'])
+def test_ftw_filters_all_image_encoder_names(tmp_path, monkeypatch, prefix):
+    from freetoken.checkpoint.ftw import FTWWriter
+    from freetoken.models.weight import load_weight
+
+    monkeypatch.setenv('FREETOKEN_VISION_WEIGHTS', 'ram')
+    writer = FTWWriter(str(tmp_path))
+    writer.add_tensor('model.weight', torch.ones(2))
+    writer.add_tensor(prefix + 'weight', torch.ones(2))
+    writer.finalize({})
+    assert set(dict(load_weight(str(tmp_path), torch.device('cpu'), include_vision=False))) == {'model.weight'}
+    assert set(dict(load_weight(str(tmp_path), torch.device('cpu'), include_vision=True))) == {'model.weight', prefix + 'weight'}

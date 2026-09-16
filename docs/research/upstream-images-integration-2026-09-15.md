@@ -75,3 +75,22 @@ PYTHONPATH=python OMP_NUM_THREADS=2 python -m pytest \
 ## Final result
 
 Combined command above: **2,433 passed, 319 skipped, 14 deselected, 4 warnings in 134.25s**. Deselections include parameterized cases in the baseline-affected groups, including two cases that pass independently. The parking-idle test passed in this final combined run. Compilation and full staged whitespace checks passed. Real HF preprocessing tests cover six image families with both processor defaults and token limits (12 cases); torch remains 2.11.0+cpu with torchvision 0.26.0+cpu and transformers 5.16.1. Independent final review found no remaining confirmed P0/P1/P2 blockers.
+
+
+## Review fixes (2026-09-16)
+
+Review of `f5a4c10` identified two P2 regressions, both reproduced by new tests before fixing:
+
+- Responses tool-output arrays now use content-block conversion only for nonempty arrays entirely composed of supported typed text/image blocks. Ordinary JSON arrays, empty arrays, and mixed/unknown elements retain JSON serialization.
+- The shared vision prefixes now include Gemma4 Unified's `vision_embedder.`. An actual FTW round trip exercises the real Unified vision modules and strict model loader with vision enabled and disabled, substituting only a tiny text parameter for the language model. The other model encoder roots (`visual.`, `vision_tower.`, `embed_vision.`) are also covered by FTW filtering tests.
+
+Before fixes: **5 failed, 61 passed** in the two regression files, including the reported strict-load failure. After fixes, with `PATH=/home/jay/projects/FreeToken/.venv/bin:$PATH` and `PYTHONPATH=python`:
+
+```bash
+python -m pytest tests/server tests/models/test_image_family_dense_contract.py -q --tb=short -k 'not test_ple_backend_is_exposed_by_the_server_cli'
+# 729 passed, 1 deselected (the previously documented baseline CLI failure)
+python -m pytest tests/engine/test_vision_weight_placement.py tests/models/test_gemma4_vision.py tests/models/qwen4_exp/test_vision_weights_ckpt.py -q --tb=short
+# 18 passed, 16 skipped (checkpoint-dependent tests)
+```
+
+These are targeted reruns; the earlier combined suite result applies to `f5a4c10`. Live GPU/checkpoint acceptance remains required before switching the running service.
