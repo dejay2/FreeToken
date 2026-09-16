@@ -231,6 +231,7 @@ class SWAAttentionGroupConfig(BaseAttentionGroupConfig):
     head_dim: int
     rotary_config: RotaryConfig
     sliding_window: int
+    bidirectional_mm_blocks: bool = False
 
 
 @dataclass(frozen=True)

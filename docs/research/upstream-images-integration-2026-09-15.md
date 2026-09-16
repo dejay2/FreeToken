@@ -94,3 +94,22 @@ python -m pytest tests/engine/test_vision_weight_placement.py tests/models/test_
 ```
 
 These are targeted reruns; the earlier combined suite result applies to `f5a4c10`. Live GPU/checkpoint acceptance remains required before switching the running service.
+
+
+## Gemma startup re-review fixes (2026-09-16)
+
+Review of `938a71a` identified two additional startup failures in the original integration:
+
+- Added `SWAAttentionGroupConfig.bidirectional_mm_blocks` with default `False`. New CPU tests parse standard and Unified Gemma configurations, with and without vision, with bidirectional attention enabled and disabled, using the real attention dataclass. Existing callers retain causal behavior by default.
+- Allowed Gemma's dense `std_scale` standardisation parameter through the shared vision validator, retaining dtype validation and encoded-weight rejection. New tests load actual safetensors through the Gemma reader and real config parser in float16, bfloat16 and float32. Only external config retrieval is substituted. Loader checks still reject integer/FP8 weights, weight scales, inverse scales, packed qweights and integer `std_scale`.
+
+Before fixes, all 12 initial CPU cases failed. Adding the attention field yielded 9 passed and 3 failures specifically at `std_scale` validation. After both fixes, with the same venv and `PYTHONPATH=python`:
+
+```bash
+python -m pytest tests/models/test_gemma4_startup.py tests/models/test_image_family_dense_contract.py tests/engine/test_vision_weight_placement.py tests/scheduler/test_multimodal_admission.py tests/scheduler/test_multimodal_chunked_prefill.py -q --tb=short
+# 72 passed
+python -m pytest tests/models/qwen4_exp/test_config.py tests/models/test_glm5_next_config.py tests/scheduler/test_swa_pagesize.py tests/scheduler/test_swa_commit_lock_and_floor.py -q --tb=short
+# 61 passed, 1 skipped
+```
+
+The existing Gemma vision test module gates all its tests on CUDA, including configuration parsing; the new startup module runs on CPU without a live checkpoint. These targeted checks do not replace the outstanding live GPU/checkpoint acceptance gate. The original combined suite was not rerun for these fixes.
