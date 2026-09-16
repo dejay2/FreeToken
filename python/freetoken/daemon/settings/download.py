@@ -26,6 +26,7 @@ from urllib.request import Request, urlopen
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from .memory_reclaim import release_completed_file
 from .model_info import (
     GIB,
     ModelInfo,
@@ -724,6 +725,8 @@ class DownloadManager:
                         self._finish(job_id, "cancelled")
                         return
                     self._download_one(job.repo, job.target_folder, item.name)
+                    if item.name.endswith('.safetensors'):
+                        release_completed_file(job.target_folder / item.name)
                     with self._lock:
                         if item.name not in job.files:
                             job.files.append(item.name)
@@ -734,6 +737,8 @@ class DownloadManager:
                 # No metadata is still useful for private repos and small test doubles.  The Hub
                 # call remains one snapshot operation and the route reports bytes from disk.
                 self._download_one(job.repo, job.target_folder, None)
+                for path in job.target_folder.glob('*.safetensors'):
+                    release_completed_file(path)
 
             with self._lock:
                 if not job.total_bytes:

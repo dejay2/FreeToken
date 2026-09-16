@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Collection, Mapping
 
 from .memory_fit import _read_vram_snapshot
+from .memory_reclaim import ReclaimController
 
 logger = logging.getLogger("freetoken.daemon.settings.governor")
 
@@ -323,9 +324,11 @@ class GovernorLoop(threading.Thread):
         # hand-driven rebuild that shrank slots or KV pages, review F4) -- and when the server
         # goes away. The comparison runs before the snapshot is overwritten.
         self._up_exhausted: set[str] = set()
+        self.reclaimer = ReclaimController(self.http_port)
 
     def stop(self) -> None:
         self._stop_event.set()
+        self.reclaimer.close()
 
     def run(self) -> None:
         while not self._stop_event.is_set():
@@ -338,9 +341,15 @@ class GovernorLoop(threading.Thread):
 
     def _tick(self) -> None:
         if not self.enabled:
+            self._tick_reclaim(enabled=False)
             return
         status = self.process_manager.server_status()
         if not status.get("reachable") or status.get("state") != "serving":
+            if status.get("reachable") and status.get("state") == "rebuilding":
+                self._probe_ram()
+                self._tick_reclaim()
+            else:
+                self._tick_reclaim(enabled=False)
             self._serving_since = None
             self._up_exhausted.clear()
             return
@@ -362,6 +371,7 @@ class GovernorLoop(threading.Thread):
             return
 
         free_ram = self._probe_ram()
+        self._tick_reclaim()
         if free_ram is None:
             return
         self.last_free_vram = free_vram
@@ -402,6 +412,21 @@ class GovernorLoop(threading.Thread):
                 # The POST blocks for the whole rebuild; intervals count from completion.
                 self.policy.note_step_done(action.axis, time.monotonic())
                 stepped = True
+
+    def _tick_reclaim(self, *, enabled: bool = True) -> None:
+        """Cache probes never call cache/step or alter layer-placement timers."""
+        target = (self.policy.ram_cushion + self.policy.ram_rungs_before_up * self.policy.rung_bytes
+                  + self.policy.margin + 256 * 1024**2)
+        try:
+            self.reclaimer.tick(
+                windows=self.last_free_windows_ram, linux=self.last_free_linux_ram,
+                target=target,
+                enabled=(enabled and self.enabled and _is_wsl()
+                         and os.environ.get("FREETOKEN_CACHE_RECLAIM", "1") != "0"),
+            )
+        except Exception as exc:  # noqa: BLE001 - optional reclaim cannot disable memory protection
+            # Failed reclamation must never disable emergency expert spills.
+            logger.warning("cache reclaim probe failed: %s", exc)
 
     def _probe_ram(self, *, force_refresh: bool = False) -> int | None:
         # Windows headroom protects the whole host; MemAvailable also respects WSL's
@@ -633,4 +658,5 @@ class GovernorLoop(threading.Thread):
             "ram_source": self.ram_source,
             "ram_probe_error": self.ram_probe_error,
             "up_exhausted": sorted(self._up_exhausted),
+            "reclaim": self.reclaimer.status(),
         }
