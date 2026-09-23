@@ -772,3 +772,31 @@ def test_checkpoint_save_runs_on_the_worker_and_holds_its_node_until_copied(tmp_
     assert entry is not None and entry.token_count == L
     _restore_equals(cm, kv, state, entry, expected_kv, expected_state)
     cm.close()
+
+
+def test_a_queued_checkpoint_slot_is_busy_and_waiting_on_it_frees_nothing(tmp_path, monkeypatch):
+    """The held checkpoint's tree slot is reported busy (the MTP shadow must not borrow it),
+    and allocation-pressure loops do not block on a hold, which releases only a lock."""
+    import threading
+
+    cm, kv, state, table = _manager(tmp_path, mode="ram", num_pages=2200)
+    store = cm.park_store
+    gate = threading.Event()
+    real_save = store.save
+
+    def gated_save(*args, **kwargs):
+        if kwargs.get("_op") is not None:
+            assert gate.wait(10), "test gate never opened"
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(store, "save", gated_save)
+    ids = torch.arange(100, 100 + 4107, dtype=torch.int32)
+    req, L = _admit(cm, kv, state, table, ids, table_idx=0, seed=1)
+    frozen = req.mamba_ping_pong[0]
+    cm.cache_req(req, finished=False)
+    assert frozen in cm.pending_park_slots()
+    assert cm._pending_parks and not cm._releasable_parks_pending()
+    gate.set()
+    _settle(cm)
+    assert cm.pending_park_slots() == set()
+    cm.close()

@@ -408,6 +408,25 @@ class CacheManager:
             self.drain_pending_parks()
         return True
 
+    def pending_park_slots(self) -> set[int]:
+        """GDN slots a background park copy may still be reading: detached leaves' slots and
+        the tree slot of every held checkpoint. Nothing may write them before copy_done."""
+        slots: set[int] = set()
+        for _pending, evicted in self._pending_parks:
+            slots.update(int(slot) for slot in evicted.mamba_slots)
+            node = evicted.lock_node
+            if not evicted.mamba_slots and node is not None and node.mamba_value is not None:
+                slots.add(int(node.mamba_value))
+        return slots
+
+    def _releasable_parks_pending(self) -> bool:
+        """A pending park whose completion returns pages or slots. Checkpoint holds release
+        only a lock, so waiting on them cannot relieve allocation pressure."""
+        return any(
+            evicted.mamba_slots or len(evicted.kv_indices)
+            for _pending, evicted in self._pending_parks
+        )
+
     def drain_pending_parks(self, *, wait: bool = False) -> int:
         """Return copied sources to their allocators; never mutate free lists inside an MTP lease."""
         if self._temporary_lease_depth:
@@ -528,7 +547,7 @@ class CacheManager:
                 self.linear_state_pool.free(er.mamba_slots)
                 self._free(er.kv_indices)
                 continue
-            if self._pending_parks:
+            if self._releasable_parks_pending():
                 self.drain_pending_parks(wait=True)
                 continue
             break
@@ -1243,7 +1262,7 @@ class CacheManager:
             self.drain_pending_parks()
         for wait_for_parks in (False, True):
             if wait_for_parks:
-                if needed_pages <= len(self.free_slots) or not self._pending_parks:
+                if needed_pages <= len(self.free_slots) or not self._releasable_parks_pending():
                     break
                 # D2H completion releases detached leaves AND unlocks their shared source
                 # paths. Evict again below: those ancestors were protected on the first pass.
