@@ -981,11 +981,14 @@ def test_save_failure_waits_for_private_copy_stream_before_releasing_sources(
 
     stream = FakeStream()
     store._stream = stream
-    monkeypatch.setattr(
-        store,
-        "_copy_to_ram",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("mid-copy failed")),
-    )
+    # Fail wherever the copy starts: the page-major source (RAM fast path, which enters the
+    # private stream first) or the per-view fallback's _copy_to_ram.
+    for name in ("_page_source", "_copy_to_ram"):
+        monkeypatch.setattr(
+            store,
+            name,
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("mid-copy failed")),
+        )
     released_after_sync = []
 
     assert not store.save(
