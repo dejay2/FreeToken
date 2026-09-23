@@ -24,6 +24,16 @@ def admission_fits(*, need_now: int, reserved: int, available: int, protect_toke
     return need_now + reserved <= available - protect_tokens
 
 
+def kv_reservation_tokens(total_len: int, cached_len: int, page_size: int) -> int:
+    """KV a request still needs, in tokens, rounded to the whole pages allocate_paged takes.
+
+    Each request gets its own pages, so charging raw tokens let several short requests share
+    one page on paper (upstream #367): with our max of two running requests that undercounted
+    up to ~2 x 63 tokens, enough to overcommit a nearly full dynamic pool. Shared by the real
+    admission and the dynamic KV pool's probe so they can never disagree."""
+    return (div_ceil(total_len, page_size) - div_ceil(cached_len, page_size)) * page_size
+
+
 @dataclass(frozen=True)
 class AdmissionProbe:
     need_now: int
@@ -327,7 +337,7 @@ class CacheManager:
         cached_len = int(getattr(handle, "cached_len", 0)) if handle is not None else 0
         node = getattr(handle, "node", None)
         protect_tokens = self._evictable_tokens_on_path(node) if node is not None else 0
-        need_now = (input_len - cached_len) + int(output_len)
+        need_now = kv_reservation_tokens(input_len + int(output_len), cached_len, self.page_size)
         empty_limit = self.num_pages * self.page_size
         # Mirrors PrefillAdder's "estimated_len > empty_cache_limit" gate (prefill.py's
         # never-fits rejection), which compares against need_now (cached tokens already
