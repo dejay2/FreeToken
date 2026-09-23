@@ -60,6 +60,7 @@ def test_named_prefix_restores_exact_endpoint_without_a_second_forward(tmp_path,
         co.drained_chunk(req)
         with cm.lazy_free_region():
             cm.cache_req(req, finished=True)
+            _settle(cm)
             tm.free(req.table_idx)
             req.table_idx = -1
             co.completed(req)
@@ -243,6 +244,13 @@ def _admit(cm, kv, state, table, ids: torch.Tensor, *, table_idx: int, seed: int
     return req, L
 
 
+def _settle(cm) -> None:
+    """Background checkpoint saves: wait for the worker, then release the copy locks."""
+    if cm.park_store is not None:
+        cm.park_store.flush()
+        cm.drain_pending_parks(wait=True)
+
+
 def _entry(cm, ids: torch.Tensor):
     return cm.park_store._entries.get(rolling_page_keys(ids, PAGE, cm.park_store.fingerprint)[-1])
 
@@ -277,6 +285,7 @@ def test_final_prefill_checkpoint_is_saved_before_slot_pressure_and_survives_evi
     free_pages_before = len(cm.free_slots)
 
     cm.cache_req(req, finished=False)
+    _settle(cm)
 
     # The checkpoint at L is stored now, from the canonical pages and the frozen tree slot.
     entry = _entry(cm, ids[:L])
@@ -301,6 +310,7 @@ def test_final_prefill_checkpoint_is_saved_before_slot_pressure_and_survives_evi
     ids12 = torch.arange(100, 100 + finish_len, dtype=torch.int32)
     req.input_ids = ids12
     cm.cache_req(req, finished=True)
+    _settle(cm)
     cm.check_integrity()
     finish = cm.prefix_cache.match_prefix(ids12)
     assert finish.cached_len == finish_len and finish.node.park_finished is True
@@ -356,10 +366,12 @@ def test_a_saved_checkpoint_leaves_the_live_tree_without_a_rewrite(tmp_path, mon
     ids = torch.arange(200, 209, dtype=torch.int32)        # 9 tokens -> L = 8
     req, L = _admit(cm, kv, state, table, ids, table_idx=0, seed=3)
     cm.cache_req(req, finished=False)
+    _settle(cm)
     entry = _entry(cm, ids[:L])
     assert entry is not None
     # Unaligned finish (9 tokens): no finish donate, the checkpoint stays the deepest node.
     cm.cache_req(req, finished=True)
+    _settle(cm)
     cm.check_integrity()
     writes = []
     real_write = store._write_ssd
@@ -386,8 +398,10 @@ def test_no_eager_checkpoint_on_off_private_or_aborted_paths(tmp_path, path):
     if path == "aborted":
         req.aborted = True
         cm.cache_req(req, finished=True)            # the abort drain frees at finish
+        _settle(cm)
     else:
         cm.cache_req(req, finished=False)
+        _settle(cm)
     if cm.park_store is not None:
         assert cm.park_store.status()["parked_count"] == 0
     if path == "aborted":
@@ -397,6 +411,7 @@ def test_no_eager_checkpoint_on_off_private_or_aborted_paths(tmp_path, path):
         assert req.mamba_ping_pong is None and req.linear_slot_idx is None
     else:
         cm.cache_req(req, finished=True)
+        _settle(cm)
     cm.check_integrity()
     cm.close()
 
@@ -455,6 +470,7 @@ def test_eager_save_reads_canonical_pages_not_the_freed_duplicates(tmp_path, mod
     # Disable the store around the first commit so only the tree learns the prefix.
     store._disabled = True
     cm.cache_req(first, finished=False)
+    _settle(cm)
     store._disabled = False
     assert store.status()["parked_count"] == 0
     canonical = cm.prefix_cache.match_prefix(ids[:L])
@@ -484,6 +500,7 @@ def test_eager_save_reads_canonical_pages_not_the_freed_duplicates(tmp_path, mod
     pages_before = len(cm.free_slots)
 
     cm.cache_req(second, finished=False)
+    _settle(cm)
 
     entry = _entry(cm, ids[:L])
     assert entry is not None
@@ -494,7 +511,9 @@ def test_eager_save_reads_canonical_pages_not_the_freed_duplicates(tmp_path, mod
     assert second.cache_handle.node is canonical.node and canonical.node.ref_count == 2
     _restore_equals(cm, kv, state, entry, canonical_kv, canonical_state)
     cm.cache_req(first, finished=True)
+    _settle(cm)
     cm.cache_req(second, finished=True)
+    _settle(cm)
     cm.check_integrity()
     cm.close()
 
@@ -511,6 +530,7 @@ def test_early_eos_checkpoint_is_saved_once_and_unaligned_finish_still_falls_bac
     slots_before = state.num_free_slots
 
     cm.cache_req(req, finished=True)                        # EOS right after the final prefill
+    _settle(cm)
 
     entry = _entry(cm, ids[:L])
     assert entry is not None and store.status()["parked_count"] == 1
@@ -529,6 +549,7 @@ def test_early_eos_checkpoint_is_saved_once_and_unaligned_finish_still_falls_bac
     again, _ = _admit(cm, kv, state, table, ids, table_idx=1, seed=13)
     before = store.status()["parked_bytes"]
     cm.cache_req(again, finished=True)
+    _settle(cm)
     assert store.status()["parked_count"] == 1 and store.status()["parked_bytes"] == before
     cm.check_integrity()
     cm.close()
@@ -547,6 +568,7 @@ def test_main_side_and_next_turn_park_incrementally_through_the_manager(tmp_path
         req, L = _admit(cm, kv, state, table, ids, table_idx=table_idx, seed=seed)
         live = req.cache_handle.cached_len
         cm.cache_req(req, finished=False)
+        _settle(cm)
         # one decoded token, then finish
         req.input_ids = torch.cat([ids, torch.tensor([seed * 1000], dtype=torch.int32)])
         req.cached_len = len(req.input_ids)
@@ -554,6 +576,7 @@ def test_main_side_and_next_turn_park_incrementally_through_the_manager(tmp_path
         cm.allocate_paged([req])
         _fill(_page_views(kv, table[table_idx, len(ids) : req.cached_len : PAGE]), seed + 5)
         cm.cache_req(req, finished=True)
+        _settle(cm)
         cm.check_integrity()
         # Idle between turns: every completed leaf is parked and the tree drains.
         while cm.park_idle(now_ns=10**30):
@@ -618,6 +641,7 @@ def test_eager_checkpoint_survives_replacement_with_all_twelve_slots_occupied(tm
     victim_ids = torch.arange(800, 811, dtype=torch.int32)
     victim, victim_L = _admit(cm, kv, state, table, victim_ids, table_idx=0, seed=20)
     cm.cache_req(victim, finished=True)
+    _settle(cm)
     victim_node = cm.prefix_cache.match_prefix(victim_ids[:victim_L]).node
     victim_slot = victim_node.mamba_value
     assert victim_slot is not None and victim_node.ref_count == 0
@@ -637,8 +661,11 @@ def test_eager_checkpoint_survives_replacement_with_all_twelve_slots_occupied(tm
         calls.append(n)
         assert state.num_free_slots == 0
         entry = _entry(cm, ids[:L])
-        assert entry is not None, "save must precede replacement-slot reclamation"
         match = cm.prefix_cache.match_prefix(ids[:L])
+        # Saved already, or queued on the worker with its node held by a copy lock until the
+        # D2H completes: either way reclamation below cannot take the checkpoint's state.
+        queued = any(ev.lock_node is match.node for _p, ev in cm._pending_parks)
+        assert entry is not None or queued, "checkpoint must be saved or held before reclamation"
         assert match.mamba_value == frozen
         assert match.node.ref_count > 0 and match.node.mamba_ref_count > 0
         real_ensure(n)
@@ -647,6 +674,7 @@ def test_eager_checkpoint_survives_replacement_with_all_twelve_slots_occupied(tm
 
     monkeypatch.setattr(cm, "ensure_mamba_slots", ensure)
     cm.cache_req(req, finished=False)
+    _settle(cm)
     assert calls == [1]
     assert state.num_free_slots == 0
     assert req.mamba_ping_pong[0] == victim_slot
@@ -660,6 +688,7 @@ def test_eager_checkpoint_survives_replacement_with_all_twelve_slots_occupied(tm
     state.free(held)
     monkeypatch.setattr(cm, "ensure_mamba_slots", real_ensure)
     cm.cache_req(req, finished=True)
+    _settle(cm)
     cm.check_integrity()
     _restore_equals(cm, kv, state, _entry(cm, ids[:L]), expected_kv, expected_state)
     while cm.park_idle(now_ns=10**30):
@@ -686,6 +715,7 @@ def test_eager_save_failure_leaves_live_state_and_ordinary_finish_intact(tmp_pat
     real_save = store.save
     monkeypatch.setattr(store, "save", failing_save)
     cm.cache_req(req, finished=False)
+    _settle(cm)
     assert calls == [1]
     assert "disk gone" in str(store.status()["last_error"])
     node = cm.prefix_cache.match_prefix(ids[:L]).node
@@ -694,9 +724,51 @@ def test_eager_save_failure_leaves_live_state_and_ordinary_finish_intact(tmp_pat
     assert node.park_finished is True, "eligible for an ordinary retry through the leaf path"
     monkeypatch.setattr(store, "save", real_save)
     cm.cache_req(req, finished=True)
+    _settle(cm)
     cm.check_integrity()
     assert cm.park_idle(now_ns=10**30) == 1
     cm.drain_pending_parks(wait=True)
     store.flush()
     assert store.status()["parked_count"] == 1 and _entry(cm, ids[:L]) is not None
+    cm.close()
+
+
+@pytest.mark.parametrize("mode", ["ram", "ssd"])
+def test_checkpoint_save_runs_on_the_worker_and_holds_its_node_until_copied(tmp_path, monkeypatch, mode):
+    """The final-prefill commit queues the checkpoint instead of copying it inline (2026-09-23:
+    the inline copy held the first answer token 8-11 s on the 5090). Until the worker's copy
+    lands, the checkpoint node carries one extra lock; afterwards the entry exists and the
+    node is back to the request's own lock."""
+    import threading
+
+    cm, kv, state, table = _manager(tmp_path, mode=mode, num_pages=2200)
+    store = cm.park_store
+    gate = threading.Event()
+    real_save = store.save
+
+    def gated_save(*args, **kwargs):
+        if kwargs.get("_op") is not None:               # the worker's queued save only
+            assert gate.wait(10), "test gate never opened"
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(store, "save", gated_save)
+    ids = torch.arange(100, 100 + 4107, dtype=torch.int32)
+    req, L = _admit(cm, kv, state, table, ids, table_idx=0, seed=1)
+    frozen = req.mamba_ping_pong[0]
+    expected_kv = _raw(_page_views(kv, table[0, :L:PAGE]))
+    expected_state = _raw(state.slot_byte_views(frozen))
+
+    cm.cache_req(req, finished=False)                   # returns with the copy still gated
+    node = cm.prefix_cache.match_prefix(ids[:L]).node
+    assert _entry(cm, ids[:L]) is None
+    assert [ev.lock_node for _p, ev in cm._pending_parks] == [node]
+    assert node.ref_count == 2                          # the request's lock + the copy lock
+    assert cm.drain_pending_parks() == 0                # not copied yet: nothing released
+
+    gate.set()
+    _settle(cm)
+    assert cm._pending_parks == [] and node.ref_count == 1
+    entry = _entry(cm, ids[:L])
+    assert entry is not None and entry.token_count == L
+    _restore_equals(cm, kv, state, entry, expected_kv, expected_state)
     cm.close()

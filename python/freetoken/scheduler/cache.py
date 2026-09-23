@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 from freetoken.core import Req
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
+from freetoken.kvcache.hybrid_radix_cache import EvictResult
 from freetoken.utils import align_down, div_ceil, init_logger
 
 if TYPE_CHECKING:
@@ -781,8 +782,8 @@ class CacheManager:
         )
 
     def _save_prompt_checkpoint(self, match, input_ids: torch.Tensor, L: int) -> bool:
-        """Persist the final-prefill checkpoint at ``L`` as its own RAM or SSD segment, synchronously
-        and without detaching anything from the tree.
+        """Persist the final-prefill checkpoint at ``L`` as its own RAM or SSD segment, without
+        detaching anything from the tree.
 
         On the live 5090 (2026-09-10, v4 parent links) real agent traffic linked almost no
         saves and hit 1 restore in 18: the harness sends one conversation prefix two or three
@@ -790,22 +791,37 @@ class CacheManager:
         before the end of the previous *finish* save, whose state encodes the side request's
         tail. The prefix every later request really shares is this prompt checkpoint, and it
         must be saved now: the engine has 12 state slots, so an internal snapshot may be
-        tombstoned long before it becomes a parkable leaf. The save reads the canonical tree
-        pages and the frozen tree slot (never the request's advancing live slot) while the
-        request's lock protects them, and returns before the caller releases anything, so
-        page/state ownership is unchanged. This is a deliberate, bounded synchronous choice:
-        it may delay the final-prefill reply while the disk write completes (J4 records that
-        latency) but adds no second GPU-ownership mode or extra state slot. A first save of a
-        new conversation is the expensive one; later checkpoints add one state plus changed
-        pages. Failure or refusal leaves inference untouched and surfaces in park status.
+        tombstoned long before it becomes a parkable leaf.
+
+        The save is queued on the store's background worker (``offer``) when it has room. The
+        checkpoint's tree node takes an extra lock until the worker's D2H copy completes, so
+        its canonical pages and frozen tree slot can be neither evicted nor reissued meanwhile;
+        ``drain_pending_parks`` drops that lock and frees nothing (the node stays in the tree).
+        Measured 2026-09-23 on the 5090 (py-spy, 50k-token prompt, RAM parking): the
+        synchronous save cost ~3.4 s of scheduler time (1.2 s pinned allocation, ~2 s of
+        per-page copy slicing, ~1 s copy) and held the first answer token 8-11 s once the
+        chunk-carried checkpoint (upstream #505) made it run on every long prompt. A full
+        worker queue or a store without one falls back to the synchronous save. Failure or
+        refusal leaves inference untouched and surfaces in park status.
         """
         store = self.park_store
         if store is None:
             return False
+        page_bases = match.kv_indices[:: self.page_size]
         try:
-            return bool(
-                store.save(input_ids[:L], match.kv_indices[:: self.page_size], match.mamba_value)
-            )
+            self.prefix_cache.inc_lock(match.node)
+            try:
+                pending = store.offer(input_ids[:L], page_bases, match.mamba_value)
+            except Exception:
+                self.prefix_cache.dec_lock(match.node)
+                raise
+            if pending is not None:
+                # Released (lock only) by drain_pending_parks once the copy is done.
+                self._pending_parks.append((pending, EvictResult(match.kv_indices[:0], [], match.node)))
+                self.drain_pending_parks()
+                return True
+            self.prefix_cache.dec_lock(match.node)
+            return bool(store.save(input_ids[:L], page_bases, match.mamba_value))
         except Exception as exc:
             logger.warning(f"KV park prompt checkpoint save failed: {exc!r}")
             note_error = getattr(store, "note_error", None)
