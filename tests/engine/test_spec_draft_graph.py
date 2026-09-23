@@ -401,8 +401,8 @@ def test_the_device_position_staging_reproduces_the_host_arithmetic():
         (SamplingParams(temperature=0.9, top_k=1), (0.0, -1, 1.0)),
         (SamplingParams(temperature=0.9, top_k=0), (0.9, -1, 1.0)),
         (SamplingParams(temperature=0.9, top_k=40, top_p=0.95), (0.9, 40, 0.95)),
-        # temperature 0 with a top_p is SAMPLED by the server (Sampler.prepare floors it)
-        (SamplingParams(temperature=0.0, top_p=0.8), (1e-6, -1, 0.8)),
+        # temperature 0 is argmax whatever top_p says (upstream #471)
+        (SamplingParams(temperature=0.0, top_p=0.8), (0.0, -1, 1.0)),
     ],
 )
 def test_the_request_filter_lands_in_the_samplers_three_cells(params, expected):
