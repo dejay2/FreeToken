@@ -915,6 +915,13 @@ class ParkStore:
                 )
             return None
         page_ids = bases // self.page_size
+        # index_select/index_copy_ on CUDA turn an out-of-range id into a device-side assert
+        # that poisons the context; the old per-view path raised IndexError here instead.
+        if len(page_ids) and int(page_ids.max()) >= int(regions[0].shape[0]):
+            raise IndexError(
+                f"park page {int(page_ids.max())} is outside the pool's "
+                f"{int(regions[0].shape[0])} pages"
+            )
         if self._stream is not None:
             # On the private stream, never the caller's: the worker thread's current stream is
             # the scheduler's, and fed931c (2026-09-23) showed what foreign work on a stream

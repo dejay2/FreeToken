@@ -665,6 +665,12 @@ def test_eager_checkpoint_survives_replacement_with_all_twelve_slots_occupied(tm
         # Saved already, or queued on the worker with its node held by a copy lock until the
         # D2H completes: either way reclamation below cannot take the checkpoint's state.
         queued = any(ev.lock_node is match.node for _p, ev in cm._pending_parks)
+        if entry is None and not queued:
+            # The copy finished and drain dropped the hold, but the worker has not published
+            # yet (copy_done is set before _publish): the state was already read, so wait for
+            # the entry rather than fail on that window (flaked 3/64 before the fast copy too).
+            store.flush()
+            entry = _entry(cm, ids[:L])
         assert entry is not None or queued, "checkpoint must be saved or held before reclamation"
         assert match.mamba_value == frozen
         assert match.node.ref_count > 0 and match.node.mamba_ref_count > 0
