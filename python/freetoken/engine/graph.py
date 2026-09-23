@@ -206,7 +206,15 @@ class GraphRunner:
                 self.buffer.logits[:bs] = model.forward()
                 # Keep the offload cache warmed for capture. Resetting here forces
                 # CUDA graph capture to replay cold-cache expert copies.
-                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                # thread_local, like the MTP captures: the KV-park worker's pinned allocation
+                # and D2H copies on its own stream must not invalidate this capture. Global
+                # mode latched the server on the 5090 on 2026-09-23, when a governor MoE-only
+                # cache step re-captured while a prompt-checkpoint save was copying
+                # (cudaErrorStreamCaptureInvalidated). A MoE-only step skips prepare_rebuild's
+                # park flush.
+                with torch.cuda.graph(
+                    graph, pool=pool, stream=self.stream, capture_error_mode="thread_local"
+                ):
                     self.buffer.logits[:bs] = model.forward()
                 self._reset_moe_offload_cache()
             if pool is None:

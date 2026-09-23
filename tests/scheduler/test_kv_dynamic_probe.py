@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import torch
 
-from freetoken.scheduler.cache import AdmissionProbe, CacheManager, admission_fits
+from freetoken.scheduler.cache import (
+    AdmissionProbe,
+    CacheManager,
+    admission_fits,
+    kv_reservation_tokens,
+)
 
 
 class _StatePool:
@@ -146,3 +151,24 @@ def test_probe_reads_the_handle_of_a_plain_radix_cache():
     assert probe.cached_len == 32                        # the inserted prefix, not 0
     assert probe.need_now == 2 + 8
     assert probe.protect_tokens == 32                    # evictable now, locked on admission
+
+
+def test_reservations_are_whole_pages_like_allocate_paged():
+    # Upstream #367: each request takes its own pages, so a 10-token request costs a page.
+    assert kv_reservation_tokens(10, 0, 64) == 64
+    assert kv_reservation_tokens(130, 64, 64) == 128    # pages 1..2; page 0 already held
+    assert kv_reservation_tokens(128, 128, 64) == 0
+    # A partly filled last page is already allocated, so only the pages past it count.
+    assert kv_reservation_tokens(100, 70, 64) == 0
+
+
+def test_probe_charges_whole_pages_like_the_real_admission():
+    table = torch.zeros((4, 1024), dtype=torch.int32)
+    cm = CacheManager(8, 64, table, "hybrid_radix", linear_state_pool=_StatePool())
+    probe = cm.probe_admission(torch.arange(1, 11), output_len=5, reserved=0)
+    assert probe.cached_len == 0 and probe.need_now == 64
+    # Eight free pages. With seven reserved the last page still seats this request; with 7.5
+    # pages reserved it does not, although raw tokens (15) would say 32 more tokens are free.
+    assert cm.available_size == 8 * 64
+    assert cm.probe_admission(torch.arange(1, 11), output_len=5, reserved=7 * 64).fits_now
+    assert not cm.probe_admission(torch.arange(1, 11), output_len=5, reserved=7 * 64 + 32).fits_now

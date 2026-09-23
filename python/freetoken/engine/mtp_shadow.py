@@ -1291,10 +1291,15 @@ class MTPShadowObserver:
                 shadow_slot = pool.alloc(1)[0]
                 owns_shadow_slot = True
             else:
+                # A background KV-park copy may still be reading a tree slot (a queued prompt
+                # checkpoint) or a detached leaf's slot; borrowing it would park a corrupted
+                # state that later restores unchecked.
+                pending_slots = getattr(self.cache_manager, "pending_park_slots", None)
+                busy = set(pending_slots()) if pending_slots is not None else set()
                 candidates = [
                     slot
                     for slot in range(1, pool.num_slots)
-                    if slot not in captured.protected_linear_slots
+                    if slot not in captured.protected_linear_slots and slot not in busy
                 ]
                 if not candidates:
                     raise RuntimeError("MTP verifier has no inactive recurrent slot to borrow")

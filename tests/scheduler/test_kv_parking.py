@@ -575,8 +575,20 @@ def test_idle_threshold_waits_until_the_leaf_is_old_enough(tmp_path: Path):
     cm.park_idle(now_ns=node.timestamp + 999_000_000)
     assert len(cm.free_slots) == free_before
     assert cm.park_store.status()["parked_count"] == 0
+    # Hold the worker's copy until the in-flight check has run: the free list must not grow
+    # before copy_done. Unheld, this raced the worker (1/30 runs on the per-view path, 3/30
+    # once the 2026-09-23 page-major copy made the save faster).
+    release = threading.Event()
+    real_copy = cm.park_store._copy_to_ram
+
+    def held_copy(source):
+        release.wait(timeout=10)
+        return real_copy(source)
+
+    cm.park_store._copy_to_ram = held_copy
     cm.park_idle(now_ns=node.timestamp + 1_000_000_000)
     assert len(cm.free_slots) == free_before
+    release.set()
     cm.drain_pending_parks(wait=True)
     cm.park_store.flush()  # copy_done releases GPU sources; publication may finish later.
     assert len(cm.free_slots) == free_before + 2

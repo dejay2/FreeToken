@@ -9,6 +9,7 @@ from freetoken import diag
 from freetoken.core import Batch, Req
 from freetoken.utils import align_down, div_ceil, init_logger
 
+from .cache import admission_fits, kv_reservation_tokens
 from .mm import mm_chunk_end, mm_rows_after
 from .utils import PendingReq
 
@@ -107,22 +108,23 @@ class PrefillAdder:
         cached_len = handle.cached_len
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
-        estimated_len = extend_len + req.output_len
+        # Whole pages, as allocate_paged will take them (upstream #367).
+        estimated_len = kv_reservation_tokens(
+            req.input_len + req.output_len, cached_len, self.cache_manager.page_size
+        )
         # Reject only what can NEVER fit, even with an empty cache and no other request running.
         # reserved_size (other requests' in-flight decode) is deliberately not subtracted: that
         # shrinks as they finish, so a request blocked by it must wait, not be refused (R1).
         empty_cache_limit = self.cache_manager.num_pages * self.cache_manager.page_size
         if estimated_len > empty_cache_limit:
             reason = (
-                f"KV admission gate rejected request {req.uid}: needs {estimated_len} tokens "
+                f"KV admission gate rejected request {req.uid}: needs {estimated_len} tokens in whole pages "
                 f"(prompt {extend_len} + output budget {req.output_len}), but the KV pool holds "
                 f"{empty_cache_limit} tokens even when empty"
             )
             req.admission_error = reason
             logger.warning_rank0(reason)
             return None
-
-        from .cache import admission_fits
 
         if not admission_fits(need_now=estimated_len, reserved=self.reserved_size,
                               available=self.cache_manager.available_size, protect_tokens=0):
@@ -194,6 +196,7 @@ class PrefillAdder:
         next_track_idx: int = 0,
         restore_src: int | None = None,
         swa_evicted_seqlen: int = 0,
+        last_track_seqlen: int | None = None,
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
@@ -249,7 +252,11 @@ class PrefillAdder:
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
-        self.reserved_size += remain_len + pending_req.output_len
+        # CacheManager allocates each request independently in whole pages; reserve the same
+        # page span here, or several short requests are admitted against one page (#367).
+        self.reserved_size += kv_reservation_tokens(
+            pending_req.input_len + pending_req.output_len, cached_len, self.cache_manager.page_size
+        )
         if self.on_reserved is not None:
             self.on_reserved(pending_req.uid)
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
@@ -279,6 +286,9 @@ class PrefillAdder:
         req.linear_slot_idx = linear_slot_idx
         req.mamba_ping_pong = ping_pong
         req.mamba_next_track_idx = next_track_idx
+        # A short continuation cannot make a new snapshot; retain the pending one
+        # together with its ping-pong cursor until the final prefill commit.
+        req.mamba_last_track_seqlen = last_track_seqlen
         req.mamba_restore_src = restore_src
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         return req
@@ -344,6 +354,7 @@ class PrefillAdder:
                 linear_slot_idx=chunked_req.linear_slot_idx,
                 ping_pong=chunked_req.mamba_ping_pong,
                 next_track_idx=chunked_req.mamba_next_track_idx,
+                last_track_seqlen=chunked_req.mamba_last_track_seqlen,
                 restore_src=None,  # continuation chunk already has live state
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
             )
@@ -450,7 +461,7 @@ class PrefillManager:
             # Preparation yields between chunks. Keep its unallocated future pages
             # reserved while another request is admitted, or both can overcommit the pool.
             reserved_size=self.decode_manager.inflight_tokens + sum(
-                p.input_len - p.chunked_req.cached_len
+                kv_reservation_tokens(p.input_len, p.chunked_req.cached_len, self.cache_manager.page_size)
                 for p in self.pending_list if p.prefill_only and p.chunked_req is not None
             ),
             cache_manager=self.cache_manager,

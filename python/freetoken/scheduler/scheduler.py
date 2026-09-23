@@ -348,6 +348,12 @@ class Scheduler(SchedulerIOMixin):
             and (num_pages is not None or num_mamba_slots is not None)
         ):
             self.cache_manager.prepare_rebuild()
+        elif getattr(self.cache_manager, "park_store", None) is not None:
+            # MoE-only step: nothing to park, but let queued checkpoint copies land first so
+            # the teardown and graph re-capture never overlap the worker's CUDA work
+            # (2026-09-23 latch, see engine/graph.py capture).
+            self.cache_manager.drain_pending_parks(wait=True)
+            self.cache_manager.park_store.flush()
         self._note_maintenance_progress("rebuild:prepared", force=True)
         self.engine.rebuild_runtime_cache(
             moe_cache_size=moe_cache_size,

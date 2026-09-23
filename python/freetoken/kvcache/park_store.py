@@ -78,6 +78,16 @@ _VERSION = 5
 _HEADER_BYTES = 4096
 _ALIGNMENT = 4096
 _COPY_BYTES = 32 << 20
+# RAM-tier device staging (2026-09-23). A 782-page (50k-token) prompt checkpoint is 742 MiB
+# (663 MB paged KV + 115 MB GDN state) and saved at 25-50 MB/s on the 5090 under WSL2: ~47k
+# per-view D2H copies (~1 s of pure dispatch on CPU before any WSL per-call cost), a
+# cudaHostAlloc of the whole entry on every save (~1.2 s, up to ~30 s under Windows memory
+# pressure, and an implicit device sync), and a second full D2H pass for the continuation
+# prefix check. The RAM tier now gathers whole pages into one reusable device buffer and moves
+# each chunk with one copy. The buffer holds two chunks (the prefix check compares a gathered
+# chunk with the parent's bytes brought back H2D); 2 x 32 MiB keeps the transient VRAM far
+# inside the 1.5 GB reserve while a 742 MiB entry still moves in ~24 chunks.
+_STAGE_CHUNK_BYTES = 32 << 20
 # Slice size of the payload digest. Independent of --kv-park-window-mib on purpose, so a
 # store booted with a different window size still verifies files an earlier boot wrote.
 _DIGEST_CHUNK_BYTES = 32 << 20
@@ -319,6 +329,71 @@ class _ByteSpan:
         return _ByteSpan.build((
             self.views[index][offset - self.offsets[index]:], *self.views[index + 1:]
         ))
+
+
+@dataclass(frozen=True)
+class _PageSource:
+    """Page-major KV bytes of whole pages, addressed through the pool's per-page regions.
+
+    ``regions`` are the ``[num_pages, bytes_i]`` uint8 views from
+    ``QSAKVCache.page_byte_regions``; row ``p`` of their column-wise concatenation is exactly
+    what ``page_byte_views(p)`` yields, so ``page_ids`` in order serialize to the same bytes
+    as ``_ByteSpan.build`` over the per-page views, followed by ``state``. A few gathers per
+    chunk replace one copy per view (see ``ParkStore._copy_to_ram``).
+    """
+
+    regions: tuple[torch.Tensor, ...]
+    widths: tuple[int, ...]
+    page_ids: torch.Tensor  # int64, on the pool's device
+    page_bytes: int
+    state: _ByteSpan
+
+    @property
+    def num_pages(self) -> int:
+        return int(self.page_ids.numel())
+
+    @property
+    def kv_bytes(self) -> int:
+        return self.num_pages * self.page_bytes
+
+    @property
+    def nbytes(self) -> int:
+        return self.kv_bytes + self.state.nbytes
+
+    def suffix(self, offset: int) -> "_PageSource":
+        """Pages from byte ``offset`` on (a page boundary inside the KV region), plus state."""
+        if offset < 0 or offset > self.kv_bytes or offset % self.page_bytes:
+            raise ValueError(f"park page source suffix {offset} is not a KV page boundary")
+        return _PageSource(
+            self.regions,
+            self.widths,
+            self.page_ids[offset // self.page_bytes :],
+            self.page_bytes,
+            self.state,
+        )
+
+    def gather(self, first: int, count: int, out: torch.Tensor) -> None:
+        """Write pages ``[first, first + count)`` page-major into ``out`` (``[count, page_bytes]``).
+
+        Each region's rows land in their column band through one ``index_select``: the
+        temporary is one region's slice of the chunk (at most ~2.6 MiB for the 5090's 32 KiB
+        K/V regions at a 32 MiB chunk), so no chunk-sized second buffer is ever allocated.
+        """
+        ids = self.page_ids[first : first + count]
+        column = 0
+        for region, width in zip(self.regions, self.widths):
+            if width:
+                out[:, column : column + width].copy_(region.index_select(0, ids))
+            column += width
+
+    def scatter(self, first: int, count: int, src: torch.Tensor) -> None:
+        """Inverse of :meth:`gather`: write ``src`` rows into pages ``[first, first + count)``."""
+        ids = self.page_ids[first : first + count]
+        column = 0
+        for region, width in zip(self.regions, self.widths):
+            if width:
+                region.index_copy_(0, ids, src[:, column : column + width])
+            column += width
 
 
 def _align_up(value: int, alignment: int = _ALIGNMENT) -> int:
@@ -593,6 +668,14 @@ class ParkStore:
         self._writer_lock = Lock()
         self._stream = None
         self._windows: tuple[torch.Tensor, torch.Tensor] | None = None
+        # RAM-tier device staging: allocated on first use, reused by every save, prefix check
+        # and restore, released by close(). _staging_lock makes each chunk's enqueue sequence
+        # (gather -> D2H, or H2D -> scatter) atomic between the save worker and a restore;
+        # both run on self._stream, so the stream itself orders reuse of the bytes.
+        self._staging: torch.Tensor | None = None
+        self._staging_lock = Lock()
+        self._stage_chunk_bytes = _STAGE_CHUNK_BYTES
+        self._regions_warned = False
         self._save_queue: Queue[PendingPark | None] | None = None
         self._worker: Thread | None = None
         self._digest_pool: ThreadPoolExecutor | None = None
@@ -786,21 +869,153 @@ class ParkStore:
         # Keep the parent allocation alive; a tensor slice owns its storage, including the slack.
         return window
 
-    def _copy_to_ram(self, span: _ByteSpan) -> torch.Tensor:
-        payload_bytes = span.nbytes
-        if self.kv_pool.device.type == "cuda":
-            from freetoken.kernel.pinned import alloc_pinned_tensor
+    # ---- RAM tier: page-major gather through one device staging buffer -------------------
 
-            host = alloc_pinned_tensor(payload_bytes, dtype=torch.uint8)
-        else:
-            host = torch.empty(payload_bytes, dtype=torch.uint8)
-        if self._stream is None:
-            self._copy_span_to_window(span, 0, payload_bytes, host)
-        else:
-            current = torch.cuda.current_stream(self.kv_pool.device)
-            self._stream.wait_stream(current)
+    def _page_source(
+        self, page_bases: torch.Tensor, state_slot: int
+    ) -> _PageSource | None:
+        """The pages and state as a :class:`_PageSource`, or ``None`` to use per-view spans.
+
+        ``None`` when the pool exposes no ``page_byte_regions`` or its regions do not line up
+        byte-for-byte with ``page_byte_views`` (count, widths, the first and last page's
+        addresses). Checked on every call: a dynamic-pool rebuild reallocates the buffers.
+        """
+        regions_of = getattr(self.kv_pool, "page_byte_regions", None)
+        if regions_of is None:
+            return None
+        bases = page_bases.detach().to(device="cpu", dtype=torch.int64).flatten()
+        for base in bases.tolist():
+            if base < 0 or base % self.page_size:
+                raise ValueError(f"park page base must be aligned, got {base}")
+        regions = tuple(regions_of())
+        widths = tuple(int(region.shape[1]) for region in regions)
+        page_bytes = sum(widths)
+        ok = page_bytes == self.page_size * self._kv_bytes_per_token() and all(
+            region.dim() == 2 and region.dtype == torch.uint8 for region in regions
+        )
+        if ok and regions:
+            last = int(regions[0].shape[0]) - 1
+            for page in {0, last}:
+                views = self.kv_pool.page_byte_views(page)
+                if len(views) != len(regions):
+                    ok = False
+                    break
+                for region, width, view in zip(regions, widths, views):
+                    if int(region.shape[0]) != last + 1 or _tensor_nbytes(view) != width or (
+                        width and region[page].data_ptr() != view.data_ptr()
+                    ):
+                        ok = False
+                        break
+        if not ok or not regions:
+            if not self._regions_warned:
+                self._regions_warned = True
+                logger.warning(
+                    "KV park: pool page regions do not match page_byte_views; "
+                    "using the per-view copy path"
+                )
+            return None
+        page_ids = bases // self.page_size
+        # index_select/index_copy_ on CUDA turn an out-of-range id into a device-side assert
+        # that poisons the context; the old per-view path raised IndexError here instead.
+        if len(page_ids) and int(page_ids.max()) >= int(regions[0].shape[0]):
+            raise IndexError(
+                f"park page {int(page_ids.max())} is outside the pool's "
+                f"{int(regions[0].shape[0])} pages"
+            )
+        if self._stream is not None:
+            # On the private stream, never the caller's: the worker thread's current stream is
+            # the scheduler's, and fed931c (2026-09-23) showed what foreign work on a stream
+            # near a decode-graph capture costs. Every later use is on this stream too.
             with torch.cuda.stream(self._stream):
-                self._copy_span_to_window(span, 0, payload_bytes, host)
+                page_ids = page_ids.to(device=regions[0].device)
+        else:
+            page_ids = page_ids.to(device=regions[0].device)
+        return _PageSource(
+            regions,
+            widths,
+            page_ids,
+            page_bytes,
+            _ByteSpan.build(self.state_pool.slot_byte_views(int(state_slot))),
+        )
+
+    def _pages_per_chunk(self, page_bytes: int) -> int:
+        return max(1, self._stage_chunk_bytes // page_bytes)
+
+    def _staging_halves(self, page_bytes: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Two ``chunk``-byte halves of the one cached device staging buffer.
+
+        Called with ``_staging_lock`` held. Allocated outside inference mode so the save
+        worker and a restore on the scheduler thread may both write it whichever mode each
+        runs in (see the inference-mode note in ``__init__``).
+        """
+        chunk = self._pages_per_chunk(page_bytes) * page_bytes
+        half = _align_up(chunk, 512)
+        if self._staging is None or self._staging.numel() < 2 * half:
+            self._staging = None
+            with torch.inference_mode(False):
+                self._staging = torch.empty(
+                    2 * half, dtype=torch.uint8, device=self.kv_pool.device
+                )
+        return self._staging[:chunk], self._staging[half : half + chunk]
+
+    @contextlib.contextmanager
+    def _copy_stream(self):
+        """Order work after the producer stream and run it on the private copy stream."""
+        if self._stream is None:
+            yield
+            return
+        self._stream.wait_stream(torch.cuda.current_stream(self.kv_pool.device))
+        with torch.cuda.stream(self._stream):
+            yield
+
+    @staticmethod
+    def _bytes_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+        # torch.equal materialises an elementwise bool tensor; comparing 8-byte words keeps
+        # that temporary at 1/8 of the chunk on the device.
+        if a.numel() % 8 == 0 and a.data_ptr() % 8 == 0 and b.data_ptr() % 8 == 0:
+            return torch.equal(a.view(torch.int64), b.view(torch.int64))
+        return torch.equal(a, b)
+
+    def _gather_to_host(self, source: _PageSource, host: torch.Tensor) -> None:
+        """Serialize ``source``'s pages into ``host[:source.kv_bytes]`` chunk by chunk."""
+        page_bytes = source.page_bytes
+        per_chunk = self._pages_per_chunk(page_bytes)
+        for first in range(0, source.num_pages, per_chunk):
+            count = min(per_chunk, source.num_pages - first)
+            dest = host[first * page_bytes : (first + count) * page_bytes].view(count, page_bytes)
+            # CPU pools take the same staged route on purpose: the CPU suite then exercises
+            # the chunking the GPU runs, at the price of one extra memcpy nobody serves on.
+            with self._staging_lock:
+                stage, _other = self._staging_halves(page_bytes)
+                staged = stage[: count * page_bytes].view(count, page_bytes)
+                source.gather(first, count, staged)
+                # One D2H per chunk into pageable memory. CUDA returns from a device-to-
+                # pageable copy only once it has completed, so the next chunk's gather cannot
+                # overwrite bytes still in flight even before the stream order says so.
+                dest.copy_(staged, non_blocking=True)
+
+    def _copy_to_ram(self, source: _PageSource | _ByteSpan) -> torch.Tensor:
+        """Copy one segment's KV suffix plus state into ordinary pageable host memory.
+
+        Never pinned (2026-09-23): cudaHostAlloc of the whole entry on every save cost ~1.2 s
+        live, up to ~30 s under Windows memory pressure, synchronised the device, and every
+        eviction paid cudaFreeHost (another sync). One large D2H per staged chunk into
+        pageable memory needs no pinning to run near PCIe rate (vLLM measured ~17 GB/s on
+        WSL2). Returns only after the private stream has finished every read of the source
+        pages and state, which is what lets the caller signal ``copy_done``.
+        """
+        host = torch.empty(source.nbytes, dtype=torch.uint8)
+        with self._copy_stream():
+            if isinstance(source, _PageSource):
+                self._gather_to_host(source, host)
+                if source.state.nbytes:
+                    # 74 state views (~115 MB) stay on the per-view path: few calls, big copies.
+                    self._copy_span_to_window(
+                        source.state, 0, source.state.nbytes, host[source.kv_bytes :]
+                    )
+            else:
+                self._copy_span_to_window(source, 0, source.nbytes, host)
+        if self._stream is not None:
             self._stream.synchronize()
         return host
 
@@ -1818,6 +2033,8 @@ class ParkStore:
         ranges = self._chain_ranges(chain, cut)
         if ranges is None:
             return False
+        if isinstance(span, _PageSource):
+            return self._ram_prefix_matches_on_device(span, ranges)
         per_token = self._kv_bytes_per_token()
         window = self._allocate_window(min(self.pinned_window_bytes, 16 << 20))
         for segment, start, stop in ranges:
@@ -1831,6 +2048,49 @@ class ParkStore:
                 self._stage_source_chunk(span, offset, take, window)
                 local = offset - segment.parent_token_count * per_token
                 if not torch.equal(window[:take], buffer[local:local + take]):
+                    return False
+        return True
+
+    def _ram_prefix_matches_on_device(self, source: _PageSource, ranges) -> bool:
+        """Compare the borrowed pages with their parents' RAM bytes on the pool's device.
+
+        The pre-2026-09-23 check staged the whole borrowed prefix back to host through a
+        fresh 16 MiB pinned window (another ~600 MB and ~89k copy calls per 50k-token
+        continuation). Here each chunk of source pages is gathered on the device, the
+        parent's bytes for the same pages go H2D into the other staging half, and one
+        on-device comparison answers the chunk: same byte-identity contract, no pinning.
+        """
+        per_token = self._kv_bytes_per_token()
+        page_bytes = source.page_bytes
+        per_chunk = self._pages_per_chunk(page_bytes)
+        for segment, start, stop in ranges:
+            buffer = segment.ram_buffer
+            if buffer is None or buffer.numel() != segment.payload_bytes:
+                with self._lock:
+                    self._drop_entry(segment.key)
+                return False
+            lo, hi = start * per_token, stop * per_token
+            if hi <= lo:
+                continue
+            if lo % page_bytes or hi % page_bytes:
+                raise RuntimeError("park prefix range is not page aligned")
+            local_base = lo - segment.parent_token_count * per_token
+            first_page, last_page = lo // page_bytes, hi // page_bytes
+            for first in range(first_page, last_page, per_chunk):
+                count = min(per_chunk, last_page - first)
+                nbytes = count * page_bytes
+                local = local_base + (first - first_page) * page_bytes
+                parent_bytes = buffer[local : local + nbytes]
+                with self._copy_stream(), self._staging_lock:
+                    stage, other = self._staging_halves(page_bytes)
+                    staged = stage[:nbytes]
+                    source.gather(first, count, staged.view(count, page_bytes))
+                    expected = other[:nbytes]
+                    expected.copy_(parent_bytes, non_blocking=True)
+                    # .item() inside torch.equal syncs the private stream, so the staging
+                    # halves are free again when the lock is released.
+                    equal = self._bytes_equal(staged, expected)
+                if not equal:
                     return False
         return True
 
@@ -1850,7 +2110,9 @@ class ParkStore:
                         on_copied()
                         return False
                     chain = op.chain
-                span = self._entry_views(bases, state_slot)
+                span = (
+                    self._page_source(bases, state_slot) if self.mode == "ram" else None
+                ) or self._entry_views(bases, state_slot)
                 expected = self.payload_bytes(len(op.tokens))
                 if span.nbytes != expected:
                     raise RuntimeError(f"KV park payload {span.nbytes} != expected {expected}")
@@ -2172,23 +2434,62 @@ class ParkStore:
                 timing["sync_ms"] += (time.perf_counter() - mark) * 1000.0
 
     def _restore_ram(self, chain, kv_span, state_span, source_offset, progress) -> None:
-        """Restore disjoint KV ranges plus only the requested endpoint's full state."""
+        """Restore disjoint KV ranges plus only the requested endpoint's full state.
+
+        With a :class:`_PageSource` destination each chunk of whole pages goes H2D once into
+        the staging buffer and is scattered into the pool with one ``index_copy_`` per
+        region, instead of one copy per page view (~47k for a 782-page entry, 2026-09-23).
+        The caller holds ``_lock`` for the whole restore, as before; ``_staging_lock`` is
+        held for this pass only, so a save worker waits at most for this restore and a
+        restore waits at most for one saved chunk.
+        """
         per_token = self._kv_bytes_per_token()
-        for segment, start, stop in self._chain_ranges(chain, chain[-1].token_count):
-            progress["key"] = segment.key
-            buffer = segment.ram_buffer
-            if buffer is None or buffer.numel() != segment.payload_bytes:
-                raise ParkEntryRejected("RAM parked payload size changed")
-            lo, hi = max(start * per_token, source_offset), stop * per_token
-            if lo < hi:
+        paged = isinstance(kv_span, _PageSource)
+        with contextlib.ExitStack() as held:
+            if paged:
+                held.enter_context(self._staging_lock)
+            for segment, start, stop in self._chain_ranges(chain, chain[-1].token_count):
+                progress["key"] = segment.key
+                buffer = segment.ram_buffer
+                if buffer is None or buffer.numel() != segment.payload_bytes:
+                    raise ParkEntryRejected("RAM parked payload size changed")
+                lo, hi = max(start * per_token, source_offset), stop * per_token
+                if lo >= hi:
+                    continue
                 local = lo - segment.parent_token_count * per_token
-                self._copy_window_to_span(
-                    buffer[local:local + hi - lo], lo - source_offset, hi - lo, kv_span
-                )
+                if paged:
+                    self._scatter_from_host(
+                        kv_span, buffer[local : local + hi - lo], lo - source_offset
+                    )
+                else:
+                    self._copy_window_to_span(
+                        buffer[local:local + hi - lo], lo - source_offset, hi - lo, kv_span
+                    )
         target = chain[-1]
         self._copy_window_to_span(
             target.ram_buffer[target.kv_bytes:], 0, target.state_bytes, state_span
         )
+
+    def _scatter_from_host(self, dest: _PageSource, host: torch.Tensor, offset: int) -> None:
+        """Write ``host`` (whole pages) into ``dest`` from KV byte ``offset``; caller holds
+        ``_staging_lock`` and runs on the copy stream."""
+        page_bytes = dest.page_bytes
+        if offset % page_bytes or host.numel() % page_bytes:
+            raise ParkEntryRejected("RAM parked range is not page aligned")
+        first_page = offset // page_bytes
+        pages = host.numel() // page_bytes
+        if first_page + pages > dest.num_pages:
+            raise ParkEntryRejected("RAM parked range overruns the restore target")
+        per_chunk = self._pages_per_chunk(page_bytes)
+        for done in range(0, pages, per_chunk):
+            count = min(per_chunk, pages - done)
+            chunk = host[done * page_bytes : (done + count) * page_bytes]
+            stage, _other = self._staging_halves(page_bytes)
+            staged = stage[: count * page_bytes]
+            # H2D from pageable memory returns once the driver has taken the bytes; the
+            # scatter and the next chunk's H2D are ordered behind it on the same stream.
+            staged.copy_(chunk, non_blocking=True)
+            dest.scatter(first_page + done, count, staged.view(count, page_bytes))
 
     def restore(
         self,
@@ -2228,9 +2529,19 @@ class ParkStore:
                 raise ValueError("restore target page count does not match parked suffix")
             # Build each destination view once. The redundant SSD split cost 105-109 ms
             # for 2,048 CPU pages in the 2026-09-09 review, outside reported views_ms.
-            kv_span, state_span = self._split_views(bases, state_slot)
-            view_bytes = kv_span.nbytes + state_span.nbytes
-            view_count = len(kv_span.views) + len(state_span.views)
+            paged = (
+                self._page_source(bases, state_slot)
+                if entry.ram_buffer is not None
+                else None
+            )
+            if paged is not None:
+                kv_span, state_span = paged, paged.state
+                view_count = len(paged.regions) + len(state_span.views)
+            else:
+                kv_span, state_span = self._split_views(bases, state_slot)
+                view_count = len(kv_span.views) + len(state_span.views)
+            kv_nbytes = paged.kv_bytes if paged is not None else kv_span.nbytes
+            view_bytes = kv_nbytes + state_span.nbytes
             per_page_bytes = self.page_size * self._kv_bytes_per_token()
             state_bytes = self._state_bytes()
             source_offset = page_offset * per_page_bytes
@@ -2239,7 +2550,7 @@ class ParkStore:
                 raise ParkEntryRejected("restore target layout does not match parked suffix")
             timing["views_ms"] = (time.perf_counter() - mark) * 1000.0
             timing["views"] = float(view_count)
-            timing["kv_bytes"] = float(kv_span.nbytes)
+            timing["kv_bytes"] = float(kv_nbytes)
             timing["state_bytes"] = float(state_span.nbytes)
             timing["page_offset"] = float(page_offset)
             try:
@@ -2518,6 +2829,8 @@ class ParkStore:
         if self._digest_pool is not None:
             self._digest_pool.shutdown(wait=True)
             self._digest_pool = None
+        with self._staging_lock:
+            self._staging = None
 
 
 __all__ = [

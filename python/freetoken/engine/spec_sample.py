@@ -126,6 +126,10 @@ def spec_filter_params(
     """
     if args.temperatures is None:
         return 0.0, -1, 1.0
+    # A greedy row inside a mixed batch carries neutral filters and is replaced by argmax
+    # after sampling (``Sampler.sample``), so it is argmax here too.
+    if args.greedy_mask is not None and bool(args.greedy_mask[row]):
+        return 0.0, -1, 1.0
     temperature = float(args.temperatures[row])
     top_k = -1 if args.top_k is None else int(args.top_k[row])
     top_p = 1.0 if args.top_p is None else float(args.top_p[row])
@@ -137,9 +141,9 @@ def request_filter_params(params) -> tuple[float, int, float]:
 
     The draft head has to choose its filter BEFORE the speculative batch (and so the batch's
     ``BatchSamplingArgs``) exists, and reading the raw params would silently disagree with
-    acceptance: ``Sampler.prepare`` floors a non-greedy request's temperature at 1e-6, so a
-    ``temperature=0, top_p<1`` request is SAMPLED by the server while its raw temperature says
-    argmax. Speculation serves one request per step, which is exactly when ``prepare``'s
+    acceptance: ``Sampler.prepare`` floors a non-greedy request's temperature at 1e-6 and
+    treats ``temperature=0`` or ``top_k=1`` as argmax whatever ``top_p`` says (upstream #471).
+    Speculation serves one request per step, which is exactly when ``prepare``'s
     whole-batch greedy fast path and its per-request path agree, so this reproduction is
     total; ``tests/engine/test_spec_draft.py`` pins it against the real ``Sampler``.
     """

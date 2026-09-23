@@ -252,6 +252,38 @@ class QSAKVCache(MHAKVCache):
             )
         return tuple(views)
 
+    def page_byte_regions(self) -> tuple[torch.Tensor, ...]:
+        """The storage behind :meth:`page_byte_views` as ``[num_pages, bytes]`` uint8 views.
+
+        Region ``i`` row ``p`` is exactly the bytes of ``page_byte_views(p)[i]`` (same order,
+        no copy), so ``torch.cat([r.index_select(0, ids) for r in regions], dim=1)`` is the
+        page-major serialization KV parking has always used, built with one gather per region
+        instead of one copy per page view. Added 2026-09-23: a 782-page (50k-token) RAM park
+        issued ~47k per-view D2H copies (60 views per page) and ran at 25-50 MB/s on the
+        5090 under WSL2.
+        """
+        num_pages = int(self._kv_buffer.shape[2])
+        regions = [
+            self._kv_buffer[kv, layer].view(num_pages, -1).view(torch.uint8)
+            for kv in range(int(self._kv_buffer.shape[0]))
+            for layer in range(int(self._kv_buffer.shape[1]))
+        ]
+        rows = self._page_size // self._index_ratio
+        regions.extend(
+            self._cmp_k_buffer[layer, : num_pages * rows]
+            .view(num_pages, -1)
+            .view(torch.uint8)
+            for layer in range(self._num_index_layers)
+        )
+        scale_buffer = getattr(self, "_kv_scale_buffer", None)
+        if scale_buffer is not None:
+            regions.extend(
+                scale_buffer[kv, layer].view(num_pages, -1).view(torch.uint8)
+                for kv in range(int(scale_buffer.shape[0]))
+                for layer in range(int(scale_buffer.shape[1]))
+            )
+        return tuple(regions)
+
     def unit_bytes(self) -> tuple[int, int]:
         # Only the shadow slab scales with pages, and only its non-scratch rows; the ring and
         # the scratch rows are the fixed term kv_cost reports separately.
