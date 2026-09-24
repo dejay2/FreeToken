@@ -507,6 +507,31 @@ def _vram_used_mb() -> int | None:
         return None
 
 
+# The card counts as released once this many one-second VRAM samples agree within the band.
+_VRAM_SETTLE_SAMPLES = 3
+_VRAM_SETTLE_BAND_MB = 256
+# ...and only after the card fell by at least this much from before the kill: a process the
+# pid scan missed holds a perfectly flat card, which must not pass as "released".
+_VRAM_SETTLE_MIN_DROP_MB = 2048
+
+
+def _vram_settled(samples: list[int]) -> bool:
+    return len(samples) >= _VRAM_SETTLE_SAMPLES and max(samples) - min(samples) <= _VRAM_SETTLE_BAND_MB
+
+
+def _pid_alive(pid: int) -> bool:
+    """A zombie has already freed its memory and CUDA context; only its parent's reap is left."""
+    if not os.path.exists(f"/proc/{pid}"):
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except FileNotFoundError:
+        return False  # reaped between the two checks
+    except (OSError, IndexError):
+        return True
+
+
 def stop_servers(
     port: int = 0,
     *,
@@ -518,6 +543,7 @@ def stop_servers(
     """Terminate the server on ``port`` and wait until the card and the ports are free."""
     pids = find_server_pids(port)
     report: dict[str, Any] = {"killed": sorted(pids), "port": port}
+    vram_before = _vram_used_mb() if pids else None
     term = signal.SIGTERM
     kill = getattr(signal, "SIGKILL", term)  # Windows has no SIGKILL; this path only runs on Linux
     for sig in (term, kill):
@@ -531,16 +557,30 @@ def stop_servers(
         deadline = monotonic() + (10.0 if sig == term else 5.0)
         while pids and monotonic() < deadline:
             sleep(0.5)
-            pids = {pid for pid in pids if os.path.exists(f"/proc/{pid}")}
+            pids = {pid for pid in pids if _pid_alive(pid)}
         if not pids:
             break
     report["remaining"] = sorted(pids)
     watched = set(range(port, port + 10)) if port else set()
     deadline = monotonic() + timeout
+    samples: list[int] = []
     while monotonic() < deadline:
         busy_ports = _listeners(watched) if watched else set()
         used = _vram_used_mb()
+        if used is not None:
+            samples = (samples + [used])[-_VRAM_SETTLE_SAMPLES:]
         card_busy = used is not None and used >= vram_free_threshold_mb
+        fell = vram_before is not None and used is not None and vram_before - used >= _VRAM_SETTLE_MIN_DROP_MB
+        # Nothing of ours was big: no server process was found at all, or it held less than
+        # the drop we look for (a boot cancelled early). Then a steady card is someone else's.
+        ours_small = vram_before is None or vram_before < vram_free_threshold_mb + _VRAM_SETTLE_MIN_DROP_MB
+        if card_busy and not pids and (fell or ours_small) and _vram_settled(samples):
+            # Other programs (browser, games, another engine) can hold more than the fixed
+            # threshold on their own: live 2026-09-24 the desktop sat at 3.1 GB and every Stop
+            # waited out the full 120 s. With the server processes gone and the card no longer
+            # falling, what is left is not ours.
+            card_busy = False
+            report["vram_settled"] = True
         if not busy_ports and not card_busy:
             report["vram_used_mb"] = used
             report["ok"] = True

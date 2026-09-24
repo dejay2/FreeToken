@@ -200,6 +200,7 @@ def iter_weights(
         desc="Loading weights",
         disable=not get_tp_info().is_primary(),
     ):
+        yielded = False
         with ExitStack() as stack:
             engine_file = stack.enter_context(
                 safetensors.safe_open(file, framework="pt", device=str(device))
@@ -229,12 +230,24 @@ def iter_weights(
                     from freetoken.models.vision_weight import require_dense_vision_weight
 
                     require_dense_vision_weight(name, tensor)
+                yielded = True
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
                         yield fused
                     continue
                 yield name, tensor
+        # Every tensor of this file has been consumed (the generator only moves on when the
+        # caller asks for more), so its buffered pages are dead weight. Measured on the RTX
+        # 5090 box (WSL, 76 GB cap, 93.6 GB PC) 2026-09-24: these bf16/int8-source shards left
+        # ~8.5-10 GiB in the Linux file cache through the whole expert load, which filled the
+        # VM to its cap and took Windows free RAM to 0 GB. autoMemoryReclaim=gradual only
+        # returns it ~10 min after boot. Mapped pages (mmap vision) are not evicted by this.
+        # Only files we read from: the PLE table shards (47.7 GiB, served warm through the
+        # page cache by the mmap backend) and the expert shards are opened here just to be
+        # skipped, and dropping them would throw a warm PLE cache away on every restart.
+        if yielded:
+            drop_page_cache(file)
 
     assert not fuse_buf, f"Incomplete projection fusions: {sorted(fuse_buf)}"
 

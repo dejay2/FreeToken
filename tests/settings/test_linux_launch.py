@@ -177,3 +177,108 @@ def test_ple_backend_dial_overrides_auto_and_mtp_still_forces_mmap():
     assert _arg(plan, "--ple-backend") == "pinned"
     plan = _plan({"PleBackend": "auto"})
     assert _arg(plan, "--ple-backend") == "disk"
+
+
+def test_stop_servers_accepts_a_card_other_programs_keep_above_the_threshold(monkeypatch):
+    # Live 2026-09-24: the desktop alone held 3.1 GB, over the 3,072 MB bar, and every Stop
+    # waited out its full timeout. Gone processes plus a steady card must be enough.
+    alive = {41}
+    monkeypatch.setattr(ll, "find_server_pids", lambda port: set(alive))
+    monkeypatch.setattr(ll, "_pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(ll.os, "kill", lambda pid, sig: alive.discard(pid))
+    monkeypatch.setattr(ll, "_listeners", lambda ports: set())
+    readings = iter([29000, 20000, 9000, 3150, 3140, 3143])  # first = before the kill
+    monkeypatch.setattr(ll, "_vram_used_mb", lambda: next(readings, 3143))
+    clock = iter(range(0, 1000))
+    report = ll.stop_servers(2020, timeout=120, sleep=lambda _: None, monotonic=lambda: float(next(clock)))
+    assert report["ok"] is True and report["vram_settled"] is True
+    assert report["vram_used_mb"] == 3143
+
+
+def test_stop_servers_keeps_waiting_while_a_live_server_holds_the_card(monkeypatch):
+    monkeypatch.setattr(ll, "find_server_pids", lambda port: {41})
+    monkeypatch.setattr(ll, "_pid_alive", lambda pid: True)  # ignores SIGTERM and SIGKILL
+    monkeypatch.setattr(ll.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(ll, "_listeners", lambda ports: set())
+    monkeypatch.setattr(ll, "_vram_used_mb", lambda: 29000)
+    clock = iter(range(0, 1000))
+    report = ll.stop_servers(2020, timeout=20, sleep=lambda _: None, monotonic=lambda: float(next(clock)))
+    assert report["ok"] is False and report["remaining"] == [41]
+
+
+def test_a_zombie_counts_as_gone(tmp_path, monkeypatch):
+    real_exists = ll.os.path.exists
+    monkeypatch.setattr(ll.os.path, "exists", lambda path: True if path == "/proc/77" else real_exists(path))
+    import builtins
+    real_open = builtins.open
+
+    def fake_open(path, *a, **k):
+        if path == "/proc/77/stat":
+            f = tmp_path / "stat"
+            f.write_text("77 (python) Z 1 77 77 0 -1")
+            return real_open(f, *a, **k)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    assert ll._pid_alive(77) is False
+
+
+def test_stop_servers_does_not_settle_on_a_flat_card_that_never_fell(monkeypatch):
+    # A process the pid scan missed keeps the card flat at 29 GB: that is not "released".
+    alive = {41}
+    monkeypatch.setattr(ll, "find_server_pids", lambda port: set(alive))
+    monkeypatch.setattr(ll, "_pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(ll.os, "kill", lambda pid, sig: alive.discard(pid))
+    monkeypatch.setattr(ll, "_listeners", lambda ports: set())
+    monkeypatch.setattr(ll, "_vram_used_mb", lambda: 29000)
+    clock = iter(range(0, 1000))
+    report = ll.stop_servers(2020, timeout=20, sleep=lambda _: None, monotonic=lambda: float(next(clock)))
+    assert report["ok"] is False and "vram_settled" not in report
+
+
+def test_stop_servers_without_nvidia_smi_does_not_block(monkeypatch):
+    monkeypatch.setattr(ll, "find_server_pids", lambda port: set())
+    monkeypatch.setattr(ll, "_listeners", lambda ports: set())
+    monkeypatch.setattr(ll, "_vram_used_mb", lambda: None)
+    clock = iter(range(0, 1000))
+    report = ll.stop_servers(2020, timeout=20, sleep=lambda _: None, monotonic=lambda: float(next(clock)))
+    assert report["ok"] is True
+
+
+def test_a_pid_reaped_between_checks_counts_as_gone(monkeypatch):
+    monkeypatch.setattr(ll.os.path, "exists", lambda path: True)
+    import builtins
+
+    real_open = builtins.open
+
+    def vanished(path, *a, **k):
+        if path == "/proc/78/stat":
+            raise FileNotFoundError(path)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", vanished)
+    assert ll._pid_alive(78) is False
+
+
+def test_stop_servers_settles_when_our_cancelled_boot_held_little(monkeypatch):
+    # llama-swap cancelled a boot that had taken ~0.5 GB; the desktop keeps 3.1 GB. Nothing
+    # big was ours, so a steady card must not cost the full timeout.
+    alive = {41}
+    monkeypatch.setattr(ll, "find_server_pids", lambda port: set(alive))
+    monkeypatch.setattr(ll, "_pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(ll.os, "kill", lambda pid, sig: alive.discard(pid))
+    monkeypatch.setattr(ll, "_listeners", lambda ports: set())
+    readings = iter([3600, 3150, 3140, 3143])
+    monkeypatch.setattr(ll, "_vram_used_mb", lambda: next(readings, 3143))
+    clock = iter(range(0, 1000))
+    report = ll.stop_servers(2020, timeout=120, sleep=lambda _: None, monotonic=lambda: float(next(clock)))
+    assert report["ok"] is True and report["vram_settled"] is True
+
+
+def test_stop_servers_with_nothing_of_ours_accepts_a_busy_steady_card(monkeypatch):
+    monkeypatch.setattr(ll, "find_server_pids", lambda port: set())
+    monkeypatch.setattr(ll, "_listeners", lambda ports: set())
+    monkeypatch.setattr(ll, "_vram_used_mb", lambda: 3143)
+    clock = iter(range(0, 1000))
+    report = ll.stop_servers(2020, timeout=120, sleep=lambda _: None, monotonic=lambda: float(next(clock)))
+    assert report["ok"] is True

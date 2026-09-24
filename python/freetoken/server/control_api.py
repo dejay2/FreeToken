@@ -1,5 +1,5 @@
 """Read-only control-plane endpoints consumed by the desktop app: /health (lifecycle),
-/v1/stats (runtime metrics, Task 6), /v1/requests (request log ring, Task 5).
+/ready (status-code readiness for process managers), /v1/stats (runtime metrics, Task 6), /v1/requests (request log ring, Task 5).
 
 All handlers read a shared FrontendManager snapshot via ``get_state``; nothing here touches
 the scheduler or blocks. Registered on the app alongside the OpenAI/Anthropic/Responses routes.
@@ -7,10 +7,12 @@ the scheduler or blocks. Registered on the app alongside the OpenAI/Anthropic/Re
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Callable
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 
 def build_health(state: Any, version: str) -> dict:
@@ -61,6 +63,34 @@ def build_health(state: Any, version: str) -> dict:
     return doc
 
 
+# Maintenance states in which a chat request is answered: a runtime cache rebuild is waited
+# out by the chat routes' gate (a few seconds of slowness), so it still counts as ready. A
+# rebuild stuck past its deadline turns /health (and so /ready) to "error" through
+# check_maintenance, the same verdict the chat gate reaches.
+_READY_MAINTENANCE = ("serving", "rebuilding")
+
+
+def is_ready(health: dict) -> bool:
+    """True when chat routes will answer instead of returning 503."""
+    return health.get("status") == "ok" and health.get("maintenance") in _READY_MAINTENANCE
+
+
+def serves_model(state: Any, wanted: str) -> bool:
+    """``wanted`` names the loaded model: its served name, its path, or the path's folder.
+    Paths compare after ``~`` expansion and symlink resolution, so a caller that spells the
+    folder differently from the boot file still matches."""
+    config = getattr(state, "config", None)
+    served = getattr(config, "served_model_name", None)
+    path = str(getattr(config, "model_path", "") or "").rstrip("/\\")
+    names = {n for n in (served, path, os.path.basename(path)) if n}
+    wanted = wanted.rstrip("/\\")
+    if wanted in names:
+        return True
+    if path and ("/" in wanted or wanted.startswith("~")):
+        return os.path.realpath(os.path.expanduser(wanted)) == os.path.realpath(path)
+    return False
+
+
 def register_control_routes(
     app: FastAPI,
     get_state: Callable[[], Any],
@@ -69,6 +99,27 @@ def register_control_routes(
     @app.get("/health")
     async def health():
         return build_health(get_state(), app.version)
+
+    # /health must stay 200 while loading (the desktop app renders its progress body), so
+    # process managers that only look at the status code -- llama-swap's checkEndpoint --
+    # would forward the first chat into a 503. /ready answers 503 until the model serves.
+    # ``?model=`` makes the answer about one model: while a swap is still stopping the old
+    # FreeToken model, that old model must not pass a readiness check made for the new one.
+    @app.get("/ready")
+    async def ready(model: str | None = None):
+        state = get_state()
+        doc = build_health(state, app.version)
+        if model and getattr(state, "config", None) is not None and not serves_model(state, model):
+            return JSONResponse(
+                {"status": "not_ready", "reason": "another model is loaded", "model": doc.get("model")},
+                status_code=503,
+            )
+        if is_ready(doc):
+            return {"status": "ready", "model": doc.get("model")}
+        return JSONResponse(
+            {"status": "not_ready", "health": doc.get("status"), "maintenance": doc.get("maintenance")},
+            status_code=503,
+        )
 
     from . import request_ring
 
