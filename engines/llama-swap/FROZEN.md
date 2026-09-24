@@ -29,6 +29,7 @@ commit above, copy only the wanted change, re-run the tests, and add a line belo
   ctx.Err() without starting when its ctx is already cancelled at the start decision, as
   ProcessCommand's run loop now does. It also gained optional `ensureGate`/`ensureExit` hooks, which
   are nil in upstream tests.
+- P5, P6: none; upstream router and server tests pass unchanged.
 
 ## Our patches
 
@@ -85,4 +86,13 @@ Notes (P5 part 2 and P6, 2026-09-24):
   `server.Rebuild`, so prepare+commit pairs never overlap; `--check-config` never builds a
   Server. The config hash is read before the config is loaded, so a write after the read
   shows up as a stale hash plus another reload, never as a new hash on an old config.
-- P5: upstream router and server tests pass unchanged.
+- P5 (fix round 1): a SIGTERM during a reload could orphan kept model processes: shutdown
+  read the old Server, the reload then retired it with `ShutdownExceptLocal` (winning
+  Shutdown's once-guard), and nobody shut the shared local router down; processes use Setpgid
+  without Pdeathsig, so they outlived llama-swap (reviewer reproduced it, SIGTERM 2.5 s into a
+  reload). The SIGINT/SIGTERM path now calls `reloadCoalescer.stop()` (refuse later reloads, drop
+  a pending one, wait for the running one) before reading the active Server, and exits through
+  `Server.ShutdownWithLocal`, which also stops a local router the Server had handed on
+  (TestReloadCoalescer_StopWaitsDropsAndRefuses, TestServer_ShutdownWithLocal).
+- P6 (fix round 1): `Load` has no "already ready" shortcut; a ready model goes through the
+  scheduler's own fast path like a chat request, so P1 supersede applies identically.

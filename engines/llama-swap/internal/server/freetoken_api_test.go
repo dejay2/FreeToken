@@ -197,3 +197,28 @@ func TestRebuild_RefusedCommitReturnsAnError(t *testing.T) {
 		t.Fatalf("next=%v kept=%v err=%v: a refused commit must return an error", next, kept, err)
 	}
 }
+
+// FreeToken patch P5 (fix round 1): the exit shutdown also stops a local
+// router the Server had handed on, and stops an owned one exactly once.
+func TestServer_ShutdownWithLocal(t *testing.T) {
+	handedOn := &reconfigRouter{stubRouter: newStubRouter([]string{"a"}, "")}
+	prev := newTestServerWithConfig(groupCfg(), handedOn, newStubRouter(nil, ""))
+	if err := prev.ShutdownExceptLocal(time.Second); err != nil {
+		t.Fatalf("ShutdownExceptLocal: %v", err)
+	}
+	if err := prev.ShutdownWithLocal(time.Second); err != nil {
+		t.Fatalf("ShutdownWithLocal: %v", err)
+	}
+	if got := handedOn.shutdownCalls.Load(); got != 1 {
+		t.Fatalf("handed-on router shutdownCalls=%d want 1", got)
+	}
+
+	owned := newStubRouter([]string{"a"}, "")
+	s := newTestServer(owned, newStubRouter(nil, ""))
+	if err := s.ShutdownWithLocal(time.Second); err != nil {
+		t.Fatalf("ShutdownWithLocal: %v", err)
+	}
+	if got := owned.shutdownCalls.Load(); got != 1 {
+		t.Fatalf("owned router shutdownCalls=%d want 1", got)
+	}
+}

@@ -491,6 +491,11 @@ func main() {
 					os.Exit(1)
 				}()
 
+				// FreeToken patch P5: let a running reload finish and refuse
+				// later ones before picking the Server to shut down, so a kept
+				// local router is never handed to a Server nobody shuts down.
+				reloads.stop()
+
 				activeMu.RLock()
 				srv := activeSrv
 				st := activeStore
@@ -522,7 +527,7 @@ func main() {
 				if remaining <= 0 {
 					remaining = time.Millisecond
 				}
-				if err := srv.Shutdown(remaining); err != nil {
+				if err := srv.ShutdownWithLocal(remaining); err != nil { // FreeToken patch P5
 					proxyLog.Warnf("router shutdown error: %v", err)
 				}
 

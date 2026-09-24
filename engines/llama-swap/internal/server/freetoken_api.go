@@ -59,6 +59,18 @@ func (s *Server) ShutdownExceptLocal(timeout time.Duration) error {
 	return s.Shutdown(timeout)
 }
 
+// FreeToken patch P5: ShutdownWithLocal is the process-exit shutdown. It is
+// Shutdown, plus the local router when this Server skipped it because a
+// reload handed it on (keepLocal): at exit nothing may be left running, even
+// if a reload retired this Server between shutdown picking it and here.
+func (s *Server) ShutdownWithLocal(timeout time.Duration) error {
+	err := s.Shutdown(timeout)
+	if s.keepLocal.Load() && s.local != nil {
+		err = errors.Join(err, s.local.Shutdown(timeout))
+	}
+	return err
+}
+
 // FreeToken patch P5: SetConfigHash records the sha256 of the config file
 // this Server was built from; GET /api/config/hash reports it so the control
 // panel knows when its new file is live.

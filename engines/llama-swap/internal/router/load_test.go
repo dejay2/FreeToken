@@ -43,10 +43,19 @@ func TestLoad_StartsTheModelAndHandsTheGrantBack(t *testing.T) {
 }
 
 func TestLoad_ReadyModelReturnsAtOnce(t *testing.T) {
-	g, a, _ := twoModelGroup(t, map[string]config.ModelConfig{"a": {}, "b": {}})
+	g, a, b := twoModelGroup(t, map[string]config.ModelConfig{"a": {}, "b": {}})
 	a.setState(process.StateReady)
 	if err := g.Load(context.Background(), "a"); err != nil || a.runCalls.Load() != 0 {
 		t.Fatalf("err=%v runCalls=%d", err, a.runCalls.Load())
+	}
+	// FreeToken patch P6 (fix round 1): the ready path now goes through the
+	// scheduler too; it must hand its grant back, so a pick of b evicts a.
+	w, done := serveAsync(g, "b")
+	waitSignal(t, b.runStarted, "b start")
+	b.markReady()
+	waitSignal(t, done, "b request")
+	if w.Code != http.StatusOK || a.stopCalls.Load() == 0 {
+		t.Fatalf("b code=%d, a stops=%d: Load leaked an in-flight count", w.Code, a.stopCalls.Load())
 	}
 }
 

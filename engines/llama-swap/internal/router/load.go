@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
 )
 
@@ -23,13 +22,11 @@ func (b *baseRouter) Load(ctx context.Context, modelID string) error {
 	if b.shuttingDown.Load() {
 		return fmt.Errorf("%s is shutting down", b.name)
 	}
-	_, procs := b.snapshot()
-	p, ok := procs[modelID]
-	if !ok {
+	// No "already ready" shortcut: a ready model goes through the scheduler
+	// like a chat request (its own fast path grants at once), so a load
+	// supersedes a colliding swap exactly as a chat request would (P1).
+	if _, procs := b.snapshot(); procs[modelID] == nil {
 		return scheduler.ErrModelNotFound
-	}
-	if p.State() == process.StateReady {
-		return nil
 	}
 	hr := scheduler.HandlerReq{
 		Model:      modelID,
