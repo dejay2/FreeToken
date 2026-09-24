@@ -258,3 +258,27 @@ def test_a_pid_reaped_between_checks_counts_as_gone(monkeypatch):
 
     monkeypatch.setattr(builtins, "open", vanished)
     assert ll._pid_alive(78) is False
+
+
+def test_stop_servers_settles_when_our_cancelled_boot_held_little(monkeypatch):
+    # llama-swap cancelled a boot that had taken ~0.5 GB; the desktop keeps 3.1 GB. Nothing
+    # big was ours, so a steady card must not cost the full timeout.
+    alive = {41}
+    monkeypatch.setattr(ll, "find_server_pids", lambda port: set(alive))
+    monkeypatch.setattr(ll, "_pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(ll.os, "kill", lambda pid, sig: alive.discard(pid))
+    monkeypatch.setattr(ll, "_listeners", lambda ports: set())
+    readings = iter([3600, 3150, 3140, 3143])
+    monkeypatch.setattr(ll, "_vram_used_mb", lambda: next(readings, 3143))
+    clock = iter(range(0, 1000))
+    report = ll.stop_servers(2020, timeout=120, sleep=lambda _: None, monotonic=lambda: float(next(clock)))
+    assert report["ok"] is True and report["vram_settled"] is True
+
+
+def test_stop_servers_with_nothing_of_ours_accepts_a_busy_steady_card(monkeypatch):
+    monkeypatch.setattr(ll, "find_server_pids", lambda port: set())
+    monkeypatch.setattr(ll, "_listeners", lambda ports: set())
+    monkeypatch.setattr(ll, "_vram_used_mb", lambda: 3143)
+    clock = iter(range(0, 1000))
+    report = ll.stop_servers(2020, timeout=120, sleep=lambda _: None, monotonic=lambda: float(next(clock)))
+    assert report["ok"] is True

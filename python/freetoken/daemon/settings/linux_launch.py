@@ -571,7 +571,10 @@ def stop_servers(
             samples = (samples + [used])[-_VRAM_SETTLE_SAMPLES:]
         card_busy = used is not None and used >= vram_free_threshold_mb
         fell = vram_before is not None and used is not None and vram_before - used >= _VRAM_SETTLE_MIN_DROP_MB
-        if card_busy and not pids and fell and _vram_settled(samples):
+        # Nothing of ours was big: no server process was found at all, or it held less than
+        # the drop we look for (a boot cancelled early). Then a steady card is someone else's.
+        ours_small = vram_before is None or vram_before < vram_free_threshold_mb + _VRAM_SETTLE_MIN_DROP_MB
+        if card_busy and not pids and (fell or ours_small) and _vram_settled(samples):
             # Other programs (browser, games, another engine) can hold more than the fixed
             # threshold on their own: live 2026-09-24 the desktop sat at 3.1 GB and every Stop
             # waited out the full 120 s. With the server processes gone and the card no longer

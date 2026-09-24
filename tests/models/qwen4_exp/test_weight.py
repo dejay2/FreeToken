@@ -9,11 +9,10 @@ from __future__ import annotations
 import ctypes
 import json
 import mmap
+import os
 import random
 import warnings
 from types import SimpleNamespace
-
-import os
 
 import pytest
 import safetensors

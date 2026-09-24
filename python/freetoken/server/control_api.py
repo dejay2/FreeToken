@@ -76,12 +76,19 @@ def is_ready(health: dict) -> bool:
 
 
 def serves_model(state: Any, wanted: str) -> bool:
-    """``wanted`` names the loaded model: its served name, its path, or the path's folder."""
+    """``wanted`` names the loaded model: its served name, its path, or the path's folder.
+    Paths compare after ``~`` expansion and symlink resolution, so a caller that spells the
+    folder differently from the boot file still matches."""
     config = getattr(state, "config", None)
     served = getattr(config, "served_model_name", None)
     path = str(getattr(config, "model_path", "") or "").rstrip("/\\")
     names = {n for n in (served, path, os.path.basename(path)) if n}
-    return wanted.rstrip("/\\") in names
+    wanted = wanted.rstrip("/\\")
+    if wanted in names:
+        return True
+    if path and ("/" in wanted or wanted.startswith("~")):
+        return os.path.realpath(os.path.expanduser(wanted)) == os.path.realpath(path)
+    return False
 
 
 def register_control_routes(
@@ -102,7 +109,7 @@ def register_control_routes(
     async def ready(model: str | None = None):
         state = get_state()
         doc = build_health(state, app.version)
-        if model and not serves_model(state, model):
+        if model and getattr(state, "config", None) is not None and not serves_model(state, model):
             return JSONResponse(
                 {"status": "not_ready", "reason": "another model is loaded", "model": doc.get("model")},
                 status_code=503,

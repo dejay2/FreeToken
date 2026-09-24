@@ -132,3 +132,18 @@ def test_ready_is_503_for_a_different_model_even_while_serving():
     response = _client(_model_state("/m/Qwen-A")).get("/ready", params={"model": "Qwen-B"})
     assert response.status_code == 503
     assert response.json()["reason"] == "another model is loaded"
+
+
+def test_ready_matches_a_differently_spelled_path_to_the_same_folder(tmp_path):
+    real = tmp_path / "Qwen-A"
+    real.mkdir()
+    link = tmp_path / "link-to-A"
+    link.symlink_to(real)
+    assert _client(_model_state(str(real))).get("/ready", params={"model": str(link)}).status_code == 200
+
+
+def test_ready_before_the_config_exists_reports_loading_not_another_model():
+    state = _state("loading", phase="expert_banks")
+    state.config = None
+    response = _client(state).get("/ready", params={"model": "Qwen-A"})
+    assert response.status_code == 503 and response.json()["health"] == "loading"

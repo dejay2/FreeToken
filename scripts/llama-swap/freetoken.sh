@@ -15,6 +15,7 @@ HELPER="${FREETOKEN_HELPER:-http://127.0.0.1:2031}"
 SERVER="${FREETOKEN_SERVER:-http://127.0.0.1:2020}"
 MODEL_PATH="${1:?usage: freetoken.sh <model folder>}"
 MODEL_PATH="${MODEL_PATH%/}"
+MODEL_NAME="$(basename "$MODEL_PATH")"  # what /ready?model= matches: the folder name
 
 log() { printf '[freetoken.sh] %s\n' "$*" >&2; }
 
@@ -34,11 +35,12 @@ print(d['server']['state'], job, live)"
 }
 
 # 0 when the server's loaded model is not this one. Asks the server itself, not the saved
-# settings: a settings edit alone must not count as a model switch.
+# settings: a settings edit alone must not count as a model switch. A server that predates
+# /ready (404) cannot prove it holds this model, so it counts as another.
 other_model_loaded() {
-  local body
-  body=$(curl -s --max-time 5 --get --data-urlencode "model=$MODEL_PATH" "$SERVER/ready")
-  case "$body" in *'another model is loaded'*) return 0 ;; *) return 1 ;; esac
+  local out
+  out=$(curl -s --max-time 5 -w '\n%{http_code}' --get --data-urlencode "model=$MODEL_NAME" "$SERVER/ready")
+  case "$out" in *'another model is loaded'*|*$'\n'404) return 0 ;; *) return 1 ;; esac
 }
 
 # wait_job <job id> <stage wanted>: 0 when reached, 1 on any other end. No time cap: a slow

@@ -10,14 +10,18 @@
 set -uo pipefail
 HELPER="${FREETOKEN_HELPER:-http://127.0.0.1:2031}"
 
-snapshot() {  # "state has_job"; "helper-down -" when the helper does not answer
+# "state has_job watchdog_live"; "helper-down - False" when the helper does not answer. A live
+# watchdog (armed, enabled, not given up) would reboot a crashed FreeToken on top of us.
+snapshot() {
   curl -s --max-time 5 "$HELPER/api/status" | python3 -c "import json,sys
-try: d=json.load(sys.stdin); print(d['server']['state'], bool(d.get('currentJob')))
-except Exception: print('helper-down -')"
+try: d=json.load(sys.stdin)
+except Exception: print('helper-down - False'); sys.exit(0)
+w=d.get('autoRestart') or {}
+print(d['server']['state'], bool(d.get('currentJob')), bool(w.get('armed') and w.get('enabled', True) and not w.get('gave_up')))"
 }
 
-read -r state has_job <<<"$(snapshot)"
-if [ "$state" != unreachable ] || [ "$has_job" = True ]; then
+read -r state has_job live <<<"$(snapshot)"
+if [ "$state" != unreachable ] || [ "$has_job" = True ] || [ "$live" = True ]; then
   if [ "$state" = helper-down ]; then
     # No helper, so no watchdog either; only a server it left behind could hold the port.
     curl -s --max-time 3 -o /dev/null http://127.0.0.1:2020/health \
@@ -26,7 +30,7 @@ if [ "$state" != unreachable ] || [ "$has_job" = True ]; then
     printf '[other-engine.sh] stopping FreeToken (state: %s) to free the card\n' "$state" >&2
     curl -s --max-time 10 -X POST "$HELPER/api/server/stop" >/dev/null
     for _ in $(seq 1 90); do
-      read -r state has_job <<<"$(snapshot)"
+      read -r state has_job _ <<<"$(snapshot)"
       [ "$state" = unreachable ] && [ "$has_job" = False ] && break
       sleep 2
     done
