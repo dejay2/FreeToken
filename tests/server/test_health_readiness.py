@@ -89,3 +89,26 @@ def test_cache_status_state_is_the_readiness_signal():
             assert response.json()["state"] == maintenance
     finally:
         api._GLOBAL_STATE, api.cache_geometry = prev_state, prev_geometry
+
+
+def test_ready_is_503_while_the_model_is_still_loading():
+    response = _client(_state("loading", phase="expert_banks")).get("/ready")
+
+    assert response.status_code == 503
+    assert response.json()["health"] == "loading"
+
+
+def test_ready_is_200_once_serving():
+    response = _client(_state("serving")).get("/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready", "model": "unit-model"}
+
+
+def test_ready_waits_out_a_runtime_rebuild_like_the_chat_gate():
+    assert _client(_state("rebuilding")).get("/ready").status_code == 200
+
+
+def test_ready_is_503_when_stopping_or_failed():
+    assert _client(_state("stopping")).get("/ready").status_code == 503
+    assert _client(_state("serving", fatal="worker died")).get("/ready").status_code == 503

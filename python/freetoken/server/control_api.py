@@ -1,5 +1,5 @@
 """Read-only control-plane endpoints consumed by the desktop app: /health (lifecycle),
-/v1/stats (runtime metrics, Task 6), /v1/requests (request log ring, Task 5).
+/ready (status-code readiness for process managers), /v1/stats (runtime metrics, Task 6), /v1/requests (request log ring, Task 5).
 
 All handlers read a shared FrontendManager snapshot via ``get_state``; nothing here touches
 the scheduler or blocks. Registered on the app alongside the OpenAI/Anthropic/Responses routes.
@@ -11,6 +11,7 @@ import time
 from typing import Any, Callable
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 
 def build_health(state: Any, version: str) -> dict:
@@ -61,6 +62,16 @@ def build_health(state: Any, version: str) -> dict:
     return doc
 
 
+# Maintenance states in which a chat request is answered: a runtime cache rebuild is waited
+# out by the chat routes' gate (a few seconds of slowness), so it still counts as ready.
+_READY_MAINTENANCE = ("serving", "rebuilding")
+
+
+def is_ready(health: dict) -> bool:
+    """True when chat routes will answer instead of returning 503."""
+    return health.get("status") == "ok" and health.get("maintenance") in _READY_MAINTENANCE
+
+
 def register_control_routes(
     app: FastAPI,
     get_state: Callable[[], Any],
@@ -69,6 +80,19 @@ def register_control_routes(
     @app.get("/health")
     async def health():
         return build_health(get_state(), app.version)
+
+    # /health must stay 200 while loading (the desktop app renders its progress body), so
+    # process managers that only look at the status code -- llama-swap's checkEndpoint --
+    # would forward the first chat into a 503. /ready answers 503 until the model serves.
+    @app.get("/ready")
+    async def ready():
+        doc = build_health(get_state(), app.version)
+        if is_ready(doc):
+            return {"status": "ready", "model": doc.get("model")}
+        return JSONResponse(
+            {"status": "not_ready", "health": doc.get("status"), "maintenance": doc.get("maintenance")},
+            status_code=503,
+        )
 
     from . import request_ring
 
