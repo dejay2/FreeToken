@@ -11,6 +11,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/memgate"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
@@ -66,6 +67,9 @@ type baseRouter struct {
 	swapMu      sync.Mutex
 	swapCancels map[string]*swapHandle
 
+	// FreeToken patch P2: nil when the memory gate is disabled.
+	memGate *memgate.Gate
+
 	// testProcessed, when non-nil, receives one event after each handlerReq
 	// or swapDone has been fully processed by run(). Tests use it to wait
 	// for run() to reach a deterministic state without sleeping. serveDone
@@ -109,6 +113,25 @@ func newBaseRouter(
 		return nil, err
 	}
 	b.schedule = sched
+
+	// FreeToken patch P2: build the memory gate from config.
+	if mg := conf.MemoryGate; mg.Probe == "windows" {
+		floor, wait := mg.FloorGB, mg.WaitSeconds
+		if floor <= 0 {
+			floor = 6
+		}
+		if wait <= 0 {
+			wait = 300
+		}
+		b.memGate = &memgate.Gate{
+			Probe:   memgate.WindowsProbe(memgate.RunWindowsFreeKB, 2*time.Second),
+			FloorGB: floor,
+			Wait:    time.Duration(wait) * time.Second,
+			Poll:    5 * time.Second,
+			Logf:    b.logger.Infof,
+		}
+	}
+
 	return b, nil
 }
 
@@ -304,11 +327,17 @@ func (b *baseRouter) doSwap(ctx context.Context, modelID string, toStop []string
 	// process nobody was ever going to start (issue #946). EnsureReady makes
 	// the same decision inside the process, where the state is owned.
 	var err error
+	// FreeToken patch P2: evicted models are stopped; now wait for room.
+	if mc, ok := b.config.Models[modelID]; ok && ctx.Err() == nil {
+		err = b.memGate.WaitForRoom(ctx, modelID, mc.RamNeedGB)
+	}
 	// FreeToken patch P1: a superseded swap must not start its target, and
 	// starts through the swap context so CancelSwap aborts EnsureReady.
-	if err = ctx.Err(); err == nil {
-		target := b.processes[modelID]
-		err = target.EnsureReady(ctx, timeout)
+	if err == nil {
+		if err = ctx.Err(); err == nil {
+			target := b.processes[modelID]
+			err = target.EnsureReady(ctx, timeout)
+		}
 	}
 	// FreeToken patch P1: a cancelled swap (outside shutdown) has already been
 	// forgotten by the scheduler: supersede deleted it, or a newer StartSwap

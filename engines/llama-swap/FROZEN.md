@@ -38,3 +38,4 @@ Every changed spot carries a `// FreeToken patch Pn:` comment.
 |---|---|---|
 | P4 | clampParams filter: clamp numeric params into [min,max] | internal/config/filters.go, internal/server/filters.go, config-schema.json |
 | P1 | latest wins: a new pick cancels a colliding not-ready swap (409 model_superseded) | internal/config/config.go, internal/router/scheduler/{scheduler.go,fifo.go}, internal/router/base.go, internal/process/process_command.go, internal/swaputil/superseded.go, config-schema.json |
+| P2 | memory gate: wait for Windows free RAM - ramNeedGB >= floorGB before loading (503 not_enough_memory) | internal/memgate/*, internal/config/{config.go,model_config.go}, internal/router/base.go, config-schema.json |

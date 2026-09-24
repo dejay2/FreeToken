@@ -120,8 +120,10 @@ type ModelConfig struct {
 	CheckEndpoint string   `yaml:"checkEndpoint"`
 	UnloadAfter   int      `yaml:"ttl"`
 	UnloadTimeout int      `yaml:"unloadTimeout"`
-	Unlisted      bool     `yaml:"unlisted"`
-	UseModelName  string   `yaml:"useModelName"`
+	// FreeToken patch P2: host RAM (GB) this model needs to load; 0 = never wait.
+	RamNeedGB    float64 `yaml:"ramNeedGB"`
+	Unlisted     bool    `yaml:"unlisted"`
+	UseModelName string  `yaml:"useModelName"`
 
 	// #179 for /v1/models
 	Name        string `yaml:"name"`

@@ -166,6 +166,9 @@ type Config struct {
 	GlobalTTL          int               `yaml:"globalTTL"`
 	UnloadTimeout      int               `yaml:"unloadTimeout"`
 
+	// FreeToken patch P2: wait for free memory before loading a model.
+	MemoryGate MemoryGateConfig `yaml:"memoryGate"`
+
 	Models    map[string]ModelConfig    `yaml:"models"` /* key is model ID */
 	Profiles  map[string]ProfileConfig  `yaml:"profiles"`
 	Selectors map[string]SelectorConfig `yaml:"selectors"`
@@ -229,6 +232,14 @@ func (c *Config) SetTailcatEnabled(enabled bool) {
 // TailcatEnabled reports whether this process has a Tailcat listener.
 func (c Config) TailcatEnabled() bool {
 	return c.tailcatEnabled
+}
+
+// FreeToken patch P2: MemoryGateConfig. Probe "windows" enables the gate
+// (WSL: asks Windows for free RAM); "" or "none" disables it.
+type MemoryGateConfig struct {
+	Probe       string  `yaml:"probe"`
+	FloorGB     float64 `yaml:"floorGB"`     // default 6
+	WaitSeconds int     `yaml:"waitSeconds"` // default 300
 }
 
 // RoutingConfig is the canonical, normalized routing/scheduling configuration.
