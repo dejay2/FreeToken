@@ -2,9 +2,9 @@
 
 Spec section 1: memoryGate becomes `system`; each model's cmd flags and filters become its
 overrides against the new engine defaults; the helper's boot file becomes FreeToken defaults.
-Values the generator fixes per engine (unloadTimeout, env, clampParams, proxy, checkEndpoint)
-are not stored; when today's value differs, the import says so in a warning so nothing changes
-silently. A command it cannot read (another adapter, an unknown NInfer option) refuses the
+Values the generator fixes per engine (unloadTimeout, env, clampParams, proxy, checkEndpoint,
+useModelName) are not stored; when today's value differs, the import says so in a warning so
+nothing changes silently. A command it cannot read (another adapter, an unknown NInfer option) refuses the
 whole import with the reason.
 
 ``boot_settings`` is the already-loaded content of the helper's *current* boot file (Ruling
@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 import os
 import shlex
+import urllib.parse
 from typing import Any, Iterable, Mapping
 
 from . import ninfer_dials
@@ -66,12 +67,24 @@ def _freetoken_values(settings: Mapping[str, Any], warnings: list[str], label: s
     return out
 
 
-def _check_fixed(model_id: str, entry: Mapping[str, Any], engine: str, warnings: list[str]) -> None:
+def _check_fixed(model_id: str, entry: Mapping[str, Any], engine: str, artifact: str, warnings: list[str]) -> None:
     timeout = entry.get("unloadTimeout")
     if timeout is not None and int(timeout) != UNLOAD_TIMEOUT[engine]:
         warnings.append(f"{model_id}: unloadTimeout {timeout} becomes {UNLOAD_TIMEOUT[engine]} (one value per engine).")
     if entry.get("proxy") not in (None, PROXY[engine]):
         warnings.append(f"{model_id}: proxy {entry.get('proxy')} becomes {PROXY[engine]}.")
+    if engine == "freetoken":
+        folder = os.path.basename(artifact.rstrip("/"))
+        wanted_endpoint = "/ready?model=" + urllib.parse.quote(folder, safe="")
+    else:
+        wanted_endpoint = "/health"
+    # llama-swap's own default when checkEndpoint is left out of the entry is "/health"; the
+    # generator always sets its engine-specific value explicitly, so an absent key is only "fine"
+    # when that default already matches (ninfer).
+    check_endpoint = entry.get("checkEndpoint")
+    effective_endpoint = check_endpoint if check_endpoint is not None else "/health"
+    if effective_endpoint != wanted_endpoint:
+        warnings.append(f"{model_id}: checkEndpoint {check_endpoint!r} becomes {wanted_endpoint!r}.")
     if engine == "ninfer":
         if list(entry.get("env") or []) != NINFER_ENV:
             warnings.append(f"{model_id}: env {entry.get('env')} becomes {NINFER_ENV}.")
@@ -79,6 +92,12 @@ def _check_fixed(model_id: str, entry: Mapping[str, Any], engine: str, warnings:
         wanted = ninfer_dials.clamp_params()
         if clamp and {k: [float(x) for x in v] for k, v in clamp.items()} != {k: [float(x) for x in v] for k, v in wanted.items()}:
             warnings.append(f"{model_id}: clampParams become the catalogue ranges {wanted}.")
+        # llama-swap's own default useModelName, when the key is left out, is the model's map
+        # key -- which import_live already used as model_id -- so an absent key is always fine.
+        use_model_name = entry.get("useModelName")
+        effective_name = use_model_name if use_model_name is not None else model_id
+        if effective_name != model_id:
+            warnings.append(f"{model_id}: useModelName {use_model_name!r} becomes {model_id!r}.")
 
 
 def _profiles_to_presets(registry: dict[str, Any], profiles: Iterable[Mapping[str, Any]], warnings: list[str]) -> None:
@@ -157,7 +176,7 @@ def import_live(config_text: str, boot_settings: Mapping[str, Any], *, env: Mapp
                          overrides=differences(launch["settings"], ninfer_base))
         else:
             model.update(runtime="freetoken", artifact=_tilde(launch["folder"], home), overrides={})
-        _check_fixed(model_id, entry, engine, warnings)
+        _check_fixed(model_id, entry, engine, model["artifact"], warnings)
         ttl = entry.get("ttl")
         model.update(
             ramNeedGB=_number(entry.get("ramNeedGB", 0) or 0),

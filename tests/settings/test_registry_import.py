@@ -76,6 +76,27 @@ def test_profiles_become_presets_on_matching_freetoken_models():
     assert flash["activePreset"] is None and "ours" not in flash["presets"]
 
 
+def test_a_changed_check_endpoint_is_reported():
+    text = EXAMPLE.replace(
+        "checkEndpoint: /ready?model=Qwen3.8-Flash-Next-NVFP4",
+        "checkEndpoint: /totally-custom-endpoint",
+        1,
+    )
+    registry, warnings = import_live(text, FT_DEFAULTS, env=ENV)
+    assert any("checkEndpoint" in warning and "/totally-custom-endpoint" in warning for warning in warnings), warnings
+    # the value is still not stored anywhere in the registry
+    flash = find_model(registry, "qwen3.8-flash")
+    assert "checkEndpoint" not in flash
+
+
+def test_a_changed_use_model_name_is_reported():
+    text = EXAMPLE.replace('useModelName: "quasar-27b"', 'useModelName: "something-else"', 1)
+    registry, warnings = import_live(text, FT_DEFAULTS, env=ENV)
+    assert any("useModelName" in warning and "something-else" in warning for warning in warnings), warnings
+    quasar = find_model(registry, "quasar-27b")
+    assert quasar["id"] == "quasar-27b"
+
+
 def test_empty_or_unreadable_config_refuses():
     with pytest.raises(ImportRefused, match="lists no models"):
         import_live("healthCheckTimeout: 600\n", FT_DEFAULTS, env=ENV)
