@@ -235,6 +235,13 @@ def iter_weights(
                         yield fused
                     continue
                 yield name, tensor
+        # Every tensor of this file has been consumed (the generator only moves on when the
+        # caller asks for more), so its buffered pages are dead weight. Measured on the RTX
+        # 5090 box (WSL, 76 GB cap, 93.6 GB PC) 2026-09-24: these bf16/int8-source shards left
+        # ~8.5-10 GiB in the Linux file cache through the whole expert load, which filled the
+        # VM to its cap and took Windows free RAM to 0 GB. autoMemoryReclaim=gradual only
+        # returns it ~10 min after boot. Mapped pages (mmap vision) are not evicted by this.
+        drop_page_cache(file)
 
     assert not fuse_buf, f"Incomplete projection fusions: {sorted(fuse_buf)}"
 

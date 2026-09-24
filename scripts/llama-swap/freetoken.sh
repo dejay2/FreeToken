@@ -67,6 +67,12 @@ else
     log "stopping the running FreeToken model first (state: $state)"
     stop_server || { log "could not stop the running server"; exit 1; }
   fi
+  # The engine swapped out (NInfer reads ~21 GB of weights buffered) leaves its file cache in
+  # the WSL VM, and the boot pins ~53 GiB on top. Clean cache only; needs passwordless sudo,
+  # skipped otherwise.
+  if sudo -n true 2>/dev/null; then
+    sync && sudo -n sh -c 'echo 1 > /proc/sys/vm/drop_caches' && log "dropped the Linux file cache before boot"
+  fi
   body=$(python3 -c 'import json,sys; print(json.dumps({"settings": {"ModelPath": sys.argv[1]}}))' "$MODEL_PATH")
   saved=$(curl -s --max-time 30 -X PUT -H 'content-type: application/json' -d "$body" "$HELPER/api/settings")
   [ "$(printf '%s' "$saved" | json_get "d.get('status')")" = "saved" ] || { log "settings refused: $saved"; exit 1; }

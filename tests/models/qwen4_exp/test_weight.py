@@ -1582,3 +1582,24 @@ def test_a_mapping_failure_falls_back_to_resident_ram_with_one_warning(
             reference = handle.get_tensor(raw_name).view(torch.int16)
             assert torch.equal(first[name].view(torch.int16), reference), name
             assert torch.equal(second[name].view(torch.int16), reference), name
+
+
+def test_each_shard_leaves_the_file_cache_once_its_tensors_are_consumed(checkpoint, monkeypatch):
+    # Live on the 5090 (WSL) the non-expert shards stayed cached through the expert load and
+    # took Windows to 0 GB free; each file must be dropped, and only after its last tensor.
+    import freetoken.models.qwen4_exp.weight as qw
+
+    folder, _raw = checkpoint
+    events: list[tuple[str, str]] = []
+    monkeypatch.setattr(qw, "drop_page_cache", lambda path: events.append(("drop", path)))
+    for name, _tensor in iter_weights(
+        folder, torch.device("cpu"), include_moe_experts=False, include_non_moe=True
+    ):
+        events.append(("yield", name))
+
+    dropped = [path for kind, path in events if kind == "drop"]
+    assert sorted(dropped) == sorted(qw.iter_weight_files(folder))
+    assert events[-1][0] == "drop"
+    # Drops interleave with the yields (per file), not one sweep at the end.
+    first_drop = next(i for i, (kind, _) in enumerate(events) if kind == "drop")
+    assert any(kind == "yield" for kind, _ in events[first_drop:])
