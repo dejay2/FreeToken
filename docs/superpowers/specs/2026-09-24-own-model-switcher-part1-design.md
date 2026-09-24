@@ -1,6 +1,6 @@
 # Own model switcher, part 1: frozen engines, one address, our rules
 
-Date: 2026-09-24. Status: design, awaiting Jay's review.
+Date: 2026-09-24. Status: approved by Jay 2026-09-24; built on feat/own-switcher.
 
 ## Why
 
@@ -76,7 +76,7 @@ outputs (`build/`, Go binaries, `node_modules`, the UI bundle) are git-ignored. 
 tree carries large test fixtures or vendored third-party blobs, those are left out and fetched
 by `build.sh` at a pinned version, with the pin recorded in `FROZEN.md`.
 
-**One NInfer or two.** QUASAR needs the MirkoCovizzi/ninfer-rtx5090-mobile runtime
+**One NInfer or two.** *Decided 2026-09-24: two. The mobile runtime refuses the v3 Fable/Twin artifacts (`artifact magic is not NInfer v2`), so `engines/ninfer` (QUASAR) and `engines/ninfer-upstream` (Fable, Twin) are both frozen; see `docs/research/own-switcher-acceptance-2026-09-24.md`.* QUASAR needs the MirkoCovizzi/ninfer-rtx5090-mobile runtime
 (d4bc75db), which includes upstream through ce7dee50. Fable and Twin run today on upstream
 Neroued/ninfer f76e19c0.
 - **First build step:** start Fable and Twin on the mobile runtime once each, send one chat,
@@ -136,10 +136,10 @@ in `engines/llama-swap/FROZEN.md`.
 
 - **Where:** in the swap goroutine, before the target process starts.
 - **Per-model config:** `ramNeedGB`, for example about 60 for FreeToken Flash and about 18 for a
-  NInfer 27B with its host KV. Global config: `ramFloorGB`, default 6, and `ramWaitSeconds`,
+  NInfer 27B with its host KV. Global config: `memoryGate.floorGB`, default 6, and `memoryGate.waitSeconds`,
   default 300.
-- **Rule:** start only when Windows free RAM − `ramNeedGB` ≥ `ramFloorGB`. Otherwise re-check
-  every 5 s until `ramWaitSeconds`, then fail the swap's waiters with HTTP 503: "not enough
+- **Rule:** start only when Windows free RAM − `ramNeedGB` ≥ `floorGB`. Otherwise re-check
+  every 5 s until `waitSeconds`, then fail the swap's waiters with HTTP 503: "not enough
   free memory to load X (need N GB, Windows has M GB free); close something and try again".
 - **Measuring Windows free RAM:** read the same way as the settings helper's governor:
   `powershell.exe ... (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory`, cached for
