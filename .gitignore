@@ -235,3 +235,10 @@ benchmarks/cross_framework
 /boot-profiles/
 .claude/worktrees/
 .superpowers/
+
+# frozen engines: build outputs only (sources are tracked)
+engines/llama-swap/build/
+engines/llama-swap/ui/node_modules/
+engines/llama-swap/internal/server/ui_dist/*
+!engines/llama-swap/internal/server/ui_dist/.gitkeep
+engines/ninfer*/build/

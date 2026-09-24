@@ -1,0 +1,37 @@
+# Starter configuration for the llama-swap container.
+#
+# Mount your models at /models, download a GGUF into it, and this runs as-is.
+# It is deliberately small: one model, so there is something working to edit.
+# Every available option is documented in docs/config.example.yaml in the
+# llama-swap repository -- that file is reference material and is not meant to
+# be run.
+#
+# The image also ships whisper-server, sd-server, audiocpp_server and
+# ik-llama-server. Add them as further entries under models: when you need them.
+
+models:
+  # https://huggingface.co/unsloth/gemma-4-12b-it-GGUF
+  #
+  #   uvx hf download unsloth/gemma-4-12b-it-GGUF \
+  #     gemma-4-12b-it-Q4_K_M.gguf --local-dir /path/to/models
+  #
+  #   # optional, for the MTP draft model enabled below
+  #   uvx hf download unsloth/gemma-4-12b-it-GGUF \
+  #     MTP/mtp-gemma-4-12b-it-Q8_0.gguf --local-dir /path/to/models
+  gemma-4-12B:
+    filters:
+      stripParams: "temperature, top_k, top_p, repeat_penalty, min_p, presence_penalty"
+    capabilities:
+      tools: true
+    cmd: |
+      llama-server
+      --host 127.0.0.1 --port ${PORT}
+      --temp 1.0 --top-p 0.95 --top-k 64
+
+      # model params
+      --model /models/gemma-4-12b-it-Q4_K_M.gguf
+      --model-draft /models/MTP/mtp-gemma-4-12b-it-Q8_0.gguf
+
+      # enable MTP
+      --spec-type draft-mtp
+      --spec-draft-n-max 4 --spec-draft-p-min 0.75

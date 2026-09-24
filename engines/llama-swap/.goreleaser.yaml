@@ -1,0 +1,41 @@
+version: 2
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    # embed the UI built by `make ui` into ui_dist (see internal/server/embed.go)
+    tags:
+      - embed_ui
+    # match the version/commit/date vars defined in llama-swap.go:
+    #   version = tag, commit = `git rev-parse --short HEAD`, date = RFC3339 UTC
+    ldflags:
+      - -X main.version={{ .Tag }}
+      - -X main.commit={{ .ShortCommit }}
+      - -X main.date={{ .Date }}
+    goos:
+      - linux
+      - darwin
+      - freebsd
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: freebsd
+        goarch: arm64
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    builds_info:
+      group: root
+      owner: root
+    format_overrides:
+      # use zip format for windows
+      - goos: windows
+        formats:
+          - zip
