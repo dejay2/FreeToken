@@ -491,6 +491,21 @@ func main() {
 					os.Exit(1)
 				}()
 
+				// Both phases share a single deadline so total shutdown is
+				// bounded by shutdownTimeout rather than 2x it.
+				// FreeToken patch P5: the deadline is taken here, before
+				// reloads.stop(), so the time spent waiting for a running
+				// reload comes out of the same budget. Taken after it, a reload
+				// of R s gave the router a full shutdownTimeout while the
+				// backstop above fires at shutdownTimeout+5s-R, so for R > 5 s
+				// a slow-exiting kept model was orphaned by os.Exit(1)
+				// (fix round 2, reviewer measured: exit 1 at 35.0 s, model left
+				// running; with this order exit 0 at 30.0 s, clean). A reload
+				// blocked longer than the backstop still ends in the forced
+				// exit; on the box systemd's cgroup sweep reaps what is left
+				// (deferred by controller ruling).
+				deadline := time.Now().Add(shutdownTimeout)
+
 				// FreeToken patch P5: let a running reload finish and refuse
 				// later ones before picking the Server to shut down, so a kept
 				// local router is never handed to a Server nobody shuts down.
@@ -506,9 +521,7 @@ func main() {
 				// drain without blocking on them for the full timeout.
 				srv.CloseStreams()
 
-				// Both phases share a single deadline so total shutdown is
-				// bounded by shutdownTimeout rather than 2x it.
-				deadline := time.Now().Add(shutdownTimeout)
+				// The shared deadline was taken before reloads.stop() above.
 				shutdownCtx, cancel := context.WithDeadline(context.Background(), deadline)
 				defer cancel()
 				if err := httpServer.Shutdown(shutdownCtx); err != nil {
