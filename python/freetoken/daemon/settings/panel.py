@@ -61,6 +61,8 @@ from .switcher import LOADED_STATES, SwitcherError
 
 GIB = 1024 ** 3
 PROFILE_NOTE = "Control panel settings for this model"
+IMPORT_UNKNOWN_MESSAGE = ("Can't tell whether a model is loaded right now, so the import would risk "
+                          "restarting it. Try again in a moment.")
 RESTART_STALE_MESSAGE = "The switcher didn't pick up the new settings; the old ones are still in use. Check the switcher log."
 
 IDENTITY_GROUP = "This model"
@@ -191,9 +193,23 @@ class PanelService:
         self.last_restart: dict[str, Any] | None = None
 
     # ---- small helpers ----
-    def _loaded(self) -> list[str]:
-        running = self.switcher.running() or {}
+    def _loaded_or_unknown(self) -> list[str] | None:
+        """Loaded model ids, or None when the switcher could not be asked (down, slow, erroring).
+
+        None is not "nothing loaded": a single failed /running call must not release a
+        "Next time" hold, because P5 then stops the still-loaded model (fix round 1)."""
+        running = self.switcher.running()
+        if running is None:
+            return None
         return sorted(model_id for model_id, state in running.items() if state in LOADED_STATES)
+
+    def _loaded(self) -> list[str]:
+        return self._loaded_or_unknown() or []
+
+    def _live_holds(self, loaded: list[str] | None) -> dict[str, str]:
+        """Holds whose model is still loaded; every hold when the state is unknown."""
+        holds = self._read_holds()
+        return holds if loaded is None else {m: t for m, t in holds.items() if m in loaded}
 
     @staticmethod
     def _named(doc: Mapping[str, Any], ids: list[str]) -> list[dict[str, str]]:
@@ -247,8 +263,13 @@ class PanelService:
             if errors:
                 raise RegistryValidationError(errors)
             old_text = self.writer.current_text() or ""
-            loaded = self._loaded()
-            holds = {m: text for m, text in self._read_holds().items() if m in loaded}
+            known = self._loaded_or_unknown()
+            # Unknown switcher state: keep every hold as it is (the watcher releases them once
+            # the state is known again) and treat no other model as loaded, which is what the
+            # last good reading said about them. A second change to a held model then needs no
+            # question: the hold keeps the running entry and the change applies at the next load.
+            loaded = known or []
+            holds = self._live_holds(known)
             before = extract_model_blocks(render_config(current, {}))
             after = extract_model_blocks(render_config(proposed, {}))
             affected = self._affected(current, proposed, loaded, before, after)
@@ -310,9 +331,9 @@ class PanelService:
         return affected
 
     def _rewrite_with_live_holds(self, doc: Mapping[str, Any]) -> None:
-        """Write the config for doc, keeping only the holds whose model is still loaded."""
-        loaded = set(self._loaded())
-        holds = {m: t for m, t in self._read_holds().items() if m in loaded}
+        """Write the config for doc, keeping only the holds whose model is still loaded (all of
+        them when the switcher cannot be asked)."""
+        holds = self._live_holds(self._loaded_or_unknown())
         self.writer.write(render_config(doc, holds))
         self._write_holds(holds)
 
@@ -365,7 +386,12 @@ class PanelService:
             except (BootParseError, OSError) as exc:
                 raise ImportRefused(f"The helper's start-up file could not be read: {exc}") from exc
             registry, warnings = import_live(text, boot_settings, env=os.environ, profiles=self.profiles.list())
-            loaded = self._loaded()
+            known = self._loaded_or_unknown()
+            if known is None:
+                # The import rewrites every entry; if /running only timed out while a model was
+                # loaded, P5 would restart it unasked (controller ruling, fix round 1).
+                raise PanelError(503, "switcher_unknown", IMPORT_UNKNOWN_MESSAGE)
+            loaded = known
             if loaded and when_loaded != "restart":
                 # Every entry is rewritten, so P5 restarts whatever is loaded: only "restart" is offered.
                 raise ChooseRestart(self._named(registry, loaded), next_time_allowed=False)
@@ -661,7 +687,10 @@ class PanelService:
             holds = self._read_holds()
             if not holds:
                 return []
-            loaded = set(self._loaded())
+            known = self._loaded_or_unknown()
+            if known is None:
+                return []  # switcher down or slow: skip this tick, never release on a blip
+            loaded = set(known)
             released = [model_id for model_id in holds if model_id not in loaded]
             if not released:
                 return []

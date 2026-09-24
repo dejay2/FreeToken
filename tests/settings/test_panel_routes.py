@@ -449,3 +449,76 @@ def test_freetoken_fit_lists_only_the_empty_card_components(env):
     view = env.client.get("/api/panel/views/model/qwen3.8-flash").json()
     fit = env.client.post("/api/panel/models/qwen3.8-flash/fit", json={"settings": engine_settings(view), "identity": {}}).json()
     assert [c["label"] for c in fit["components"]] == ["Weights", "KV empty"]
+
+
+# ---- fix round 1: an unanswered /running is "unknown", not "nothing loaded" ----
+def hold_quasar(env):
+    revision = seed(env)
+    env.switcher.states = {"quasar-27b": "ready"}
+    settings = engine_settings(env.client.get("/api/panel/views/model/quasar-27b").json())
+    settings["draft-tokens"] = 5
+    held = env.client.put("/api/panel/models/quasar-27b", json={
+        "revision": revision, "settings": settings, "identity": {}, "activePreset": None, "whenLoaded": "next-time"})
+    assert held.status_code == 200 and held.json()["held"] == ["quasar-27b"]
+    return held.json()["revision"]
+
+
+def quasar_block(env):
+    return extract_model_blocks(env.cfg.read_text())["quasar-27b"]
+
+
+def test_a_switcher_blip_does_not_release_a_hold(env):
+    hold_quasar(env)
+    env.switcher.up = False
+    assert env.service.release_finished_holds() == []
+    assert "--draft-tokens 7" in quasar_block(env) and env.client.get("/api/panel/now").json()["held"] == ["quasar-27b"]
+    env.switcher.up = True
+    assert env.service.release_finished_holds() == []  # still loaded
+    env.switcher.states = {}
+    assert env.service.release_finished_holds() == ["quasar-27b"]
+    assert "--draft-tokens 5" in quasar_block(env)
+
+
+def test_sync_config_with_the_switcher_down_keeps_holds(env):
+    hold_quasar(env)
+    env.switcher.up = False
+    env.service.sync_config()
+    assert "--draft-tokens 7" in quasar_block(env)
+    assert env.client.get("/api/panel/now").json()["held"] == ["quasar-27b"]
+
+
+def test_restore_with_the_switcher_down_keeps_holds(env):
+    hold_quasar(env)
+    env.switcher.up = False
+    backup = env.store.backups()[0]
+    assert env.client.post("/api/panel/registry/restore", json={"backup": backup}).status_code == 200
+    assert "--draft-tokens 7" in quasar_block(env)
+    assert env.client.get("/api/panel/now").json()["held"] == ["quasar-27b"]
+
+
+def test_a_save_while_the_switcher_is_unknown_keeps_existing_holds(env):
+    revision = hold_quasar(env)
+    env.switcher.up = False
+    other = env.client.put("/api/panel/system", json={"revision": revision, "system": {"floorGB": 8}})
+    assert other.status_code == 200, other.text
+    assert other.json()["held"] == ["quasar-27b"] and "--draft-tokens 7" in quasar_block(env)
+    settings = engine_settings(env.client.get("/api/panel/views/model/quasar-27b").json())
+    settings["draft-tokens"] = 6
+    again = env.client.put("/api/panel/models/quasar-27b", json={
+        "revision": other.json()["revision"], "settings": settings, "identity": {}, "activePreset": None})
+    assert again.status_code == 200, again.text
+    assert again.json()["held"] == ["quasar-27b"] and "--draft-tokens 7" in quasar_block(env)
+    env.switcher.up, env.switcher.states = True, {}
+    assert env.service.release_finished_holds() == ["quasar-27b"]
+    assert "--draft-tokens 6" in quasar_block(env)
+
+
+def test_import_is_refused_while_the_switcher_state_is_unknown(env):
+    env.cfg.write_text(EXAMPLE)
+    env.switcher.up = False
+    refused = env.client.post("/api/panel/import", json={"whenLoaded": "restart"})
+    assert refused.status_code == 503 and refused.json()["code"] == "switcher_unknown"
+    assert refused.json()["message"].startswith("Can't tell whether a model is loaded right now")
+    assert not env.store.exists() and env.cfg.read_text() == EXAMPLE and env.switcher.calls == []
+    env.switcher.up = True
+    assert env.client.post("/api/panel/import", json={}).status_code == 200
