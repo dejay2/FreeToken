@@ -197,6 +197,9 @@ func (s *FIFO) supersede(target string, evict []string) bool {
 		}
 		s.queued = kept
 	}
+	// A victim that turns ready between the state check above and this stop
+	// is still stopped. Its callers already got the 409, so nobody is left
+	// waiting on it and stopping it keeps the group consistent with that.
 	for _, id := range victims {
 		s.effects.StopProcesses(s.effects.UnloadTimeout(id), []string{id})
 	}
@@ -291,8 +294,8 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 	}
 
 	// Release waiters of any in-flight swap whose target is being unloaded.
-	// The swap goroutine itself is left to finish on its own; when its
-	// SwapDone arrives, OnSwapDone will find no entry in active and drop it.
+	// The swap goroutine is cancelled (FreeToken patch P1/P2, below); a
+	// SwapDone that still arrives finds no entry in active and is dropped.
 	for id := range targetSet {
 		sw, ok := s.active[id]
 		if !ok {
@@ -302,6 +305,11 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 			s.grantError(w, unloadErr)
 		}
 		delete(s.active, id)
+		// FreeToken patch P1/P2: cancel the swap goroutine too. Without this a
+		// swap parked in the memory gate's wait (P2) outlived the unload and
+		// booted its model once room appeared, even beside a newer pick in
+		// the same exclusive group (final review 2026-09-24).
+		s.effects.CancelSwap(id)
 	}
 
 	// Drop queued requests addressed to unloaded models. Requests for other

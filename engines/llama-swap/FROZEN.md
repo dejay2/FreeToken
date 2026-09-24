@@ -38,4 +38,16 @@ Every changed spot carries a `// FreeToken patch Pn:` comment.
 |---|---|---|
 | P4 | clampParams filter: clamp numeric params into [min,max] | internal/config/filters.go, internal/server/filters.go, config-schema.json |
 | P1 | latest wins: a new pick cancels a colliding not-ready swap (409 model_superseded) | internal/config/config.go, internal/router/scheduler/{scheduler.go,fifo.go}, internal/router/base.go, internal/process/process_command.go, internal/swaputil/superseded.go, config-schema.json |
-| P2 | memory gate: wait for Windows free RAM - ramNeedGB >= floorGB before loading (503 not_enough_memory) | internal/memgate/*, internal/config/{config.go,model_config.go}, internal/router/base.go, config-schema.json |
+| P2 | memory gate: wait for Windows free RAM - ramNeedGB >= floorGB before loading (503 not_enough_memory); optional `memoryGate.helperURL` bypass when the settings helper runs a FreeToken llama-swap did not start; probe cmd has WaitDelay; probe failure logs Warn, a cancelled probe returns ctx.Err() | internal/memgate/*, internal/config/{config.go,model_config.go}, internal/router/base.go, config-schema.json |
+
+Notes (final review fixes, 2026-09-24):
+
+- P1/P2: `FIFO.OnUnload` (internal/router/scheduler/fifo.go) now calls `CancelSwap` for every
+  unloaded in-flight swap. Upstream left the swap goroutine running; with the P2 gate that let a
+  swap parked in the memory wait boot its model after the unload, even beside a newer pick in the
+  same exclusive group. Covered by TestBase_MemGate_UnloadDuringWaitNeverStarts and
+  TestBase_MemGate_UnloadThenPickOtherOnlyOtherRuns (internal/router/memgate_test.go).
+- P1: `supersede` carries a comment that a victim turning ready before its stop is still stopped.
+- P2: `memoryGate.helperURL` parsing is covered by internal/config/memgate_config_test.go (new file);
+  the bypass, the Warn-level probe failure, the cancelled-probe ctx.Err() and the probe WaitDelay by
+  internal/memgate/memgate_test.go.

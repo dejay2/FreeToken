@@ -192,6 +192,11 @@
                 "waitSeconds": {
                     "type": "integer",
                     "default": 300
+                },
+                "helperURL": {
+                    "type": "string",
+                    "default": "",
+                    "description": "FreeToken patch P2: settings helper base URL (e.g. http://127.0.0.1:2031). When set, the gate skips its wait if the helper reports a FreeToken server llama-swap did not start. Empty turns this off."
                 }
             },
             "additionalProperties": false

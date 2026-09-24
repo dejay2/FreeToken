@@ -39,6 +39,7 @@ build_llama_swap() {
   go build -tags embed_ui -ldflags "-X main.version=frozen-v257-freetoken -X main.commit=$(git -C "$REPO" rev-parse --short HEAD)" -o "$OUT/llama-swap.new" .
   mv "$OUT/llama-swap.new" "$OUT/llama-swap"
   "$OUT/llama-swap" --version
+  echo "note: restart the service to use it: systemctl --user restart llama-swap"
 }
 
 build_ninfer() {

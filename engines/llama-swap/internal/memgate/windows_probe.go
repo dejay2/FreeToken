@@ -20,15 +20,26 @@ func powershellPath() string {
 	return "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 }
 
+// windowsFreeCmd builds the FreePhysicalMemory query. FreeToken patch P2
+// (final review 2026-09-24): WaitDelay bounds Output() after the ctx kill. A
+// descendant that keeps stdout open would otherwise block Output() forever
+// while WindowsProbe holds its mutex, stalling every gated load.
+func windowsFreeCmd(ctx context.Context, ps string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, ps, "-NoProfile", "-Command",
+		"(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory")
+	cmd.WaitDelay = 2 * time.Second
+	return cmd
+}
+
 // RunWindowsFreeKB asks Windows for FreePhysicalMemory (KB), with a 10 s cap.
 func RunWindowsFreeKB(ctx context.Context) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if _, err := os.Stat(powershellPath()); err != nil {
+	ps := powershellPath()
+	if _, err := os.Stat(ps); err != nil {
 		return nil, fmt.Errorf("powershell.exe not reachable: %w", err)
 	}
-	return exec.CommandContext(ctx, powershellPath(), "-NoProfile", "-Command",
-		"(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory").Output()
+	return windowsFreeCmd(ctx, ps).Output()
 }
 
 // WindowsProbe turns run's KB output into GB and caches it for ttl.

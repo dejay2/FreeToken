@@ -129,6 +129,12 @@ func newBaseRouter(
 			Wait:    time.Duration(wait) * time.Second,
 			Poll:    5 * time.Second,
 			Logf:    b.logger.Infof,
+			Warnf:   b.logger.Warnf,
+		}
+		// FreeToken patch P2: skip the wait for a FreeToken the helper runs
+		// but llama-swap did not start (final review 2026-09-24).
+		if mg.HelperURL != "" {
+			b.memGate.Bypass = memgate.HelperBypass(mg.HelperURL, nil)
 		}
 	}
 

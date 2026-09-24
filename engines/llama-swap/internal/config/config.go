@@ -240,6 +240,10 @@ type MemoryGateConfig struct {
 	Probe       string  `yaml:"probe"`
 	FloorGB     float64 `yaml:"floorGB"`     // default 6
 	WaitSeconds int     `yaml:"waitSeconds"` // default 300
+	// HelperURL, when set (e.g. http://127.0.0.1:2031), lets the gate skip
+	// its wait when the FreeToken settings helper reports a server llama-swap
+	// did not start; the adapter stops that server after the gate. "" = off.
+	HelperURL string `yaml:"helperURL"`
 }
 
 // RoutingConfig is the canonical, normalized routing/scheduling configuration.

@@ -5,8 +5,10 @@ package memgate
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
@@ -22,6 +24,14 @@ type Gate struct {
 	Wait    time.Duration
 	Poll    time.Duration
 	Logf    func(format string, args ...any)
+	// Warnf logs problems (probe failure, bypass); falls back to Logf.
+	Warnf func(format string, args ...any)
+	// Bypass, when set, is asked once per gated load before any probe. true
+	// skips the wait: a FreeToken that llama-swap did not start is holding
+	// the RAM, and the adapter's make-room step will stop it after the gate,
+	// so waiting would only end in a 503 (final review 2026-09-24). The
+	// string is detail for the log line.
+	Bypass func(ctx context.Context) (bool, string)
 }
 
 // WaitForRoom returns nil when the model may load, NotEnoughMemoryError after
@@ -30,11 +40,21 @@ func (g *Gate) WaitForRoom(ctx context.Context, model string, needGB float64) er
 	if g == nil || g.Probe == nil || needGB <= 0 {
 		return nil
 	}
+	if g.Bypass != nil {
+		if skip, detail := g.Bypass(ctx); skip {
+			g.warnf("memory gate: FreeToken (not started by llama-swap) is up; skipping the wait, the adapter will stop it (%s, loading %s)", detail, model)
+			return nil
+		}
+	}
 	deadline := time.Now().Add(g.Wait)
 	for {
 		free, err := g.Probe(ctx)
 		if err != nil {
-			g.logf("memory gate: probe failed, loading %s anyway: %v", model, err)
+			// A cancelled swap is not a probe fault: report the cancel.
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			g.warnf("memory gate: probe failed, loading %s anyway: %v", model, err)
 			return nil
 		}
 		if free-needGB >= g.FloorGB {
@@ -57,6 +77,58 @@ func (g *Gate) WaitForRoom(ctx context.Context, model string, needGB float64) er
 func (g *Gate) logf(format string, args ...any) {
 	if g.Logf != nil {
 		g.Logf(format, args...)
+	}
+}
+
+func (g *Gate) warnf(format string, args ...any) {
+	if g.Warnf != nil {
+		g.Warnf(format, args...)
+		return
+	}
+	g.logf(format, args...)
+}
+
+// HelperBypass builds a Gate.Bypass that asks the FreeToken settings helper
+// (GET <helperURL>/api/status, 2 s cap) whether its server is up or a job is
+// running. Any failure answers false, so the gate behaves as before.
+func HelperBypass(helperURL string, client *http.Client) func(context.Context) (bool, string) {
+	if client == nil {
+		client = &http.Client{}
+	}
+	url := strings.TrimRight(helperURL, "/") + "/api/status"
+	return func(ctx context.Context) (bool, string) {
+		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return false, ""
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return false, ""
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return false, ""
+		}
+		var st struct {
+			Server struct {
+				State string `json:"state"`
+			} `json:"server"`
+			CurrentJob json.RawMessage `json:"currentJob"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+			return false, ""
+		}
+		job := strings.TrimSpace(string(st.CurrentJob))
+		hasJob := job != "" && job != "null"
+		if st.Server.State == "" && !hasJob {
+			return false, "" // not a helper status answer
+		}
+		if st.Server.State != "unreachable" || hasJob {
+			return true, fmt.Sprintf("helper server state %q, job running %v", st.Server.State, hasJob)
+		}
+		return false, ""
 	}
 }
 

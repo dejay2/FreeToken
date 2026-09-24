@@ -1,6 +1,8 @@
 # llama-swap (FreeToken frozen build) config. Copy to ~/llama-swap/config.yaml and fix paths.
 # Patches used here: P1 latestWins, P2 memoryGate/ramNeedGB, P4 clampParams (engines/llama-swap/FROZEN.md).
 # ttl per model: 0 = keep loaded, N = unload after N idle seconds.
+# The service runs with --watch-config: saving this file reloads llama-swap and stops the loaded
+# model (FreeToken then reboots, about 2.5 min, on the next request).
 
 healthCheckTimeout: 600
 logLevel: info
@@ -11,6 +13,7 @@ memoryGate:
   probe: windows      # asks Windows for free RAM from WSL; "none" turns the wait off
   floorGB: 6          # keep at least this much free for Windows after the load
   waitSeconds: 300    # then answer 503 with the numbers
+  helperURL: "http://127.0.0.1:2031"  # skip the wait when the settings page runs a FreeToken llama-swap did not start
 
 routing:
   scheduler:
@@ -38,7 +41,7 @@ models:
     proxy: http://127.0.0.1:2020
     checkEndpoint: /ready?model=Qwen3.8-Flash-Next-NVFP4
     unloadTimeout: 180
-    ramNeedGB: 62        # measured 2026-09-24: Linux used peaks at 62 GB, settles at 60
+    ramNeedGB: 58        # Windows-side cost measured 2026-09-24: Windows free 57.5 -> 0.3 GB during boot (Linux used peaks 62)
     ttl: 0
     aliases: ["Qwen3.8-Flash-Next-NVFP4"]
 
@@ -48,7 +51,7 @@ models:
     proxy: http://127.0.0.1:2020
     checkEndpoint: /ready?model=Qwen3.8-Flash-Next-ABLITERATED-NVFP4
     unloadTimeout: 180
-    ramNeedGB: 62
+    ramNeedGB: 58        # Windows-side cost measured 2026-09-24: Windows free 57.5 -> 0.3 GB during boot (Linux used peaks 62)
     ttl: 0
     aliases: ["Qwen3.8-Flash-Next-ABLITERATED-NVFP4"]
 
