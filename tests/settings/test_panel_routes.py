@@ -522,3 +522,39 @@ def test_import_is_refused_while_the_switcher_state_is_unknown(env):
     assert not env.store.exists() and env.cfg.read_text() == EXAMPLE and env.switcher.calls == []
     env.switcher.up = True
     assert env.client.post("/api/panel/import", json={}).status_code == 200
+
+
+# ---- fix round 2: while the state is unknown, a save that moves an unheld entry is refused ----
+def test_a_save_moving_a_possibly_loaded_model_is_refused_while_unknown(env):
+    revision = seed(env)
+    env.switcher.states = {"fable-27b": "ready"}
+    settings = engine_settings(env.client.get("/api/panel/views/model/fable-27b").json())
+    settings["draft-tokens"] = 3
+    before, backups = env.cfg.read_text(), env.store.backups()
+    env.switcher.up = False
+    refused = env.client.put("/api/panel/models/fable-27b", json={
+        "revision": revision, "settings": settings, "identity": {}, "activePreset": None})
+    assert refused.status_code == 503 and refused.json()["code"] == "switcher_unknown"
+    assert refused.json()["message"] == ("Can't tell whether Fable 27B NVFP4 (NInfer) is loaded right now, "
+                                         "so saving could restart it. Try again in a moment.")
+    assert env.cfg.read_text() == before and env.store.backups() == backups
+    assert env.store.load()[1] == revision and env.switcher.calls == []
+
+
+def test_an_engine_default_change_while_unknown_names_every_moved_model(env):
+    revision = seed(env)
+    env.switcher.up = False
+    settings = dict(env.client.get("/api/panel/views/engine/ninfer").json()["settings"])
+    settings["max-concurrency"] = 5
+    refused = env.client.put("/api/panel/engines/ninfer/defaults", json={"revision": revision, "settings": settings})
+    assert refused.status_code == 503 and refused.json()["code"] == "switcher_unknown"
+    assert "QUASAR" in refused.json()["message"] and "Twin 27B" in refused.json()["message"]
+    assert refused.json()["message"].endswith("so saving could restart one of them. Try again in a moment.")
+
+
+def test_a_system_only_save_while_unknown_still_saves(env):
+    revision = seed(env)
+    env.switcher.up = False
+    saved = env.client.put("/api/panel/system", json={"revision": revision, "system": {"floorGB": 9}})
+    assert saved.status_code == 200, saved.text
+    assert "floorGB: 9" in env.cfg.read_text() and env.store.load()[0]["system"]["floorGB"] == 9

@@ -148,6 +148,14 @@ def _engine_dials(engine: str, values: Mapping[str, Any], runtime: str | None, m
     return dials, groups
 
 
+def _unknown_save_message(names: list[str]) -> str:
+    if len(names) == 1:
+        who, pronoun = f"{names[0]} is", "it"
+    else:
+        who, pronoun = f"{', '.join(names[:-1])} or {names[-1]} is", "one of them"
+    return f"Can't tell whether {who} loaded right now, so saving could restart {pronoun}. Try again in a moment."
+
+
 def _default_card_probe() -> dict[str, int] | None:
     from .memory_fit import probe_machine
 
@@ -264,14 +272,21 @@ class PanelService:
                 raise RegistryValidationError(errors)
             old_text = self.writer.current_text() or ""
             known = self._loaded_or_unknown()
-            # Unknown switcher state: keep every hold as it is (the watcher releases them once
-            # the state is known again) and treat no other model as loaded, which is what the
-            # last good reading said about them. A second change to a held model then needs no
-            # question: the hold keeps the running entry and the change applies at the next load.
+            # Unknown switcher state (fix rounds 1-2): keep every hold as it is (the watcher
+            # releases them once the state is known again). A change to a held model is safe:
+            # the hold pins the running entry in the file and the change applies at the next
+            # load. A change to any other model's entry is refused, because that model may be
+            # loaded and P5 would stop it. Saves that move no entry (most System fields, a
+            # FreeToken profile-only change, which the adapter applies at the next load) go through.
             loaded = known or []
             holds = self._live_holds(known)
             before = extract_model_blocks(render_config(current, {}))
             after = extract_model_blocks(render_config(proposed, {}))
+            if known is None:
+                moved = [m for m in after if m not in holds and before.get(m) != after[m]]
+                if moved:
+                    raise PanelError(503, "switcher_unknown", _unknown_save_message(
+                        [row["name"] for row in self._named(proposed, moved)]))
             affected = self._affected(current, proposed, loaded, before, after)
             if affected and when_loaded is None:
                 raise ChooseRestart(self._named(proposed, affected))
