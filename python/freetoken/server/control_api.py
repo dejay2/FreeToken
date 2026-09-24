@@ -7,6 +7,7 @@ the scheduler or blocks. Registered on the app alongside the OpenAI/Anthropic/Re
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Callable
 
@@ -63,13 +64,24 @@ def build_health(state: Any, version: str) -> dict:
 
 
 # Maintenance states in which a chat request is answered: a runtime cache rebuild is waited
-# out by the chat routes' gate (a few seconds of slowness), so it still counts as ready.
+# out by the chat routes' gate (a few seconds of slowness), so it still counts as ready. A
+# rebuild stuck past its deadline turns /health (and so /ready) to "error" through
+# check_maintenance, the same verdict the chat gate reaches.
 _READY_MAINTENANCE = ("serving", "rebuilding")
 
 
 def is_ready(health: dict) -> bool:
     """True when chat routes will answer instead of returning 503."""
     return health.get("status") == "ok" and health.get("maintenance") in _READY_MAINTENANCE
+
+
+def serves_model(state: Any, wanted: str) -> bool:
+    """``wanted`` names the loaded model: its served name, its path, or the path's folder."""
+    config = getattr(state, "config", None)
+    served = getattr(config, "served_model_name", None)
+    path = str(getattr(config, "model_path", "") or "").rstrip("/\\")
+    names = {n for n in (served, path, os.path.basename(path)) if n}
+    return wanted.rstrip("/\\") in names
 
 
 def register_control_routes(
@@ -84,9 +96,17 @@ def register_control_routes(
     # /health must stay 200 while loading (the desktop app renders its progress body), so
     # process managers that only look at the status code -- llama-swap's checkEndpoint --
     # would forward the first chat into a 503. /ready answers 503 until the model serves.
+    # ``?model=`` makes the answer about one model: while a swap is still stopping the old
+    # FreeToken model, that old model must not pass a readiness check made for the new one.
     @app.get("/ready")
-    async def ready():
-        doc = build_health(get_state(), app.version)
+    async def ready(model: str | None = None):
+        state = get_state()
+        doc = build_health(state, app.version)
+        if model and not serves_model(state, model):
+            return JSONResponse(
+                {"status": "not_ready", "reason": "another model is loaded", "model": doc.get("model")},
+                status_code=503,
+            )
         if is_ready(doc):
             return {"status": "ready", "model": doc.get("model")}
         return JSONResponse(

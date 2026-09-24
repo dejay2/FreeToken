@@ -187,7 +187,7 @@ def test_stop_servers_accepts_a_card_other_programs_keep_above_the_threshold(mon
     monkeypatch.setattr(ll, "_pid_alive", lambda pid: pid in alive)
     monkeypatch.setattr(ll.os, "kill", lambda pid, sig: alive.discard(pid))
     monkeypatch.setattr(ll, "_listeners", lambda ports: set())
-    readings = iter([20000, 9000, 3150, 3140, 3143])
+    readings = iter([29000, 20000, 9000, 3150, 3140, 3143])  # first = before the kill
     monkeypatch.setattr(ll, "_vram_used_mb", lambda: next(readings, 3143))
     clock = iter(range(0, 1000))
     report = ll.stop_servers(2020, timeout=120, sleep=lambda _: None, monotonic=lambda: float(next(clock)))
@@ -221,3 +221,40 @@ def test_a_zombie_counts_as_gone(tmp_path, monkeypatch):
 
     monkeypatch.setattr(builtins, "open", fake_open)
     assert ll._pid_alive(77) is False
+
+
+def test_stop_servers_does_not_settle_on_a_flat_card_that_never_fell(monkeypatch):
+    # A process the pid scan missed keeps the card flat at 29 GB: that is not "released".
+    alive = {41}
+    monkeypatch.setattr(ll, "find_server_pids", lambda port: set(alive))
+    monkeypatch.setattr(ll, "_pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(ll.os, "kill", lambda pid, sig: alive.discard(pid))
+    monkeypatch.setattr(ll, "_listeners", lambda ports: set())
+    monkeypatch.setattr(ll, "_vram_used_mb", lambda: 29000)
+    clock = iter(range(0, 1000))
+    report = ll.stop_servers(2020, timeout=20, sleep=lambda _: None, monotonic=lambda: float(next(clock)))
+    assert report["ok"] is False and "vram_settled" not in report
+
+
+def test_stop_servers_without_nvidia_smi_does_not_block(monkeypatch):
+    monkeypatch.setattr(ll, "find_server_pids", lambda port: set())
+    monkeypatch.setattr(ll, "_listeners", lambda ports: set())
+    monkeypatch.setattr(ll, "_vram_used_mb", lambda: None)
+    clock = iter(range(0, 1000))
+    report = ll.stop_servers(2020, timeout=20, sleep=lambda _: None, monotonic=lambda: float(next(clock)))
+    assert report["ok"] is True
+
+
+def test_a_pid_reaped_between_checks_counts_as_gone(monkeypatch):
+    monkeypatch.setattr(ll.os.path, "exists", lambda path: True)
+    import builtins
+
+    real_open = builtins.open
+
+    def vanished(path, *a, **k):
+        if path == "/proc/78/stat":
+            raise FileNotFoundError(path)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", vanished)
+    assert ll._pid_alive(78) is False

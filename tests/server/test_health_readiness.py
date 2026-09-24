@@ -9,6 +9,7 @@ halves: /health stays 200 and names the phase, and the cache-status gate is what
 
 from __future__ import annotations
 
+import pytest
 from types import SimpleNamespace
 
 from fastapi import FastAPI
@@ -112,3 +113,22 @@ def test_ready_waits_out_a_runtime_rebuild_like_the_chat_gate():
 def test_ready_is_503_when_stopping_or_failed():
     assert _client(_state("stopping")).get("/ready").status_code == 503
     assert _client(_state("serving", fatal="worker died")).get("/ready").status_code == 503
+
+
+def _model_state(path):
+    state = _state("serving")
+    state.config = SimpleNamespace(served_model_name="served-name", model_path=path)
+    return state
+
+
+@pytest.mark.parametrize("wanted", ["served-name", "/m/Qwen-A", "/m/Qwen-A/", "Qwen-A"])
+def test_ready_for_the_loaded_model_by_any_of_its_names(wanted):
+    assert _client(_model_state("/m/Qwen-A")).get("/ready", params={"model": wanted}).status_code == 200
+
+
+def test_ready_is_503_for_a_different_model_even_while_serving():
+    # A llama-swap swap between two FreeToken models: the old one still serves for a few
+    # seconds while the wrapper stops it, and must not pass the new model's check.
+    response = _client(_model_state("/m/Qwen-A")).get("/ready", params={"model": "Qwen-B"})
+    assert response.status_code == 503
+    assert response.json()["reason"] == "another model is loaded"

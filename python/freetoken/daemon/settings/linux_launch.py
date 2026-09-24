@@ -510,6 +510,9 @@ def _vram_used_mb() -> int | None:
 # The card counts as released once this many one-second VRAM samples agree within the band.
 _VRAM_SETTLE_SAMPLES = 3
 _VRAM_SETTLE_BAND_MB = 256
+# ...and only after the card fell by at least this much from before the kill: a process the
+# pid scan missed holds a perfectly flat card, which must not pass as "released".
+_VRAM_SETTLE_MIN_DROP_MB = 2048
 
 
 def _vram_settled(samples: list[int]) -> bool:
@@ -523,6 +526,8 @@ def _pid_alive(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
             return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except FileNotFoundError:
+        return False  # reaped between the two checks
     except (OSError, IndexError):
         return True
 
@@ -538,6 +543,7 @@ def stop_servers(
     """Terminate the server on ``port`` and wait until the card and the ports are free."""
     pids = find_server_pids(port)
     report: dict[str, Any] = {"killed": sorted(pids), "port": port}
+    vram_before = _vram_used_mb() if pids else None
     term = signal.SIGTERM
     kill = getattr(signal, "SIGKILL", term)  # Windows has no SIGKILL; this path only runs on Linux
     for sig in (term, kill):
@@ -564,7 +570,8 @@ def stop_servers(
         if used is not None:
             samples = (samples + [used])[-_VRAM_SETTLE_SAMPLES:]
         card_busy = used is not None and used >= vram_free_threshold_mb
-        if card_busy and not pids and _vram_settled(samples):
+        fell = vram_before is not None and used is not None and vram_before - used >= _VRAM_SETTLE_MIN_DROP_MB
+        if card_busy and not pids and fell and _vram_settled(samples):
             # Other programs (browser, games, another engine) can hold more than the fixed
             # threshold on their own: live 2026-09-24 the desktop sat at 3.1 GB and every Stop
             # waited out the full 120 s. With the server processes gone and the card no longer

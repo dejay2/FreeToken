@@ -29,8 +29,9 @@ models:
     name: "Qwen3.8 Flash Next NVFP4 (FreeToken)"
     cmd: ${ft} ${env.HOME}/models/Qwen3.8-Flash-Next-NVFP4
     proxy: http://127.0.0.1:2020
-    # /health answers 200 while loading; /ready is 503 until chats are answered.
-    checkEndpoint: /ready
+    # /health answers 200 while loading; /ready is 503 until chats are answered, and
+    # ?model= (the folder name) keeps the model being swapped out from passing the check.
+    checkEndpoint: /ready?model=Qwen3.8-Flash-Next-NVFP4
     # A page Stop takes up to ~2 min to free the card.
     unloadTimeout: 180
     aliases:
