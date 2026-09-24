@@ -5,12 +5,13 @@
 - Commit: d4bc75dbc7066109c3d9692ed564e5904a849ba0
 - Copied: 2026-09-24, without .git and build/
 - License: Apache-2.0 (LICENSE kept)
-- Runs: quasar-27b (DFlash2 K7) — this is the reason this runtime is frozen here. It should
-  also run fable-27b and twin-27b; the live check comparing it against the upstream build
-  (Steps 1-2 of task-6-brief.md) is pending a live session. If mobile falls short of 95% of
-  upstream's tok/s on either, or fails to load/answer, a second copy is added as
-  `engines/ninfer-upstream/` (Neroued/ninfer at f76e19c0) and `engines/README.md` is updated
-  accordingly.
+- Runs: quasar-27b (DFlash2 K7) only. Live check on the serving box: this build refused the
+  Fable and Twin artifacts at startup with `FATAL server failed during startup | artifact magic
+  is not NInfer v2` — those artifacts are NInfer v3, converted with upstream Neroued/ninfer at
+  f76e19c0fbd026c86f46005acf2c80c54084bade, and this mobile fork's artifact loader only reads
+  v2. Per the spec's fallback, a second copy is frozen at `engines/ninfer-upstream/` (that same
+  upstream commit) to run fable-27b and twin-27b; see `engines/README.md` and
+  `engines/ninfer-upstream/FROZEN.md`.
 - No git submodules: `git submodule status` on the clone printed nothing.
 - No FetchContent/ExternalProject: `CMakeLists.txt` and the whole tree have no such calls;
   `third_party/{spdlog,utf8proc,nlohmann,cpp-httplib}` are vendored directly as plain source

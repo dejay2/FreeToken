@@ -21,6 +21,9 @@ routing:
 macros:
   ft: "${env.HOME}/FreeToken/engines/adapters/freetoken.sh"
   ninfer: "${env.HOME}/FreeToken/engines/adapters/ninfer.sh ${env.HOME}/FreeToken/engines/ninfer/build/apps/ninfer-serve"
+  # ninfer's mobile artifact loader reads only NInfer v2; fable-27b/twin-27b are v3, so they run
+  # on the upstream build instead (engines/ninfer-upstream/FROZEN.md).
+  ninfer_upstream: "${env.HOME}/FreeToken/engines/adapters/ninfer.sh ${env.HOME}/FreeToken/engines/ninfer-upstream/build/apps/ninfer-serve"
   ninfer_common: >-
     --host 127.0.0.1 --port 8090
     --max-context 150000 --kv-capacity 200000
@@ -63,7 +66,7 @@ models:
 
   "fable-27b":
     name: "Fable 27B NVFP4 (NInfer)"
-    cmd: ${ninfer} ${env.HOME}/ninfer-work/models/fable_27b_nvfp4.ninfer fable-27b ${ninfer_common} --kv-dtype fp8 --spec mtp --draft-tokens 4
+    cmd: ${ninfer_upstream} ${env.HOME}/ninfer-work/models/fable_27b_nvfp4.ninfer fable-27b ${ninfer_common} --kv-dtype fp8 --spec mtp --draft-tokens 4
     proxy: http://127.0.0.1:8090
     useModelName: "fable-27b"
     unloadTimeout: 60
@@ -75,7 +78,7 @@ models:
 
   "twin-27b":
     name: "Twin 27B NVFP4 (NInfer)"
-    cmd: ${ninfer} ${env.HOME}/ninfer-work/models/twin_nvfp4.ninfer twin-27b ${ninfer_common} --kv-dtype fp8 --spec mtp --draft-tokens 4
+    cmd: ${ninfer_upstream} ${env.HOME}/ninfer-work/models/twin_nvfp4.ninfer twin-27b ${ninfer_common} --kv-dtype fp8 --spec mtp --draft-tokens 4
     proxy: http://127.0.0.1:8090
     useModelName: "twin-27b"
     unloadTimeout: 60
