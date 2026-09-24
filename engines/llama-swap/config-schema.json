@@ -510,6 +510,16 @@
                                 "pattern": "^[a-zA-Z0-9_, ]*$",
                                 "description": "Comma separated list of parameters to remove from the request. Used for server-side enforcement of sampling parameters."
                             },
+                            "clampParams": {
+                                "type": "object",
+                                "description": "FreeToken patch P4: inclusive [min, max] per numeric request parameter; out-of-range values are clamped.",
+                                "additionalProperties": {
+                                    "type": "array",
+                                    "items": {"type": "number"},
+                                    "minItems": 2,
+                                    "maxItems": 2
+                                }
+                            },
                             "setParams": {
                                 "type": "object",
                                 "additionalProperties": true,
@@ -755,6 +765,16 @@
                                 "default": "",
                                 "pattern": "^[a-zA-Z0-9_, ]*$",
                                 "description": "Comma separated list of parameters to remove from the request. Useful for removing parameters that the peer doesn't support."
+                            },
+                            "clampParams": {
+                                "type": "object",
+                                "description": "FreeToken patch P4: inclusive [min, max] per numeric request parameter; out-of-range values are clamped.",
+                                "additionalProperties": {
+                                    "type": "array",
+                                    "items": {"type": "number"},
+                                    "minItems": 2,
+                                    "maxItems": 2
+                                }
                             },
                             "setParams": {
                                 "type": "object",

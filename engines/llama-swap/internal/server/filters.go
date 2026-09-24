@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -139,6 +140,33 @@ func applyFilters(body []byte, requested, useModelName string, f config.Filters)
 	for _, param := range f.SanitizedStripParams() {
 		if body, err = sjson.DeleteBytes(body, param); err != nil {
 			return nil, fmt.Errorf("error stripping parameter %s from request", param)
+		}
+	}
+
+	// FreeToken patch P4: clamp numeric params into their configured range.
+	clampKeys, clampBounds := f.SanitizedClampParams()
+	for _, key := range clampKeys {
+		v := gjson.GetBytes(body, key)
+		if v.Type != gjson.Number {
+			continue
+		}
+		b := clampBounds[key]
+		x := v.Float()
+		var bound float64
+		switch {
+		case x < b[0]:
+			bound = b[0]
+		case x > b[1]:
+			bound = b[1]
+		default:
+			continue
+		}
+		var out any = bound
+		if bound == math.Trunc(bound) {
+			out = int64(bound)
+		}
+		if body, err = sjson.SetBytes(body, key, out); err != nil {
+			return nil, fmt.Errorf("error clamping parameter %s in request", key)
 		}
 	}
 

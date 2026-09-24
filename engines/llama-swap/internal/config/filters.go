@@ -29,6 +29,12 @@ type Filters struct {
 	// Keys ending in "?" are set-if-undefined, as in SetParams.
 	// Protected params (like "model") cannot be set.
 	SetParamsByID map[string]map[string]any `yaml:"setParamsByID"`
+
+	// FreeToken patch P4: ClampParams pulls numeric request parameters into an
+	// inclusive [min, max] range instead of letting the upstream reject them
+	// (NInfer answers 400 "top_k must be in [0,20]"). Non-numeric or absent
+	// params are left alone. Applied after StripParams, before SetParams.
+	ClampParams map[string][]float64 `yaml:"clampParams"`
 }
 
 // SanitizedStripParams returns a sorted list of parameters to strip,
@@ -133,4 +139,28 @@ func sanitizeParams(raw map[string]any) (map[string]any, []string, map[string]bo
 	sort.Strings(keys)
 
 	return result, keys, soft
+}
+
+// FreeToken patch P4: SanitizedClampParams returns the clamp keys in sorted
+// order and their [min, max] bounds, dropping protected params, entries that
+// are not exactly two numbers, and inverted ranges.
+func (f Filters) SanitizedClampParams() ([]string, map[string][2]float64) {
+	if len(f.ClampParams) == 0 {
+		return nil, nil
+	}
+	bounds := make(map[string][2]float64, len(f.ClampParams))
+	keys := make([]string, 0, len(f.ClampParams))
+	for key, pair := range f.ClampParams {
+		key = strings.TrimSpace(key)
+		if key == "" || slices.Contains(ProtectedParams, key) || len(pair) != 2 || pair[0] > pair[1] {
+			continue
+		}
+		bounds[key] = [2]float64{pair[0], pair[1]}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	sort.Strings(keys)
+	return keys, bounds
 }

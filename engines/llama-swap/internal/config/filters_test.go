@@ -1,6 +1,7 @@
 package config
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -361,4 +362,23 @@ func TestFilters_SanitizedSetParamsByID(t *testing.T) {
 func TestProtectedParams(t *testing.T) {
 	// Verify that "model" is protected
 	assert.Contains(t, ProtectedParams, "model")
+}
+
+// FreeToken patch P4: clampParams sanitising.
+func TestFilters_SanitizedClampParams(t *testing.T) {
+	f := Filters{ClampParams: map[string][]float64{
+		"top_k":       {0, 20},
+		"temperature": {0, 2},
+		"model":       {0, 1}, // protected: dropped
+		"bad_len":     {1},    // not a pair: dropped
+		"inverted":    {5, 1}, // min > max: dropped
+	}}
+	keys, bounds := f.SanitizedClampParams()
+	want := []string{"temperature", "top_k"}
+	if !slices.Equal(keys, want) {
+		t.Fatalf("keys=%v want %v", keys, want)
+	}
+	if bounds["top_k"] != [2]float64{0, 20} {
+		t.Errorf("top_k bounds=%v", bounds["top_k"])
+	}
 }

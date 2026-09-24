@@ -18,3 +18,4 @@ Every changed spot carries a `// FreeToken patch Pn:` comment.
 
 | Patch | What | Files |
 |---|---|---|
+| P4 | clampParams filter: clamp numeric params into [min,max] | internal/config/filters.go, internal/server/filters.go, config-schema.json |

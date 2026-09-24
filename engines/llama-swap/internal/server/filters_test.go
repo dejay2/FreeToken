@@ -189,6 +189,31 @@ func TestServer_ApplyFilters(t *testing.T) {
 	})
 }
 
+// FreeToken patch P4: clamp numbers into range; leave everything else alone.
+func TestApplyFilters_ClampParams(t *testing.T) {
+	f := config.Filters{ClampParams: map[string][]float64{
+		"top_k": {0, 20}, "temperature": {0, 2}, "top_p": {0, 1},
+	}}
+	cases := []struct{ name, in, want string }{
+		{"above max int", `{"model":"m","top_k":40}`, `{"model":"m","top_k":20}`},
+		{"below min float", `{"model":"m","temperature":-0.5}`, `{"model":"m","temperature":0}`},
+		{"in range untouched", `{"model":"m","top_p":0.95}`, `{"model":"m","top_p":0.95}`},
+		{"absent untouched", `{"model":"m"}`, `{"model":"m"}`},
+		{"string untouched", `{"model":"m","top_k":"40"}`, `{"model":"m","top_k":"40"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := applyFilters([]byte(tc.in), "m", "", f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("got %s want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestServer_ResolveFilters_QualifiedPeer(t *testing.T) {
 	want := config.Filters{StripParams: "temperature"}
 	cfg := config.Config{Peers: config.PeerDictionaryConfig{
