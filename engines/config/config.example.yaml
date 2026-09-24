@@ -1,47 +1,86 @@
-# llama-swap config: one OpenAI/Anthropic address that switches between FreeToken models
-# and other engines (here NInfer) on one GPU. Copy next to the llama-swap binary, fix paths.
-# Run: llama-swap --config config.yaml --listen 0.0.0.0:2040
-#
-# Only one model runs at a time (the default swap group). Swapping back to FreeToken reloads
-# its expert banks (~68 GB of host RAM, 2-3 min on the RTX 5090 box), so nothing unloads on
-# a timer: ttl 0 everywhere, and a swap happens only when a request names another model.
+# llama-swap (FreeToken frozen build) config. Copy to ~/llama-swap/config.yaml and fix paths.
+# Patches used here: P1 latestWins, P2 memoryGate/ramNeedGB, P4 clampParams (engines/llama-swap/FROZEN.md).
+# ttl per model: 0 = keep loaded, N = unload after N idle seconds.
 
 healthCheckTimeout: 600
 logLevel: info
-# Off: it writes "loading..." text into the model's thinking output.
 sendLoadingState: false
 globalTTL: 0
 
+memoryGate:
+  probe: windows      # asks Windows for free RAM from WSL; "none" turns the wait off
+  floorGB: 6          # keep at least this much free for Windows after the load
+  waitSeconds: 300    # then answer 503 with the numbers
+
+routing:
+  scheduler:
+    settings:
+      fifo:
+        latestWins: true   # a new pick cancels a half-finished load
+
 macros:
-  ft: "${env.HOME}/FreeToken/scripts/llama-swap/freetoken.sh"
-  other: "${env.HOME}/FreeToken/scripts/llama-swap/other-engine.sh"
-  ninfer: "${other} ${env.HOME}/ninfer-work/ninfer/build/apps/ninfer-serve"
-  ninfer_args: >-
+  ft: "${env.HOME}/FreeToken/engines/adapters/freetoken.sh"
+  ninfer: "${env.HOME}/FreeToken/engines/adapters/ninfer.sh ${env.HOME}/FreeToken/engines/ninfer/build/apps/ninfer-serve"
+  ninfer_common: >-
     --host 127.0.0.1 --port 8090
     --max-context 150000 --kv-capacity 200000
     --max-concurrency 4 --max-pending-requests 16 --pending-timeout-ms 300000
-    --kv-dtype fp8 --host-state-slots 8 --host-kv-mib 8192
-    --spec mtp --draft-tokens 4 --lm-head-draft
-    --preserve-thinking --vision
+    --host-state-slots 8 --host-kv-mib 8192
+    --lm-head-draft --preserve-thinking --vision
 
 models:
   "qwen3.8-flash":
     name: "Qwen3.8 Flash Next NVFP4 (FreeToken)"
     cmd: ${ft} ${env.HOME}/models/Qwen3.8-Flash-Next-NVFP4
     proxy: http://127.0.0.1:2020
-    # /health answers 200 while loading; /ready is 503 until chats are answered, and
-    # ?model= (the folder name) keeps the model being swapped out from passing the check.
     checkEndpoint: /ready?model=Qwen3.8-Flash-Next-NVFP4
-    # A page Stop takes up to ~2 min to free the card.
     unloadTimeout: 180
-    aliases:
-      - "Qwen3.8-Flash-Next-NVFP4"
+    ramNeedGB: 60        # measured in Task 8; update from the measurement
+    ttl: 0
+    aliases: ["Qwen3.8-Flash-Next-NVFP4"]
+
+  "qwen3.8-flash-abliterated":
+    name: "Qwen3.8 Flash Next ABLITERATED NVFP4 (FreeToken, uncensored)"
+    cmd: ${ft} ${env.HOME}/models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4
+    proxy: http://127.0.0.1:2020
+    checkEndpoint: /ready?model=Qwen3.8-Flash-Next-ABLITERATED-NVFP4
+    unloadTimeout: 180
+    ramNeedGB: 60
+    ttl: 0
+    aliases: ["Qwen3.8-Flash-Next-ABLITERATED-NVFP4"]
+
+  "quasar-27b":
+    name: "Qwen3.8 27B QUASAR NVFP4 (NInfer, DFlash2)"
+    cmd: ${ninfer} ${env.HOME}/ninfer-work/models/quasar_27b_nvfp4.ninfer quasar-27b ${ninfer_common} --kv-dtype int8 --spec dflash2 --draft-tokens 7
+    proxy: http://127.0.0.1:8090
+    useModelName: "quasar-27b"
+    unloadTimeout: 60
+    ramNeedGB: 18
+    ttl: 0
+    env: ["PATH=/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"]
+    filters:
+      clampParams: {top_k: [0, 20], temperature: [0, 2], top_p: [0, 1], min_p: [0, 1], presence_penalty: [-2, 2], frequency_penalty: [-2, 2]}
 
   "fable-27b":
     name: "Fable 27B NVFP4 (NInfer)"
-    cmd: ${ninfer} ${env.HOME}/ninfer-work/models/fable_27b_nvfp4.ninfer --model-id fable-27b ${ninfer_args}
+    cmd: ${ninfer} ${env.HOME}/ninfer-work/models/fable_27b_nvfp4.ninfer fable-27b ${ninfer_common} --kv-dtype fp8 --spec mtp --draft-tokens 4
     proxy: http://127.0.0.1:8090
     useModelName: "fable-27b"
     unloadTimeout: 60
-    env:
-      - "PATH=/usr/local/cuda/bin:/usr/bin:/bin"
+    ramNeedGB: 18
+    ttl: 0
+    env: ["PATH=/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"]
+    filters:
+      clampParams: {top_k: [0, 20], temperature: [0, 2], top_p: [0, 1], min_p: [0, 1], presence_penalty: [-2, 2], frequency_penalty: [-2, 2]}
+
+  "twin-27b":
+    name: "Twin 27B NVFP4 (NInfer)"
+    cmd: ${ninfer} ${env.HOME}/ninfer-work/models/twin_nvfp4.ninfer twin-27b ${ninfer_common} --kv-dtype fp8 --spec mtp --draft-tokens 4
+    proxy: http://127.0.0.1:8090
+    useModelName: "twin-27b"
+    unloadTimeout: 60
+    ramNeedGB: 18
+    ttl: 0
+    env: ["PATH=/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"]
+    filters:
+      clampParams: {top_k: [0, 20], temperature: [0, 2], top_p: [0, 1], min_p: [0, 1], presence_penalty: [-2, 2], frequency_penalty: [-2, 2]}
