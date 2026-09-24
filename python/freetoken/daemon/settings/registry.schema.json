@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FreeToken control panel registry",
+  "description": "~/.config/freetoken/registry.json on the serving box. registry.py validates it (no jsonschema dependency); tests/settings/test_registry.py keeps this file in step.",
+  "type": "object",
+  "required": ["version", "system", "engines", "models"],
+  "properties": {
+    "version": {"const": 1},
+    "system": {"$ref": "#/$defs/system"},
+    "engines": {
+      "type": "object",
+      "required": ["ninfer", "freetoken"],
+      "properties": {"ninfer": {"$ref": "#/$defs/engine"}, "freetoken": {"$ref": "#/$defs/engine"}}
+    },
+    "models": {"type": "array", "items": {"$ref": "#/$defs/model"}}
+  },
+  "$defs": {
+    "settings": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}},
+    "engine": {"type": "object", "required": ["defaults"], "properties": {"defaults": {"$ref": "#/$defs/settings"}}},
+    "system": {
+      "type": "object",
+      "required": ["floorGB", "waitSeconds", "latestWins", "defaultIdleMinutes", "helperURL"],
+      "properties": {
+        "floorGB": {"type": "number", "minimum": 0, "maximum": 64},
+        "waitSeconds": {"type": "integer", "minimum": 0, "maximum": 3600},
+        "latestWins": {"type": "boolean"},
+        "defaultIdleMinutes": {"type": "integer", "minimum": 0, "maximum": 1440},
+        "helperURL": {"type": "string", "pattern": "^http://127\\.0\\.0\\.1:"}
+      }
+    },
+    "model": {
+      "type": "object",
+      "required": ["id", "name", "engine", "runtime", "artifact", "ramNeedGB"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$"},
+        "name": {"type": "string", "minLength": 1, "maxLength": 120},
+        "engine": {"enum": ["ninfer", "freetoken"]},
+        "runtime": {"enum": ["ninfer", "ninfer-upstream", "freetoken"]},
+        "artifact": {"type": "string", "pattern": "^(~/|/)"},
+        "ramNeedGB": {"type": "number", "minimum": 0, "maximum": 512},
+        "idleMinutes": {"type": ["integer", "null"], "minimum": 0, "maximum": 1440},
+        "aliases": {"type": "array", "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"}},
+        "overrides": {"$ref": "#/$defs/settings"},
+        "presets": {"type": "object", "additionalProperties": {"$ref": "#/$defs/settings"}},
+        "activePreset": {"type": ["string", "null"]}
+      }
+    }
+  }
+}
