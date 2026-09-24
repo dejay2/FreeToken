@@ -53,3 +53,35 @@ def test_turning_off_pictures_and_guess_ahead_lowers_the_estimate():
     lighter = quasar()
     lighter.update({"vision": False, "spec": "off"})
     assert estimate(lighter, QUASAR_BYTES)["needBytes"] < full
+
+
+def test_more_concurrent_chats_use_more_card_memory():
+    # GDN keeps a fixed-size recurrent-state + conv-history StateImage per active lane
+    # (src/core/linear_attention_state.{h,cpp}; slot count = max-concurrency + device-state-slots,
+    # src/runtime/engine/engine.cpp:63,75-76), so raising concurrency alone must raise the estimate.
+    needs = []
+    for concurrency in (1, 2, 4, 8):
+        settings = quasar()
+        settings["max-concurrency"] = concurrency
+        needs.append(estimate(settings, QUASAR_BYTES)["needBytes"])
+    assert needs == sorted(needs)
+    assert len(set(needs)) == len(needs)
+
+
+def test_more_device_state_slots_uses_more_card_memory():
+    needs = []
+    for slots in (0, 4, 8):
+        settings = quasar()
+        settings["device-state-slots"] = slots
+        needs.append(estimate(settings, QUASAR_BYTES)["needBytes"])
+    assert needs == sorted(needs)
+    assert len(set(needs)) == len(needs)
+
+
+def test_unknown_kv_dtype_raises_a_plain_error():
+    try:
+        kv_bytes_per_token("q9")
+    except ValueError as exc:
+        assert "q9" in str(exc)
+    else:
+        raise AssertionError("expected a ValueError")
