@@ -10,6 +10,9 @@ change them. Each folder has a FROZEN.md with its source commit and our patch li
 | ninfer-upstream/ | upstream inference runtime; runs fable-27b, twin-27b (NInfer v3 artifacts) | Neroued/ninfer @ f76e19c0fbd026c86f46005acf2c80c54084bade |
 | adapters/ | start/stop/ready scripts, one per engine (see adapters/CONTRACT.md) | ours |
 | config/ | example switcher config; the live one is ~/llama-swap/config.yaml on the box | ours |
+| (generated) | ~/llama-swap/config.yaml is written by the settings page (daemon/settings/swap_config.py) from ~/.config/freetoken/registry.json | ours |
+
+llama-swap patch P5 keeps a loaded model through a config reload when its entry did not change.
 
 Two NInfer copies are frozen, not one. The live check on the serving box (task-6-brief.md
 Steps 1-2) found `engines/ninfer`'s mobile build refuses the Fable and Twin artifacts at
