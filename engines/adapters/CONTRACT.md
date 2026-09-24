@@ -14,3 +14,9 @@ An adapter is the program llama-swap runs as a model's `cmd`. Every adapter must
 
 Adding an engine means writing one adapter against this contract, adding a build step to
 `scripts/engines/build.sh` if needed, and adding config entries.
+
+FreeToken's adapter takes `--profile model-<registry id>` from the control panel's generated
+config. It pushes the model's effective settings (`GET /api/panel/models/<id>/effective`) into
+that helper profile (`PUT /api/profiles/<id>` with `replace: true`) and activates it before the
+boot. It adopts a running server only when that server runs the same folder, on the same
+profile, and the push reported no change.

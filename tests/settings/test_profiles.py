@@ -39,3 +39,26 @@ def test_profile_delete_does_not_delete_presets(tmp_path):
     manager = ProfilesManager(tmp_path / "boot-profiles.json")
     assert manager.delete("profile-a") == {"deleted": False, "id": "profile-a"}
     assert manager.get("profile-a") is not None
+
+
+def test_upsert_creates_model_profiles_by_id_and_reports_changes(tmp_path):
+    from freetoken.daemon.settings.profiles_manager import ProfileError, ProfilesManager
+
+    manager = ProfilesManager(tmp_path / "boot-profiles.json", profile_dir=tmp_path / "boot-profiles")
+    first = manager.upsert("model-qwen3.8-flash", name="Flash", description="panel",
+                           settings={"ModelPath": "/m/B", "KVDtype": "fp8"})
+    assert first["id"] == "model-qwen3.8-flash" and first["changed"] is True
+    again = manager.upsert("model-qwen3.8-flash", name="Flash", description="panel",
+                           settings={"ModelPath": "/m/B", "KVDtype": "fp8"})
+    assert again["changed"] is False
+    replaced = manager.upsert("model-qwen3.8-flash", name="Flash", description="panel",
+                              settings={"ModelPath": "/m/B", "KVDtype": "bf16"})
+    assert replaced["changed"] is True
+    assert manager.get("model-qwen3.8-flash")["settings"] == {"ModelPath": "/m/B", "KVDtype": "bf16"}
+    kept = manager.upsert("model-qwen3.8-flash", name="Other", description="panel",
+                          settings={"ModelPath": "/m/C"}, create_only=True)
+    assert kept["changed"] is False and manager.get("model-qwen3.8-flash")["settings"]["ModelPath"] == "/m/B"
+    assert (tmp_path / "boot-profiles" / "model-qwen3.8-flash.ps1").is_file()
+    import pytest
+    with pytest.raises(ProfileError):
+        manager.upsert("prof-123", name="x", description="", settings={})

@@ -4,7 +4,11 @@
 # stay in charge. A bare `ft serve` under llama-swap fights the helper: the watchdog adopts
 # any server serving on the port and restarts it after llama-swap kills it.
 #
-#   freetoken.sh <model folder>    boot that model, then stay alive while it serves
+#   freetoken.sh [--profile <id>] <model folder>
+#
+# With --profile (the control panel's generated config always passes it) the model's settings
+# come from the panel's registry: they are pushed into the helper profile <id> (model-<registry
+# id>), which is activated before the boot. Without it, only ModelPath is saved (the old path).
 #
 # llama-swap's SIGTERM (unload or swap) becomes a page Stop, which also disarms the watchdog.
 # Point llama-swap's checkEndpoint at /ready?model=<folder name>: /health is 200 while the
@@ -13,7 +17,12 @@ set -uo pipefail
 
 HELPER="${FREETOKEN_HELPER:-http://127.0.0.1:2031}"
 SERVER="${FREETOKEN_SERVER:-http://127.0.0.1:2020}"
-MODEL_PATH="${1:?usage: freetoken.sh <model folder>}"
+PROFILE=""
+if [ "${1:-}" = --profile ]; then
+  PROFILE="${2:?usage: freetoken.sh [--profile <id>] <model folder>}"
+  shift 2
+fi
+MODEL_PATH="${1:?usage: freetoken.sh [--profile <id>] <model folder>}"
 MODEL_PATH="${MODEL_PATH%/}"
 MODEL_NAME="$(basename "$MODEL_PATH")"  # what /ready?model= matches: the folder name
 
@@ -76,6 +85,42 @@ except Exception: print('')")
   [ -n "$job" ] && wait_job "$job" stopped
 }
 
+# --profile: push this model's effective settings from the control panel into its helper
+# profile. Prints "changed" or "same"; fails when the panel does not know the model.
+push_profile() {
+  local rid="${PROFILE#model-}" eff code body out
+  eff=$(curl -s --max-time 10 -w '\n%{http_code}' "$HELPER/api/panel/models/$rid/effective")
+  code="${eff##*$'\n'}"
+  if [ "$code" != 200 ]; then
+    log "the control panel does not know model $rid (HTTP $code): ${eff%$'\n'*}"
+    return 1
+  fi
+  body=$(printf '%s' "${eff%$'\n'*}" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+print(json.dumps({"name": d.get("name") or sys.argv[1], "description": "Control panel settings for this model",
+                  "settings": d["settings"], "replace": True}))' "$PROFILE") || return 1
+  out=$(curl -s --max-time 30 -X PUT -H 'content-type: application/json' -d "$body" "$HELPER/api/profiles/$PROFILE")
+  printf '%s' "$out" | python3 -c 'import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(1)
+if not d.get("id"): sys.exit(1)
+print("changed" if d.get("changed") else "same")' || { log "the helper refused profile $PROFILE: $out"; return 1; }
+}
+
+active_profile() {
+  curl -s --max-time 10 "$HELPER/api/settings" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("activeProfile") or "-")
+except Exception: print("-")'
+}
+
+activate_profile() {
+  local out
+  out=$(curl -s --max-time 30 -X POST "$HELPER/api/profiles/$PROFILE/activate")
+  case "$out" in *'"activated":true'*) return 0 ;; esac
+  log "profile $PROFILE could not be activated: $out"
+  return 1
+}
+
 on_term() {
   log "unload requested: stopping FreeToken through the helper"
   if stop_server; then exit 0; fi
@@ -96,7 +141,19 @@ fi
 
 read -r state job_now _ <<<"$(snapshot)"
 [ "$state" = helper-down ] && { log "settings helper not reachable at $HELPER"; exit 1; }
+profile_state=same
+if [ -n "$PROFILE" ]; then
+  profile_state=$(push_profile) || exit 1
+fi
+adopt=0
 if [ "$state" = serving ] && [ "$job_now" = - ] && ! other_model_loaded; then
+  # A running server is kept only if it runs this folder, on this model's profile, with the
+  # settings the panel has now; anything else reboots so the new settings take effect.
+  if [ -z "$PROFILE" ] || { [ "$(active_profile)" = "$PROFILE" ] && [ "$profile_state" = same ]; }; then
+    adopt=1
+  fi
+fi
+if [ "$adopt" = 1 ]; then
   log "already serving $MODEL_PATH; adopting it"
 else
   # Also stop when only a job is in flight: a page or watchdog boot that has not bound its
@@ -105,9 +162,13 @@ else
     log "stopping the running FreeToken model first (state: $state, job: $job_now)"
     stop_server || { log "could not stop the running server"; exit 1; }
   fi
-  body=$(python3 -c 'import json,sys; print(json.dumps({"settings": {"ModelPath": sys.argv[1]}}))' "$MODEL_PATH")
-  saved=$(curl -s --max-time 30 -X PUT -H 'content-type: application/json' -d "$body" "$HELPER/api/settings")
-  case "$saved" in *'"status":"saved"'*) ;; *) log "settings refused: $saved"; exit 1 ;; esac
+  if [ -n "$PROFILE" ]; then
+    activate_profile || exit 1
+  else
+    body=$(python3 -c 'import json,sys; print(json.dumps({"settings": {"ModelPath": sys.argv[1]}}))' "$MODEL_PATH")
+    saved=$(curl -s --max-time 30 -X PUT -H 'content-type: application/json' -d "$body" "$HELPER/api/settings")
+    case "$saved" in *'"status":"saved"'*) ;; *) log "settings refused: $saved"; exit 1 ;; esac
+  fi
   job=$(curl -s --max-time 30 -X POST "$HELPER/api/server/start" | python3 -c "import json,sys
 try: print(json.load(sys.stdin).get('jobId') or '')
 except Exception: print('')")

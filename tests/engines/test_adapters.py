@@ -33,6 +33,9 @@ class FakeHelper:
         self.start_result = "serving"
         self.calls: list[str] = []
         self.jobs: dict[str, str] = {}
+        self.active_profile = "default"
+        self.effective = {}  # registry id -> {"name": ..., "settings": {...}}
+        self.profiles: dict[str, dict] = {}
         helper = self
 
         class H(BaseHTTPRequestHandler):
@@ -62,7 +65,13 @@ class FakeHelper:
                         "autoRestart": {"armed": helper.armed, "enabled": True, "gave_up": False},
                     })
                 if self.path == "/api/settings":
-                    return self._send(200, {"settings": {"ModelPath": helper.model_path}})
+                    return self._send(200, {"settings": {"ModelPath": helper.model_path},
+                                            "activeProfile": helper.active_profile})
+                if self.path.startswith("/api/panel/models/") and self.path.endswith("/effective"):
+                    rid = self.path.split("/")[4]
+                    if rid not in helper.effective:
+                        return self._send(404, {"detail": f"not found: {rid}"})
+                    return self._send(200, {"id": rid, **helper.effective[rid]})
                 if self.path.startswith("/api/server/jobs/"):
                     jid = self.path.rsplit("/", 1)[1]
                     if jid not in helper.jobs:
@@ -79,6 +88,11 @@ class FakeHelper:
                 n = int(self.headers.get("content-length", 0))
                 body = json.loads(self.rfile.read(n) or b"{}")
                 helper.calls.append("PUT " + self.path)
+                if self.path.startswith("/api/profiles/"):
+                    pid = self.path.rsplit("/", 1)[1]
+                    changed = helper.profiles.get(pid) != body["settings"]
+                    helper.profiles[pid] = body["settings"]
+                    return self._send(200, {"id": pid, "changed": changed, "settings": body["settings"]})
                 helper.model_path = body["settings"]["ModelPath"]
                 return self._send(200, {"status": "saved", "settings": body["settings"]})
 
@@ -95,6 +109,13 @@ class FakeHelper:
                     if helper.start_result == "serving":
                         helper.state = "serving"
                     return self._send(202, {"jobId": jid})
+                if self.path.startswith("/api/profiles/") and self.path.endswith("/activate"):
+                    pid = self.path.split("/")[3]
+                    if pid not in helper.profiles:
+                        return self._send(404, {"detail": "not found"})
+                    helper.active_profile = pid
+                    helper.model_path = helper.profiles[pid]["ModelPath"]
+                    return self._send(200, {"activated": True, "profileId": pid})
                 return self._send(404, {})
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
@@ -206,4 +227,78 @@ def test_freetoken_adopts_the_same_model_without_rebooting(helper, tmp_path):
     time.sleep(1.5)
     proc.terminate()
     proc.wait(20)
+    assert "POST /api/server/start" not in helper.calls
+
+
+FLASH = {"name": "Flash", "settings": {"ModelPath": "/m/B", "KVDtype": "fp8"}}
+
+
+def test_freetoken_profile_pushes_settings_activates_then_boots(helper, tmp_path):
+    helper.effective = {"flash": FLASH}
+    proc = subprocess.Popen([ADAPTERS / "freetoken.sh", "--profile", "model-flash", "/m/B"],
+                            env=env_for(helper, tmp_path))
+    for _ in range(100):
+        if helper.state == "serving":
+            break
+        time.sleep(0.1)
+    proc.terminate()
+    proc.wait(20)
+    order = [c for c in helper.calls if c.startswith(("PUT", "POST"))]
+    assert order[:3] == ["PUT /api/profiles/model-flash", "POST /api/profiles/model-flash/activate",
+                         "POST /api/server/start"]
+    assert helper.active_profile == "model-flash" and helper.model_path == "/m/B"
+    assert "PUT /api/settings" not in helper.calls
+
+
+def test_freetoken_profile_adopts_only_the_same_folder_profile_and_settings(helper, tmp_path):
+    helper.effective = {"flash": FLASH}
+    helper.profiles = {"model-flash": dict(FLASH["settings"])}
+    helper.state, helper.model_path, helper.active_profile = "serving", "/m/B", "model-flash"
+    proc = subprocess.Popen([ADAPTERS / "freetoken.sh", "--profile", "model-flash", "/m/B"],
+                            env=env_for(helper, tmp_path))
+    time.sleep(1.5)
+    # F9: adopting must not touch the running server (no stop) but still push the profile, and
+    # the adapter itself must still be alive (not crashed) rather than having exited early.
+    assert proc.poll() is None
+    assert "PUT /api/profiles/model-flash" in helper.calls
+    assert "POST /api/server/stop" not in helper.calls
+    assert "POST /api/server/start" not in helper.calls
+    proc.terminate()
+    proc.wait(20)
+
+
+def test_freetoken_profile_reboots_when_another_profile_is_active(helper, tmp_path):
+    helper.effective = {"flash": FLASH}
+    helper.profiles = {"model-flash": dict(FLASH["settings"])}
+    helper.state, helper.model_path, helper.active_profile = "serving", "/m/B", "default"
+    proc = subprocess.Popen([ADAPTERS / "freetoken.sh", "--profile", "model-flash", "/m/B"],
+                            env=env_for(helper, tmp_path))
+    for _ in range(100):
+        if "POST /api/server/start" in helper.calls:
+            break
+        time.sleep(0.1)
+    proc.terminate()
+    proc.wait(20)
+    assert "POST /api/server/stop" in helper.calls and "POST /api/server/start" in helper.calls
+
+
+def test_freetoken_profile_reboots_when_the_settings_changed(helper, tmp_path):
+    helper.effective = {"flash": {"name": "Flash", "settings": {"ModelPath": "/m/B", "KVDtype": "bf16"}}}
+    helper.profiles = {"model-flash": dict(FLASH["settings"])}
+    helper.state, helper.model_path, helper.active_profile = "serving", "/m/B", "model-flash"
+    proc = subprocess.Popen([ADAPTERS / "freetoken.sh", "--profile", "model-flash", "/m/B"],
+                            env=env_for(helper, tmp_path))
+    for _ in range(100):
+        if "POST /api/server/start" in helper.calls:
+            break
+        time.sleep(0.1)
+    proc.terminate()
+    proc.wait(20)
+    assert "POST /api/server/start" in helper.calls
+
+
+def test_freetoken_profile_refuses_a_model_the_panel_does_not_know(helper, tmp_path):
+    r = subprocess.run([ADAPTERS / "freetoken.sh", "--profile", "model-ghost", "/m/B"],
+                       env=env_for(helper, tmp_path), capture_output=True, text=True, timeout=30)
+    assert r.returncode != 0 and "does not know" in r.stderr
     assert "POST /api/server/start" not in helper.calls

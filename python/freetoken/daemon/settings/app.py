@@ -45,6 +45,9 @@ class ProfileBody(BaseModel):
     name: str
     description: str = ""
     settings: dict[str, Any] = Field(default_factory=dict)
+    # True: create a control panel profile (model-<id>) when missing and replace its
+    # settings as a whole (freetoken.sh --profile). False keeps the update-only behaviour.
+    replace: bool = False
 
 
 class ServerActionBody(BaseModel):
@@ -365,6 +368,13 @@ def create_app(
 
     @app.put("/api/profiles/{profile_id}")
     async def put_profile(profile_id: str, body: ProfileBody):
+        if body.replace:
+            try:
+                return profiles.upsert(profile_id, name=body.name, description=body.description, settings=body.settings)
+            except ProfileValidationError as exc:
+                return _validation_response(exc.errors)
+            except ProfileError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         try:
             return profiles.update(
                 profile_id,
