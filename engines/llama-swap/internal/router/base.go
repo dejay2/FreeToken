@@ -310,10 +310,17 @@ func (b *baseRouter) doSwap(ctx context.Context, modelID string, toStop []string
 		target := b.processes[modelID]
 		err = target.EnsureReady(ctx, timeout)
 	}
-	if err != nil && b.shutdownCtx.Err() == nil && ctx.Err() == nil {
+	// FreeToken patch P1: a cancelled swap (outside shutdown) has already been
+	// forgotten by the scheduler: supersede deleted it, or a newer StartSwap
+	// for the same model replaced it. Report nothing. OnSwapDone matches by
+	// model ID, so a stale SwapDone would fail a newer swap for this model
+	// (A -> B -> A) and drop it from the active set while it keeps loading.
+	if ctx.Err() != nil && b.shutdownCtx.Err() == nil {
+		return
+	}
+	if err != nil && b.shutdownCtx.Err() == nil {
 		// Quiet during shutdown: every in-flight swap fails at once there, and
 		// that is expected rather than worth a warning per model.
-		// FreeToken patch P1: also quiet for a superseded (cancelled) swap.
 		b.logger.Warnf("%s: starting %s failed: %v", b.name, modelID, err)
 	}
 

@@ -418,8 +418,7 @@ func TestFIFO_OverlappingEvictSetsDoNotRunInParallel(t *testing.T) {
 	eff.states["b"] = process.StateStopped
 	eff.states["x"] = process.StateReady // shared eviction target, running
 	// Loading a or b both require evicting x.
-	// FreeToken patch P1: upstream queueing behind a not-ready swap; latestWins off.
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"x"}, "b": {"x"}}}, config.FifoConfig{LatestWins: boolPtr(false)}, nil, eff)
+	s := newFIFO(&stubPlanner{evict: map[string][]string{"a": {"x"}, "b": {"x"}}}, eff)
 
 	s.OnRequest(req("a")) // StartSwap(a, [x])
 	s.OnRequest(req("b")) // overlaps a's evict set ([x]) -> queue
@@ -1116,3 +1115,66 @@ func TestFIFO_LatestWinsOff_KeepsUpstreamQueueing(t *testing.T) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// FreeToken patch P1: swaps that only share an eviction target (A and B each
+// evict X, not each other) are not a direct conflict. B queues behind A as
+// upstream does, and A's load is not cancelled.
+func TestFIFO_LatestWins_OverlapOnlyQueuesNotCancels(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	eff.states["b"] = process.StateStopped
+	eff.states["x"] = process.StateReady
+	s := newFIFO(&stubPlanner{evict: map[string][]string{"a": {"x"}, "b": {"x"}}}, eff)
+
+	s.OnRequest(req("a"))
+	eff.states["a"] = process.StateStarting
+	s.OnRequest(req("b"))
+
+	if len(eff.cancelled) != 0 || len(eff.stops) != 0 {
+		t.Fatalf("overlap-only: cancelled=%v stops=%v; want none", eff.cancelled, eff.stops)
+	}
+	if eff.startsFor("b") != 0 || len(s.queued) != 1 {
+		t.Fatalf("b must queue: StartSwap(b)=%d queued=%d", eff.startsFor("b"), len(s.queued))
+	}
+}
+
+// FreeToken patch P1: A, then B, then A again while each load is still
+// starting. The second A request gets a fresh swap that is live in the
+// scheduler, and it is served when that swap completes. The router never
+// delivers a SwapDone for a cancelled swap (doSwap returns without sending),
+// because OnSwapDone matches by model ID and a stale one would fail this
+// request; TestBase_LatestWins_StaleSwapDoneDoesNotFailRepick in
+// internal/router pins that side.
+func TestFIFO_LatestWins_RepickAfterSupersedeStartsFreshSwap(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	eff.states["b"] = process.StateStopped
+	s := newFIFO(exclusivePlanner("a", "b"), eff)
+
+	s.OnRequest(req("a"))
+	eff.states["a"] = process.StateStarting
+	s.OnRequest(req("b"))
+	eff.states["a"] = process.StateStopped
+	eff.states["b"] = process.StateStarting
+	s.OnRequest(req("a"))
+
+	if !slices.Equal(eff.cancelled, []string{"a", "b"}) {
+		t.Fatalf("cancelled=%v want [a b]", eff.cancelled)
+	}
+	if eff.startsFor("a") != 2 {
+		t.Fatalf("StartSwap(a)=%d want 2", eff.startsFor("a"))
+	}
+	sw, ok := s.active["a"]
+	if !ok || len(sw.waiters) != 1 {
+		t.Fatalf("active[a]=%v want one live waiter", sw)
+	}
+	eff.states["b"] = process.StateStopped
+	eff.states["a"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "a"})
+	if eff.served("a") != 1 {
+		t.Errorf("served(a)=%d want 1 (the re-pick)", eff.served("a"))
+	}
+	if supersededFor(eff, "a") != 1 || supersededFor(eff, "b") != 1 {
+		t.Errorf("superseded a=%d b=%d want 1 each", supersededFor(eff, "a"), supersededFor(eff, "b"))
+	}
+}

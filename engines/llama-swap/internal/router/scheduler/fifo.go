@@ -148,17 +148,20 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 }
 
 // FreeToken patch P1: supersede cancels every in-flight swap for another model
-// that collides with target and whose process is not ready yet: its waiters
-// get SupersededError, as do queued requests for models whose load would evict
-// target; the swap goroutine is cancelled and its process stopped (blocking,
-// as OnUnload does). Reports whether any swap was cancelled.
+// that directly conflicts with target (target's load evicts it, or its load
+// evicts target) and whose process is not ready yet. Swaps that merely share
+// an eviction target are left alone and the request queues as upstream. The
+// cancelled swap's waiters get SupersededError, as do queued requests for
+// models whose load would evict target; the swap goroutine is cancelled and
+// its process stopped (blocking, as OnUnload does). Reports whether any swap
+// was cancelled.
 func (s *FIFO) supersede(target string, evict []string) bool {
 	var victims []string
 	for id, sw := range s.active {
 		if id == target {
 			continue
 		}
-		if !containsString(evict, id) && !containsString(sw.evict, target) && !slicesOverlap(evict, sw.evict) {
+		if !containsString(evict, id) && !containsString(sw.evict, target) {
 			continue
 		}
 		if st, ok := s.effects.ModelState(id); ok && st == process.StateReady {

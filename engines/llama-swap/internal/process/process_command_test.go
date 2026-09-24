@@ -875,3 +875,52 @@ func TestProcessCommand_ConcurrentRunStop(t *testing.T) {
 		}
 	}
 }
+
+// FreeToken patch P1: a start request whose caller context is already cancelled
+// must be refused by the run loop without starting the upstream. This closes
+// the race where EnsureReady's first select sends on startCh even though the
+// router has already cancelled the swap (Go picks randomly between the send and
+// ctx.Done when both are ready) and a superseding Stop has already finished.
+// The request is sent on startCh directly so the test is deterministic.
+func TestProcessCommand_StartRequestWithCancelledCtxIsRefused(t *testing.T) {
+	skipIfNoSimpleResponder(t)
+
+	cmd, port := simpleResponderCmd(t, "-silent")
+	p := newProcessCommand(t, config.ModelConfig{
+		Cmd:                cmd,
+		Proxy:              fmt.Sprintf("http://127.0.0.1:%d", port),
+		CheckEndpoint:      "/health",
+		HealthCheckTimeout: 10,
+	})
+	t.Cleanup(func() { p.Stop(testStopTimeout) }) //nolint: errcheck
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := startReq{timeout: testStartTimeout, respond: make(chan error, 1), ctx: ctx}
+	select {
+	case p.startCh <- req:
+	case <-time.After(testReturnTimeout):
+		t.Fatal("run loop did not accept the start request")
+	}
+	select {
+	case err := <-req.respond:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("respond err=%v want context.Canceled", err)
+		}
+	case <-time.After(testStartTimeout):
+		t.Fatal("start request was not answered")
+	}
+	if got := p.State(); got != StateStopped {
+		t.Fatalf("State()=%s want %s (a cancelled start must not boot the upstream)", got, StateStopped)
+	}
+
+	// A live context still starts normally afterwards.
+	live, cancelLive := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelLive()
+	if err := p.EnsureReady(live, testStartTimeout); err != nil {
+		t.Fatalf("EnsureReady with live ctx: %v", err)
+	}
+	if got := p.State(); got != StateReady {
+		t.Fatalf("State()=%s want %s", got, StateReady)
+	}
+}

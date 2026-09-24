@@ -86,6 +86,9 @@ type startReq struct {
 	timeout time.Duration
 	respond chan error
 	block   bool
+	// FreeToken patch P1: ctx is EnsureReady's caller context (nil for Run).
+	// The run loop refuses to start when it is already cancelled; see startCh.
+	ctx context.Context
 }
 
 type stopReq struct {
@@ -285,6 +288,17 @@ func (p *ProcessCommand) run() {
 		// listen for an incoming Stop — that's how callers cancel an in-flight
 		// start.
 		case req := <-p.startCh:
+			// FreeToken patch P1: refuse a start whose caller has already given
+			// up. EnsureReady's first select can send on startCh even when its
+			// ctx is cancelled (Go picks randomly among ready cases), so without
+			// this a superseded swap could boot its model after the router's
+			// superseding Stop finished. This loop handles one message at a
+			// time and the router cancels before it stops, so once a Stop has
+			// been processed any later start from that swap is refused here.
+			if req.ctx != nil && req.ctx.Err() != nil {
+				req.respond <- req.ctx.Err()
+				continue
+			}
 			// EnsureReady answers straight from the current state when the
 			// "is it ready?" question is already settled. There is deliberately
 			// no StateStopping case: a stop keeps this loop parked inside
@@ -747,6 +761,7 @@ func (p *ProcessCommand) EnsureReady(ctx context.Context, timeout time.Duration)
 	req := startReq{
 		timeout: timeout,
 		respond: make(chan error, 1),
+		ctx:     ctx, // FreeToken patch P1
 	}
 	select {
 	case p.startCh <- req:

@@ -54,6 +54,13 @@ type fakeProcess struct {
 
 	autoReady bool
 
+	// FreeToken patch P1: ensureGate, when non-nil, holds EnsureReady after it
+	// signals ensureAsked and before it takes the start decision, so a test can
+	// cancel the swap in exactly that window. ensureExit, when non-nil, is
+	// closed when EnsureReady returns.
+	ensureGate chan struct{}
+	ensureExit chan struct{}
+
 	// ensureErr, when non-nil, makes EnsureReady fail with it, driving the
 	// dispatch-error path without needing a real process to die.
 	ensureErr error
@@ -225,8 +232,23 @@ func (f *fakeProcess) EnsureReady(ctx context.Context, _ time.Duration) error {
 	}
 	f.mu.Unlock()
 
+	// FreeToken patch P1: see ensureGate / ensureExit.
+	if f.ensureExit != nil {
+		defer close(f.ensureExit)
+	}
+	if f.ensureGate != nil {
+		<-f.ensureGate
+	}
+
 	f.opMu.Lock()
 	f.mu.Lock()
+	// FreeToken patch P1: mirror ProcessCommand's run loop, which refuses a
+	// start whose caller ctx is already cancelled.
+	if err := ctx.Err(); err != nil {
+		f.mu.Unlock()
+		f.opMu.Unlock()
+		return err
+	}
 	if f.ensureErr != nil {
 		err := f.ensureErr
 		f.mu.Unlock()
