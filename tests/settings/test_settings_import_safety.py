@@ -31,6 +31,13 @@ for name in [
     "freetoken.daemon.settings.profiles_manager",
     "freetoken.daemon.settings.app",
     "freetoken.daemon.settings.server",
+    "freetoken.daemon.settings.ninfer_dials",
+    "freetoken.daemon.settings.registry",
+    "freetoken.daemon.settings.registry_import",
+    "freetoken.daemon.settings.swap_config",
+    "freetoken.daemon.settings.ninfer_fit",
+    "freetoken.daemon.settings.switcher",
+    "freetoken.daemon.settings.panel",
 ]:
     importlib.import_module(name)
 assert not any(name.split(".")[0] in FORBIDDEN for name in sys.modules)

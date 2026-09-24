@@ -30,9 +30,13 @@ from .model_info import ModelInfo, read_model
 from .memory_fit import EstimateUnavailable, MemoryFitService, SettingsValidationError, prepare_settings
 from .process_manager import LifecycleError, ProcessManager
 from .prompt_cache import create_prompt_cache_router
+from .panel import PanelService, create_panel_router
 from .profiles_manager import ProfileError, ProfileValidationError, ProfilesManager
+from .registry import RegistryStore
+from .swap_config import SwapConfigWriter
+from .switcher import SwitcherClient
 
-HELPER_VERSION = "1.5.0"
+HELPER_VERSION = "2.0.0"
 
 
 class SettingsBody(BaseModel):
@@ -158,6 +162,7 @@ def create_app(
     estimate_service: MemoryFitService | Any | None = None,
     version: str = HELPER_VERSION,
     wall_now=time.time,
+    panel: PanelService | None = None,
 ) -> FastAPI:
     """Build an app with injectable file/process pieces so routes are testable without a GPU."""
     paths = default_paths()
@@ -220,6 +225,18 @@ def create_app(
     app.state.estimate_service = estimate_service or MemoryFitService(
         release_probe=release_probe if callable(release_probe) else None
     )
+    if panel is None:
+        panel = PanelService(
+            store=RegistryStore(),
+            writer=SwapConfigWriter(),
+            switcher=SwitcherClient(),
+            profiles=profiles,
+            boot_file=lambda: app.state.boot_file,
+            default_boot=lambda: app.state.default_boot_file,
+            estimate_service=app.state.estimate_service,
+        )
+    app.state.panel = panel
+    app.include_router(create_panel_router(panel))
     app.state.started_monotonic = started
     app.include_router(create_download_router(models_dir=model_root, manager=download_manager))
     app.include_router(create_prompt_cache_router(lambda: process_manager.port))
@@ -251,6 +268,14 @@ def create_app(
         if static.is_file():
             return FileResponse(static, media_type="text/html")
         return PlainTextResponse("Settings page is not available yet\n", status_code=404)
+
+    panel_script = static.with_name("panel.js")
+
+    @app.get("/panel.js")
+    async def panel_js():
+        if panel_script.is_file():
+            return FileResponse(panel_script, media_type="text/javascript")
+        return PlainTextResponse("", status_code=404)
 
     @app.get("/api/settings")
     async def get_settings(model: str | None = Query(default=None)):
