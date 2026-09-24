@@ -1,0 +1,554 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/mostlygeek/llama-swap/internal/capcompat"
+	"github.com/mostlygeek/llama-swap/internal/chain"
+	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/docagent"
+	"github.com/mostlygeek/llama-swap/internal/event"
+	"github.com/mostlygeek/llama-swap/internal/hw"
+	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/mcptools"
+	"github.com/mostlygeek/llama-swap/internal/perf"
+	"github.com/mostlygeek/llama-swap/internal/router"
+	"github.com/mostlygeek/llama-swap/internal/store"
+	"github.com/mostlygeek/llama-swap/internal/swaputil"
+)
+
+// Server owns the HTTP mux, cross-cutting middleware, and the local/peer model
+// dispatch. It supersedes router.Server: it builds the local and peer routers
+// directly and dispatches between them itself.
+type Server struct {
+	cfg config.Config
+
+	muxlog      *logmon.Monitor
+	proxylog    *logmon.Monitor
+	upstreamlog *logmon.Monitor
+
+	perf     *perf.Monitor
+	inflight *inflightTracker
+	metrics  *metricsMonitor
+	store    store.Store
+	build    BuildInfo
+	hardware *hw.HardwareSnapshot
+
+	// reference is llama-swap's own embedded documentation, served to the
+	// Playground's agentic chat and to external MCP clients through /api/mcp.
+	// It is immutable and independent of cfg, so the same library is shared
+	// across the Server instances a hot config reload creates. A nil value
+	// disables the endpoint; Docs methods are nil-receiver safe.
+	reference *docagent.Docs
+
+	// capcompat holds model capabilities discovered from upstream servers.
+	// It is refreshed when a model becomes ready and read by /v1/models, so
+	// an unloaded model still advertises what it can do. A nil value disables
+	// discovery; Service methods are nil-receiver safe.
+	capcompat *capcompat.Service
+
+	// capcompatCancel unsubscribes the process-state listener that drives
+	// discovery. The event dispatcher is process-wide, so a hot config reload
+	// would otherwise leave the retired Server probing alongside the new one.
+	capcompatCancel context.CancelFunc
+
+	// tools is the MCP tool surface served at /api/mcp. Providers are
+	// aggregated here rather than enumerated in the handler, so a future
+	// provider that proxies an upstream MCP endpoint plugs in without
+	// touching the transport.
+	tools *mcptools.Registry
+
+	profileMu     sync.RWMutex
+	activeProfile string
+
+	local router.LocalRouter
+	peer  router.Router
+
+	mux     *http.ServeMux
+	handler http.Handler
+
+	shutdownCtx    context.Context
+	shutdownFn     context.CancelFunc
+	shuttingDown   atomic.Bool
+	tailcatAddress atomic.Pointer[string]
+}
+
+func (s *Server) SetTailcatAddress(address string) {
+	value := address
+	s.tailcatAddress.Store(&value)
+}
+
+func (s *Server) TailcatAddress() string {
+	if value := s.tailcatAddress.Load(); value != nil {
+		return *value
+	}
+	return ""
+}
+
+type tailcatRequestContextKey struct{}
+
+func isTailcatRequest(ctx context.Context) bool {
+	marked, _ := ctx.Value(tailcatRequestContextKey{}).(bool)
+	return marked
+}
+
+// ActiveProfile returns the active runtime profile, or an empty string when no
+// profile is active.
+func (s *Server) ActiveProfile() string {
+	s.profileMu.RLock()
+	defer s.profileMu.RUnlock()
+	return s.activeProfile
+}
+
+// setActiveProfile updates the runtime selection. An empty name deactivates
+// profiles. It returns whether the selection changed.
+func (s *Server) setActiveProfile(name string) (bool, error) {
+	if name != "" {
+		if _, ok := s.cfg.Profiles[name]; !ok {
+			return false, fmt.Errorf("profile %q not found", name)
+		}
+	}
+	s.profileMu.Lock()
+	if s.activeProfile == name {
+		s.profileMu.Unlock()
+		return false, nil
+	}
+	s.activeProfile = name
+	s.profileMu.Unlock()
+
+	s.proxylog.Infof("active profile changed to %q", name)
+	event.Emit(swaputil.ProfileChangedEvent{Active: name})
+	return true, nil
+}
+
+// modelPostJSONRoutes are endpoints with a model id in the JSON request body.
+var modelPostJSONRoutes = []string{
+	"/v1/chat/completions",
+	"/v1/responses",
+	"/v1/completions",
+	"/v1/messages",
+	"/v1/messages/count_tokens",
+	"/v1/embeddings",
+	"/reranking",
+	"/rerank",
+	"/v1/rerank",
+	"/v1/reranking",
+	"/infill",
+	"/completion",
+	"/v1/audio/speech",
+	"/v1/audio/voices",
+	"/v1/images/generations",
+	"/sdapi/v1/txt2img",
+	"/sdapi/v1/img2img",
+
+	// audio.cpp generic task API
+	"/audioapi/v1/tasks/run",
+
+	// versionless routes, the /v/ is stripped before the request is forwarded upstream
+	// see issue #728
+	"/v/chat/completions",
+	"/v/responses",
+	"/v/completions",
+	"/v/messages",
+	"/v/messages/count_tokens",
+	"/v/embeddings",
+	"/v/rerank",
+	"/v/reranking",
+}
+
+// modelPostFormRoutes are multipart/form-data endpoints with a model id in the form data
+var modelPostFormRoutes = []string{
+	"/v1/audio/transcriptions",
+	"/v1/images/edits",
+}
+
+// modelGetRoutes are model-dispatched GET endpoints (the model arrives as a
+// query parameter).
+var modelGetRoutes = []string{
+	"/v1/audio/voices",
+	"/sdapi/v1/loras",
+	"/props",
+}
+
+// isMetricsRecordPath reports whether path is one of the model-dispatched
+// endpoints that the metrics middleware records in the activity log.
+func isMetricsRecordPath(path string) bool {
+	for _, p := range modelPostJSONRoutes {
+		if p == path {
+			return true
+		}
+	}
+	for _, p := range modelPostFormRoutes {
+		if p == path {
+			return true
+		}
+	}
+	for _, p := range modelGetRoutes {
+		if p == path {
+			return true
+		}
+	}
+	return false
+}
+
+// BuildInfo carries version metadata surfaced by GET /api/version.
+type BuildInfo struct {
+	Version string
+	Commit  string
+	Date    string
+}
+
+func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, upstreamlog *logmon.Monitor, perfMon *perf.Monitor, st store.Store, build BuildInfo, hardware *hw.HardwareSnapshot, refs *docagent.Docs) (*Server, error) {
+	var local router.LocalRouter
+	var err error
+
+	switch cfg.Routing.Router.Use {
+	case "matrix":
+		local, err = router.NewMatrix(cfg, proxylog, upstreamlog)
+		if err != nil {
+			return nil, fmt.Errorf("creating matrix router: %w", err)
+		}
+	default: // "group"
+		local, err = router.NewGroup(cfg, proxylog, upstreamlog)
+		if err != nil {
+			return nil, fmt.Errorf("creating group router: %w", err)
+		}
+	}
+
+	peer, err := router.NewPeer(cfg, proxylog)
+	if err != nil {
+		return nil, fmt.Errorf("creating peer router: %w", err)
+	}
+
+	if st == nil {
+		return nil, fmt.Errorf("store is required")
+	}
+
+	shutdownCtx, shutdownFn := context.WithCancel(context.Background())
+	s := &Server{
+		cfg:           cfg,
+		muxlog:        muxlog,
+		proxylog:      proxylog,
+		upstreamlog:   upstreamlog,
+		perf:          perfMon,
+		inflight:      newInflightTracker(),
+		metrics:       newMetricsMonitor(proxylog, cfg.MetricsMaxInMemory, cfg.CaptureBuffer, st),
+		store:         st,
+		build:         build,
+		hardware:      hardware,
+		reference:     refs,
+		activeProfile: cfg.Hooks.OnStartup.Profile,
+		local:         local,
+		peer:          peer,
+		shutdownCtx:   shutdownCtx,
+		shutdownFn:    shutdownFn,
+	}
+	s.capcompat = capcompat.New(st.Cache(), proxylog)
+	s.capcompatCancel = event.On(s.onProcessStateChange)
+
+	// SysProvider is constructed here because this is where perf and hardware
+	// are in scope; wiring those in later is a change to internal/mcptools.
+	tools, err := mcptools.New(
+		docagent.NewDocsProvider(refs),
+		mcptools.NewSysProvider(nil),
+		config.NewConfigProvider(cfg),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("building the MCP tool registry: %w", err)
+	}
+	s.tools = tools
+
+	s.routes()
+	s.startPreload()
+	return s, nil
+}
+
+// localPeerHandler dispatches a model-routed request to the local or peer
+// router. The model is resolved once via swaputil.FetchContext.
+func (s *Server) localPeerHandler(w http.ResponseWriter, r *http.Request) {
+	stripVersionPrefix(r)
+	stripAudioAPIPrefix(r)
+
+	data, err := swaputil.FetchContext(r, s.cfg)
+	if err != nil {
+		swaputil.SendError(w, r, swaputil.ErrNoModelInContext)
+		return
+	}
+
+	switch {
+	case s.local.Handles(data.ModelID):
+		s.proxylog.Debugf("dispatch: using local process for model: %s", data.ModelID)
+		s.local.ServeHTTP(w, r)
+	case s.peer.Handles(data.ModelID):
+		s.proxylog.Debugf("dispatch: using peer for model: %s", data.ModelID)
+		s.peer.ServeHTTP(w, r)
+	default:
+		swaputil.SendError(w, r, router.ErrNoRouterFound)
+	}
+}
+
+// stripVersionPrefix rewrites versionless /v/... requests to their /... form
+// before forwarding upstream (issue #728).
+func stripVersionPrefix(r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/v/") {
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/v")
+	}
+}
+
+// stripAudioAPIPrefix rewrites /audioapi/... requests to their /... form
+// before forwarding upstream, so /audioapi/v1/tasks/run reaches the upstream
+// as /v1/tasks/run.
+func stripAudioAPIPrefix(r *http.Request) {
+	r.URL.Path = strings.TrimPrefix(r.URL.Path, "/audioapi")
+}
+
+// routes builds the mux, registers every route, and wraps the mux with the
+// global CORS middleware.
+func (s *Server) routes() {
+
+	authMW := CreateAuthMiddleware(s.cfg)
+	modelMWs := []chain.Middleware{authMW}
+	// globalConcurrencyLimit guards the top of the inference chain; a limit of
+	// 0 (the default) means no limit, so the handler is left out of the chain
+	// entirely rather than wrapping every request in a no-op semaphore.
+	if s.cfg.GlobalConcurrencyLimit > 0 {
+		modelMWs = append(modelMWs, CreateConcurrencyLimitMiddleware(s.cfg.GlobalConcurrencyLimit))
+	}
+	modelMWs = append(modelMWs,
+		CreateProfileMiddleware(s),
+		CreateSelectorMiddleware(s),
+		CreateRequestContextMiddleware(s.cfg),
+		CreateInflightMiddleware(s.inflight, s.cfg),
+		CreateFilterMiddleware(s.cfg),
+		CreateFormFilterMiddleware(s.cfg),
+		CreateMetricsMiddleware(s.metrics, s.cfg),
+	)
+	modelChain := chain.New(modelMWs...)
+	// Custom endpoints only need auth.
+	apiChain := chain.New(authMW)
+
+	mux := http.NewServeMux()
+	dispatch := http.HandlerFunc(s.localPeerHandler)
+
+	for _, path := range modelPostJSONRoutes {
+		mux.Handle("POST "+path, modelChain.Then(dispatch))
+	}
+	for _, path := range modelPostFormRoutes {
+		mux.Handle("POST "+path, modelChain.Then(dispatch))
+	}
+	for _, path := range modelGetRoutes {
+		mux.Handle("GET "+path, modelChain.Then(dispatch))
+	}
+
+	// llama-swap API + custom endpoints.
+	mux.Handle("GET /v1/models", apiChain.ThenFunc(s.handleListModels))
+	mux.Handle("GET /models", apiChain.ThenFunc(s.handleListModels))
+	mux.Handle("GET /logs", apiChain.ThenFunc(s.handleLogs))
+	mux.Handle("GET /logs/stream", apiChain.ThenFunc(s.handleLogStream))
+	mux.Handle("GET /logs/stream/{logMonitorID...}", apiChain.ThenFunc(s.handleLogStream))
+
+	mux.HandleFunc("GET /health", handleHealth)
+	mux.HandleFunc("GET /wol-health", handleHealth)
+	mux.HandleFunc("GET /{$}", handleRootRedirect)
+
+	// Embedded UI.
+	mux.Handle("GET /ui/", chain.New(authMW).ThenFunc(s.handleUI))
+	mux.HandleFunc("GET /favicon.ico", s.handleFavicon)
+
+	// Prometheus metrics (wrapped by apiChain, matches the legacy endpoint).
+	mux.Handle("GET /metrics", apiChain.ThenFunc(s.handleMetrics))
+
+	// Operations endpoints.
+	mux.Handle("GET /unload", apiChain.ThenFunc(s.handleUnload))
+	mux.Handle("GET /running", apiChain.ThenFunc(s.handleRunning))
+
+	// Upstream passthrough. Meter only the model-dispatched endpoints that can
+	// produce token usage/timings.
+	upstreamChain := apiChain.Append(
+		CreateProfileMiddleware(s),
+		CreateUpstreamInflightMiddleware(s.inflight, s.cfg),
+		CreateMetricsMiddleware(s.metrics, s.cfg),
+	)
+	mux.HandleFunc("GET /upstream", handleUpstreamRedirect)
+	mux.Handle("/upstream/{upstreamPath...}", upstreamChain.ThenFunc(s.handleUpstream))
+
+	// ComfyUI compatibility passthrough. This uses the fixed comfyui_auto model,
+	// whose compatibility settings are applied while loading config. A GET to
+	// /ws may not start an unloaded model.
+	mux.Handle("/comfyui", apiChain.ThenFunc(handleComfyUIRedirect))
+	mux.Handle("/comfyui/{comfyPath...}", apiChain.ThenFunc(s.handleComfyUI))
+
+	// API group (API-key protected) consumed by the UI.
+	mux.Handle("POST /api/models/unload", apiChain.ThenFunc(s.handleAPIUnloadAll))
+	mux.Handle("POST /api/models/unload/{model...}", apiChain.ThenFunc(s.handleAPIUnloadModel))
+	mux.Handle("GET /api/profiles", apiChain.ThenFunc(s.handleAPIProfiles))
+	mux.Handle("PUT /api/profiles/active", apiChain.ThenFunc(s.handleAPIActiveProfile))
+	mux.Handle("POST /api/inflight/{id}/cancel", apiChain.ThenFunc(s.handleAPICancelInflight))
+	mux.Handle("GET /api/events", apiChain.ThenFunc(s.handleAPIEvents))
+	mux.Handle("GET /api/metrics/activity", apiChain.ThenFunc(s.handleAPIActivity))
+	mux.Handle("GET /api/metrics/stats", apiChain.ThenFunc(s.handleAPIActivityStats))
+	mux.Handle("GET /api/performance", apiChain.ThenFunc(s.handleAPIPerformance))
+	mux.Handle("GET /api/version", apiChain.ThenFunc(s.handleAPIVersion))
+	mux.Handle("GET /api/hardware", apiChain.ThenFunc(s.handleAPIHardware))
+	mux.Handle("GET /api/tailcat", apiChain.ThenFunc(s.handleAPITailcat))
+	mux.Handle("GET /api/captures/{id}", apiChain.ThenFunc(s.handleAPICapture))
+
+	// Stateless MCP server exposing llama-swap's own documentation as tools,
+	// consumed by the Playground's agentic chat and by any external MCP client.
+	// Registered without a method so non-POST reaches the handler and gets a
+	// 405 with Allow, rather than the mux's bare 404.
+	mux.Handle("/api/mcp", apiChain.ThenFunc(s.handleAPIMCP))
+
+	s.mux = mux
+	s.handler = chain.New(CreateRequestLogMiddleware(s.proxylog), CreateCORSMiddleware(s.cfg)).Then(mux)
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.handler.ServeHTTP(w, r)
+}
+
+// ServeTailcatHTTP applies Tailcat's deliberately narrow HTTP capability
+// surface before delegating to the normal, API-key-protected handler.
+func (s *Server) ServeTailcatHTTP(w http.ResponseWriter, r *http.Request) {
+	tc := s.cfg.Tailcat
+	if !s.cfg.TailcatEnabled() || tc == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	inference := isTailcatInferenceRequest(r)
+	if !tc.Admin {
+		allowed := r.Method == http.MethodGet && (r.URL.Path == "/health" || r.URL.Path == "/v1/models" || r.URL.Path == "/models")
+		if r.Method == http.MethodOptions {
+			allowed = isTailcatInferencePath(r.URL.Path)
+		}
+		if inference {
+			allowed = true
+		}
+		if !allowed {
+			http.NotFound(w, r)
+			return
+		}
+	}
+
+	if inference && r.Method != http.MethodOptions {
+		model, err := swaputil.ExtractModel(r)
+		if err != nil || !tailcatModelAllowed(tc.Models, model) {
+			http.NotFound(w, r)
+			return
+		}
+	}
+	r = r.WithContext(context.WithValue(r.Context(), tailcatRequestContextKey{}, true))
+	s.handler.ServeHTTP(w, r)
+}
+
+func isTailcatInferenceRequest(r *http.Request) bool {
+	if r.Method == http.MethodPost {
+		for _, path := range modelPostJSONRoutes {
+			if r.URL.Path == path {
+				return true
+			}
+		}
+		for _, path := range modelPostFormRoutes {
+			if r.URL.Path == path {
+				return true
+			}
+		}
+	}
+	if r.Method == http.MethodGet {
+		for _, path := range modelGetRoutes {
+			if r.URL.Path == path {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isTailcatInferencePath(path string) bool {
+	for _, candidate := range modelPostJSONRoutes {
+		if path == candidate {
+			return true
+		}
+	}
+	for _, candidate := range modelPostFormRoutes {
+		if path == candidate {
+			return true
+		}
+	}
+	for _, candidate := range modelGetRoutes {
+		if path == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func tailcatModelAllowed(models []string, id string) bool {
+	for _, exposed := range models {
+		if exposed == "*" || exposed == id {
+			return true
+		}
+	}
+	return false
+}
+
+// CloseStreams cancels long-lived response streams (Server-Sent Events) so a
+// graceful httpServer.Shutdown can drain without blocking on them. It does not
+// tear down routers; call Shutdown for that. Safe to call repeatedly.
+func (s *Server) CloseStreams() {
+	s.shutdownFn()
+}
+
+// Shutdown stops the local and peer routers in parallel. It is idempotent;
+// repeated calls return nil without re-running shutdown.
+//
+// Callers must drain inflight HTTP requests (httpServer.Shutdown) before
+// calling this, otherwise inflight requests 502 when their processes are torn
+// down. Call CloseStreams before httpServer.Shutdown so SSE streams do not
+// block the drain.
+func (s *Server) Shutdown(timeout time.Duration) error {
+	if !s.shuttingDown.CompareAndSwap(false, true) {
+		return nil
+	}
+	s.shutdownFn()
+	if s.capcompatCancel != nil {
+		s.capcompatCancel()
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errs []error
+
+	// Server.Shutdown is a closed list: anything holding resources that is not
+	// released here leaks. The tool registry is cheap today and expensive once
+	// a provider holds upstream connections or subprocesses.
+	if err := s.tools.Shutdown(timeout); err != nil {
+		errs = append(errs, err)
+	}
+
+	for _, rt := range []router.Router{s.local, s.peer} {
+		if rt == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(rt router.Router) {
+			defer wg.Done()
+			if err := rt.Shutdown(timeout); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+			}
+		}(rt)
+	}
+
+	wg.Wait()
+	return errors.Join(errs...)
+}
