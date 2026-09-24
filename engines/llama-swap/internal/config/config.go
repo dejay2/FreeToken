@@ -248,7 +248,13 @@ type SchedulerSettings struct {
 
 type FifoConfig struct {
 	Priority map[string]int `yaml:"priority"` // model ID -> priority, default 0
+	// FreeToken patch P1: when true (the default), a request for a different
+	// model cancels an in-flight swap whose target has not become ready.
+	LatestWins *bool `yaml:"latestWins"`
 }
+
+// FreeToken patch P1: LatestWinsEnabled reports the effective latestWins value.
+func (c FifoConfig) LatestWinsEnabled() bool { return c.LatestWins == nil || *c.LatestWins }
 
 type RouterConfig struct {
 	Use      string         `yaml:"use"` // "group" (default) | "matrix"

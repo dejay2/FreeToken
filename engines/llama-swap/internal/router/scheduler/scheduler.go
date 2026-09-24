@@ -90,6 +90,11 @@ type Effects interface {
 	// StopProcesses stops the named processes in parallel and blocks until all
 	// have stopped. Unknown IDs are skipped.
 	StopProcesses(timeout time.Duration, ids []string)
+	// FreeToken patch P1: CancelSwap aborts the swap goroutine for modelID so
+	// it never starts its target after a superseding stop. No-op if none runs.
+	CancelSwap(modelID string)
+	// FreeToken patch P1: UnloadTimeout is modelID's configured graceful stop timeout.
+	UnloadTimeout(modelID string) time.Duration
 }
 
 // New returns a Scheduler selected by conf.Routing.Scheduler.Use, configured

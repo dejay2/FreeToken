@@ -62,6 +62,10 @@ type baseRouter struct {
 
 	runDone chan struct{}
 
+	// FreeToken patch P1: per-model cancel handles for running swap goroutines.
+	swapMu      sync.Mutex
+	swapCancels map[string]*swapHandle
+
 	// testProcessed, when non-nil, receives one event after each handlerReq
 	// or swapDone has been fully processed by run(). Tests use it to wait
 	// for run() to reach a deterministic state without sleeping. serveDone
@@ -69,6 +73,9 @@ type baseRouter struct {
 	// remain stable.
 	testProcessed chan struct{}
 }
+
+// FreeToken patch P1: swapHandle identifies one swap goroutine's cancel func.
+type swapHandle struct{ cancel context.CancelFunc }
 
 func newBaseRouter(
 	name string,
@@ -95,6 +102,7 @@ func newBaseRouter(
 		swapDoneCh:  make(chan scheduler.SwapDone),
 		serveDoneCh: make(chan scheduler.ServeDoneEvent),
 		runDone:     make(chan struct{}),
+		swapCancels: make(map[string]*swapHandle), // FreeToken patch P1
 	}
 	sched, err := scheduler.New(conf, name, logger, planner, b)
 	if err != nil {
@@ -178,8 +186,41 @@ func (b *baseRouter) ModelState(modelID string) (process.ProcessState, bool) {
 
 // StartSwap implements scheduler.Effects, launching the swap goroutine.
 func (b *baseRouter) StartSwap(modelID string, evict []string) {
-	go b.doSwap(modelID, evict)
+	// FreeToken patch P1: each swap gets a cancellable context.
+	ctx, cancel := context.WithCancel(b.shutdownCtx)
+	h := &swapHandle{cancel: cancel}
+	b.swapMu.Lock()
+	if old := b.swapCancels[modelID]; old != nil {
+		old.cancel()
+	}
+	b.swapCancels[modelID] = h
+	b.swapMu.Unlock()
+	go func() {
+		defer func() {
+			b.swapMu.Lock()
+			if b.swapCancels[modelID] == h {
+				delete(b.swapCancels, modelID)
+			}
+			b.swapMu.Unlock()
+			cancel()
+		}()
+		b.doSwap(ctx, modelID, evict)
+	}()
 }
+
+// FreeToken patch P1: CancelSwap implements scheduler.Effects.
+func (b *baseRouter) CancelSwap(modelID string) {
+	b.swapMu.Lock()
+	h := b.swapCancels[modelID]
+	delete(b.swapCancels, modelID)
+	b.swapMu.Unlock()
+	if h != nil {
+		h.cancel()
+	}
+}
+
+// FreeToken patch P1: UnloadTimeout implements scheduler.Effects.
+func (b *baseRouter) UnloadTimeout(modelID string) time.Duration { return b.unloadTimeout(modelID) }
 
 // GrantError implements scheduler.Effects.
 func (b *baseRouter) GrantError(req scheduler.HandlerReq, err error) {
@@ -240,7 +281,8 @@ func (b *baseRouter) trackedServe(modelID string, p process.Process) http.Handle
 	}
 }
 
-func (b *baseRouter) doSwap(modelID string, toStop []string) {
+// FreeToken patch P1: doSwap takes the swap's cancellable context.
+func (b *baseRouter) doSwap(ctx context.Context, modelID string, toStop []string) {
 	timeout := b.healthCheckTimeout()
 
 	var wg sync.WaitGroup
@@ -261,11 +303,17 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 	// a TTL unload landing in that window used to leave the swap waiting on a
 	// process nobody was ever going to start (issue #946). EnsureReady makes
 	// the same decision inside the process, where the state is owned.
-	target := b.processes[modelID]
-	err := target.EnsureReady(b.shutdownCtx, timeout)
-	if err != nil && b.shutdownCtx.Err() == nil {
+	var err error
+	// FreeToken patch P1: a superseded swap must not start its target, and
+	// starts through the swap context so CancelSwap aborts EnsureReady.
+	if err = ctx.Err(); err == nil {
+		target := b.processes[modelID]
+		err = target.EnsureReady(ctx, timeout)
+	}
+	if err != nil && b.shutdownCtx.Err() == nil && ctx.Err() == nil {
 		// Quiet during shutdown: every in-flight swap fails at once there, and
 		// that is expected rather than worth a warning per model.
+		// FreeToken patch P1: also quiet for a superseded (cancelled) swap.
 		b.logger.Warnf("%s: starting %s failed: %v", b.name, modelID, err)
 	}
 

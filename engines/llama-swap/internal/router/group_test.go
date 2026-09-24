@@ -216,6 +216,9 @@ func TestGroup_SameGroupSwapSerialises(t *testing.T) {
 			"g": {Swap: true, Exclusive: false, Members: []string{"a", "b"}},
 		}),
 	}
+	// FreeToken patch P1: upstream queueing behind a not-ready swap; latestWins off.
+	latestWinsOff := false
+	conf.Routing.Scheduler.Settings.Fifo.LatestWins = &latestWinsOff
 	g := newTestGroup(t, conf, map[string]process.Process{"a": a, "b": pb})
 
 	w1 := httptest.NewRecorder()

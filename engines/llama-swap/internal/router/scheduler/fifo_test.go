@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"testing"
 	"time"
 
@@ -62,6 +63,8 @@ type fakeEffects struct {
 	starts []startRec
 	grants []grantRec
 	stops  []stopRec
+
+	cancelled []string // FreeToken patch P1: CancelSwap calls
 }
 
 func newFakeEffects() *fakeEffects {
@@ -108,6 +111,12 @@ func (f *fakeEffects) GrantServe(req HandlerReq, modelID string) bool {
 func (f *fakeEffects) StopProcesses(timeout time.Duration, ids []string) {
 	f.stops = append(f.stops, stopRec{timeout: timeout, ids: ids})
 }
+
+// FreeToken patch P1: CancelSwap records the cancelled model.
+func (f *fakeEffects) CancelSwap(modelID string) { f.cancelled = append(f.cancelled, modelID) }
+
+// FreeToken patch P1: UnloadTimeout returns a fixed timeout.
+func (f *fakeEffects) UnloadTimeout(string) time.Duration { return 7 * time.Second }
 
 // served counts grants that handed modelID a handler and were received.
 func (f *fakeEffects) served(modelID string) int {
@@ -356,7 +365,8 @@ func TestFIFO_QueueOnEvictionCollision(t *testing.T) {
 	eff.states["a"] = process.StateStopped
 	eff.states["b"] = process.StateStopped
 	// Loading b evicts a.
-	s := newFIFO(&stubPlanner{evict: map[string][]string{"b": {"a"}}}, eff)
+	// FreeToken patch P1: upstream queueing behind a not-ready swap; latestWins off.
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"b": {"a"}}}, config.FifoConfig{LatestWins: boolPtr(false)}, nil, eff)
 
 	s.OnRequest(req("a")) // StartSwap(a)
 	s.OnRequest(req("b")) // collides with a's in-flight swap -> queue
@@ -408,7 +418,8 @@ func TestFIFO_OverlappingEvictSetsDoNotRunInParallel(t *testing.T) {
 	eff.states["b"] = process.StateStopped
 	eff.states["x"] = process.StateReady // shared eviction target, running
 	// Loading a or b both require evicting x.
-	s := newFIFO(&stubPlanner{evict: map[string][]string{"a": {"x"}, "b": {"x"}}}, eff)
+	// FreeToken patch P1: upstream queueing behind a not-ready swap; latestWins off.
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"x"}, "b": {"x"}}}, config.FifoConfig{LatestWins: boolPtr(false)}, nil, eff)
 
 	s.OnRequest(req("a")) // StartSwap(a, [x])
 	s.OnRequest(req("b")) // overlaps a's evict set ([x]) -> queue
@@ -436,7 +447,8 @@ func TestFIFO_QueueDrainPromotesMultiple(t *testing.T) {
 	eff.states["b"] = process.StateStopped
 	eff.states["c"] = process.StateStopped
 	// a's swap evicts both b and c; b and c evict nothing.
-	s := newFIFO(&stubPlanner{evict: map[string][]string{"a": {"b", "c"}}}, eff)
+	// FreeToken patch P1: upstream queueing behind a not-ready swap; latestWins off.
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b", "c"}}}, config.FifoConfig{LatestWins: boolPtr(false)}, nil, eff)
 
 	s.OnRequest(req("a")) // StartSwap(a, [b,c])
 	s.OnRequest(req("b")) // collides (in a's evict set) -> queue
@@ -466,11 +478,12 @@ func TestFIFO_QueueCollation(t *testing.T) {
 		eff.states[id] = process.StateStopped
 	}
 	// Each model evicts the other two: all swaps are mutually exclusive.
-	s := newFIFO(&stubPlanner{evict: map[string][]string{
+	// FreeToken patch P1: upstream queueing behind a not-ready swap; latestWins off.
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{
 		"a": {"b", "c"},
 		"b": {"a", "c"},
 		"c": {"a", "b"},
-	}}, eff)
+	}}, config.FifoConfig{LatestWins: boolPtr(false)}, nil, eff)
 
 	for _, id := range []string{"a", "b", "c", "a", "b", "c"} {
 		s.OnRequest(req(id))
@@ -594,7 +607,8 @@ func TestFIFO_OnUnload_DropsQueuedRequests(t *testing.T) {
 	eff.states["a"] = process.StateStopped
 	eff.states["b"] = process.StateStopped
 	// b evicts a, so a request for b queues while a is loading.
-	s := newFIFO(&stubPlanner{evict: map[string][]string{"b": {"a"}}}, eff)
+	// FreeToken patch P1: upstream queueing behind a not-ready swap; latestWins off.
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"b": {"a"}}}, config.FifoConfig{LatestWins: boolPtr(false)}, nil, eff)
 
 	s.OnRequest(req("a")) // StartSwap(a)
 	s.OnRequest(req("b")) // queued
@@ -623,7 +637,8 @@ func TestFIFO_PriorityQueueOrder(t *testing.T) {
 	// z's swap evicts every other model, so any request that arrives while z is
 	// loading collides with z's in-flight swap and parks in the queue.
 	planner := &stubPlanner{evict: map[string][]string{"z": {"A", "B", "C", "D"}}}
-	cfg := config.FifoConfig{Priority: map[string]int{"A": 10, "B": 5, "C": 5, "D": 1}}
+	// FreeToken patch P1: upstream queueing behind a not-ready swap; latestWins off.
+	cfg := config.FifoConfig{Priority: map[string]int{"A": 10, "B": 5, "C": 5, "D": 1}, LatestWins: boolPtr(false)}
 	s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, cfg, nil, eff)
 
 	s.OnRequest(req("z")) // StartSwap(z, [A,B,C,D])
@@ -656,7 +671,8 @@ func TestFIFO_OnCancel_QueuedRequest(t *testing.T) {
 	eff.states["a"] = process.StateStopped
 	eff.states["b"] = process.StateStopped
 	// b evicts a, so a request for b queues while a is loading.
-	s := newFIFO(&stubPlanner{evict: map[string][]string{"b": {"a"}}}, eff)
+	// FreeToken patch P1: upstream queueing behind a not-ready swap; latestWins off.
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"b": {"a"}}}, config.FifoConfig{LatestWins: boolPtr(false)}, nil, eff)
 
 	s.OnRequest(req("a")) // StartSwap(a)
 
@@ -878,7 +894,8 @@ func TestFIFO_ConcurrencyLimit_QueuedWaitersReserveCapacity(t *testing.T) {
 		"a": {ConcurrencyLimit: 2},
 		"b": {},
 	}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, config.FifoConfig{}, models, eff)
+	// FreeToken patch P1: upstream queueing behind a not-ready swap; latestWins off.
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, config.FifoConfig{LatestWins: boolPtr(false)}, models, eff)
 
 	bReq := req("b")
 	aReq1 := req("a")
@@ -924,7 +941,8 @@ func TestFIFO_ConcurrencyLimit_CancelledQueuedWaiterReleasesReservation(t *testi
 		"a": {ConcurrencyLimit: 1},
 		"b": {},
 	}
-	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, config.FifoConfig{}, models, eff)
+	// FreeToken patch P1: upstream queueing behind a not-ready swap; latestWins off.
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{evict: map[string][]string{"a": {"b"}}}, config.FifoConfig{LatestWins: boolPtr(false)}, models, eff)
 
 	bReq := req("b")
 	cancelledReq := reqCh("a")
@@ -946,3 +964,155 @@ func TestFIFO_ConcurrencyLimit_CancelledQueuedWaiterReleasesReservation(t *testi
 		t.Fatalf("queue len=%d want 1 after cancel and retry", got)
 	}
 }
+
+// FreeToken patch P1: helpers — a group-style planner where every model evicts every other.
+func exclusivePlanner(models ...string) *stubPlanner {
+	ev := map[string][]string{}
+	for _, m := range models {
+		for _, o := range models {
+			if o != m {
+				ev[m] = append(ev[m], o)
+			}
+		}
+	}
+	return &stubPlanner{evict: ev}
+}
+
+func supersededFor(eff *fakeEffects, model string) int {
+	n := 0
+	for _, g := range eff.grants {
+		var se swaputil.SupersededError
+		if g.model == model && errors.As(g.err, &se) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestFIFO_LatestWins_CancelsStartingSwap(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	eff.states["b"] = process.StateStopped
+	s := newFIFO(exclusivePlanner("a", "b"), eff)
+
+	s.OnRequest(req("a"))
+	eff.states["a"] = process.StateStarting
+	s.OnRequest(req("b"))
+
+	if !slices.Equal(eff.cancelled, []string{"a"}) {
+		t.Fatalf("cancelled=%v want [a]", eff.cancelled)
+	}
+	if len(eff.stops) != 1 || !slices.Equal(eff.stops[0].ids, []string{"a"}) || eff.stops[0].timeout != 7*time.Second {
+		t.Fatalf("stops=%v want one stop of [a] with the unload timeout", eff.stops)
+	}
+	if got := supersededFor(eff, "a"); got != 1 {
+		t.Errorf("a waiters superseded=%d want 1", got)
+	}
+	if got := eff.startsFor("b"); got != 1 {
+		t.Errorf("StartSwap(b)=%d want 1", got)
+	}
+	// A late SwapDone for the cancelled swap must not grant anything.
+	s.OnSwapDone(SwapDone{ModelID: "a", Err: context.Canceled})
+	if got := eff.served("a"); got != 0 {
+		t.Errorf("served(a)=%d want 0", got)
+	}
+}
+
+func TestFIFO_LatestWins_ThreeQuickPicksOnlyLastLoads(t *testing.T) {
+	eff := newFakeEffects()
+	for _, m := range []string{"a", "b", "c"} {
+		eff.states[m] = process.StateStopped
+	}
+	s := newFIFO(exclusivePlanner("a", "b", "c"), eff)
+
+	s.OnRequest(req("a"))
+	eff.states["a"] = process.StateStarting
+	s.OnRequest(req("b"))
+	eff.states["a"] = process.StateStopped
+	eff.states["b"] = process.StateStarting
+	s.OnRequest(req("c"))
+
+	if !slices.Equal(eff.cancelled, []string{"a", "b"}) {
+		t.Fatalf("cancelled=%v want [a b]", eff.cancelled)
+	}
+	if supersededFor(eff, "a") != 1 || supersededFor(eff, "b") != 1 {
+		t.Errorf("superseded a=%d b=%d want 1 each", supersededFor(eff, "a"), supersededFor(eff, "b"))
+	}
+	if eff.startsFor("c") != 1 {
+		t.Errorf("StartSwap(c)=%d want 1", eff.startsFor("c"))
+	}
+}
+
+func TestFIFO_LatestWins_SameModelJoinsNotCancels(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	s := newFIFO(exclusivePlanner("a", "b"), eff)
+
+	s.OnRequest(req("a"))
+	eff.states["a"] = process.StateStarting
+	s.OnRequest(req("a"))
+
+	if len(eff.cancelled) != 0 || len(eff.stops) != 0 {
+		t.Fatalf("same-model request cancelled=%v stops=%v; want none", eff.cancelled, eff.stops)
+	}
+	if eff.startsFor("a") != 1 {
+		t.Errorf("StartSwap(a)=%d want 1", eff.startsFor("a"))
+	}
+}
+
+func TestFIFO_LatestWins_ReadyTargetNotCancelled(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	eff.states["b"] = process.StateStopped
+	s := newFIFO(exclusivePlanner("a", "b"), eff)
+
+	s.OnRequest(req("a"))
+	eff.states["a"] = process.StateReady // ready, SwapDone not processed yet
+	s.OnRequest(req("b"))
+
+	if len(eff.cancelled) != 0 {
+		t.Fatalf("cancelled=%v; a ready target must not be cancelled", eff.cancelled)
+	}
+	if eff.startsFor("b") != 0 {
+		t.Errorf("b must queue behind the finishing swap, StartSwap(b)=%d", eff.startsFor("b"))
+	}
+}
+
+func TestFIFO_LatestWins_QueuedRequestsForVictimAreSuperseded(t *testing.T) {
+	eff := newFakeEffects()
+	for _, m := range []string{"a", "b", "c"} {
+		eff.states[m] = process.StateStopped
+	}
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), exclusivePlanner("a", "b", "c"),
+		config.FifoConfig{LatestWins: boolPtr(false)}, nil, eff)
+	s.OnRequest(req("a"))
+	eff.states["a"] = process.StateStarting
+	s.OnRequest(req("b")) // latestWins off: queued behind a
+	s.cfg.LatestWins = boolPtr(true)
+	s.OnRequest(req("c"))
+
+	if supersededFor(eff, "a") != 1 || supersededFor(eff, "b") != 1 {
+		t.Errorf("superseded a=%d b=%d want 1 each", supersededFor(eff, "a"), supersededFor(eff, "b"))
+	}
+	if eff.startsFor("b") != 0 {
+		t.Errorf("queued b must not start later, StartSwap(b)=%d", eff.startsFor("b"))
+	}
+}
+
+func TestFIFO_LatestWinsOff_KeepsUpstreamQueueing(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	eff.states["b"] = process.StateStopped
+	s := NewFIFO("test", logmon.NewWriter(io.Discard), exclusivePlanner("a", "b"),
+		config.FifoConfig{LatestWins: boolPtr(false)}, nil, eff)
+
+	s.OnRequest(req("a"))
+	eff.states["a"] = process.StateStarting
+	s.OnRequest(req("b"))
+
+	if len(eff.cancelled) != 0 || eff.startsFor("b") != 0 {
+		t.Fatalf("latestWins=false: cancelled=%v StartSwap(b)=%d; want none", eff.cancelled, eff.startsFor("b"))
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }

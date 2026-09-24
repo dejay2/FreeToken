@@ -121,6 +121,13 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 		return
 	}
 
+	// (3b) FreeToken patch P1 — latest wins: cancel colliding in-flight swaps
+	// for other models whose target is not ready yet, then decide afresh.
+	if s.cfg.LatestWinsEnabled() && s.supersede(req.Model, evict) {
+		running = s.runningSet(req.Model)
+		evict = s.planner.EvictionFor(req.Model, running)
+	}
+
 	// (4) Collision with an in-flight swap — queue.
 	if collidesWith(req.Model, evict, s.active) {
 		s.logger.Debugf("%s: queuing request for model %s (collides with in-flight swap)", s.name, req.Model)
@@ -138,6 +145,59 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	// (6) Start a new (possibly parallel) swap.
 	s.logger.Debugf("%s: starting swap for model %s, evicting %v", s.name, req.Model, evict)
 	s.startSwap(req, evict, running)
+}
+
+// FreeToken patch P1: supersede cancels every in-flight swap for another model
+// that collides with target and whose process is not ready yet: its waiters
+// get SupersededError, as do queued requests for models whose load would evict
+// target; the swap goroutine is cancelled and its process stopped (blocking,
+// as OnUnload does). Reports whether any swap was cancelled.
+func (s *FIFO) supersede(target string, evict []string) bool {
+	var victims []string
+	for id, sw := range s.active {
+		if id == target {
+			continue
+		}
+		if !containsString(evict, id) && !containsString(sw.evict, target) && !slicesOverlap(evict, sw.evict) {
+			continue
+		}
+		if st, ok := s.effects.ModelState(id); ok && st == process.StateReady {
+			continue
+		}
+		victims = append(victims, id)
+	}
+	if len(victims) == 0 {
+		return false
+	}
+	sort.Strings(victims)
+	victimSet := make(map[string]bool, len(victims))
+	for _, id := range victims {
+		victimSet[id] = true
+		sw := s.active[id]
+		delete(s.active, id)
+		s.effects.CancelSwap(id)
+		for _, w := range sw.waiters {
+			s.grantError(w, swaputil.SupersededError{Model: id, By: target})
+		}
+		s.logger.Infof("%s: latest wins: cancelled load of %s for %s", s.name, id, target)
+	}
+	// Older picks still queued lose too: any queued request for another model
+	// whose load would evict target (the planner is pure, so asking is safe).
+	if len(s.queued) > 0 {
+		kept := s.queued[:0]
+		for _, w := range s.queued {
+			if victimSet[w.Model] || (w.Model != target && containsString(s.planner.EvictionFor(w.Model, []string{target}), target)) {
+				s.grantError(w, swaputil.SupersededError{Model: w.Model, By: target})
+				continue
+			}
+			kept = append(kept, w)
+		}
+		s.queued = kept
+	}
+	for _, id := range victims {
+		s.effects.StopProcesses(s.effects.UnloadTimeout(id), []string{id})
+	}
+	return true
 }
 
 // OnCancel removes a request whose client has disconnected from the queue and

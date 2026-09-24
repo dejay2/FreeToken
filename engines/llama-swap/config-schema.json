@@ -969,6 +969,11 @@
                                             "additionalProperties": {
                                                 "type": "integer"
                                             }
+                                        },
+                                        "latestWins": {
+                                            "type": "boolean",
+                                            "default": true,
+                                            "description": "FreeToken patch P1: a request for a different model cancels an in-flight load that is not ready yet."
                                         }
                                     },
                                     "additionalProperties": false

@@ -177,7 +177,11 @@ func TestMatrix_IncompatibleQueues(t *testing.T) {
 		{Name: "s_a", DSL: "a"},
 		{Name: "s_b", DSL: "b"},
 	}
-	r := newTestMatrix(t, baseMatrixConfig(), sets, nil, map[string]process.Process{"a": a, "b": pb})
+	// FreeToken patch P1: upstream queueing behind a not-ready swap; latestWins off.
+	conf := baseMatrixConfig()
+	latestWinsOff := false
+	conf.Routing.Scheduler.Settings.Fifo.LatestWins = &latestWinsOff
+	r := newTestMatrix(t, conf, sets, nil, map[string]process.Process{"a": a, "b": pb})
 
 	w1 := httptest.NewRecorder()
 	done1 := make(chan struct{})
