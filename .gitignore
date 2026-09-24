@@ -242,3 +242,11 @@ engines/llama-swap/ui/node_modules/
 engines/llama-swap/internal/server/ui_dist/*
 !engines/llama-swap/internal/server/ui_dist/.gitkeep
 engines/ninfer*/build/
+
+# re-include upstream source dirs under engines/ that collide with root ignore
+# patterns above (e.g. the Python "lib/" rule at line 17 was silently eating
+# engines/llama-swap/ui/src/lib/, ~200 upstream TS files); a directory-level
+# exclude needs the directory itself un-excluded before its contents can be,
+# so both lines are required.
+!engines/**/lib/
+!engines/**/lib/**
