@@ -552,6 +552,14 @@
     </div>
   </div>
 
+  <div class="modal" id="confirm-ask" hidden role="dialog" aria-modal="true" aria-labelledby="confirm-ask-title">
+    <div class="modal-card" style="width:min(520px,100%)">
+      <div class="modal-head"><h2 id="confirm-ask-title">Are you sure?</h2></div>
+      <div class="modal-body"><p id="confirm-ask-text"></p></div>
+      <div class="modal-foot"><button class="button" type="button" id="confirm-ask-cancel">Cancel</button><div class="actions"><button class="button primary" type="button" id="confirm-ask-ok">Carry on</button></div></div>
+    </div>
+  </div>
+
   <script src="/panel.js"></script>
   <script>
     'use strict';
@@ -950,7 +958,7 @@
     $('browser-path').addEventListener('keydown', (event) => { if (event.key === 'Enter') browseTo($('browser-path').value); });
     $('browser-choose').addEventListener('click', () => { if (state.browser?.path) pickPath(state.browser.path); });
     $('browser').addEventListener('click', (event) => { if (event.target === $('browser')) closeBrowser(); });
-    document.addEventListener('keydown', (event) => { if (event.key === 'Escape') { closeBrowser(); if (!$('restart-ask').hidden) answerRestart(null); } });
+    document.addEventListener('keydown', (event) => { if (event.key === 'Escape') { closeBrowser(); if (!$('restart-ask').hidden) answerRestart(null); if (!$('confirm-ask').hidden) answerConfirm(false); } });
 
     /* ---------- prompt cache (live controls, separate from launch settings) ---------- */
     const cacheUI = {busy:false, loading:null, connected:false, model:null, data:null, budgetDirty:false, signature:null};

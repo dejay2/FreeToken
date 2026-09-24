@@ -16,7 +16,7 @@ from freetoken.daemon.settings.process_manager import ProcessManager
 from freetoken.daemon.settings.profiles_manager import ProfilesManager
 from freetoken.daemon.settings.registry import RegistryStore, find_model
 from freetoken.daemon.settings.swap_config import SwapConfigWriter, config_sha256, extract_model_blocks, render_config
-from freetoken.daemon.settings.switcher import SwitcherError
+from freetoken.daemon.settings.switcher import DOWN, SwitcherError
 from tests.settings.registry_fixtures import five
 
 GIB = 1024 ** 3
@@ -25,17 +25,25 @@ EXAMPLE = (REPO / "engines" / "config" / "config.example.yaml").read_text(encodi
 
 
 class FakeSwitcher:
+    """up=False alone is "unknown" (a timeout or HTTP error); up=False with refused=True is
+    "down" (connection refused)."""
+
     def __init__(self, cfg: Path):
         self.cfg, self.states, self.up, self.calls, self.load_error = cfg, {}, True, [], None
+        self.refused, self.unload_ok = False, True
 
     def running(self):
-        return dict(self.states) if self.up else None
+        if not self.up:
+            return DOWN if self.refused else None
+        return dict(self.states)
 
     def config_hash(self):
         return config_sha256(self.cfg.read_text()) if self.up and self.cfg.exists() else None
 
     def unload(self, model_id):
         self.calls.append(("unload", model_id))
+        if not self.unload_ok:
+            return False
         self.states.pop(model_id, None)
         return self.up
 
@@ -280,7 +288,7 @@ def test_right_now_strip_when_the_switcher_is_down(env):
     seed(env)
     env.switcher.up = False
     body = env.client.get("/api/panel/now").json()
-    assert body["switcher"] == {"up": False, "running": []}
+    assert body["switcher"] == {"up": False, "running": [], "stale": False}
     assert body["card"]["totalBytes"] == 32 * GIB and body["windowsFreeBytes"] == 40 * GIB and body["cushionGB"] == 6
     rows = env.client.get("/api/panel/models").json()
     assert rows["switcherUp"] is False and {row["state"] for row in rows["models"]} == {"unknown"}
@@ -558,3 +566,255 @@ def test_a_system_only_save_while_unknown_still_saves(env):
     saved = env.client.put("/api/panel/system", json={"revision": revision, "system": {"floorGB": 9}})
     assert saved.status_code == 200, saved.text
     assert "floorGB: 9" in env.cfg.read_text() and env.store.load()[0]["system"]["floorGB"] == 9
+
+
+# ---- final whole-branch review fix wave ----
+def switcher_down(env):
+    env.switcher.up, env.switcher.refused = False, True
+
+
+def test_switcher_client_tells_down_from_unknown():
+    # Item 1: a refused connection is "down" (nothing loaded); a timeout, an HTTP error or a
+    # bad body stays "unknown" (None).
+    import io
+    import socket
+    import urllib.error
+
+    from freetoken.daemon.settings.switcher import SwitcherClient, is_down
+
+    def raising(exc):
+        def urlopen(request, timeout):
+            raise exc
+        return urlopen
+
+    class Response:
+        def __init__(self, body):
+            self.status, self._body = 200, body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return self._body
+
+    def answering(body):
+        return lambda request, timeout: Response(body)
+
+    assert is_down(SwitcherClient(urlopen=raising(urllib.error.URLError(ConnectionRefusedError(111, "refused")))).running())
+    assert is_down(SwitcherClient(urlopen=raising(ConnectionRefusedError(111, "refused"))).running())
+    assert SwitcherClient(urlopen=raising(urllib.error.URLError(socket.timeout("timed out")))).running() is None
+    assert SwitcherClient(urlopen=raising(TimeoutError("timed out"))).running() is None
+    http_500 = urllib.error.HTTPError("http://x/running", 500, "boom", {}, io.BytesIO(b"{}"))
+    assert SwitcherClient(urlopen=raising(http_500)).running() is None
+    assert SwitcherClient(urlopen=answering(b"not json")).running() is None
+    up = SwitcherClient(urlopen=answering(b'{"running": [{"model": "q", "state": "ready"}]}')).running()
+    assert up == {"q": "ready"} and not is_down(up)
+    empty = SwitcherClient(urlopen=answering(b'{"running": []}')).running()
+    assert empty == {} and not is_down(empty)
+
+
+def test_a_save_while_the_switcher_is_down_saves_and_writes(env):
+    # Item 1 (critical): spec error table, "settings still save and apply on its next start".
+    revision = seed(env)
+    switcher_down(env)
+    settings = engine_settings(env.client.get("/api/panel/views/model/fable-27b").json())
+    settings["draft-tokens"] = 3
+    saved = env.client.put("/api/panel/models/fable-27b", json={
+        "revision": revision, "settings": settings, "identity": {}, "activePreset": None})
+    assert saved.status_code == 200, saved.text
+    assert "--draft-tokens 3" in extract_model_blocks(env.cfg.read_text())["fable-27b"]
+    assert env.switcher.calls == [] and saved.json()["restarting"] == []
+    assert env.client.get("/api/panel/now").json()["switcher"]["up"] is False
+    rows = env.client.get("/api/panel/models").json()
+    assert rows["switcherUp"] is False and {row["state"] for row in rows["models"]} == {"unknown"}
+    assert env.client.get("/api/panel/views/model/fable-27b").json()["state"] == "unknown"
+
+
+def test_holds_stay_while_the_switcher_is_down(env):
+    revision = hold_quasar(env)
+    switcher_down(env)
+    assert env.service.release_finished_holds() == []
+    other = env.client.put("/api/panel/system", json={"revision": revision, "system": {"floorGB": 8}})
+    assert other.status_code == 200 and other.json()["held"] == ["quasar-27b"]
+    assert "--draft-tokens 7" in quasar_block(env)
+    env.switcher.up, env.switcher.states = True, {}
+    assert env.service.release_finished_holds() == ["quasar-27b"]
+    assert "--draft-tokens 5" in quasar_block(env)
+
+
+def test_import_while_the_switcher_is_down_goes_ahead(env):
+    env.cfg.write_text(EXAMPLE)
+    switcher_down(env)
+    answer = env.client.post("/api/panel/import", json={})
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["restarting"] == [] and env.switcher.calls == []
+    assert env.cfg.read_text().startswith("# generated by the control panel")
+
+
+def test_restore_while_a_model_is_loaded_keeps_its_running_entry(env):
+    # Item 2 (critical): restore rewrote a loaded, unheld model's entry, so P5 stopped it.
+    revision = seed(env)
+    settings = engine_settings(env.client.get("/api/panel/views/model/quasar-27b").json())
+    settings["draft-tokens"] = 5
+    saved = env.client.put("/api/panel/models/quasar-27b", json={
+        "revision": revision, "settings": settings, "identity": {}, "activePreset": None})
+    assert saved.status_code == 200 and saved.json()["held"] == []
+    env.switcher.states = {"quasar-27b": "ready"}
+    restored = env.client.post("/api/panel/registry/restore", json={"backup": env.store.backups()[0]})
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["held"] == ["quasar-27b"]
+    assert "--draft-tokens 5" in quasar_block(env)  # what is running stays in the file
+    assert find_model(env.store.load()[0], "quasar-27b")["overrides"]["draft-tokens"] == 7
+    assert env.switcher.calls == [] and env.client.get("/api/panel/now").json()["held"] == ["quasar-27b"]
+    env.switcher.states = {}
+    assert env.service.release_finished_holds() == ["quasar-27b"]
+    assert "--draft-tokens 7" in quasar_block(env)
+
+
+def _move_entries_behind_the_files_back(env, revision):
+    # What a catalogue/generator change or a crash between store.save and the holds write
+    # leaves behind: the registry moved two entries, the file did not.
+    doc, _ = env.store.load()
+    find_model(doc, "quasar-27b").setdefault("overrides", {})["max-concurrency"] = 5
+    find_model(doc, "fable-27b").setdefault("overrides", {})["max-concurrency"] = 5
+    env.store.save(doc, expected_revision=revision)
+
+
+def test_start_up_sync_holds_a_loaded_model_whose_entry_moved(env):
+    revision = seed(env)
+    _move_entries_behind_the_files_back(env, revision)
+    env.switcher.states = {"quasar-27b": "ready"}
+    env.service.sync_config()
+    blocks = extract_model_blocks(env.cfg.read_text())
+    assert "--max-concurrency 5" not in blocks["quasar-27b"] and "--max-concurrency 5" in blocks["fable-27b"]
+    assert env.client.get("/api/panel/now").json()["held"] == ["quasar-27b"]
+    env.switcher.states = {}
+    assert env.service.release_finished_holds() == ["quasar-27b"]
+    assert "--max-concurrency 5" in quasar_block(env)
+
+
+def test_start_up_sync_while_unknown_holds_every_moved_entry(env):
+    revision = seed(env)
+    _move_entries_behind_the_files_back(env, revision)
+    before = env.cfg.read_text()
+    env.switcher.up = False
+    env.service.sync_config()
+    assert env.cfg.read_text() == before  # every moved entry is held on what the file had
+    assert env.client.get("/api/panel/now").json()["held"] == ["fable-27b", "quasar-27b"]
+    env.switcher.up, env.switcher.states = True, {"fable-27b": "ready"}
+    assert env.service.release_finished_holds() == ["quasar-27b"]
+    blocks = extract_model_blocks(env.cfg.read_text())
+    assert "--max-concurrency 5" in blocks["quasar-27b"] and "--max-concurrency 5" not in blocks["fable-27b"]
+
+
+def test_a_refused_restore_changes_nothing(env):
+    # Item 2 fold-in: restore used to restore the registry, then answer 422 when the switcher
+    # refused the file. Every check now runs first.
+    first = seed(env)
+    second = env.client.put("/api/panel/system", json={"revision": first, "system": {"floorGB": 7}}).json()["revision"]
+    before = env.cfg.read_text()
+    env.writer._runner = checker(ok=False)
+    refused = env.client.post("/api/panel/registry/restore", json={"backup": env.store.backups()[0]})
+    assert refused.status_code == 422 and refused.json()["code"] == "switcher_refused"
+    assert env.store.load()[1] == second and env.cfg.read_text() == before
+
+
+def test_restore_over_a_file_the_panel_did_not_write_asks_to_unload_first(env):
+    first = seed(env)
+    second = env.client.put("/api/panel/system", json={"revision": first, "system": {"floorGB": 7}}).json()["revision"]
+    env.cfg.write_text(EXAMPLE)
+    env.switcher.states = {"quasar-27b": "ready"}
+    refused = env.client.post("/api/panel/registry/restore", json={"backup": env.store.backups()[0]})
+    assert refused.status_code == 409 and refused.json()["code"] == "unload_first"
+    assert refused.json()["message"].startswith("Qwen3.8 27B QUASAR NVFP4 (NInfer, DFlash2) is loaded")
+    assert env.store.load()[1] == second and env.cfg.read_text() == EXAMPLE
+
+
+def test_restart_now_saves_nothing_when_the_model_does_not_unload(env):
+    # Item 4: an unload the switcher does not confirm used to save and report "restarting".
+    revision = seed(env)
+    env.switcher.states = {"quasar-27b": "ready"}
+    env.switcher.unload_ok = False
+    before = env.cfg.read_text()
+    settings = engine_settings(env.client.get("/api/panel/views/model/quasar-27b").json())
+    settings["draft-tokens"] = 5
+    answer = env.client.put("/api/panel/models/quasar-27b", json={
+        "revision": revision, "settings": settings, "identity": {}, "activePreset": None, "whenLoaded": "restart"})
+    assert answer.status_code == 503 and answer.json()["code"] == "restart_failed"
+    assert answer.json()["message"] == ("Couldn't put Qwen3.8 27B QUASAR NVFP4 (NInfer, DFlash2) away to restart it, "
+                                        "so nothing was saved. Try again in a moment.")
+    assert env.store.load()[1] == revision and env.cfg.read_text() == before and env.spawned == []
+
+
+def test_right_now_says_when_the_switcher_is_on_older_settings(env):
+    # Item 5: the switcher's config hash (P5) differs from the file's.
+    revision = seed(env)
+    clock = [1000.0]
+    env.service._clock = lambda: clock[0]
+    env.switcher.config_hash = lambda: "older"
+    assert env.client.get("/api/panel/now").json()["switcher"]["stale"] is True
+    assert env.client.put("/api/panel/system", json={"revision": revision, "system": {"floorGB": 8}}).status_code == 200
+    assert env.client.get("/api/panel/now").json()["switcher"]["stale"] is False  # llama-swap polls every 2 s
+    clock[0] += 11
+    assert env.client.get("/api/panel/now").json()["switcher"]["stale"] is True
+    env.switcher.config_hash = lambda: config_sha256(env.cfg.read_text())
+    assert env.client.get("/api/panel/now").json()["switcher"]["stale"] is False
+    env.switcher.config_hash = lambda: None  # an older switcher without P5: say nothing
+    assert env.client.get("/api/panel/now").json()["switcher"]["stale"] is False
+
+
+def test_a_failed_restart_note_clears_on_the_next_save_or_after_ten_minutes(env):
+    # Item 6.
+    revision = seed(env)
+    clock = [0.0]
+    env.service._clock = lambda: clock[0]
+    env.service._sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    env.switcher.states = {"quasar-27b": "ready"}
+    env.switcher.config_hash = lambda: "stale"
+    settings = engine_settings(env.client.get("/api/panel/views/model/quasar-27b").json())
+    settings["draft-tokens"] = 5
+    saved = env.client.put("/api/panel/models/quasar-27b", json={
+        "revision": revision, "settings": settings, "identity": {}, "activePreset": None, "whenLoaded": "restart"})
+    assert saved.status_code == 200
+    run_spawned(env)
+    assert env.client.get("/api/panel/now").json()["lastRestart"]["ok"] is False
+    clock[0] += 599
+    assert env.client.get("/api/panel/now").json()["lastRestart"] is not None
+    clock[0] += 2
+    assert env.client.get("/api/panel/now").json()["lastRestart"] is None
+    env.service._restart_done(["quasar-27b"], False, "Restarting quasar-27b failed: boom")
+    assert env.client.get("/api/panel/now").json()["lastRestart"] is not None
+    assert env.client.put("/api/panel/system", json={"revision": saved.json()["revision"],
+                                                     "system": {"floorGB": 8}}).status_code == 200
+    assert env.client.get("/api/panel/now").json()["lastRestart"] is None
+    env.service._restart_done(["quasar-27b"], False, "x")
+    assert env.client.post("/api/panel/models/fable-27b/load").status_code == 200
+    assert env.client.get("/api/panel/now").json()["lastRestart"] is None
+
+
+def test_import_refuses_settings_a_model_could_never_save(env, monkeypatch):
+    # Item 8: every save checks each FreeToken model's own limits; an import that breaks one
+    # would make every later save fail, so it is refused with the reasons.
+    env.cfg.write_text(EXAMPLE)
+    monkeypatch.setattr(env.service, "_model_limit_errors", lambda doc: [
+        {"field": "KVCacheTokens", "message": "More than this model's longest chat.", "where": "qwen3.8-flash"}])
+    refused = env.client.post("/api/panel/import", json={})
+    assert refused.status_code == 409 and refused.json()["code"] == "import_refused"
+    message = refused.json()["message"]
+    assert message.startswith("Nothing was copied, because these settings can't be used:")
+    assert "More than this model's longest chat." in message and "qwen3.8-flash:" not in message  # named, not id'd
+    assert message.endswith("Change them in the helper's start-up file and try again.")
+    assert not env.store.exists() and env.cfg.read_text() == EXAMPLE and env.switcher.calls == []
+
+
+def test_status_route_runs_in_the_threadpool(env):
+    # Open item: /api/status probes the model server (~4 s when it is down); as an async
+    # route it blocked the event loop and every panel request with it.
+    import inspect
+
+    route = next(r for r in env.client.app.routes if getattr(r, "path", "") == "/api/status")
+    assert not inspect.iscoroutinefunction(route.endpoint)
+    assert env.client.get("/api/status").json()["helper"]["status"] == "up"

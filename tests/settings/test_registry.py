@@ -125,7 +125,13 @@ def test_restore_brings_back_a_backup_and_keeps_the_broken_file(tmp_path):
     store.restore(store.backups()[0])
     restored, _ = store.load()
     assert restored["system"]["floorGB"] == 6
-    assert any((tmp_path / name).read_text() == "{broken" for name in store.backups())
+    # The broken file is kept, but outside the backup list, so "restore the newest backup"
+    # never brings the damage back (final review, open item).
+    assert not any((tmp_path / name).read_text() == "{broken" for name in store.backups())
+    kept = [p for p in tmp_path.iterdir() if p.name.startswith("registry.json.corrupt-")]
+    assert len(kept) == 1 and kept[0].read_text() == "{broken"
+    store.restore(store.backups()[0])  # a good current file still becomes a normal backup
+    assert not any(p.name.startswith("registry.json.corrupt-") and p != kept[0] for p in tmp_path.iterdir())
     with pytest.raises(KeyError):
         store.restore("registry.json.bak-nope")
 

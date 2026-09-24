@@ -96,6 +96,7 @@ def test_page_contract():
                  'id="restart-dialog"', 'id="fit-panel"', 'id="server-pill"'):
         assert gone not in page, gone
     for present in ('id="restart-ask"', "Restart now", "Next time", 'id="now-strip"', 'id="models-view"',
+                    'id="confirm-ask"', 'id="confirm-ask-ok"', 'id="confirm-ask-cancel"',
                     'id="editor"', 'id="preset-picker"', 'id="save-anyway"', 'id="status-strip"'):
         assert present in page, present
     assert "PANEL_NOW_MS = 5000" in js
@@ -200,5 +201,109 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
   await tick();
   assert.equal(calls, 4);
   assert.equal(timers.length, 1);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
+
+
+# ---- final whole-branch review fix wave ----
+def test_load_and_unload_questions_name_the_models():
+    """Item 9: Load asks only when another model is loaded; Unload always asks."""
+    _node(r"""
+const rows = [{id: 'a', name: 'Alpha', state: 'ready'}, {id: 'b', name: 'Beta', state: 'stopped'}];
+assert.equal(p.loadQuestion('b', rows), 'This will put away Alpha and load Beta. Carry on?');
+assert.equal(p.loadQuestion('a', rows), null);
+assert.equal(p.loadQuestion('b', [{id: 'b', name: 'Beta', state: 'stopped'}]), null);
+assert.equal(p.loadQuestion('b', [{id: 'a', name: 'Alpha', state: 'starting'}, {id: 'b', name: 'Beta'}]),
+  'This will put away Alpha and load Beta. Carry on?');
+assert.equal(p.unloadQuestion('a', rows), 'Put away Alpha? Anything using it will stop.');
+""")
+
+
+def test_load_waits_for_the_answer_and_cancel_loads_nothing():
+    _node(r"""
+const nodes = {};
+global.$ = (id) => (nodes[id] ||= {hidden: true, textContent: '', innerHTML: '', querySelectorAll: () => []});
+global.document = {hidden: false, querySelectorAll: () => [], querySelector: () => null};
+global.state = {view: null};
+global.setNotice = () => {};
+const posts = [];
+global.json = async (url, options = {}) => { if (options.method === 'POST') posts.push(url); return {response: {ok: true, status: 200}, body: {models: [], switcher: {up: true}}}; };
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+(async () => {
+  p.panel.models = [{id: 'a', name: 'Alpha', state: 'ready'}, {id: 'b', name: 'Beta', state: 'stopped'}];
+  const first = p.loadModel('b');
+  await tick();
+  assert.equal($('confirm-ask').hidden, false);
+  assert.equal($('confirm-ask-text').textContent, 'This will put away Alpha and load Beta. Carry on?');
+  p.answerConfirm(false);
+  await first;
+  assert.deepEqual(posts, []);
+  const second = p.loadModel('b');
+  await tick();
+  p.answerConfirm(true);
+  await second;
+  assert.deepEqual(posts, ['/api/panel/models/b/load']);
+  p.panel.models = [{id: 'a', name: 'Alpha', state: 'ready'}];  // the refresh after a load replaced the list
+  const third = p.unloadModel('a');
+  await tick();
+  assert.equal($('confirm-ask-text').textContent, 'Put away Alpha? Anything using it will stop.');
+  assert.equal($('confirm-ask-ok').textContent, 'Put it away');
+  p.answerConfirm(true);
+  await third;
+  assert.deepEqual(posts, ['/api/panel/models/b/load', '/api/panel/models/a/unload']);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
+
+
+def test_missing_list_offers_the_backups_too():
+    """Item 3: spec, missing or corrupt -> offer restore."""
+    _node(r"""
+const missing = p.registryProblemHtml({status: 'missing', configPath: '/c.yaml', backups: ['registry.json.bak-20260924-101112-000001']});
+assert.ok(missing.includes('id="import-now"'));
+assert.ok(missing.includes('data-restore="registry.json.bak-20260924-101112-000001"'));
+const bare = p.registryProblemHtml({status: 'missing', configPath: '/c.yaml', backups: []});
+assert.ok(bare.includes('id="import-now"') && !bare.includes('data-restore'));
+const corrupt = p.registryProblemHtml({status: 'corrupt', message: 'bad', backups: ['registry.json.bak-20260924-101112-000001']});
+assert.ok(corrupt.includes('data-restore=') && !corrupt.includes('import-now'));
+""")
+
+
+def test_right_now_says_when_the_switcher_is_on_older_settings():
+    """Item 5."""
+    _node(r"""
+const base = {switcher: {up: true, running: []}, card: null, windowsFreeBytes: null, cushionGB: 6, held: []};
+assert.ok(!p.nowStripHtml(base).includes("hasn't picked up"));
+assert.ok(p.nowStripHtml({...base, switcher: {up: true, running: [], stale: true}}).includes("The switcher hasn't picked up the latest settings yet."));
+""")
+
+
+def test_a_second_save_press_during_the_fit_check_does_nothing():
+    """Item 7: busy is set before the fit check, so a second press cannot send a second PUT."""
+    _node(r"""
+const nodes = {};
+global.$ = (id) => (nodes[id] ||= {hidden: true, textContent: '', innerHTML: '', value: '', className: '', disabled: false, addEventListener() {}, querySelectorAll: () => []});
+global.document = {querySelectorAll: () => [], querySelector: () => null};
+global.state = {view: {kind: 'model', id: 'q', url: '/api/panel/views/model/q', activePreset: null}, settings: {'kv-dtype': 'int8'}, saved: {}};
+const busy = []; global.setBusy = (value) => busy.push(value);
+global.showFieldErrors = () => {}; global.changedNames = () => []; global.setNotice = () => {};
+global.renderSettings = () => {}; global.renderModelCard = () => {}; global.renderPresetPicker = () => {}; global.showEditor = () => {};
+let fits = 0; let puts = 0; let releaseFit;
+global.json = (url, options = {}) => {
+  if (url.endsWith('/fit')) { fits += 1; return new Promise((resolve) => { releaseFit = () => resolve({response: {ok: true, status: 200}, body: {verdict: 'fits'}}); }); }
+  if (options.method === 'PUT') { puts += 1; return Promise.resolve({response: {ok: true, status: 200}, body: {revision: 'r2', restarting: [], held: []}}); }
+  return Promise.resolve({response: {ok: false, status: 500}, body: {}});
+};
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+(async () => {
+  const first = p.panelSave();
+  await tick();
+  assert.deepEqual(busy, [true]);
+  await p.panelSave();                      // the second press while the check runs
+  assert.equal(fits, 1);
+  releaseFit();
+  await first;
+  assert.equal(fits, 1);
+  assert.equal(puts, 1);
+  assert.deepEqual(busy, [true, false]);
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """)

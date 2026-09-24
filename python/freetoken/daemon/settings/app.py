@@ -467,8 +467,11 @@ def create_app(
         _reapply_helper_flags(result.get("settings") if not result.get("activated") else None)
         return result
 
+    # A plain def, so FastAPI runs it in the threadpool: server_status() probes the model
+    # server and takes ~4 s when it is down, which blocked the event loop and every other
+    # panel request while the Server & advanced tab polled it (final review, open item).
     @app.get("/api/status")
-    async def status():
+    def status():
         server = process_manager.server_status()
         geometry = server.get("geometry") or {}
         parking = server.get("parking") or {}

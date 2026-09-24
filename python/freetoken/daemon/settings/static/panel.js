@@ -7,7 +7,7 @@
 
 const PANEL_NOW_MS = 5000;
 const PANEL_GB = 1024 ** 3;
-const panel = { main: 'models', revision: '', models: [], now: null, busy: false, fit: null, fitDraft: '', nowTimer: null, nowLoop: false, restartResolve: null, presetMode: 'add' };
+const panel = { main: 'models', revision: '', models: [], now: null, busy: false, fit: null, fitDraft: '', nowTimer: null, nowLoop: false, restartResolve: null, confirmResolve: null, presetMode: 'add' };
 
 function panelEsc(value) { return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 function fmtGB(bytes) { const n = Number(bytes); if (bytes == null || bytes === '' || !Number.isFinite(n)) return '—'; return `${(n / PANEL_GB).toFixed(1)} GB`; }
@@ -46,6 +46,21 @@ function restartQuestion(affected, nextTimeAllowed) {
   if (!nextTimeAllowed) return `${names} ${one ? 'is' : 'are'} loaded right now and must restart for this. Restart now?`;
   return `${names} ${one ? 'is' : 'are'} loaded right now. Restart now to use the new settings, or keep ${one ? 'it' : 'them'} running on the old ones until ${one ? 'its' : 'their'} next load?`;
 }
+// Load/Unload questions (final review item 9). Load asks only when another model is loaded,
+// because the switcher puts that one away first; Unload always asks.
+function isLoadedState(value) { return value === 'ready' || value === 'starting'; }
+function loadQuestion(id, rows) {
+  const list = rows || [];
+  const target = list.find((row) => row.id === id) || { id };
+  const others = list.filter((row) => row.id !== id && isLoadedState(row.state));
+  if (!others.length) return null;
+  return `This will put away ${others.map((row) => row.name || row.id).join(', ')} and load ${target.name || target.id}. Carry on?`;
+}
+function unloadQuestion(id, rows) {
+  const target = (rows || []).find((row) => row.id === id) || { id };
+  return `Put away ${target.name || target.id}? Anything using it will stop.`;
+}
+const STALE_WORDS = "The switcher hasn't picked up the latest settings yet.";
 function nowStripHtml(now) {
   if (!now) return '<p class="empty">Checking…</p>';
   const sw = now.switcher || {};
@@ -56,8 +71,9 @@ function nowStripHtml(now) {
   const cushion = now.cushionGB == null ? '—' : `${now.cushionGB} GB`;
   const held = (now.held || []).length ? `<div class="sub">Old settings until the next load: ${panelEsc(now.held.map((id) => ((sw.running || []).find((row) => row.id === id) || {}).name || id).join(', '))}</div>` : '';
   const restart = now.lastRestart && !now.lastRestart.ok ? `<div class="error">${panelEsc(now.lastRestart.message)}</div>` : '';
+  const stale = sw.up && sw.stale ? `<div class="error">${STALE_WORDS}</div>` : '';
   return [
-    `<div class="stat"><span class="small">Loaded</span><strong class="now-list">${running}</strong>${held}${restart}</div>`,
+    `<div class="stat"><span class="small">Loaded</span><strong class="now-list">${running}</strong>${held}${stale}${restart}</div>`,
     `<div class="stat"><span class="small">Graphics card</span><strong>${card}</strong><div class="bar" aria-label="Graphics card memory used"><span style="width:${pct}%"></span></div></div>`,
     `<div class="stat"><span class="small">Windows free memory</span><strong>${win}</strong></div>`,
     `<div class="stat"><span class="small">Cushion kept free</span><strong>${cushion}</strong></div>`,
@@ -83,8 +99,27 @@ function panelErrorText(body, fallback) {
   if (typeof detail === 'string' && detail && !detail.startsWith('not found')) return detail;
   return fallback;
 }
+// Backups are named registry.json.bak-YYYYmmdd-HHMMSS-ffffff; show the time, not the file name.
+function backupWhen(name) {
+  const m = String(name).match(/bak-(\d{4})(\d\d)(\d\d)-(\d\d)(\d\d)(\d\d)/);
+  if (!m) return name;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6])).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+function backupListHtml(backups) {
+  return (backups || []).map((name) => `<li><button class="button small" type="button" data-restore="${panelEsc(name)}">Restore the copy from ${panelEsc(backupWhen(name))}</button></li>`).join('');
+}
+// The fix-it box on Models. Missing or damaged, the backups are offered (spec: Error handling);
+// a missing list also offers a fresh copy of today's settings (final review item 3).
+function registryProblemHtml(body) {
+  const backups = backupListHtml(body.backups);
+  if (body.status === 'missing') {
+    const restore = backups ? `<p class="small">Or bring back a saved copy of the panel's own list:</p><ul class="backups">${backups}</ul>` : '';
+    return `<div class="panel-head"><div><h2>Set up the control panel</h2><p class="small">This copies today's models and settings from ${panelEsc(body.configPath)} and the helper's start-up file into the panel's own list. The old switcher file is kept as a backup.</p></div><button class="button primary" id="import-now" type="button">Copy today's settings</button></div>${restore}`;
+  }
+  return `<div class="panel-head"><div><h2>The model list is damaged</h2><p class="small">${panelEsc(body.message || '')}</p><p class="small">Nothing was changed. Restore the last good backup:</p></div></div>${backups ? `<ul class="backups">${backups}</ul>` : '<p class="empty">No backups were found.</p>'}`;
+}
 if (typeof module !== 'undefined') module.exports = { fmtGB, stateWord, sourceText, dialSourceFor, verdictWords, fitSummary, ramSummary, restartQuestion, nowStripHtml, modelsTableHtml, panelErrorText,
-  panelSave, answerRestart, startNow };
+  loadQuestion, unloadQuestion, registryProblemHtml, panelSave, answerRestart, answerConfirm, startNow, loadModel, unloadModel, panel };
 
 /* ---------- browser side: uses index.html's state, json, $, setNotice and dial renderer ---------- */
 const postJson = (url, payload) => json(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload ?? {}) });
@@ -139,24 +174,13 @@ async function loadRegistry() {
   renderRegistryProblem(body);
   return body.status === 'ok';
 }
-// Backups are named registry.json.bak-YYYYmmdd-HHMMSS-ffffff; show the time, not the file name.
-function backupWhen(name) {
-  const m = String(name).match(/bak-(\d{4})(\d\d)(\d\d)-(\d\d)(\d\d)(\d\d)/);
-  if (!m) return name;
-  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6])).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' });
-}
 function renderRegistryProblem(body) {
   const box = $('registry-problem');
   $('models-head').hidden = body.status !== 'ok';
   if (body.status === 'ok') { box.hidden = true; box.innerHTML = ''; return; }
   box.hidden = false;
-  if (body.status === 'missing') {
-    box.innerHTML = `<div class="panel-head"><div><h2>Set up the control panel</h2><p class="small">This copies today's models and settings from ${panelEsc(body.configPath)} and the helper's start-up file into the panel's own list. The old switcher file is kept as a backup.</p></div><button class="button primary" id="import-now" type="button">Copy today's settings</button></div>`;
-    $('import-now').addEventListener('click', () => importLive());
-    return;
-  }
-  const backups = (body.backups || []).map((name) => `<li><button class="button small" type="button" data-restore="${panelEsc(name)}">Restore the copy from ${panelEsc(backupWhen(name))}</button></li>`).join('');
-  box.innerHTML = `<div class="panel-head"><div><h2>The model list is damaged</h2><p class="small">${panelEsc(body.message || '')}</p><p class="small">Nothing was changed. Restore the last good backup:</p></div></div>${backups ? `<ul class="backups">${backups}</ul>` : '<p class="empty">No backups were found.</p>'}`;
+  box.innerHTML = registryProblemHtml(body);
+  if (body.status === 'missing') $('import-now').addEventListener('click', () => importLive());
   box.querySelectorAll('[data-restore]').forEach((button) => button.addEventListener('click', () => restoreBackup(button.dataset.restore)));
 }
 async function importLive(whenLoaded = null) {
@@ -220,6 +244,8 @@ async function loadModels() {
   list.querySelectorAll('[data-settings]').forEach((button) => button.addEventListener('click', () => openModel(button.dataset.settings)));
 }
 async function loadModel(id) {
+  const question = loadQuestion(id, panel.models);
+  if (question && !(await askConfirm(question, 'Carry on'))) return;
   setNotice(`Loading ${id}… FreeToken models take a few minutes.`);
   loadNow();
   const { response, body } = await json(`/api/panel/models/${encodeURIComponent(id)}/load`, { method: 'POST' });
@@ -227,6 +253,7 @@ async function loadModel(id) {
   loadNow(); loadModels();
 }
 async function unloadModel(id) {
+  if (!(await askConfirm(unloadQuestion(id, panel.models), 'Put it away'))) return;
   setNotice(`Unloading ${id}…`);
   const { response, body } = await json(`/api/panel/models/${encodeURIComponent(id)}/unload`, { method: 'POST' });
   if (response.ok) setNotice(`${id} is unloaded.`, 'good'); else setNotice(panelErrorText(body, `Could not unload ${id}.`), 'bad');
@@ -336,6 +363,19 @@ function answerRestart(choice) {
   panel.restartResolve = null;
   if (resolve) resolve(choice);
 }
+// A yes/no question in the page's own dialog, never the browser's built-in one.
+function askConfirm(text, okLabel) {
+  $('confirm-ask-text').textContent = text;
+  $('confirm-ask-ok').textContent = okLabel || 'Carry on';
+  $('confirm-ask').hidden = false;
+  return new Promise((resolve) => { panel.confirmResolve = resolve; });
+}
+function answerConfirm(yes) {
+  $('confirm-ask').hidden = true;
+  const resolve = panel.confirmResolve;
+  panel.confirmResolve = null;
+  if (resolve) resolve(!!yes);
+}
 
 function draftBody() {
   const view = state.view;
@@ -380,14 +420,17 @@ function useSuggestion() {
 async function panelSave(options = {}) {
   const view = state.view;
   if (!view || panel.busy) return;
-  if (view.kind === 'model' && !options.anyway && !options.whenLoaded) {
-    const fit = panel.fit && panel.fitDraft === JSON.stringify(draftBody()) ? panel.fit : await runFit();
-    if (fit && fit.verdict === 'wont_fit') { setNotice("This won't fit on the graphics card. Change the values, or press Save anyway.", 'bad'); return; }
-  }
-  const url = view.kind === 'system' ? '/api/panel/system' : view.kind === 'engine' ? `/api/panel/engines/${encodeURIComponent(view.engine)}/defaults` : `/api/panel/models/${encodeURIComponent(view.id)}`;
-  panel.busy = true; setBusy(true); showFieldErrors([]);
+  // Busy before the fit check (final review): a second Save press while the check ran sent a
+  // second PUT, which came back stale_revision or raised a second restart question.
+  panel.busy = true; setBusy(true);
   let retry = null;
   try {
+    if (view.kind === 'model' && !options.anyway && !options.whenLoaded) {
+      const fit = panel.fit && panel.fitDraft === JSON.stringify(draftBody()) ? panel.fit : await runFit();
+      if (fit && fit.verdict === 'wont_fit') { setNotice("This won't fit on the graphics card. Change the values, or press Save anyway.", 'bad'); return; }
+    }
+    const url = view.kind === 'system' ? '/api/panel/system' : view.kind === 'engine' ? `/api/panel/engines/${encodeURIComponent(view.engine)}/defaults` : `/api/panel/models/${encodeURIComponent(view.id)}`;
+    showFieldErrors([]);
     retry = await panelPut(url, options);
   } finally {
     panel.busy = false; setBusy(false);
@@ -443,6 +486,8 @@ function wirePanel() {
   $('restart-ask-now').addEventListener('click', () => answerRestart('restart'));
   $('restart-ask-later').addEventListener('click', () => answerRestart('next-time'));
   $('restart-ask-cancel').addEventListener('click', () => answerRestart(null));
+  $('confirm-ask-ok').addEventListener('click', () => answerConfirm(true));
+  $('confirm-ask-cancel').addEventListener('click', () => answerConfirm(false));
 }
 async function panelBoot() {
   wirePanel();

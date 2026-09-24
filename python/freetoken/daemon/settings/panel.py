@@ -56,13 +56,20 @@ from .registry import (
     validate_registry,
 )
 from .registry_import import ImportRefused, import_live
-from .swap_config import SwitcherRefused, config_sha256, extract_model_blocks, profile_id, render_config
-from .switcher import LOADED_STATES, SwitcherError
+from .swap_config import HEADER, SwitcherRefused, config_sha256, extract_model_blocks, profile_id, render_config
+from .switcher import LOADED_STATES, SwitcherError, is_down
 
 GIB = 1024 ** 3
 PROFILE_NOTE = "Control panel settings for this model"
 IMPORT_UNKNOWN_MESSAGE = ("Can't tell whether a model is loaded right now, so the import would risk "
                           "restarting it. Try again in a moment.")
+REWRITE_UNKNOWN_MESSAGE = ("Can't tell whether a model is loaded right now, so this could restart it. "
+                           "Try again in a moment.")
+# llama-swap polls its config file every 2 s; give it this long after a write before the
+# Right-now strip says it is still on older settings (final review item 5).
+STALE_GRACE_S = 10.0
+# A failed restart stays on the Right-now strip this long, or until the next save/load/unload.
+RESTART_SHOWN_S = 600.0
 RESTART_STALE_MESSAGE = "The switcher didn't pick up the new settings; the old ones are still in use. Check the switcher log."
 
 IDENTITY_GROUP = "This model"
@@ -199,25 +206,40 @@ class PanelService:
         self._stop = threading.Event()
         self._watcher: threading.Thread | None = None
         self.last_restart: dict[str, Any] | None = None
+        self._last_restart_at: float | None = None
+        self._last_write: float | None = None
 
     # ---- small helpers ----
-    def _loaded_or_unknown(self) -> list[str] | None:
-        """Loaded model ids, or None when the switcher could not be asked (down, slow, erroring).
+    def _ask(self) -> tuple[list[str] | None, bool]:
+        """(loaded model ids, down).
 
-        None is not "nothing loaded": a single failed /running call must not release a
-        "Next time" hold, because P5 then stops the still-loaded model (fix round 1)."""
+        Loaded is None when the switcher's state is unknown (timeout, HTTP error, bad body):
+        that is not "nothing loaded", because a single failed /running call must not release a
+        "Next time" hold (P5 then stops the still-loaded model, fix round 1). A refused
+        connection is "down": nothing is loaded, so saves go through (final review, ruling
+        2026-09-24); holds are kept while it is down, which is harmless."""
         running = self.switcher.running()
         if running is None:
-            return None
-        return sorted(model_id for model_id, state in running.items() if state in LOADED_STATES)
+            return None, False
+        return sorted(model_id for model_id, state in running.items() if state in LOADED_STATES), is_down(running)
+
+    def _loaded_or_unknown(self) -> list[str] | None:
+        return self._ask()[0]
 
     def _loaded(self) -> list[str]:
         return self._loaded_or_unknown() or []
 
-    def _live_holds(self, loaded: list[str] | None) -> dict[str, str]:
-        """Holds whose model is still loaded; every hold when the state is unknown."""
+    def _live_holds(self, loaded: list[str] | None, down: bool = False) -> dict[str, str]:
+        """Holds whose model is still loaded; every hold when the state is unknown or the
+        switcher is down."""
         holds = self._read_holds()
-        return holds if loaded is None else {m: t for m, t in holds.items() if m in loaded}
+        return holds if loaded is None or down else {m: t for m, t in holds.items() if m in loaded}
+
+    def _mark_written(self) -> None:
+        self._last_write = self._clock()
+
+    def _clear_restart(self) -> None:
+        self.last_restart, self._last_restart_at = None, None
 
     @staticmethod
     def _named(doc: Mapping[str, Any], ids: list[str]) -> list[dict[str, str]]:
@@ -271,7 +293,7 @@ class PanelService:
             if errors:
                 raise RegistryValidationError(errors)
             old_text = self.writer.current_text() or ""
-            known = self._loaded_or_unknown()
+            known, down = self._ask()
             # Unknown switcher state (fix rounds 1-2): keep every hold as it is (the watcher
             # releases them once the state is known again). A change to a held model is safe:
             # the hold pins the running entry in the file and the change applies at the next
@@ -279,7 +301,7 @@ class PanelService:
             # loaded and P5 would stop it. Saves that move no entry (most System fields, a
             # FreeToken profile-only change, which the adapter applies at the next load) go through.
             loaded = known or []
-            holds = self._live_holds(known)
+            holds = self._live_holds(known, down)
             before = extract_model_blocks(render_config(current, {}))
             after = extract_model_blocks(render_config(proposed, {}))
             if known is None:
@@ -306,8 +328,7 @@ class PanelService:
             new_text = render_config(proposed, holds)
             staged = self.writer.check(new_text) if new_text != old_text else None
             try:
-                for model_id in restarting:
-                    self.switcher.unload(model_id)
+                self._unload_for_restart(proposed, restarting)
                 new_revision = self.store.save(proposed, expected_revision=current_revision)
             except BaseException:
                 if staged is not None:
@@ -316,6 +337,8 @@ class PanelService:
             self._write_holds(holds)
             if staged is not None:
                 self.writer.commit(staged)
+                self._mark_written()
+            self._clear_restart()
             self._ensure_profiles(proposed)
             if restarting:
                 self._spawn(self._reload_after_write, restarting, new_text)
@@ -345,15 +368,62 @@ class PanelService:
                 affected.append(model_id)
         return affected
 
-    def _rewrite_with_live_holds(self, doc: Mapping[str, Any]) -> None:
-        """Write the config for doc, keeping only the holds whose model is still loaded (all of
-        them when the switcher cannot be asked)."""
-        holds = self._live_holds(self._loaded_or_unknown())
-        self.writer.write(render_config(doc, holds))
+    def _unload_for_restart(self, doc: Mapping[str, Any], model_ids: list[str]) -> None:
+        """"Restart now" puts each model away first. If the switcher does not confirm, nothing
+        is saved: before this, the save went on and the page said "restarting" while the old
+        model kept running on the old settings (final review item 4)."""
+        for row in self._named(doc, model_ids):
+            if not self.switcher.unload(row["id"]):
+                raise PanelError(503, "restart_failed", f"Couldn't put {row['name']} away to restart it, "
+                                                        "so nothing was saved. Try again in a moment.")
+
+    def _plan_rewrite(self, doc: Mapping[str, Any], state: tuple[list[str] | None, bool] | None = None
+                      ) -> tuple[str, dict[str, str]]:
+        """The config text and holds for writing doc without moving a loaded model's entry.
+
+        Holds carry over while their model is loaded (all of them when the state is unknown or
+        the switcher is down). Restore and the helper's start-up sync rewrite every entry, and
+        P5 stops a loaded model whose entry changes (reproduced in the final review: QUASAR
+        loaded on fp8, restore of an int8 backup stopped it). So a loaded model (any model when
+        the state is unknown) whose new entry differs from the one in the file gets a hold on
+        the file's entry; the hold watcher writes the new entry once it unloads. This also
+        mends a crash between store.save and the holds write in _save. A loaded model whose
+        entry cannot be found (the file was not written by the panel) is refused instead."""
+        known, down = state if state is not None else self._ask()
+        holds = self._live_holds(known, down)
+        old_text = self.writer.current_text()
+        current = extract_model_blocks(old_text)
+        fresh = extract_model_blocks(render_config(doc, {}))
+        foreign = bool(old_text) and not old_text.startswith(HEADER + "\n")
+        at_risk = list(fresh) if known is None else [] if down else known
+        unprotected = []
+        for model_id in at_risk:
+            if model_id in holds or model_id not in fresh:
+                continue
+            running_block = current.get(model_id)
+            if running_block is None:
+                if foreign:
+                    unprotected.append(model_id)
+            elif running_block != fresh[model_id]:
+                holds[model_id] = running_block
+        if unprotected:
+            if known is None:
+                raise PanelError(503, "switcher_unknown", REWRITE_UNKNOWN_MESSAGE)
+            names = ", ".join(row["name"] for row in self._named(doc, unprotected))
+            raise PanelError(409, "unload_first", f"{names} is loaded and the switcher file was not written by the "
+                                                  "control panel, so this would restart it. Unload it first.")
+        return render_config(doc, holds), holds
+
+    def _rewrite(self, doc: Mapping[str, Any], state: tuple[list[str] | None, bool] | None = None) -> dict[str, str]:
+        text, holds = self._plan_rewrite(doc, state)
+        if self.writer.write(text):
+            self._mark_written()
         self._write_holds(holds)
+        return holds
 
     def _restart_done(self, model_ids: list[str], ok: bool, message: str) -> None:
         self.last_restart = {"models": model_ids, "ok": ok, "at": _now_iso(), "message": message}
+        self._last_restart_at = self._clock()
 
     def _reload_after_write(self, model_ids: list[str], text: str) -> None:
         # Bounded wait (Task 7 review): if the switcher's rebuild fails for a reason
@@ -401,6 +471,16 @@ class PanelService:
             except (BootParseError, OSError) as exc:
                 raise ImportRefused(f"The helper's start-up file could not be read: {exc}") from exc
             registry, warnings = import_live(text, boot_settings, env=os.environ, profiles=self.profiles.list())
+            # The same limits every save checks (final review item 8): an imported model that
+            # breaks one would make every later save fail, so say which and copy nothing.
+            # Checked against config.example.yaml + the real boot file: no errors, so today's
+            # box imports as before.
+            limits = self._model_limit_errors(registry)
+            if limits:
+                names = {m["id"]: m["name"] for m in registry["models"]}
+                reasons = " ".join(f"{names.get(row['where'], row['where'])}: {row['message']}" for row in limits)
+                raise ImportRefused(f"Nothing was copied, because these settings can't be used: {reasons} "
+                                    "Change them in the helper's start-up file and try again.")
             known = self._loaded_or_unknown()
             if known is None:
                 # The import rewrites every entry; if /running only timed out while a model was
@@ -413,14 +493,15 @@ class PanelService:
             new_text = render_config(registry, {})
             staged = self.writer.check(new_text)
             try:
-                for model_id in loaded:
-                    self.switcher.unload(model_id)
+                self._unload_for_restart(registry, loaded)
                 revision = self.store.save(registry, expected_revision=None)
             except BaseException:
                 self.writer.discard(staged)
                 raise
             self.writer.backup_before_registry()
             self.writer.commit(staged)
+            self._mark_written()
+            self._clear_restart()
             self._write_holds({})
             self._ensure_profiles(registry)
             if loaded:
@@ -428,11 +509,24 @@ class PanelService:
             return {"status": "imported", "revision": revision, "warnings": warnings, "restarting": loaded}
 
     def restore(self, name: str) -> dict[str, Any]:
+        """Check everything first (the backup, the holds plan, --check-config), then restore
+        the registry and swap the file in: a refusal now changes nothing, where before the
+        registry was already restored when the switcher refused the file (final review)."""
         with self._lock:
-            self.store.restore(name)
-            doc, revision = self.store.load()
-            self._rewrite_with_live_holds(doc)
-            return {"status": "restored", "revision": revision}
+            doc = self.store.read_backup(name)
+            text, holds = self._plan_rewrite(doc)
+            staged = self.writer.check(text) if text != self.writer.current_text() else None
+            try:
+                revision = self.store.restore(name)
+            except BaseException:
+                if staged is not None:
+                    self.writer.discard(staged)
+                raise
+            if staged is not None:
+                self.writer.commit(staged)
+                self._mark_written()
+            self._write_holds(holds)
+            return {"status": "restored", "revision": revision, "held": sorted(holds)}
 
     # ---- views ----
     def system_view(self) -> dict[str, Any]:
@@ -472,11 +566,12 @@ class PanelService:
                     "model.ramNeedGB": model["ramNeedGB"],
                     "model.idleMinutes": -1 if model.get("idleMinutes") is None else model["idleMinutes"]}
         running = self.switcher.running()
+        up = running is not None and not is_down(running)
         return {
             "kind": "model", "id": model_id, "name": model["name"], "title": model["name"], "revision": revision,
             "engine": engine, "engineLabel": ENGINE_LABELS[engine], "runtime": model.get("runtime"),
             "runtimeLabel": ninfer_dials.RUNTIME_LABELS.get(model.get("runtime"), ""),
-            "state": "unknown" if running is None else running.get(model_id, "stopped"),
+            "state": running.get(model_id, "stopped") if up else "unknown",
             "presets": sorted(presets), "activePreset": chosen, "savedPreset": model.get("activePreset"),
             "dials": [dial.as_dict(identity[dial.name]) for dial in IDENTITY_DIALS] + dials,
             "groups": [{"name": IDENTITY_GROUP, "plain": IDENTITY_GROUP, "info": "Its name, other names and memory."}] + groups,
@@ -641,21 +736,36 @@ class PanelService:
                       "loadedNow": model_id in self._loaded()}
         return out
 
+    def _switcher_stale(self) -> bool:
+        """True when the switcher answers with a config hash that is not the file's (P5): it
+        is still on older settings, for example after a rebuild it could not do. Not flagged
+        within STALE_GRACE_S of the panel's own write (final review item 5)."""
+        if self._last_write is not None and self._clock() - self._last_write < STALE_GRACE_S:
+            return False
+        live = self.switcher.config_hash()
+        text = self.writer.current_text()
+        return live is not None and text is not None and live != config_sha256(text)
+
     def now(self) -> dict[str, Any]:
         running = self.switcher.running()
+        up = running is not None and not is_down(running)
         try:
             doc, _ = self.store.load()
             names, floor = {m["id"]: m["name"] for m in doc["models"]}, doc["system"]["floorGB"]
         except RegistryError:
             names, floor = {}, None
         rows = [{"id": m, "name": names.get(m, m), "state": s} for m, s in sorted((running or {}).items())]
-        return {"switcher": {"up": running is not None, "running": rows}, "card": self._card_probe(),
-                "windowsFreeBytes": self._windows_free(), "cushionGB": floor,
-                "held": sorted(self._read_holds()), "lastRestart": self.last_restart}
+        last = self.last_restart
+        if last is not None and self._last_restart_at is not None and self._clock() - self._last_restart_at >= RESTART_SHOWN_S:
+            last = None
+        return {"switcher": {"up": up, "running": rows, "stale": up and self._switcher_stale()},
+                "card": self._card_probe(), "windowsFreeBytes": self._windows_free(), "cushionGB": floor,
+                "held": sorted(self._read_holds()), "lastRestart": last}
 
     def models(self) -> dict[str, Any]:
         doc, revision = self.store.load()
         running = self.switcher.running()
+        up = running is not None and not is_down(running)
         holds = self._read_holds()
         rows = []
         for model in doc["models"]:
@@ -666,10 +776,10 @@ class PanelService:
                 "activePreset": model.get("activePreset"), "presets": sorted(model.get("presets") or {}),
                 "ramNeedGB": model["ramNeedGB"], "idleMinutes": idle_minutes(doc, model),
                 "idleFromSystem": model.get("idleMinutes") is None,
-                "state": "unknown" if running is None else running.get(model["id"], "stopped"),
+                "state": running.get(model["id"], "stopped") if up else "unknown",
                 "held": model["id"] in holds,
             })
-        return {"revision": revision, "switcherUp": running is not None, "models": rows}
+        return {"revision": revision, "switcherUp": up, "models": rows}
 
     def load(self, model_id: str) -> dict[str, Any]:
         doc, _ = self.store.load()
@@ -680,6 +790,7 @@ class PanelService:
             raise PanelError(exc.status, exc.code, exc.message) from exc
         except OSError as exc:
             raise PanelError(503, "switcher_down", "The model switcher is not running.") from exc
+        self._clear_restart()
         return {"id": model_id, "state": "ready"}
 
     def unload(self, model_id: str) -> dict[str, Any]:
@@ -687,6 +798,7 @@ class PanelService:
         find_model(doc, model_id)
         if not self.switcher.unload(model_id):
             raise PanelError(503, "switcher_down", "The model switcher is not running.")
+        self._clear_restart()
         return {"id": model_id, "state": "stopped"}
 
     def effective(self, model_id: str) -> dict[str, Any]:
@@ -702,20 +814,17 @@ class PanelService:
             holds = self._read_holds()
             if not holds:
                 return []
-            known = self._loaded_or_unknown()
-            if known is None:
+            known, down = self._ask()
+            if known is None or down:
                 return []  # switcher down or slow: skip this tick, never release on a blip
-            loaded = set(known)
-            released = [model_id for model_id in holds if model_id not in loaded]
+            released = [model_id for model_id in holds if model_id not in known]
             if not released:
                 return []
             try:
                 doc, _ = self.store.load()
             except RegistryError:
                 return []
-            kept = {m: t for m, t in holds.items() if m in loaded}
-            self.writer.write(render_config(doc, kept))
-            self._write_holds(kept)
+            self._rewrite(doc, (known, down))
             return sorted(released)
 
     def sync_config(self) -> None:
@@ -723,8 +832,8 @@ class PanelService:
         try:
             with self._lock:
                 doc, _ = self.store.load()
-                self._rewrite_with_live_holds(doc)
-        except (RegistryError, SwitcherRefused, OSError):
+                self._rewrite(doc)
+        except (RegistryError, SwitcherRefused, OSError, PanelError):
             pass  # the page shows the registry problem; the old file stays live
 
     def start_hold_watcher(self, interval: float = 5.0) -> None:

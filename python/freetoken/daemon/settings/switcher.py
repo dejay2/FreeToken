@@ -13,6 +13,30 @@ DEFAULT_URL = "http://127.0.0.1:2040"
 LOADED_STATES = frozenset({"starting", "ready"})
 
 
+class SwitcherDown(dict):
+    """What running() answers when the switcher refused the connection (not running at all).
+
+    It is an empty mapping on purpose: a switcher that is not running has nothing loaded, and
+    llama-swap reads the config file fresh when it starts (systemd KillMode=mixed clears the old
+    model processes), so a save may write the file (spec error table: "settings still save and
+    apply on its next start"). A timeout, an HTTP error or a bad body is different: the switcher
+    may be up with a model loaded, so running() answers None ("unknown") for those (final
+    review, controller ruling 2026-09-24)."""
+
+
+DOWN = SwitcherDown()
+
+
+def is_down(running: object) -> bool:
+    return isinstance(running, SwitcherDown)
+
+
+def _refused(exc: BaseException) -> bool:
+    if isinstance(exc, ConnectionRefusedError):
+        return True
+    return isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, ConnectionRefusedError)
+
+
 class SwitcherError(RuntimeError):
     def __init__(self, status: int, code: str, message: str) -> None:
         super().__init__(message)
@@ -46,10 +70,12 @@ class SwitcherClient:
         return urllib.parse.quote(model_id, safe="")
 
     def running(self) -> dict[str, str] | None:
+        """{model: state} when the switcher answers; DOWN (an empty SwitcherDown) when the
+        connection is refused; None when the state is unknown (timeout, HTTP error, bad body)."""
         try:
             status, body = self._request("GET", "/running")
-        except OSError:
-            return None
+        except OSError as exc:
+            return DOWN if _refused(exc) else None
         if status != 200 or not isinstance(body, dict):
             return None
         return {str(row.get("model")): str(row.get("state"))
@@ -80,4 +106,4 @@ class SwitcherClient:
         raise SwitcherError(status, "load_failed", str(body or f"HTTP {status}"))
 
 
-__all__ = ["DEFAULT_URL", "LOADED_STATES", "SwitcherClient", "SwitcherError"]
+__all__ = ["DEFAULT_URL", "DOWN", "LOADED_STATES", "SwitcherClient", "SwitcherDown", "SwitcherError", "is_down"]

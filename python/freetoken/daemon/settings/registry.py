@@ -379,23 +379,37 @@ class RegistryStore:
             self._prune()
         return revision_of(data)
 
-    def restore(self, name: str) -> str:
+    def read_backup(self, name: str) -> dict[str, Any]:
+        """The registry a backup holds, checked like the current file (a bad backup is refused)."""
         if name not in self.backups():
             raise KeyError(name)
+        return self._parse((self.path.parent / name).read_bytes())
+
+    def restore(self, name: str) -> str:
+        self.read_backup(name)
         data = (self.path.parent / name).read_bytes()
-        self._parse(data)  # a bad backup is refused like a bad current file
         with self._lock:
             try:
-                self._backup(self.path.read_bytes())
+                current = self.path.read_bytes()
             except FileNotFoundError:
-                pass
+                current = None
+            if current is not None:
+                # A damaged current file is kept as registry.json.corrupt-<time>, outside the
+                # backup list: kept as a .bak it became the newest backup, so "restore the
+                # newest" brought the damage straight back (final review, open item).
+                try:
+                    self._parse(current)
+                except RegistryCorrupt:
+                    self._backup(current, kind="corrupt")
+                else:
+                    self._backup(current)
             self._atomic_write(data)
             self._prune()
         return revision_of(data)
 
-    def _backup(self, data: bytes) -> None:
+    def _backup(self, data: bytes, kind: str = "bak") -> None:
         stamp = self._now().strftime("%Y%m%d-%H%M%S-%f")
-        target = self.path.with_name(f"{self.path.name}.bak-{stamp}")
+        target = self.path.with_name(f"{self.path.name}.{kind}-{stamp}")
         target.write_bytes(data)
         os.chmod(target, 0o600)
 
