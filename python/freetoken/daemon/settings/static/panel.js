@@ -7,7 +7,7 @@
 
 const PANEL_NOW_MS = 5000;
 const PANEL_GB = 1024 ** 3;
-const panel = { main: 'models', revision: '', models: [], now: null, busy: false, fit: null, fitDraft: '', nowTimer: null, restartResolve: null, presetMode: 'add' };
+const panel = { main: 'models', revision: '', models: [], now: null, busy: false, fit: null, fitDraft: '', nowTimer: null, nowLoop: false, restartResolve: null, presetMode: 'add' };
 
 function panelEsc(value) { return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 function fmtGB(bytes) { const n = Number(bytes); if (bytes == null || bytes === '' || !Number.isFinite(n)) return '—'; return `${(n / PANEL_GB).toFixed(1)} GB`; }
@@ -84,7 +84,7 @@ function panelErrorText(body, fallback) {
   return fallback;
 }
 if (typeof module !== 'undefined') module.exports = { fmtGB, stateWord, sourceText, dialSourceFor, verdictWords, fitSummary, ramSummary, restartQuestion, nowStripHtml, modelsTableHtml, panelErrorText,
-  panelSave, answerRestart };
+  panelSave, answerRestart, startNow };
 
 /* ---------- browser side: uses index.html's state, json, $, setNotice and dial renderer ---------- */
 const postJson = (url, payload) => json(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload ?? {}) });
@@ -187,10 +187,24 @@ async function loadNow() {
   $('now').innerHTML = nowStripHtml(body);
   $('now-updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
 }
+// One refresh loop, chained: the next tick is scheduled only after this one's requests have
+// settled (errors too). /api/panel/now can take longer than 5 s when the switcher hangs
+// (running() waits 5 s, then the card and Windows probes up to 3 s each), and a setInterval
+// then piled overlapping requests onto the helper's threadpool (Task 11 review).
+async function nowTick() {
+  if (document.hidden) return;
+  const jobs = [loadNow()];
+  if (panel.main === 'models' && !state.view) jobs.push(loadModels());
+  await Promise.allSettled(jobs);
+}
 function startNow() {
-  clearInterval(panel.nowTimer);
-  loadNow();
-  panel.nowTimer = setInterval(() => { if (document.hidden) return; loadNow(); if (panel.main === 'models' && !state.view) loadModels(); }, PANEL_NOW_MS);
+  if (panel.nowLoop) return; // tab switches or a second boot never start a second chain
+  panel.nowLoop = true;
+  const run = async () => {
+    try { await nowTick(); } catch (_) { /* the next tick tries again */ }
+    panel.nowTimer = setTimeout(run, PANEL_NOW_MS);
+  };
+  run();
 }
 
 async function loadModels() {

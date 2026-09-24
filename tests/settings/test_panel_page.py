@@ -167,3 +167,38 @@ global.json = async (url, options = {}) => {
   assert.ok(notes.includes('Saved. The loaded model keeps its old settings until its next load.'), notes.join(' / '));
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """)
+
+
+def test_a_slow_refresh_never_overlaps_the_next_one():
+    """Review finding: a 5 s setInterval stacked /now and /models requests on the helper when
+    the switcher hung. The loop is chained: the next tick is set only after both settle."""
+    _node(r"""
+const nodes = {};
+global.$ = (id) => (nodes[id] ||= {hidden: true, textContent: '', innerHTML: '', querySelectorAll: () => []});
+global.document = {hidden: false, querySelectorAll: () => [], querySelector: () => null};
+global.state = {view: null};
+const timers = [];
+global.setTimeout = (fn, ms) => { timers.push({fn, ms}); return timers.length; };
+const pending = [];
+let calls = 0;
+global.json = (url) => { calls += 1; return new Promise((resolve, reject) => pending.push({url, resolve, reject})); };
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+(async () => {
+  p.startNow(); p.startNow();                         // a second start must not add a chain
+  await tick();
+  assert.deepEqual(pending.map((row) => row.url), ['/api/panel/now', '/api/panel/models']);
+  assert.equal(timers.length, 0, 'no next tick while this one is still waiting');
+  pending.shift().resolve({response: {ok: true, status: 200}, body: {switcher: {up: true, running: []}}});
+  await tick();
+  assert.equal(timers.length, 0, 'still waiting for the model list');
+  pending.shift().reject(new Error('helper went away'));  // a failure still settles the tick
+  await tick(); await tick();
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 5000);
+  assert.equal(calls, 2);
+  timers[0].fn();                                      // the next tick starts only now
+  await tick();
+  assert.equal(calls, 4);
+  assert.equal(timers.length, 1);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
