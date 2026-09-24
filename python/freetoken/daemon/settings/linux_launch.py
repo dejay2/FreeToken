@@ -507,6 +507,26 @@ def _vram_used_mb() -> int | None:
         return None
 
 
+# The card counts as released once this many one-second VRAM samples agree within the band.
+_VRAM_SETTLE_SAMPLES = 3
+_VRAM_SETTLE_BAND_MB = 256
+
+
+def _vram_settled(samples: list[int]) -> bool:
+    return len(samples) >= _VRAM_SETTLE_SAMPLES and max(samples) - min(samples) <= _VRAM_SETTLE_BAND_MB
+
+
+def _pid_alive(pid: int) -> bool:
+    """A zombie has already freed its memory and CUDA context; only its parent's reap is left."""
+    if not os.path.exists(f"/proc/{pid}"):
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
+
+
 def stop_servers(
     port: int = 0,
     *,
@@ -531,16 +551,26 @@ def stop_servers(
         deadline = monotonic() + (10.0 if sig == term else 5.0)
         while pids and monotonic() < deadline:
             sleep(0.5)
-            pids = {pid for pid in pids if os.path.exists(f"/proc/{pid}")}
+            pids = {pid for pid in pids if _pid_alive(pid)}
         if not pids:
             break
     report["remaining"] = sorted(pids)
     watched = set(range(port, port + 10)) if port else set()
     deadline = monotonic() + timeout
+    samples: list[int] = []
     while monotonic() < deadline:
         busy_ports = _listeners(watched) if watched else set()
         used = _vram_used_mb()
+        if used is not None:
+            samples = (samples + [used])[-_VRAM_SETTLE_SAMPLES:]
         card_busy = used is not None and used >= vram_free_threshold_mb
+        if card_busy and not pids and _vram_settled(samples):
+            # Other programs (browser, games, another engine) can hold more than the fixed
+            # threshold on their own: live 2026-09-24 the desktop sat at 3.1 GB and every Stop
+            # waited out the full 120 s. With the server processes gone and the card no longer
+            # falling, what is left is not ours.
+            card_busy = False
+            report["vram_settled"] = True
         if not busy_ports and not card_busy:
             report["vram_used_mb"] = used
             report["ok"] = True

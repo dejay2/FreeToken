@@ -177,3 +177,47 @@ def test_ple_backend_dial_overrides_auto_and_mtp_still_forces_mmap():
     assert _arg(plan, "--ple-backend") == "pinned"
     plan = _plan({"PleBackend": "auto"})
     assert _arg(plan, "--ple-backend") == "disk"
+
+
+def test_stop_servers_accepts_a_card_other_programs_keep_above_the_threshold(monkeypatch):
+    # Live 2026-09-24: the desktop alone held 3.1 GB, over the 3,072 MB bar, and every Stop
+    # waited out its full timeout. Gone processes plus a steady card must be enough.
+    alive = {41}
+    monkeypatch.setattr(ll, "find_server_pids", lambda port: set(alive))
+    monkeypatch.setattr(ll, "_pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(ll.os, "kill", lambda pid, sig: alive.discard(pid))
+    monkeypatch.setattr(ll, "_listeners", lambda ports: set())
+    readings = iter([20000, 9000, 3150, 3140, 3143])
+    monkeypatch.setattr(ll, "_vram_used_mb", lambda: next(readings, 3143))
+    clock = iter(range(0, 1000))
+    report = ll.stop_servers(2020, timeout=120, sleep=lambda _: None, monotonic=lambda: float(next(clock)))
+    assert report["ok"] is True and report["vram_settled"] is True
+    assert report["vram_used_mb"] == 3143
+
+
+def test_stop_servers_keeps_waiting_while_a_live_server_holds_the_card(monkeypatch):
+    monkeypatch.setattr(ll, "find_server_pids", lambda port: {41})
+    monkeypatch.setattr(ll, "_pid_alive", lambda pid: True)  # ignores SIGTERM and SIGKILL
+    monkeypatch.setattr(ll.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(ll, "_listeners", lambda ports: set())
+    monkeypatch.setattr(ll, "_vram_used_mb", lambda: 29000)
+    clock = iter(range(0, 1000))
+    report = ll.stop_servers(2020, timeout=20, sleep=lambda _: None, monotonic=lambda: float(next(clock)))
+    assert report["ok"] is False and report["remaining"] == [41]
+
+
+def test_a_zombie_counts_as_gone(tmp_path, monkeypatch):
+    real_exists = ll.os.path.exists
+    monkeypatch.setattr(ll.os.path, "exists", lambda path: True if path == "/proc/77" else real_exists(path))
+    import builtins
+    real_open = builtins.open
+
+    def fake_open(path, *a, **k):
+        if path == "/proc/77/stat":
+            f = tmp_path / "stat"
+            f.write_text("77 (python) Z 1 77 77 0 -1")
+            return real_open(f, *a, **k)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    assert ll._pid_alive(77) is False
