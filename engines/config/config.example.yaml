@@ -38,7 +38,7 @@ models:
     proxy: http://127.0.0.1:2020
     checkEndpoint: /ready?model=Qwen3.8-Flash-Next-NVFP4
     unloadTimeout: 180
-    ramNeedGB: 60        # measured in Task 8; update from the measurement
+    ramNeedGB: 62        # measured 2026-09-24: Linux used peaks at 62 GB, settles at 60
     ttl: 0
     aliases: ["Qwen3.8-Flash-Next-NVFP4"]
 
@@ -48,7 +48,7 @@ models:
     proxy: http://127.0.0.1:2020
     checkEndpoint: /ready?model=Qwen3.8-Flash-Next-ABLITERATED-NVFP4
     unloadTimeout: 180
-    ramNeedGB: 60
+    ramNeedGB: 62
     ttl: 0
     aliases: ["Qwen3.8-Flash-Next-ABLITERATED-NVFP4"]
 
