@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -74,6 +76,20 @@ func configStorePath(cfg config.Config) string {
 	return strings.TrimSpace(cfg.Store.Path)
 }
 
+// FreeToken patch P5: configFileHash is the sha256 of the -config file, or ""
+// when only -config-dir is used or the file cannot be read.
+func configFileHash(path string) string {
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
 func configureTailcatListener(cfg *config.Config, keyPath string) error {
 	enabled := keyPath != ""
 	cfg.SetTailcatEnabled(enabled)
@@ -121,6 +137,9 @@ func main() {
 	flagVersion := flag.Bool("version", false, "show version and exit")
 	flagWatchConfig := flag.Bool("watch-config", false, "reload config on file change")
 	flagValidate := flag.Bool("validate", false, "validate the config file and exit (without starting the server)")
+	// FreeToken patch P5: --check-config is -validate under the name the control
+	// panel uses (load, validate, print errors, exit 0/1).
+	flagCheckConfig := flag.Bool("check-config", false, "validate the config file and exit (same as -validate)")
 	flag.Parse()
 
 	if *flagVersion {
@@ -133,7 +152,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *flagValidate {
+	if *flagValidate || *flagCheckConfig { // FreeToken patch P5
 		code := runValidate(*flagConfig, *flagConfigDir, os.Stdout)
 		os.Exit(code)
 	}
@@ -153,6 +172,7 @@ func main() {
 		}
 	}
 
+	initialHash := configFileHash(*flagConfig) // FreeToken patch P5
 	cfg, err := config.LoadConfigSources(*flagConfig, *flagConfigDir)
 	if err != nil {
 		slog.Error("failed to load config", "config", *flagConfig, "config-dir", *flagConfigDir, "error", err)
@@ -246,6 +266,7 @@ func main() {
 		initialStore.Close()
 		os.Exit(1)
 	}
+	initialSrv.SetConfigHash(initialHash) // FreeToken patch P5
 
 	// activeSrv is swapped atomically during hot reload.
 	var activeMu sync.RWMutex
@@ -300,25 +321,14 @@ func main() {
 
 	// reload guards against overlapping reloads triggered by concurrent signals
 	// or file-watcher callbacks.
-	var reloading bool
-	var reloadMu sync.Mutex
+	// FreeToken patch P5: a reload asked for during a reload is no longer
+	// dropped; it runs once more afterwards (reloadCoalescer).
+	var reloads reloadCoalescer
 
-	reload := func() {
-		reloadMu.Lock()
-		if reloading {
-			reloadMu.Unlock()
-			return
-		}
-		reloading = true
-		reloadMu.Unlock()
-		defer func() {
-			reloadMu.Lock()
-			reloading = false
-			reloadMu.Unlock()
-		}()
-
+	doReload := func() {
 		proxyLog.Info("reloading configuration")
 
+		newHash := configFileHash(*flagConfig) // FreeToken patch P5: hash before load (a later write triggers another reload)
 		newCfg, err := config.LoadConfigSources(*flagConfig, *flagConfigDir)
 		if err != nil {
 			proxyLog.Warnf("failed to reload config: %v", err)
@@ -334,6 +344,7 @@ func main() {
 		currentStore := activeStore
 		currentStorePath := activeStorePath
 		currentTailcat := activeTailcat
+		currentSrv := activeSrv // FreeToken patch P5
 		activeMu.RUnlock()
 
 		newStore := currentStore
@@ -346,7 +357,8 @@ func main() {
 			}
 		}
 
-		newSrv, err := server.New(newCfg, muxLog, proxyLog, upstreamLog, perfMon, newStore, buildInfo, hardwareSnapshot, referenceDocs)
+		// FreeToken patch P5: keep loaded models whose entry did not change.
+		newSrv, keptLocal, err := server.Rebuild(currentSrv, newCfg, newStore, buildInfo, hardwareSnapshot, referenceDocs)
 		if err != nil {
 			proxyLog.Warnf("failed to build new server during reload: %v", err)
 			if storeChanged {
@@ -354,6 +366,8 @@ func main() {
 			}
 			return
 		}
+
+		newSrv.SetConfigHash(newHash) // FreeToken patch P5
 
 		if currentTailcat != nil {
 			newSrv.SetTailcatAddress(currentTailcat.Address())
@@ -372,7 +386,11 @@ func main() {
 			perfMon.UpdateConfig(newCfg.Performance)
 		}
 
-		if err := old.Shutdown(shutdownTimeout); err != nil {
+		shutdownOld := old.Shutdown
+		if keptLocal { // FreeToken patch P5
+			shutdownOld = old.ShutdownExceptLocal
+		}
+		if err := shutdownOld(shutdownTimeout); err != nil {
 			proxyLog.Warnf("error shutting down old server during reload: %v", err)
 		}
 		if storeChanged {
@@ -388,6 +406,7 @@ func main() {
 
 		proxyLog.Info("configuration reloaded")
 	}
+	reload := func() { reloads.run(doReload) } // FreeToken patch P5
 
 	watcherCtx, watcherCancel := context.WithCancel(context.Background())
 	defer watcherCancel()

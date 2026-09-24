@@ -78,6 +78,12 @@ type Server struct {
 	shutdownFn     context.CancelFunc
 	shuttingDown   atomic.Bool
 	tailcatAddress atomic.Pointer[string]
+
+	// FreeToken patch P5: keepLocal makes Shutdown leave the local router
+	// running because a newer Server took it over (Rebuild). configHash is the
+	// sha256 of the config file this Server was built from.
+	keepLocal  atomic.Bool
+	configHash atomic.Pointer[string]
 }
 
 func (s *Server) SetTailcatAddress(address string) {
@@ -222,6 +228,12 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		}
 	}
 
+	return newWithLocal(cfg, local, muxlog, proxylog, upstreamlog, perfMon, st, build, hardware, refs)
+}
+
+// FreeToken patch P5: newWithLocal builds a Server around an existing local
+// router (a new one from New, or a kept one from Rebuild).
+func newWithLocal(cfg config.Config, local router.LocalRouter, muxlog *logmon.Monitor, proxylog *logmon.Monitor, upstreamlog *logmon.Monitor, perfMon *perf.Monitor, st store.Store, build BuildInfo, hardware *hw.HardwareSnapshot, refs *docagent.Docs) (*Server, error) {
 	peer, err := router.NewPeer(cfg, proxylog)
 	if err != nil {
 		return nil, fmt.Errorf("creating peer router: %w", err)
@@ -388,6 +400,8 @@ func (s *Server) routes() {
 	// API group (API-key protected) consumed by the UI.
 	mux.Handle("POST /api/models/unload", apiChain.ThenFunc(s.handleAPIUnloadAll))
 	mux.Handle("POST /api/models/unload/{model...}", apiChain.ThenFunc(s.handleAPIUnloadModel))
+	mux.Handle("POST /api/models/load/{model...}", apiChain.ThenFunc(s.handleAPILoadModel)) // FreeToken patch P6
+	mux.Handle("GET /api/config/hash", apiChain.ThenFunc(s.handleAPIConfigHash))            // FreeToken patch P5
 	mux.Handle("GET /api/profiles", apiChain.ThenFunc(s.handleAPIProfiles))
 	mux.Handle("PUT /api/profiles/active", apiChain.ThenFunc(s.handleAPIActiveProfile))
 	mux.Handle("POST /api/inflight/{id}/cancel", apiChain.ThenFunc(s.handleAPICancelInflight))
@@ -536,6 +550,10 @@ func (s *Server) Shutdown(timeout time.Duration) error {
 
 	for _, rt := range []router.Router{s.local, s.peer} {
 		if rt == nil {
+			continue
+		}
+		// FreeToken patch P5: a newer Server owns the local router now.
+		if rt == router.Router(s.local) && s.keepLocal.Load() {
 			continue
 		}
 		wg.Add(1)

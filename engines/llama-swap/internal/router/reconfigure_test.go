@@ -195,3 +195,73 @@ func TestReconfigure_UnsupportedWithoutAPlannerFactory(t *testing.T) {
 		t.Fatalf("err=%v want ErrReconfigureUnsupported", err)
 	}
 }
+
+// FreeToken patch P5: two plans prepared from the same table; the first
+// commit wins and the second is refused as stale, so its processes are
+// thrown away and nothing of the first plan is lost or cancelled.
+func TestReconfigure_StalePlanIsRefused(t *testing.T) {
+	a, b := newFakeProcess("a"), newFakeProcess("b")
+	a.setState(process.StateReady)
+	conf := p5Conf(map[string]config.ModelConfig{"a": {Cmd: "run-a"}, "b": {Cmd: "run-b"}}, map[string][]string{"g": {"a", "b"}})
+	g := newTestGroup(t, conf, map[string]process.Process{"a": a, "b": b})
+	type built struct {
+		ctx context.Context
+		p   *fakeProcess
+	}
+	var mu sync.Mutex
+	var made []built
+	g.factory = func(ctx context.Context, id string, _ config.ModelConfig) (process.Process, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		p := newFakeProcess(id)
+		made = append(made, built{ctx, p})
+		return p, nil
+	}
+	g.plannerFor = groupPlannerFor
+
+	plan1, err := g.PrepareReconfigure(p5Conf(map[string]config.ModelConfig{"a": {Cmd: "run-a"}, "b": {Cmd: "run-b1"}}, map[string][]string{"g": {"a", "b"}}))
+	if err != nil {
+		t.Fatalf("PrepareReconfigure 1: %v", err)
+	}
+	plan2, err := g.PrepareReconfigure(p5Conf(map[string]config.ModelConfig{"a": {Cmd: "run-a"}, "b": {Cmd: "run-b2"}}, map[string][]string{"g": {"a", "b"}}))
+	if err != nil {
+		t.Fatalf("PrepareReconfigure 2: %v", err)
+	}
+	if len(made) != 2 {
+		t.Fatalf("made %d processes, want 2", len(made))
+	}
+	b1, b2 := made[0], made[1]
+
+	if err := plan1.Commit(); err != nil {
+		t.Fatalf("plan1.Commit: %v", err)
+	}
+	if err := plan2.Commit(); !errors.Is(err, ErrStaleReconfigure) {
+		t.Fatalf("plan2.Commit = %v, want ErrStaleReconfigure", err)
+	}
+
+	if procOf(g, "b") != process.Process(b1.p) || procOf(g, "a") != process.Process(a) {
+		t.Fatalf("the table does not hold plan1's processes")
+	}
+	if b1.ctx.Err() != nil {
+		t.Fatalf("plan1's b was cancelled by the refused plan")
+	}
+	if b2.ctx.Err() == nil {
+		t.Fatalf("the refused plan's b was leaked (its context is still live)")
+	}
+	g.stateMu.RLock()
+	_, hasCancel := g.procCancels["b"]
+	g.stateMu.RUnlock()
+	if !hasCancel {
+		t.Fatalf("plan1's b lost its cancel handle")
+	}
+	if a.stopCalls.Load() != 0 {
+		t.Fatalf("a was stopped")
+	}
+	w, done := serveAsync(g, "b")
+	waitSignal(t, b1.p.runStarted, "plan1's b start")
+	b1.p.markReady()
+	waitSignal(t, done, "b request")
+	if w.Code != http.StatusOK || b2.p.runCalls.Load() != 0 {
+		t.Fatalf("b: code=%d, refused b runs=%d", w.Code, b2.p.runCalls.Load())
+	}
+}

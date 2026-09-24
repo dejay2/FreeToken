@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -88,4 +90,15 @@ models:
 	assert.Equal(t, 0, code)
 	assert.NotEmpty(t, buf.String())
 	assert.Contains(t, buf.String(), "config is valid")
+}
+
+// FreeToken patch P5.
+func TestConfigFileHash(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("models: {}\n"), 0o644))
+	sum := sha256.Sum256([]byte("models: {}\n"))
+	assert.Equal(t, hex.EncodeToString(sum[:]), configFileHash(path))
+	assert.Equal(t, "", configFileHash(""))
+	assert.Equal(t, "", configFileHash(filepath.Join(dir, "missing.yaml")))
 }

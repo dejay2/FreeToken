@@ -78,7 +78,11 @@ type baseRouter struct {
 	procCancels map[string]context.CancelFunc
 	factory     ProcessFactory
 	plannerFor  func(config.Config) (scheduler.Swapper, []string, error)
-	reconfigCh  chan reconfigReq
+	reconfigCh  chan *reconfigReq
+	// generation counts committed reconfigures; a plan prepared from an older
+	// generation is refused (ErrStaleReconfigure). Written by the run loop
+	// under stateMu.
+	generation uint64
 
 	// testProcessed, when non-nil, receives one event after each handlerReq
 	// or swapDone has been fully processed by run(). Tests use it to wait
@@ -125,7 +129,7 @@ func newBaseRouter(
 		runDone:     make(chan struct{}),
 		swapCancels: make(map[string]*swapHandle),        // FreeToken patch P1
 		procCancels: make(map[string]context.CancelFunc), // FreeToken patch P5
-		reconfigCh:  make(chan reconfigReq),              // FreeToken patch P5
+		reconfigCh:  make(chan *reconfigReq),             // FreeToken patch P5
 	}
 	sched, err := scheduler.New(conf, name, logger, planner, b)
 	if err != nil {

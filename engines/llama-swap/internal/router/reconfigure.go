@@ -27,6 +27,10 @@ import (
 // ErrReconfigureUnsupported sends the caller down upstream's full rebuild.
 var ErrReconfigureUnsupported = errors.New("router cannot be reconfigured in place")
 
+// ErrStaleReconfigure refuses a plan prepared from a table that another
+// commit has replaced since: applying it would drop that commit's processes.
+var ErrStaleReconfigure = errors.New("reload plan is stale: the router was reconfigured after it was prepared")
+
 // ProcessFactory builds a stopped process for one model entry.
 type ProcessFactory func(ctx context.Context, id string, mc config.ModelConfig) (process.Process, error)
 
@@ -42,14 +46,19 @@ type ReconfigPlan struct {
 	Kept, Stopped, Added []string
 	CommitFn, AbortFn    func()
 	once                 sync.Once
+	err                  error // set by CommitFn when the commit was refused
 }
 
-func (p *ReconfigPlan) Commit() {
+// Commit applies the plan. A non-nil error means it was refused (stale, or
+// the router has shut down); the plan's own processes are then thrown away
+// and the router is left as it was.
+func (p *ReconfigPlan) Commit() error {
 	p.once.Do(func() {
 		if p.CommitFn != nil {
 			p.CommitFn()
 		}
 	})
+	return p.err
 }
 func (p *ReconfigPlan) Abort() {
 	p.once.Do(func() {
@@ -67,11 +76,13 @@ type reconfigState struct {
 	kept        []string
 	stopped     []string
 	stopTimeout time.Duration
+	generation  uint64 // the table generation this state was prepared from
 }
 
 type reconfigReq struct {
 	state *reconfigState
 	done  chan struct{}
+	err   error // set by applyReconfig before done is closed
 }
 
 // processFactory builds real upstream processes.
@@ -143,12 +154,15 @@ func (b *baseRouter) PrepareReconfigure(newCfg config.Config) (*ReconfigPlan, er
 	if err != nil {
 		return nil, err
 	}
-	oldCfg, oldProcs := b.snapshot()
+	b.stateMu.RLock()
+	oldCfg, oldProcs, gen := b.config, b.processes, b.generation
+	b.stateMu.RUnlock()
 	st := &reconfigState{
-		cfg:       newCfg,
-		processes: make(map[string]process.Process, len(members)),
-		cancels:   make(map[string]context.CancelFunc),
-		planner:   planner,
+		generation: gen,
+		cfg:        newCfg,
+		processes:  make(map[string]process.Process, len(members)),
+		cancels:    make(map[string]context.CancelFunc),
+		planner:    planner,
 	}
 	abort := func() {
 		for _, cancel := range st.cancels {
@@ -192,27 +206,40 @@ func (b *baseRouter) PrepareReconfigure(newCfg config.Config) (*ReconfigPlan, er
 	sort.Strings(st.kept)
 	sort.Strings(st.stopped)
 	sort.Strings(added)
-	return &ReconfigPlan{
+	plan := &ReconfigPlan{
 		Kept:    st.kept,
 		Stopped: st.stopped,
 		Added:   added,
-		CommitFn: func() {
-			req := reconfigReq{state: st, done: make(chan struct{})}
-			select {
-			case b.reconfigCh <- req:
-				<-req.done
-			case <-b.runDone:
-				abort()
-			}
-		},
 		AbortFn: abort,
-	}, nil
+	}
+	plan.CommitFn = func() {
+		req := &reconfigReq{state: st, done: make(chan struct{})}
+		select {
+		case b.reconfigCh <- req:
+			<-req.done
+			if req.err != nil {
+				abort()
+				plan.err = req.err
+			}
+		case <-b.runDone:
+			abort()
+			plan.err = fmt.Errorf("%s has shut down", b.name)
+		}
+	}
+	return plan, nil
 }
 
 // applyReconfig runs in the run loop, so it is ordered with every scheduler
 // event: requests that arrive meanwhile are handled against the new table.
-func (b *baseRouter) applyReconfig(req reconfigReq) {
+func (b *baseRouter) applyReconfig(req *reconfigReq) {
 	st := req.state
+	// The run loop is the only writer of generation, so it reads it unlocked.
+	if st.generation != b.generation {
+		req.err = ErrStaleReconfigure
+		b.logger.Warnf("%s: reload refused: %v", b.name, req.err)
+		close(req.done)
+		return
+	}
 	if len(st.stopped) > 0 {
 		// Waiters and queued requests for these models get an error, their
 		// swaps are cancelled (P1), and the processes are stopped.
@@ -233,6 +260,7 @@ func (b *baseRouter) applyReconfig(req reconfigReq) {
 		cancels[id] = cancel
 	}
 	b.procCancels = cancels
+	b.generation++
 	b.stateMu.Unlock()
 	for _, id := range st.stopped {
 		if cancel, ok := oldCancels[id]; ok {
