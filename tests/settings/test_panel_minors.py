@@ -131,8 +131,9 @@ def test_restart_loads_when_the_file_moved_on_after_the_write(env):
     answer = env.client.put("/api/panel/models/quasar-27b", json={
         "revision": revision, "settings": settings, "identity": {}, "whenLoaded": "restart"})
     assert answer.status_code == 200 and answer.json()["restarting"] == ["quasar-27b"], answer.text
-    # Another write lands before the switcher catches up (the hold watcher, a second save).
-    env.cfg.write_text(env.cfg.read_text() + "# a later write\n")
+    # Another panel write lands before the switcher catches up (the hold watcher, a second save).
+    later = env.client.put("/api/panel/system", json={"revision": answer.json()["revision"], "system": {"floorGB": 7}})
+    assert later.status_code == 200, later.text
     env.service.restart_wait_s = 0
     run_spawned(env)
     assert env.service.last_restart["ok"] is True, env.service.last_restart

@@ -241,7 +241,8 @@ if (typeof module !== 'undefined') module.exports = { fmtGB, stateWord, rowState
   loadQuestion, unloadQuestion, registryProblemHtml, panelSave, answerRestart, answerConfirm, startNow, loadModel, unloadModel, panel, applyView,
   idProblem, detectionText, planSummary, downloadLine, removeQuestion, removeFilesNote, removeOkLabel, ramProblem, piNote, addedNote, removedNote,
   addState, openAdd, closeAdd, addCheckPath, addValidate, addPlan, addPathEdited, addRepoEdited, wirePanel, addDownload, addCancelDownload, pollAddJob, addSave, openRemove, answerRemove,
-  heldNote, backupListHtml, restoredNote, restoreBackup, whereName, unplacedErrors, leaveGuard, viewDirty, presetButtons, loadModels };
+  heldNote, backupListHtml, restoredNote, restoreBackup, whereName, unplacedErrors, leaveGuard, viewDirty, presetButtons, loadModels,
+  switcherKnown, pickPreset, openModel };
 
 /* ---------- browser side: uses index.html's state, json, $, setNotice and dial renderer ---------- */
 const postJson = (url, payload) => json(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload ?? {}) });
@@ -365,10 +366,14 @@ function startNow() {
   run();
 }
 
+// The switcher's answer is usable only when it is up and every row has a known state.
+function switcherKnown(body) { return !!(body && body.switcherUp && (body.models || []).every((row) => row.state !== 'unknown')); }
+const SWITCHER_SILENT = "The model switcher isn't answering; try again.";
+// Returns the list's answer, or null when it could not be read.
 async function loadModels() {
   const { response, body } = await json('/api/panel/models');
-  if (response.status === 409) { await loadRegistry(); $('models-list').innerHTML = ''; return; }
-  if (!response.ok) { $('models-list').innerHTML = `<p class="empty">${panelEsc(panelErrorText(body, 'Could not read the model list.'))}</p>`; return; }
+  if (response.status === 409) { await loadRegistry(); $('models-list').innerHTML = ''; return null; }
+  if (!response.ok) { $('models-list').innerHTML = `<p class="empty">${panelEsc(panelErrorText(body, 'Could not read the model list.'))}</p>`; return null; }
   panel.revision = body.revision || panel.revision;
   panel.models = body.models || [];
   const list = $('models-list');
@@ -378,6 +383,7 @@ async function loadModels() {
   list.querySelectorAll('[data-sleep]').forEach((button) => button.addEventListener('click', () => sleepModel(button.dataset.sleep, 'sleep')));
   list.querySelectorAll('[data-wake]').forEach((button) => button.addEventListener('click', () => sleepModel(button.dataset.wake, 'wake')));
   list.querySelectorAll('[data-settings]').forEach((button) => button.addEventListener('click', () => openModel(button.dataset.settings)));
+  return body;
 }
 // No question before Sleep or Wake: neither loses anything (chats are parked first, and a
 // chat wakes a sleeping model by itself), unlike Unload.
@@ -392,7 +398,10 @@ async function sleepModel(id, action) {
 async function loadModel(id) {
   // The list on screen can be up to 5 s old (or older while a load runs): read it again so the
   // question names what is loaded now (stage A deferred minor: a stale snapshot).
-  await loadModels();
+  // A switcher that is down or did not answer shows no loaded model, so the question would be
+  // skipped and the load would put away whatever is loaded unasked (PR #20 review): stop.
+  const fresh = await loadModels();
+  if (!switcherKnown(fresh)) { setNotice(SWITCHER_SILENT, 'bad'); return; }
   const question = loadQuestion(id, panel.models);
   if (question && !(await askConfirm(question, 'Carry on'))) return;
   setNotice(`Loading ${id}… FreeToken models take a few minutes.`);
@@ -409,13 +418,16 @@ async function unloadModel(id) {
   loadNow(); loadModels();
 }
 
-async function openModel(id, preset) {
+// force: the caller already dealt with unsaved changes (a preset pick, a reload after a save
+// or a stale answer), so the leave guard is not asked (PR #20 review: an unsaved preset pick
+// blocked picking the saved preset back, and a saved preset change blocked the reload).
+async function openModel(id, preset, force = false) {
   document.querySelectorAll('[data-main]').forEach((button) => button.setAttribute('aria-selected', String(button.dataset.main === 'models')));
   panel.main = 'models';
-  await openView(`/api/panel/views/model/${encodeURIComponent(id)}${preset === undefined ? '' : `?preset=${encodeURIComponent(preset)}`}`);
+  await openView(`/api/panel/views/model/${encodeURIComponent(id)}${preset === undefined ? '' : `?preset=${encodeURIComponent(preset)}`}`, force);
 }
-async function openView(url) {
-  if (!leaveGuard()) return;
+async function openView(url, force = false) {
+  if (!force && !leaveGuard()) return;
   const { response, body } = await json(url);
   if (response.status === 409) { await backToRegistryProblem(body); return; }
   if (response.status === 404) { setNotice('That model or preset was not found. It may have been removed; the list has been refreshed.', 'bad'); clearView(); showMain('models'); return; }
@@ -457,7 +469,7 @@ async function reopenView() {
   if (!state.view || !state.view.url) return;
   const view = state.view;
   state.saved = JSON.parse(JSON.stringify(state.settings));
-  if (view.kind === 'model') await openModel(view.id); else await openView(view.url);
+  if (view.kind === 'model') await openModel(view.id, undefined, true); else await openView(view.url, true);
 }
 
 function renderPresetPicker() {
@@ -477,7 +489,7 @@ function presetButtons() {
 async function pickPreset() {
   const value = $('preset-picker').value;
   if (changedNames().length) { $('preset-picker').value = state.view.activePreset || ''; setNotice('Save or undo your changes before switching presets.', 'warn'); return; }
-  await openModel(state.view.id, value);
+  await openModel(state.view.id, value, true);
   setNotice(value ? `Showing preset “${value}”. Press Save to use it.` : 'Showing no preset. Press Save to use it.');
 }
 function presetForm(mode) {
@@ -750,11 +762,14 @@ async function addSave() {
 async function openRemove() {
   const view = state.view;
   if (!view || view.kind !== 'model' || panel.busy || !leaveGuard()) return;
-  // view.state is from when the settings opened, maybe minutes ago: read the list again so
-  // "It is loaded now" is true now (stage A deferred minor).
-  await loadModels();
+  // view.state is from when the settings opened, maybe minutes ago: read the states again so
+  // "It is loaded now" is true now (stage A deferred minor). Only the states: loadModels()
+  // moved panel.revision past the editor's view, so a cancelled Remove then a Save sent stale
+  // settings under a newer revision (PR #20 review).
+  let rows = [];
+  try { const answer = await json('/api/panel/models'); if (answer.response.ok) rows = answer.body.models || []; } catch (_) { /* fall back to view.state */ }
   if (state.view !== view || panel.busy) return;
-  const fresh = (panel.models || []).find((item) => item.id === view.id);
+  const fresh = rows.find((item) => item.id === view.id);
   const row = fresh || { id: view.id, name: view.name };
   $('remove-ask-text').textContent = removeQuestion(row, isLoadedState(fresh ? fresh.state : view.state));
   $('remove-files').checked = false; // spec: "also delete the model files" is off by default, every time
@@ -768,10 +783,12 @@ async function openRemove() {
   // of Remove, Save or Load meanwhile would race it.
   panel.busy = true; setBusy(true);
   try {
-    const { response, body } = await postJson(`/api/panel/models/${encodeURIComponent(view.id)}/remove`, { revision: panel.revision, deleteFiles: !!$('remove-files').checked });
+    // The editor's own revision and the files the question named: the server refuses when the
+    // model changed since (a same-id model added again would lose its new files otherwise).
+    const { response, body } = await postJson(`/api/panel/models/${encodeURIComponent(view.id)}/remove`, { revision: view.revision || panel.revision, artifact: view.artifact, deleteFiles: !!$('remove-files').checked });
     if (response.status === 409 && body.code === 'stale_revision') { setNotice(body.message, 'bad'); await reopenView(); return; }
     if (registryProblem(response, body)) { await backToRegistryProblem(body); return; }
-    // 409 files_missing / files_unsafe / files_shared and 503 switcher_unknown / unload_failed all
+    // 409 artifact_changed / files_missing / files_unsafe / files_shared and 503 switcher_unknown / unload_failed all
     // carry plain words that say nothing was removed.
     if (!response.ok) { setNotice(panelErrorText(body, 'Could not remove the model.'), 'bad'); return; }
     panel.revision = body.revision || panel.revision;
@@ -878,6 +895,8 @@ async function panelPut(url, options) {
   else if (options.whenLoaded === 'next-time') note = heldNote(options.affected);
   else if (body.inherits && body.inherits.length) note = `Saved. Used by: ${body.inherits.join(', ')}.`;
   state.saved = JSON.parse(JSON.stringify(state.settings));
+  // The picked preset is the saved one now (PR #20 review: the view stayed "changed").
+  if (state.view && state.view.kind === 'model') state.view.savedPreset = state.view.activePreset || null;
   await reopenView();
   setNotice(note, 'good');
   loadNow();

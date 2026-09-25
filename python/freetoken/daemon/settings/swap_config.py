@@ -310,7 +310,9 @@ class SwapConfigWriter:
         return proc.returncode == 0, last
 
     def commit(self, staged: Path) -> None:
-        self.backup_hand_written()
+        """Swap the staged file in. A hand-written file is copied by the caller BEFORE anything
+        else changes (backup_hand_written): done here, a copy that could not be made failed
+        after the registry was already saved (PR #20 review)."""
         os.replace(staged, self.path)
 
     def backup_hand_written(self) -> Path | None:
@@ -332,7 +334,13 @@ class SwapConfigWriter:
     def write(self, text: str) -> bool:
         if self.current_text() == text:
             return False
-        self.commit(self.check(text))
+        staged = self.check(text)
+        try:
+            self.backup_hand_written()
+        except BaseException:
+            self.discard(staged)
+            raise
+        self.commit(staged)
         return True
 
     def backup_before_registry(self) -> Path | None:

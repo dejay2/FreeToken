@@ -234,7 +234,7 @@ global.state = {view: null};
 global.setNotice = () => {};
 const posts = [];
 let rows = [{id: 'a', name: 'Alpha', state: 'ready'}, {id: 'b', name: 'Beta', state: 'stopped'}];
-global.json = async (url, options = {}) => { if (options.method === 'POST') posts.push(url); return {response: {ok: true, status: 200}, body: {models: rows, switcher: {up: true}}}; };
+global.json = async (url, options = {}) => { if (options.method === 'POST') posts.push(url); return {response: {ok: true, status: 200}, body: {models: rows, switcherUp: true}}; };
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 (async () => {
   p.panel.models = [{id: 'a', name: 'Alpha', state: 'ready'}, {id: 'b', name: 'Beta', state: 'stopped'}];
@@ -420,7 +420,7 @@ global.json = async (url) => ({response: {ok: true, status: 200}, body: answer})
 
 def test_remove_asks_with_delete_files_off_and_cancel_sends_nothing():
     _node(_FAKE_PAGE + r"""
-global.state = {view: {kind: 'model', id: 'q', name: 'QUASAR', state: 'ready', artifact: '~/ninfer-work/models/q.ninfer', url: '/api/panel/views/model/q'}, settings: {}, saved: {}};
+global.state = {view: {kind: 'model', id: 'q', name: 'QUASAR', state: 'ready', artifact: '~/ninfer-work/models/q.ninfer', url: '/api/panel/views/model/q', revision: 'r1'}, settings: {}, saved: {}};
 global.json = async (url, options = {}) => {
   if (options.method !== 'POST') return {response: {ok: true, status: 200}, body: {revision: 'r1', models: [], switcherUp: true}};
   posts.push({url, body: JSON.parse(options.body || '{}')});
@@ -439,7 +439,7 @@ global.json = async (url, options = {}) => {
   assert.deepEqual(posts, []);
   const second = p.openRemove(); await tick();
   p.answerRemove(true); await second;
-  assert.deepEqual(posts[0], {url: '/api/panel/models/q/remove', body: {revision: 'r1', deleteFiles: false}});
+  assert.deepEqual(posts[0], {url: '/api/panel/models/q/remove', body: {revision: 'r1', artifact: '~/ninfer-work/models/q.ninfer', deleteFiles: false}});
   assert.ok(notes.includes('Removed QUASAR. Pi updated.'), notes.join(' / '));
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """)
