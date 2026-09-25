@@ -440,3 +440,80 @@ def test_dense_gemm_launch_carries_the_op_label(monkeypatch):
     finally:
         el._WORKSPACES.pop(torch.device("cpu"), None)
     assert seen == ["layers.1.attn.o_proj"]
+
+
+# --- real card: the _CudaOps event/capture path (the fakes above cannot prove CUDA accepts it) ---
+
+needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+
+
+@pytest.fixture
+def real_ops():
+    L._reset_for_tests()
+    yield
+    L._reset_for_tests()
+
+
+def _spin(ms: int) -> None:
+    # ~ms of GPU busy time on the current stream (torch.cuda._sleep counts clock cycles).
+    torch.cuda._sleep(int(ms * 1.5e6))
+
+
+@needs_cuda
+def test_real_stream_switch_orders_the_new_launch_after_the_old_stream(real_ops):
+    device = torch.device("cuda")
+    a, b = torch.cuda.Stream(), torch.cuda.Stream()
+    done_a, done_b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    with torch.cuda.stream(a):
+        L.launch("t", lambda: (_spin(200), done_a.record(a)), device=device, m=1, k=1, n=1, bits=3)
+    with torch.cuda.stream(b):
+        L.launch("t", lambda: done_b.record(b), device=device, m=1, k=1, n=1, bits=3)
+    torch.cuda.synchronize()
+    # Without the cross-stream wait, b's record would finish ~200 ms before a's spin ends.
+    assert done_a.elapsed_time(done_b) >= 0.0
+
+
+@needs_cuda
+def test_real_capture_after_eager_launch_skips_the_wait_and_replays(real_ops):
+    device = torch.device("cuda")
+    x = torch.ones(1024, device=device)
+    L.launch("t", lambda: x.mul_(1.0), device=device, m=1, k=1, n=1, bits=3)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(side), torch.cuda.graph(graph, stream=side):
+        L.launch("t", lambda: x.add_(1.0), device=device, m=1, k=1, n=1, bits=3)
+    torch.cuda.current_stream().wait_stream(side)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert float(x[0]) == 2.0  # the captured add runs only at replay
+
+
+@needs_cuda
+def test_real_fork_inside_one_capture_becomes_a_graph_edge(real_ops):
+    device = torch.device("cuda")
+    x = torch.zeros(1024, device=device)
+    cap = torch.cuda.Stream()
+    fork = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(cap), torch.cuda.graph(graph, stream=cap):
+        L.launch("t", lambda: x.add_(1.0), device=device, m=1, k=1, n=1, bits=3)
+        fork.wait_stream(cap)
+        with torch.cuda.stream(fork):
+            L.launch("t", lambda: x.mul_(2.0), device=device, m=1, k=1, n=1, bits=3)
+        cap.wait_stream(fork)  # join, or capture end fails
+    graph.replay()
+    torch.cuda.synchronize()
+    assert float(x[0]) == 2.0
+
+
+@needs_cuda
+def test_real_strict_mode_raises_on_a_second_eager_stream(real_ops, monkeypatch, tmp_path):
+    monkeypatch.setenv(L.STRICT_ENV, "1")
+    monkeypatch.setenv(L.TRACE_ENV, str(tmp_path / "trace.log"))
+    device = torch.device("cuda")
+    L.launch("t", lambda: None, device=device, m=1, k=1, n=1, bits=3)
+    with torch.cuda.stream(torch.cuda.Stream()), pytest.raises(RuntimeError, match="second CUDA stream"):
+        L.launch("t", lambda: None, device=device, m=1, k=1, n=1, bits=3)
+    text = (tmp_path / "trace.log").read_text()
+    assert "BEGIN" in text and "END" in text and "STRICT-FAIL" in text
