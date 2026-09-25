@@ -3,6 +3,8 @@
 The helper only ever answers on 127.0.0.1, and this module only lists names: it never opens a
 file. A folder counts as a model folder when it holds ``config.json`` next to at least one
 ``.safetensors`` file, which is what every checkpoint this fork serves looks like.
+Kind ``add`` (the control panel's Add model wizard) lists folders and ``.ninfer`` files and
+marks model folders and ``.ninfer`` files.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 MAX_ENTRIES = 500
-BROWSE_KINDS = ("folder", "model", "file")
+BROWSE_KINDS = ("folder", "model", "file", "add")
 
 
 def drives() -> list[str]:
@@ -31,6 +33,10 @@ def resolve_start(path: str | None) -> Path | None:
         return None
     candidate = Path(text)
     for probe in (candidate, candidate.parent):
+        if probe == Path("."):
+            # A bare name (or a Windows path read on POSIX) has "." for a parent; the
+            # helper's working directory is never what the page asked for.
+            continue
         try:
             if probe.is_dir():
                 return probe.resolve()
@@ -74,7 +80,7 @@ def list_directory(path: str | None, kind: str = "folder") -> dict[str, Any]:
             is_dir = child.is_dir()
         except OSError:
             continue
-        if not is_dir and kind != "file":
+        if not is_dir and kind != "file" and not (kind == "add" and child.name.endswith(".ninfer")):
             continue
         if len(entries) >= MAX_ENTRIES:
             truncated = True
@@ -84,7 +90,8 @@ def list_directory(path: str | None, kind: str = "folder") -> dict[str, Any]:
                 "name": child.name,
                 "path": str(child),
                 "kind": "dir" if is_dir else "file",
-                "isModel": bool(is_dir and kind == "model" and is_model_folder(child)),
+                "isModel": bool((is_dir and kind in ("model", "add") and is_model_folder(child))
+                                or (not is_dir and kind == "add")),
             }
         )
     parent = start.parent
@@ -93,7 +100,7 @@ def list_directory(path: str | None, kind: str = "folder") -> dict[str, Any]:
         "parent": None if parent == start else str(parent),
         "drives": drives(),
         "entries": entries,
-        "isModel": kind == "model" and is_model_folder(start),
+        "isModel": kind in ("model", "add") and is_model_folder(start),
         "truncated": truncated,
     }
 
