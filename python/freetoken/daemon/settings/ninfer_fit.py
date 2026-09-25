@@ -83,8 +83,14 @@ Where the numbers come from in the frozen runtime (engines/ninfer):
   planning. With the 2.6 GiB desktop measured that day and the 19,782,132,224 B artifact, the
   device weights plus CUDA context come to the artifact minus 1,494,504,550 B (not every artifact
   object is materialized on the card: src/artifact/binder.cpp:85-116 host/validate-only objects).
-  The startup check therefore uses a 2.6 GiB desktop (the highest idle reading, since the check
-  must hold on a busy desktop) while the used-memory components keep the typical 1.9 GiB.
+  The startup check therefore uses a 2.6 GiB desktop, the value that reproduces the room NInfer
+  reported on the refusal day (idle card 2614-2688 MiB then); the used-memory components keep the
+  typical 1.9 GiB. When the switcher is known to have nothing loaded, the panel passes the live
+  card reading and the check uses whichever is larger (fix round 1 ruling, 2026-09-25).
+* The workspace constant is scaled by max(1, prefill-chunk / 1024): the prefill buffers
+  (layouts_impl.h:200-221 prefill features/positions/hidden sized by effective_prefill_chunk, and
+  the text_prefill workspace plan, :247-270 and :394) grow with the chunk. Scaling the whole
+  constant over-predicts, which is the safe side for a refusal check; smaller chunks keep it.
 
 Calibration (predicted vs logged): runtime mc4 int8 10.58 GiB (10.6), mc5 11.42 (11.4), mc6
 13,177,821,184 B exactly, mc4 fp8 10.43 (10.4); room 13,111,561,216 B at 2.6 GiB desktop on the
@@ -213,7 +219,7 @@ def runtime_reservation(full: Mapping[str, Any], pages: int) -> dict[str, int]:
         lanes += DFLASH_FEATURE_ROWS * (draft + 1) * concurrency * 2
     graphs = 0 if full["no-cuda-graph"] else graph_allowance_bytes(spec, concurrency, capacity, draft)
     parts = {"kv": kv, "stateImages": slots * slot_bytes, "lanes": lanes, "graphs": graphs,
-             "workspace": RUNTIME_WORKSPACE_BYTES}
+             "workspace": int(RUNTIME_WORKSPACE_BYTES * max(1.0, int(full["prefill-chunk"]) / 1024))}
     parts["total"] = sum(parts.values())
     return parts
 
@@ -225,16 +231,21 @@ def _page_bounds(full: Mapping[str, Any]) -> tuple[int, int]:
     return max(logical, concurrency), concurrency * logical
 
 
-def startup_room(artifact_bytes: int, card_total_bytes: int) -> int:
-    """What cudaMemGetInfo will call free after the weights (registry.cpp:67-78, :121)."""
-    return card_total_bytes - STARTUP_DESKTOP_BYTES - (int(artifact_bytes) + WEIGHTS_SEEN_DELTA_BYTES)
+def startup_room(artifact_bytes: int, card_total_bytes: int, desktop_bytes: int | None = None) -> int:
+    """What cudaMemGetInfo will call free after the weights (registry.cpp:67-78, :121).
+
+    desktop_bytes is a live card reading taken with nothing loaded; the larger of it and
+    STARTUP_DESKTOP_BYTES is used."""
+    desktop = max(STARTUP_DESKTOP_BYTES, int(desktop_bytes or 0))
+    return card_total_bytes - desktop - (int(artifact_bytes) + WEIGHTS_SEEN_DELTA_BYTES)
 
 
-def startup_check(full: Mapping[str, Any], artifact_bytes: int, card_total_bytes: int | None) -> dict[str, Any]:
+def startup_check(full: Mapping[str, Any], artifact_bytes: int, card_total_bytes: int | None,
+                  desktop_bytes: int | None = None) -> dict[str, Any]:
     """Predict kv_capacity.cpp:76-127 for these settings: reservation, room and a verdict."""
     minimum, maximum = _page_bounds(full)
     capacity = full["kv-capacity"]
-    room = startup_room(artifact_bytes, card_total_bytes) if card_total_bytes else None
+    room = startup_room(artifact_bytes, card_total_bytes, desktop_bytes) if card_total_bytes else None
     if capacity == 0:
         if room is None:
             pages = minimum
@@ -255,7 +266,7 @@ def startup_check(full: Mapping[str, Any], artifact_bytes: int, card_total_bytes
     need_gb, free_gb = reservation / GIB, max(0, budget) / GIB
     if reservation > budget:
         out["verdict"] = "wont_fit"
-        out["message"] = (f"NInfer would refuse to start: it needs to set aside {need_gb:.1f} GB for chats "
+        out["message"] = (f"NInfer would refuse to start. It needs to set aside {need_gb:.1f} GB for chats "
                           f"but only {free_gb:.1f} GB would be free. Try fewer chats at the same time "
                           "or a smaller chat memory.")
     elif capacity != 0 and budget - reservation < TIGHT_MARGIN_BYTES:
@@ -285,7 +296,8 @@ def kv_bytes_per_token(dtype: str) -> int:
         ) from None
 
 
-def estimate(settings: Mapping[str, Any], artifact_bytes: int, *, card_total_bytes: int | None = None) -> dict[str, Any]:
+def estimate(settings: Mapping[str, Any], artifact_bytes: int, *, card_total_bytes: int | None = None,
+             desktop_bytes: int | None = None) -> dict[str, Any]:
     full = ninfer_dials.normalized(settings)
     dtype = full["kv-dtype"]
     concurrency = full["max-concurrency"]
@@ -321,7 +333,7 @@ def estimate(settings: Mapping[str, Any], artifact_bytes: int, *, card_total_byt
         kv = tokens * kv_bytes_per_token(dtype)
     components = [{"label": label, "bytes": int(size)} for label, size in fixed]
     components.append({"label": f"Chat memory ({tokens:,} tokens, {dtype})", "bytes": int(kv)})
-    startup = startup_check(full, artifact_bytes, card_total_bytes)
+    startup = startup_check(full, artifact_bytes, card_total_bytes, desktop_bytes)
     return {"needBytes": sum(item["bytes"] for item in components), "components": components,
             "notes": notes, "kvTokens": int(tokens),
             "runtimeReservationBytes": startup["reservationBytes"], "runtimeRoomBytes": startup["roomBytes"],

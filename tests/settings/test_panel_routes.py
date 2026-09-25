@@ -830,3 +830,36 @@ def test_ninfer_fit_warns_when_ninfer_would_refuse_to_start(env):
     assert fit["verdict"] == "wont_fit"
     assert fit["runtimeReservationBytes"] > fit["runtimeRoomBytes"] > 0
     assert fit["message"].startswith("NInfer would refuse to start")
+
+
+def _quasar_room(env, running, refused=False):
+    seed(env)
+    if running is None:
+        env.switcher.up, env.switcher.refused = False, refused
+    else:
+        env.switcher.states = running
+    env.service._card_probe = lambda: {"totalBytes": 32 * GIB, "usedBytes": 4 * GIB}
+    view = env.client.get("/api/panel/views/model/quasar-27b").json()
+    fit = env.client.post("/api/panel/models/quasar-27b/fit", json={"settings": engine_settings(view), "identity": {}}).json()
+    return fit["runtimeRoomBytes"]
+
+
+def test_startup_room_uses_the_live_desktop_only_when_nothing_is_loaded(env):
+    from freetoken.daemon.settings.ninfer_fit import startup_room
+    fixed = startup_room(19_782_132_224, 32 * GIB)
+    assert _quasar_room(env, {}) == startup_room(19_782_132_224, 32 * GIB, 4 * GIB) < fixed
+
+
+def test_startup_room_keeps_the_fixed_desktop_when_a_model_is_loaded(env):
+    from freetoken.daemon.settings.ninfer_fit import startup_room
+    assert _quasar_room(env, {"quasar-27b": "ready"}) == startup_room(19_782_132_224, 32 * GIB)
+
+
+def test_startup_room_keeps_the_fixed_desktop_when_the_switcher_state_is_unknown(env):
+    from freetoken.daemon.settings.ninfer_fit import startup_room
+    assert _quasar_room(env, None) == startup_room(19_782_132_224, 32 * GIB)
+
+
+def test_startup_room_keeps_the_fixed_desktop_when_the_switcher_is_down(env):
+    from freetoken.daemon.settings.ninfer_fit import startup_room
+    assert _quasar_room(env, None, refused=True) == startup_room(19_782_132_224, 32 * GIB)

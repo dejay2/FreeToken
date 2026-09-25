@@ -29,6 +29,10 @@ function verdictWords(verdict) { return ({ fits: 'Fits', tight: 'Tight', wont_fi
 function fitSummary(fit) {
   if (!fit) return '';
   if (fit.needBytes == null || !fit.cardTotalBytes) return `${verdictWords(fit.verdict)}: ${fit.message || 'no estimate'}`;
+  // NInfer's startup check (fit round 2) can make a model tight or won't-fit while the memory it
+  // uses once running looks fine; its message carries the numbers behind that verdict, so show it
+  // instead of the used-memory line, which would contradict the verdict.
+  if (fit.message && (fit.verdict === 'tight' || fit.verdict === 'wont_fit')) return `${verdictWords(fit.verdict)}: ${fit.message}`;
   return `${verdictWords(fit.verdict)}: needs about ${fmtGB(fit.needBytes)} of the graphics card's ${fmtGB(fit.cardTotalBytes)}.`;
 }
 function ramSummary(ram) {

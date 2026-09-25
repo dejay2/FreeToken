@@ -109,7 +109,7 @@ def test_mc6_int8_reproduces_the_refusal():
     result = quasar_at(6)
     assert result["runtimeReservationBytes"] == REFUSED_NEEDS
     assert result["startupVerdict"] == "wont_fit"
-    assert result["startupMessage"].startswith("NInfer would refuse to start: it needs to set aside 12.3 GB")
+    assert result["startupMessage"].startswith("NInfer would refuse to start. It needs to set aside 12.3 GB")
     assert "fewer chats" in result["startupMessage"]
 
 
@@ -152,3 +152,21 @@ def test_fill_the_card_only_refuses_when_the_minimum_does_not_fit():
     settings["kv-capacity"] = 0
     assert estimate(settings, QUASAR_BYTES, card_total_bytes=CARD_5090)["startupVerdict"] == "fits"
     assert estimate(settings, QUASAR_BYTES, card_total_bytes=24 * GIB)["startupVerdict"] == "wont_fit"
+
+
+def test_a_larger_live_desktop_shrinks_the_room_and_a_smaller_one_does_not():
+    base = startup_room(QUASAR_BYTES, CARD_5090)
+    assert startup_room(QUASAR_BYTES, CARD_5090, int(1.9 * GIB)) == base
+    assert startup_room(QUASAR_BYTES, CARD_5090, 3 * GIB) == base - (3 * GIB - int(2.6 * GIB))
+    settings = quasar()
+    settings["max-concurrency"] = 4
+    assert estimate(settings, QUASAR_BYTES, card_total_bytes=CARD_5090,
+                    desktop_bytes=5 * GIB)["startupVerdict"] == "wont_fit"
+
+
+def test_a_bigger_prefill_chunk_raises_the_reservation():
+    small, big = quasar(), quasar()
+    small["prefill-chunk"], big["prefill-chunk"] = 512, 2048
+    at_1024 = estimate(quasar(), QUASAR_BYTES)["runtimeReservationBytes"]
+    assert estimate(small, QUASAR_BYTES)["runtimeReservationBytes"] == at_1024
+    assert estimate(big, QUASAR_BYTES)["runtimeReservationBytes"] > at_1024

@@ -54,6 +54,12 @@ def test_fit_and_memory_lines():
     _node(r"""
 assert.equal(p.fitSummary({verdict: 'fits', needBytes: 29.7 * G, cardTotalBytes: 31.8 * G}),
   "Fits: needs about 29.7 GB of the graphics card's 31.8 GB.");
+// A startup refusal whose used-memory number would fit shows the startup reason, not the numbers.
+const refused = p.fitSummary({verdict: 'wont_fit', needBytes: 30.3 * G, cardTotalBytes: 31.8 * G,
+  message: 'NInfer would refuse to start. It needs to set aside 12.3 GB for chats but only 12.2 GB would be free.'});
+assert.equal(refused, "Won't fit: NInfer would refuse to start. It needs to set aside 12.3 GB for chats but only 12.2 GB would be free.");
+assert.doesNotMatch(refused, /needs about/);
+assert.match(p.fitSummary({verdict: 'tight', needBytes: 30 * G, cardTotalBytes: 31.8 * G, message: 'Close to the limit.'}), /^Tight: Close to the limit\.$/);
 assert.equal(p.fitSummary({verdict: 'unknown', message: 'The graphics card could not be read.'}),
   "Couldn't check: The graphics card could not be read.");
 assert.equal(p.ramSummary({needGB: 18, cushionGB: 6, windowsFreeGB: 40, loadedNow: false}),
