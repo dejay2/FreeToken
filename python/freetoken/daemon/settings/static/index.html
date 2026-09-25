@@ -214,6 +214,11 @@
     .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 14px 18px; border-bottom: 1px solid var(--line); }
     .modal-body { padding: 14px 18px; overflow: auto; flex: 1; }
     .modal-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 12px 18px; border-top: 1px solid var(--line); flex-wrap: wrap; }
+    #browser { z-index: 50; } /* opened from the Add model wizard, it must sit on top of it */
+    .add-field { display: grid; gap: 4px; margin-top: 10px; }
+    .add-field input { width: 100%; }
+    .add-source { margin-bottom: 10px; }
+    #add-wizard section { margin-top: 14px; }
     .crumbs { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
     .crumbs input { flex: 1 1 260px; font-family: ui-monospace, Consolas, monospace; font-size: .86rem; }
     .drives { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
@@ -290,13 +295,13 @@
 
     <section class="panel" id="models-view">
       <div id="registry-problem" hidden></div>
-      <div class="panel-head" id="models-head"><div><h2>Models</h2><p class="small">Load or unload a model, or open its settings. Apps keep using the same address whichever model is loaded.</p></div></div>
+      <div class="panel-head" id="models-head"><div><h2>Models</h2><p class="small">Load or unload a model, or open its settings. Apps keep using the same address whichever model is loaded.</p></div><button class="button primary" id="add-model" type="button">Add a model</button></div>
       <div id="models-list"><p class="empty">Loading models…</p></div>
     </section>
 
     <section id="editor" hidden>
       <div class="panel view-head" id="view-head">
-        <div><button class="button small" id="view-back" type="button" hidden>← All models</button><h2 id="view-title"></h2><p class="small" id="view-note"></p></div>
+        <div><button class="button small" id="view-back" type="button" hidden>← All models</button><h2 id="view-title"></h2><p class="small" id="view-note"></p><button class="button small danger" id="model-remove" type="button" hidden>Remove this model…</button></div>
         <div class="actions" id="preset-tools" hidden>
           <label class="small" for="preset-picker">Preset</label><select id="preset-picker"></select>
           <button class="button small" id="preset-save-new" type="button">Save as new preset</button>
@@ -532,6 +537,48 @@
 
   <p id="notice" class="notice hidden" aria-live="polite"></p>
 
+  <div class="modal" id="add-wizard" hidden role="dialog" aria-modal="true" aria-labelledby="add-title">
+    <div class="modal-card">
+      <div class="modal-head"><h2 id="add-title">Add a model</h2><button class="button small ghost" type="button" id="add-close" aria-label="Close">✕</button></div>
+      <div class="modal-body">
+        <p class="small">Step 1 of 3: where is the model?</p>
+        <nav class="tabs add-source" role="tablist" aria-label="Where the model is">
+          <button class="tab-btn" role="tab" type="button" data-add-source="pc" aria-selected="true">On this PC</button>
+          <button class="tab-btn" role="tab" type="button" data-add-source="link" aria-selected="false">Download from Hugging Face</button>
+        </nav>
+        <div id="add-pc">
+          <p class="small">Pick a NInfer file (it ends in .ninfer) or a model folder (config.json plus .safetensors files).</p>
+          <div class="path-row"><input id="add-path" type="text" spellcheck="false" placeholder="~/ninfer-work/models/… or ~/models/…" aria-label="Model file or folder"><button class="button" type="button" id="add-browse">Browse…</button><button class="button primary" type="button" id="add-check">Check</button></div>
+        </div>
+        <div id="add-link" hidden>
+          <p class="small">Paste a Hugging Face link. NInfer files go to the NInfer models folder and model folders to the models folder. Nothing already on the PC is overwritten, and the files are checked against the checksums the repo publishes.</p>
+          <div class="inline-form"><input id="add-repo" type="text" spellcheck="false" placeholder="https://huggingface.co/owner/name" aria-label="Hugging Face link"><button class="button primary" type="button" id="add-plan">Check link</button></div>
+          <select id="add-entry" hidden aria-label="Which NInfer file"></select>
+          <p class="small" id="add-plan-card" hidden aria-live="polite"></p>
+          <div class="actions" id="add-download-actions" hidden><button class="button primary" type="button" id="add-download">Download</button></div>
+          <div class="job" id="add-progress" hidden aria-live="polite"><div style="flex:1;min-width:220px"><strong id="add-progress-stage">Waiting</strong><div class="bar"><span id="add-progress-bar" style="width:0%"></span></div><span class="small" id="add-progress-detail"></span></div><button class="button small" type="button" id="add-download-cancel">Cancel download</button></div>
+        </div>
+        <section id="add-step-found" hidden><p class="small">Step 2 of 3: what it is</p><p id="add-found-text" aria-live="polite"></p></section>
+        <section id="add-step-identity" hidden>
+          <p class="small">Step 3 of 3: how it shows up in apps</p>
+          <div class="add-field"><label for="add-id">Id (the name apps ask for)</label><input id="add-id" type="text" maxlength="63" spellcheck="false"><p class="small error" id="add-id-error"></p></div>
+          <div class="add-field"><label for="add-name">Name in apps</label><input id="add-name" type="text" maxlength="120"></div>
+          <div class="add-field"><label for="add-ram">PC memory it needs (GB)</label><input id="add-ram" type="number" min="0" max="512" step="1"><p class="small">Suggested from the model's size. The switcher waits until this much PC memory is free before loading it.</p></div>
+        </section>
+        <p class="error" id="add-errors" aria-live="polite"></p>
+      </div>
+      <div class="modal-foot"><button class="button" type="button" id="add-cancel">Close</button><div class="actions"><button class="button primary" type="button" id="add-save" disabled>Add model</button></div></div>
+    </div>
+  </div>
+
+  <div class="modal" id="remove-ask" hidden role="dialog" aria-modal="true" aria-labelledby="remove-ask-title">
+    <div class="modal-card" style="width:min(560px,100%)">
+      <div class="modal-head"><h2 id="remove-ask-title">Remove this model?</h2></div>
+      <div class="modal-body"><p id="remove-ask-text"></p><label class="check"><input id="remove-files" type="checkbox"> Also delete the model files</label><p class="small" id="remove-files-note"></p></div>
+      <div class="modal-foot"><button class="button" type="button" id="remove-ask-cancel">Cancel</button><div class="actions"><button class="button danger" type="button" id="remove-ask-ok">Remove</button></div></div>
+    </div>
+  </div>
+
   <div class="modal" id="browser" hidden role="dialog" aria-modal="true" aria-labelledby="browser-title">
     <div class="modal-card">
       <div class="modal-head"><h2 id="browser-title">Choose a folder</h2><button class="button small ghost" type="button" id="browser-close" aria-label="Close">✕</button></div>
@@ -594,7 +641,7 @@
       const modelCard = $('model-card');
       if (modelCard) modelCard.hidden = !(view.kind === 'model' && state.model && state.tab === 'this-model');
       const modelTools = $('models-tools');
-      if (modelTools) modelTools.hidden = true; // adding models comes back in Stage B (spec section 7)
+      if (modelTools) modelTools.hidden = true; // replaced by the Add a model wizard on the Models tab (Stage B)
       const status = $('status-strip');
       const showStatus = view.kind === 'engine' && view.engine === 'freetoken' && state.tab === 'server-advanced';
       if (status && showStatus && status.hidden) loadStatus(); // fill it now, not on the next 3 s tick
@@ -915,13 +962,14 @@
     function startLogRefresh() { clearTimeout(state.logTimer); if ($('auto-follow').checked) state.logTimer = setTimeout(async () => { await loadLogs(); startLogRefresh(); }, 3000); }
 
     /* ---------- folder browser ---------- */
-    async function openBrowser(name, kind) {
-      const dial = dialByName(name);
-      state.browser = { name, kind, path: '', isModel: false };
-      $('browser-title').textContent = kind === 'file' ? `Choose a file for “${dial.plain}”` : `Choose a folder for “${dial.plain}”`;
+    // options.onPick (the Add model wizard): hand the chosen path back instead of filling a dial.
+    async function openBrowser(name, kind, options = {}) {
+      const dial = options.onPick ? null : dialByName(name);
+      state.browser = { name, kind, path: '', isModel: false, onPick: options.onPick || null };
+      $('browser-title').textContent = options.title || (kind === 'file' ? `Choose a file for “${dial.plain}”` : `Choose a folder for “${dial.plain}”`);
       $('browser-choose').textContent = kind === 'file' ? 'Use this file' : 'Use this folder';
       $('browser').hidden = false;
-      await browseTo(String(valueFor(dial) || ''));
+      await browseTo(options.onPick ? String(options.start || '') : String(valueFor(dial) || ''));
     }
     function closeBrowser() { $('browser').hidden = true; state.browser = null; }
     async function browseTo(path) {
@@ -941,11 +989,13 @@
       $('browser-choose').disabled = !body.path || kind === 'file';
       const hint = $('browser-hint');
       if (kind === 'model') { hint.textContent = body.isModel ? 'This folder holds a model (config.json plus weight files).' : (body.path ? 'This folder does not look like a model: no config.json next to weight files. Open a folder marked Model, or use it anyway.' : 'Pick a drive to start.'); hint.className = `hint ${body.isModel || !body.path ? '' : 'warn'}`; }
+      else if (kind === 'add') { hint.textContent = 'Click a .ninfer file, or open a folder marked Model and press Choose.'; hint.className = 'hint'; }
       else if (kind === 'file') { hint.textContent = 'Click a file to choose it.'; hint.className = 'hint'; }
       else { hint.textContent = body.path ? 'Open folders to find the one you want, then press Use this folder.' : 'Pick a drive to start.'; hint.className = 'hint'; }
     }
     function pickPath(path) {
-      const { name } = state.browser;
+      const { name, onPick } = state.browser;
+      if (onPick) { closeBrowser(); onPick(path); return; }
       const input = document.querySelector(`[data-dial="${CSS.escape(name)}"]`);
       input.value = path; state.settings[name] = path; markChanged(name);
       const dial = dialByName(name); if (dial && dial.browse === 'model') refreshModel(path);
@@ -958,7 +1008,14 @@
     $('browser-path').addEventListener('keydown', (event) => { if (event.key === 'Enter') browseTo($('browser-path').value); });
     $('browser-choose').addEventListener('click', () => { if (state.browser?.path) pickPath(state.browser.path); });
     $('browser').addEventListener('click', (event) => { if (event.target === $('browser')) closeBrowser(); });
-    document.addEventListener('keydown', (event) => { if (event.key === 'Escape') { closeBrowser(); if (!$('restart-ask').hidden) answerRestart(null); if (!$('confirm-ask').hidden) answerConfirm(false); } });
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      if (!$('browser').hidden) { closeBrowser(); return; } // one dialog per Escape: the browser sits on the wizard
+      if (!$('restart-ask').hidden) answerRestart(null);
+      if (!$('confirm-ask').hidden) answerConfirm(false);
+      if (!$('remove-ask').hidden) answerRemove(false);
+      if (!$('add-wizard').hidden) closeAdd();
+    });
 
     /* ---------- prompt cache (live controls, separate from launch settings) ---------- */
     const cacheUI = {busy:false, loading:null, connected:false, model:null, data:null, budgetDirty:false, signature:null};

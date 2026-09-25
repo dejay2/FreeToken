@@ -313,3 +313,150 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(busy, [true, false]);
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """)
+
+
+# ---- Stage B: add and remove ----
+def test_add_and_remove_speak_plain_words():
+    _node(r"""
+const rows = [{id: 'quasar-27b', name: 'QUASAR', aliases: []}, {id: 'qwen3.8-flash', name: 'Flash', aliases: ['Qwen3.8-Flash-Next-NVFP4']}];
+assert.equal(p.idProblem('small_9b', rows), '');
+assert.equal(p.idProblem('Bad Id', rows), 'Use 1 to 63 small letters, numbers, dots, dashes or underscores, starting with a letter or number.');
+assert.equal(p.idProblem('qwen3.8-flash-next-nvfp4', rows), 'That id is already used by Flash.');
+assert.equal(p.idProblem('QUASAR-27B', rows), 'Use 1 to 63 small letters, numbers, dots, dashes or underscores, starting with a letter or number.');
+assert.equal(p.detectionText({kind: 'unsupported', reason: 'This file is not a NInfer model (those end in .ninfer). It is not supported by your engines.'}),
+  'This file is not a NInfer model (those end in .ninfer). It is not supported by your engines.');
+assert.equal(p.detectionText({kind: 'ninfer', format: 'NInfer v3 file', engineLabel: 'NInfer', runtimeLabel: 'upstream runtime', bytes: 5 * G}),
+  'This is a NInfer v3 file for NInfer (upstream runtime), 5.0 GB.');
+assert.equal(p.detectionText({kind: 'ninfer', format: 'NInfer v2 file', engineLabel: 'NInfer', runtimeLabel: 'QUASAR runtime', bytes: 18.4 * G, already: 'QUASAR'}),
+  'This is a NInfer v2 file for NInfer (QUASAR runtime), 18.4 GB. It is already in the list as QUASAR.');
+const plan = {kind: 'ninfer', entry: 'small.ninfer', entries: ['small.ninfer'], totalBytes: 5 * G, target: '/h/ninfer-work/models/small.ninfer',
+  files: [{name: 'small.ninfer', check: 'published'}, {name: 'small.ninfer.part-0001', check: 'published'}], diskFits: true, diskFreeBytes: 900 * G, exists: false};
+assert.equal(p.planSummary(plan), 'Downloads the NInfer file small.ninfer (5.0 GB) into /h/ninfer-work/models/small.ninfer. All 2 files will be checked against the checksums the repo publishes.');
+assert.match(p.planSummary({...plan, files: [{name: 'a', check: null}]}), /publishes no checksums/);
+assert.match(p.planSummary({...plan, diskFits: false, diskFreeBytes: 2 * G}), /Not enough drive space: 2\.0 GB free\./);
+assert.match(p.planSummary({...plan, exists: true}), /already on this PC/);
+assert.equal(p.planSummary({kind: 'ninfer', entry: null, entries: ['a.ninfer', 'b.ninfer'], files: []}), 'This repo has 2 NInfer files. Pick one.');
+assert.equal(p.downloadLine({stage: 'downloading', percent: 41.6, receivedBytes: 2 * G, totalBytes: 5 * G}), 'Downloading · 42% · 2.0 GB of 5.0 GB');
+assert.equal(p.downloadLine({stage: 'failed', error: 'small.ninfer does not match the checksum the repo publishes, so the download was deleted.'}),
+  'Download failed: small.ninfer does not match the checksum the repo publishes, so the download was deleted. Its partial files were deleted.');
+assert.equal(p.downloadLine({stage: 'done', percent: 100, receivedBytes: 5 * G, totalBytes: 5 * G, verified: ['a', 'b']}),
+  'Downloaded · 100% · 5.0 GB of 5.0 GB · 2 file(s) matched the published checksums');
+assert.equal(p.removeQuestion({id: 'q', name: 'QUASAR'}, true), 'Remove QUASAR from the list? It is loaded now and will be put away first. Apps will no longer see it.');
+assert.equal(p.removeQuestion({id: 'q'}, false), 'Remove q from the list? Apps will no longer see it.');
+assert.equal(p.piNote({status: 'not_updated', message: "Pi's files could not be read."}), "Pi not updated: Pi's files could not be read.");
+assert.equal(p.addedNote({id: 't', name: 'Tiny', adjusted: ['Longest chat set to 8,192, the most this model allows.'], pi: {status: 'updated', notes: []}}),
+  'Added Tiny. Longest chat set to 8,192, the most this model allows. Pi updated.');
+assert.equal(p.removedNote({id: 'q', name: 'QUASAR', files: {deleted: true, message: 'Its files were deleted.'}, pi: {status: 'updated', notes: ['Pi still starts with q by default; pick another default model in Pi.']}}),
+  'Removed QUASAR. Its files were deleted. Pi updated. Pi still starts with q by default; pick another default model in Pi.');
+""")
+
+
+_FAKE_PAGE = r"""
+const nodes = {};
+global.$ = (id) => (nodes[id] ||= {hidden: true, textContent: '', innerHTML: '', value: '', className: '', disabled: false, checked: false, style: {}, addEventListener() {}, querySelectorAll: () => [], focus() {}});
+global.document = {hidden: false, querySelectorAll: () => [], querySelector: () => null};
+const notes = []; global.setNotice = (message) => notes.push(message);
+global.changedNames = () => [];
+const posts = [];
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+"""
+
+
+def test_the_wizard_checks_a_path_then_adds_it():
+    _node(_FAKE_PAGE + r"""
+global.state = {view: null};
+global.json = async (url, options = {}) => {
+  if (options.method === 'POST') posts.push({url, body: JSON.parse(options.body || '{}')});
+  if (url === '/api/panel/add/detect') return {response: {ok: true, status: 200}, body: {kind: 'ninfer', path: '/h/ninfer-work/models/small_9b.ninfer',
+    engine: 'ninfer', runtime: 'ninfer-upstream', engineLabel: 'NInfer', runtimeLabel: 'upstream runtime', format: 'NInfer v3 file', bytes: 5 * G,
+    already: null, suggested: {id: 'small_9b', name: 'small 9b (NInfer)', ramNeedGB: 5}}};
+  if (url === '/api/panel/models' && options.method === 'POST') return {response: {ok: true, status: 200},
+    body: {status: 'added', id: 'small_9b', name: 'small 9b (NInfer)', revision: 'r2', adjusted: [], pi: {status: 'updated', notes: []}}};
+  return {response: {ok: true, status: 200}, body: {models: [], switcher: {up: true, running: []}}};
+};
+(async () => {
+  p.panel.revision = 'r1';
+  p.panel.models = [{id: 'quasar-27b', name: 'QUASAR', aliases: []}];
+  $('add-wizard').hidden = false;
+  await p.addCheckPath('/h/ninfer-work/models/small_9b.ninfer');
+  assert.equal($('add-found-text').textContent, 'This is a NInfer v3 file for NInfer (upstream runtime), 5.0 GB.');
+  assert.equal($('add-step-identity').hidden, false);
+  assert.equal($('add-id').value, 'small_9b');
+  assert.equal($('add-save').disabled, false);
+  $('add-id').value = 'quasar-27b'; p.addValidate();
+  assert.equal($('add-save').disabled, true);
+  assert.equal($('add-id-error').textContent, 'That id is already used by QUASAR.');
+  $('add-id').value = 'small_9b'; p.addValidate();
+  await p.addSave();
+  const sent = posts.find((row) => row.url === '/api/panel/models').body;
+  assert.deepEqual(sent, {revision: 'r1', path: '/h/ninfer-work/models/small_9b.ninfer', id: 'small_9b', name: 'small 9b (NInfer)', ramNeedGB: '5'});
+  assert.equal($('add-wizard').hidden, true);
+  assert.equal(p.panel.revision, 'r2');
+  assert.ok(notes.includes('Added small 9b (NInfer). Pi updated.'), notes.join(' / '));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
+
+
+def test_an_unsupported_or_known_path_offers_no_save():
+    _node(_FAKE_PAGE + r"""
+global.state = {view: null};
+let answer = {kind: 'unsupported', path: '/x/notes.txt', reason: 'This file is not a NInfer model (those end in .ninfer). It is not supported by your engines.', suggested: null};
+global.json = async (url) => ({response: {ok: true, status: 200}, body: answer});
+(async () => {
+  await p.addCheckPath('/x/notes.txt');
+  assert.equal($('add-step-identity').hidden, true);
+  assert.equal($('add-save').disabled, true);
+  assert.equal($('add-found-text').className, 'error');
+  answer = {kind: 'ninfer', path: '/q.ninfer', format: 'NInfer v2 file', engineLabel: 'NInfer', runtimeLabel: 'QUASAR runtime', bytes: G, already: 'QUASAR', suggested: {id: 'q-2', name: 'q', ramNeedGB: 1}};
+  await p.addCheckPath('/q.ninfer');
+  assert.equal($('add-save').disabled, true);
+  assert.match($('add-found-text').textContent, /already in the list as QUASAR/);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
+
+
+def test_remove_asks_with_delete_files_off_and_cancel_sends_nothing():
+    _node(_FAKE_PAGE + r"""
+global.state = {view: {kind: 'model', id: 'q', name: 'QUASAR', state: 'ready', artifact: '~/ninfer-work/models/q.ninfer', url: '/api/panel/views/model/q'}, settings: {}, saved: {}};
+global.json = async (url, options = {}) => {
+  if (options.method === 'POST') posts.push({url, body: JSON.parse(options.body || '{}')});
+  return {response: {ok: true, status: 200}, body: {status: 'removed', id: 'q', name: 'QUASAR', revision: 'r2', files: null,
+    pi: {status: 'updated', notes: []}, models: [], switcher: {up: true, running: []}}};
+};
+(async () => {
+  p.panel.revision = 'r1';
+  $('remove-files').checked = true;              // left over from an earlier question
+  const first = p.openRemove(); await tick();
+  assert.equal($('remove-ask').hidden, false);
+  assert.equal($('remove-files').checked, false);
+  assert.equal($('remove-ask-text').textContent, 'Remove QUASAR from the list? It is loaded now and will be put away first. Apps will no longer see it.');
+  assert.match($('remove-files-note').textContent, /~\/ninfer-work\/models\/q\.ninfer/);
+  p.answerRemove(false); await first;
+  assert.deepEqual(posts, []);
+  const second = p.openRemove(); await tick();
+  p.answerRemove(true); await second;
+  assert.deepEqual(posts[0], {url: '/api/panel/models/q/remove', body: {revision: 'r1', deleteFiles: false}});
+  assert.ok(notes.includes('Removed QUASAR. Pi updated.'), notes.join(' / '));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
+
+
+def test_stage_b_page_contract():
+    from freetoken.daemon.settings.registry import MODEL_ID_RE
+
+    page, js = PAGE.read_text(encoding="utf-8"), PANEL_JS.read_text(encoding="utf-8")
+    for present in ('id="add-model"', 'id="add-wizard"', 'data-add-source="pc"', 'data-add-source="link"', 'id="add-path"',
+                    'id="add-browse"', 'id="add-check"', 'id="add-repo"', 'id="add-plan"', 'id="add-entry"',
+                    'id="add-download"', 'id="add-download-cancel"', 'id="add-progress"', 'id="add-id"', 'id="add-name"',
+                    'id="add-ram"', 'id="add-save"', 'id="model-remove"', 'id="remove-ask"', 'id="remove-ask-ok"',
+                    'id="remove-ask-cancel"', 'Also delete the model files'):
+        assert present in page, present
+    assert '<input id="remove-files" type="checkbox">' in page, "the delete checkbox starts unticked"
+    for route in ("/api/panel/add/info", "/api/panel/add/detect", "/api/panel/add/plan", "/api/panel/add/downloads",
+                  "/remove", "'/api/panel/models'"):
+        assert route in js, route
+    assert MODEL_ID_RE.pattern == "^[a-z0-9][a-z0-9._-]{0,62}$"
+    assert "/^[a-z0-9][a-z0-9._-]{0,62}$/" in js, "the page's id rule must match registry.MODEL_ID_RE"
+    assert "options.onPick" in page and "if (onPick)" in page
+    for banned in ("window.confirm", "window.alert", "window.prompt"):
+        assert banned not in js
