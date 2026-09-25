@@ -32,12 +32,13 @@ from .process_manager import LifecycleError, ProcessManager
 from .prompt_cache import create_prompt_cache_router
 from .panel import PanelService, create_panel_router
 from .pi_sync import PiSync
+from .playground import PlaygroundRunner, create_playground_router
 from .profiles_manager import ProfileError, ProfileValidationError, ProfilesManager
 from .registry import RegistryStore
 from .swap_config import SwapConfigWriter
 from .switcher import SwitcherClient
 
-HELPER_VERSION = "2.1.0"
+HELPER_VERSION = "2.2.0"
 
 
 class SettingsBody(BaseModel):
@@ -164,6 +165,7 @@ def create_app(
     version: str = HELPER_VERSION,
     wall_now=time.time,
     panel: PanelService | None = None,
+    playground: PlaygroundRunner | None = None,
 ) -> FastAPI:
     """Build an app with injectable file/process pieces so routes are testable without a GPU."""
     paths = default_paths()
@@ -242,6 +244,12 @@ def create_app(
     if panel.downloads is None:
         panel.downloads = download_manager
     app.include_router(create_panel_router(panel))
+    # The Test tab (own model system part 3) runs on the same panel: its overlay and write
+    # guards keep the registry untouched while a test holds the card.
+    if playground is None:
+        playground = PlaygroundRunner(panel)
+    app.state.playground = playground
+    app.include_router(create_playground_router(playground))
     app.state.started_monotonic = started
     app.include_router(create_download_router(models_dir=model_root, manager=download_manager))
     app.include_router(create_prompt_cache_router(lambda: process_manager.port))
@@ -286,6 +294,14 @@ def create_app(
     async def panel_js():
         if panel_script.is_file():
             return FileResponse(panel_script, media_type="text/javascript")
+        return PlainTextResponse("", status_code=404)
+
+    playground_script = static.with_name("playground.js")
+
+    @app.get("/playground.js")
+    async def playground_js():
+        if playground_script.is_file():
+            return FileResponse(playground_script, media_type="text/javascript")
         return PlainTextResponse("", status_code=404)
 
     @app.get("/api/settings")

@@ -25,6 +25,21 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def start_panel(app) -> None:
+    """Control panel start-up. First put away a model an interrupted Test-tab test left on test
+    settings (playground.recover), then make the switcher file match the registry, then keep
+    releasing "next time" holds once their model unloads (panel.py). recover() runs before
+    sync_config() because sync rewrites the switcher file from the registry, and the marker
+    tells recover which model was on test settings. A failing recover must never stop the
+    helper: the Right-now strip still shows what is loaded."""
+    try:
+        app.state.playground.recover()
+    except Exception:  # noqa: BLE001
+        pass
+    app.state.panel.sync_config()
+    app.state.panel.start_hold_watcher()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     boot = Path(args.boot_file)
@@ -44,11 +59,8 @@ def main(argv: list[str] | None = None) -> int:
         log_path=args.log_file,
         version=HELPER_VERSION,
     )
-    # Control panel (Stage A): make the switcher file match the registry, then keep releasing
-    # "next time" holds once their model unloads (panel.py).
     panel = app.state.panel
-    panel.sync_config()
-    panel.start_hold_watcher()
+    start_panel(app)
     # Start the memory governor with the helper, not only from a page-driven Start: a helper
     # restart adopts a model server that is already serving (helper 1.3.0), and without this
     # the adopted server ran with no governor at all (seen live 2026-09-07 18:06: status stuck
@@ -72,4 +84,4 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-__all__ = ["main"]
+__all__ = ["main", "start_panel"]

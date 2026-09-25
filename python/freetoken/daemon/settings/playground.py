@@ -47,6 +47,10 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Iterator
 
+from fastapi import APIRouter, Body
+from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
+
 from .panel import PanelError
 from .playground_speed import AnswerTracker, answer_stats
 from .registry import RegistryCorrupt, RegistryError, RegistryMissing, find_model
@@ -866,3 +870,54 @@ class PlaygroundRunner:
                 result = "left"
         self.panel.clear_test_marker()
         return result
+
+    # ---- the page's pick lists ----
+    def options(self) -> dict[str, Any]:
+        """What the Test tab's setup pickers need: the panel's model rows cut down to the
+        keys the page uses, plus the fixed guesses and answer-length limits."""
+        try:
+            listing = self.panel.models()
+        except RegistryMissing:
+            raise PlaygroundError(409, "registry_missing",
+                                  "The control panel has no model list yet. Copy today's settings first.") from None
+        except RegistryCorrupt as exc:
+            raise PlaygroundError(409, "registry_corrupt", exc.message) from None
+        keys = ("id", "name", "engine", "engineLabel", "presets", "activePreset", "state")
+        return {"models": [{key: row[key] for key in keys} for row in listing["models"]],
+                "switcherUp": listing["switcherUp"], "loadGuessS": dict(LOAD_GUESS_S),
+                "defaults": {"maxTokens": DEFAULT_ANSWER_TOKENS, "maxAnswerTokens": MAX_ANSWER_TOKENS}}
+
+
+def create_playground_router(runner: PlaygroundRunner) -> APIRouter:
+    """The /api/playground routes. Every handler runs the runner in the threadpool: plan()
+    and start() read the switcher and llama-swap's in-flight list (seconds when it is slow),
+    and the event loop must keep serving the panel and the Right-now strip meanwhile."""
+    router = APIRouter(prefix="/api/playground")
+
+    async def call(fn: Callable[..., Any], *args: Any) -> Any:
+        try:
+            return await run_in_threadpool(fn, *args)
+        except (PlaygroundError, PanelError) as exc:
+            return JSONResponse(status_code=exc.status, content=exc.payload)
+
+    @router.get("/options")
+    async def options():
+        return await call(runner.options)
+
+    @router.post("/plan")
+    async def plan(body: dict[str, Any] = Body(default_factory=dict)):
+        return await call(runner.plan, body)
+
+    @router.post("/runs")
+    async def start(body: dict[str, Any] = Body(default_factory=dict)):
+        return await call(runner.start, body)
+
+    @router.get("/runs/current")
+    async def current():
+        return await call(runner.snapshot)
+
+    @router.post("/runs/current/stop")
+    async def stop():
+        return await call(runner.stop)
+
+    return router
