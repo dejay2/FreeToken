@@ -47,6 +47,10 @@ class MHAKVCache(BaseKVCachePool):
                     raise ValueError(f"KV layer id {global_id} outside [0, {num_layers})")
                 layer_map[global_id] = dense
             self._layer_map = layer_map
+        # Layout kept apart from the tensor so rebuild never has to read it off the buffer: a
+        # rebuild that OOMs leaves _kv_buffer None, and the failed wake's way back to sleep
+        # (engine/sleep.py release_to_sleep force_pools) must still be able to re-make the pool.
+        self._layout = (num_storage_layers, page_size, local_kv_heads, head_dim, dtype)
         self._kv_buffer = torch.empty(
             (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
             device=device,
@@ -60,12 +64,13 @@ class MHAKVCache(BaseKVCachePool):
     def rebuild(self, num_pages: int) -> None:
         """Reallocate the KV buffer for ``num_pages`` pages IN PLACE.
 
-        Geometry (storage layers, page_size, kv heads, head_dim) is taken from the
-        existing buffer; only the page count changes. Views and ``_storage_shape`` are
-        refreshed. Object identity is preserved so cached backend references stay valid.
+        Geometry (storage layers, page_size, kv heads, head_dim, dtype) is the layout
+        recorded at construction, not read off the buffer, so a pool whose previous rebuild
+        died mid-allocation (buffer None) can still be rebuilt; only the page count changes.
+        Views and ``_storage_shape`` are refreshed. Object identity is preserved so cached
+        backend references stay valid.
         """
-        _, num_storage_layers, _old_pages, page_size, local_kv_heads, head_dim = self._kv_buffer.shape
-        dtype = self._kv_buffer.dtype
+        num_storage_layers, page_size, local_kv_heads, head_dim, dtype = self._layout
         device = self._device
         self._k_buffer = None
         self._v_buffer = None

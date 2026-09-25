@@ -31,6 +31,12 @@ logger = init_logger(__name__)
 # what the card had free before the sleep (see _wake_margin).
 WAKE_MARGIN_BYTES = 512 << 20
 
+# Failed wakes in a row (each one went back to sleep cleanly) before the next is treated as an
+# engine fault: three OOMs with the preflight passing each time means the free-bytes probe and
+# the real allocations disagree, and a restart (the helper's watchdog on "failed") is the only
+# thing that resets that; retrying forever would hold chats in a loop that never ends.
+MAX_FAILED_WAKES = 3
+
 
 class SleepRefused(CacheRebuildRejected):
     """Sleep or wake refused before anything was freed or allocated, or a failed wake that went
@@ -52,6 +58,12 @@ class SleepSnapshot:
     graph_bs: list[int]
     had_spec_draft: bool
     free_before: int
+    # The draft head's private KV width at sleep time. SpecDraftHead otherwise sizes it from
+    # engine.max_seq_len, which after an idle sleep reflects the shrunk dynamic pool: a narrower
+    # draft KV than the target's would take out-of-bounds writes on the first long chat.
+    draft_num_pages: int | None = None
+    draft_seed: int | None = None
+    failed_wakes: int = 0
     free_after: int = 0
     slept_at: float = 0.0
     spilled_while_asleep: list[int] = field(default_factory=list)
@@ -114,7 +126,12 @@ def check_can_sleep(engine) -> None:
     owned = sorted(engine._gpu_owned_layer_ids) if cache is not None else []
     if owned:
         disk = _disk_copy(engine)
-        missing = [l for l in owned if disk is None or not disk.layer_complete(l)]
+        if disk is None:
+            raise SleepRefused(
+                f"expert layers {owned} live on the graphics card and no SSD expert copy is "
+                "configured, so sleep has nowhere to put them"
+            )
+        missing = [l for l in owned if not disk.layer_complete(l)]
         if missing:
             raise SleepRefused(
                 f"expert layers {missing} have no finished copy on the SSD yet (the first boot "
@@ -143,6 +160,10 @@ def sleep_engine(engine) -> dict:
         had_spec_draft=getattr(engine, "spec_draft", None) is not None,
         free_before=free_before,
     )
+    draft = getattr(engine, "spec_draft", None)
+    if draft is not None:
+        snap.draft_num_pages = getattr(draft, "num_pages", None)
+        snap.draft_seed = getattr(draft, "seed", None)
     # Point of no return for the scheduler's verdict: a failure from here is "after teardown".
     engine.rebuild_teardown_started = True
     release_to_sleep(engine, snap)
@@ -207,6 +228,13 @@ def release_to_sleep(engine, snap: SleepSnapshot, *, force_pools: bool = False) 
                 engine._move_layer(layer_id, "disk")
                 progress("sleep:layer", f"layer {layer_id} -> SSD")
         # 4. The shared slot cache, after the moves (a disk rebind reads the cache geometry).
+        #    EXL3's packed pointer tables hold references to the slot tensors: drop them first
+        #    or release_slots frees nothing (same as _resize_pools, engine.py; the next eager
+        #    call after the wake rebuilds them for the new bank addresses).
+        scratch = getattr(cache, "exl3_scratch", None)
+        tables = getattr(scratch, "mgemm_tables", None)
+        if tables is not None:
+            tables.clear()
         if cache.cache_size or force_pools:
             cache.release_slots()
             progress("sleep:slots")
@@ -237,7 +265,8 @@ def wake_engine(engine) -> dict:
     t0 = time.monotonic()
     snap = getattr(engine, "sleep_snapshot", None)
     if snap is None:
-        return _report(None, asleep=False, elapsed=0.0, free=0, note="already awake")
+        return _report(None, asleep=False, elapsed=0.0, free=int(engine._sync_get_memory()[0]),
+                       note="already awake")
     # Preflight, nothing allocated yet (review focus 1): a game holding the card gets a plain
     # refusal and the model stays exactly as it slept.
     free_now = int(engine._sync_get_memory()[0])
@@ -250,7 +279,12 @@ def wake_engine(engine) -> dict:
     engine.rebuild_teardown_started = True
     try:
         _restore(engine, snap)
-    except Exception as exc:  # noqa: BLE001 - every failure takes the same way back
+    except Exception as exc:  # noqa: BLE001
+        if not _is_oom(exc):
+            # Not a shortage the game can fix by quitting: a CUDA fault, a kernel error or a
+            # bug. The engine state is unknown, so no way back is attempted; the scheduler
+            # latches failed and the helper's watchdog restarts the server.
+            raise WakeFailed(f"wake failed ({exc!r}); not an out-of-memory, restart needed") from exc
         logger.error(f"wake failed ({exc!r}); putting the model back to sleep")
         try:
             release_to_sleep(engine, snap, force_pools=True)
@@ -259,6 +293,12 @@ def wake_engine(engine) -> dict:
             raise WakeFailed(
                 f"wake failed ({exc!r}) and going back to sleep failed too ({exc2!r})"
             ) from exc2
+        snap.failed_wakes += 1
+        if snap.failed_wakes >= MAX_FAILED_WAKES:
+            raise WakeFailed(
+                f"{snap.failed_wakes} wakes in a row ran out of memory after the free-memory "
+                f"check passed (last: {exc!r}); restart needed"
+            ) from exc
         raise SleepRefused(f"wake failed and the model went back to sleep: {exc!r}") from exc
     engine.sleep_snapshot = None
     engine.snapshot_pool_budget()
@@ -268,11 +308,16 @@ def wake_engine(engine) -> dict:
     return _report(None, asleep=False, elapsed=elapsed, free=free_after)
 
 
+def _is_oom(exc: BaseException) -> bool:
+    return isinstance(exc, torch.OutOfMemoryError) or "out of memory" in str(exc).lower()
+
+
 def _restore(engine, snap: SleepSnapshot) -> None:
     progress = engine._report_maintenance_progress
     config = engine.config
-    # 1. GDN and KV back to their pre-sleep sizes (the draft head below sizes its private KV
-    #    from engine.max_seq_len, so _refresh_seq_state must run first).
+    # 1. GDN and KV back to their pre-sleep sizes (the draft head below gets its private KV
+    #    width from the snapshot, not from engine.max_seq_len; _refresh_seq_state still runs
+    #    first so the page table and max_seq_len match the restored pool).
     pool = engine.linear_state_pool
     if pool is not None and snap.linear_slots is not None and pool.num_slots != snap.linear_slots:
         pool.rebuild(snap.linear_slots)
@@ -314,7 +359,8 @@ def _restore(engine, snap: SleepSnapshot) -> None:
     if snap.had_spec_draft and getattr(engine, "spec_draft", None) is None:
         from .spec_draft import SpecDraftHead
 
-        engine.spec_draft = SpecDraftHead(engine, spec)
+        engine.spec_draft = SpecDraftHead(engine, spec, seed=snap.draft_seed,
+                                          num_pages=snap.draft_num_pages)
         progress("wake:draft")
     engine._rearm_spec_graphs()
     wants_spec_capture = spec is not None and (
@@ -330,7 +376,11 @@ def _restore(engine, snap: SleepSnapshot) -> None:
     # 6. Self-check: two short prefills through the fresh pools and kernels, so a sticky CUDA
     #    fault surfaces as a failed wake, not inside Jay's next chat. Harmless to the KV: the
     #    pool is freshly zeroed and parked prefixes restore after the wake, on their next turn.
-    engine._warmup_prefill()
+    # The boot's own lengths (backend- and format-dependent, incl. _SMALL_PREFILL_ROWS): nothing
+    # a wake runs here was not compiled and proven at boot. None at boot means none here.
+    lengths = engine._boot_warmup_lengths(config)
+    if lengths:
+        engine._warmup_prefill(lengths=lengths)
     progress("wake:checked")
 
 

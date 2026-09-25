@@ -62,6 +62,11 @@ class LinearStatePool:
         self._conv_dtype = dtype
 
         n_layers, local_conv_dim, local_v_heads = _linear_local_dims(group, tp_size)
+        # Recorded so rebuild never reads geometry off the tensors: a rebuild that OOMs leaves
+        # them None, and the failed wake's way back to sleep (engine/sleep.py release_to_sleep
+        # force_pools) must still be able to re-make the pool.
+        self._conv_shape = (n_layers, local_conv_dim, group.conv_kernel_dim - 1)
+        self._rec_shape = (n_layers, local_v_heads, group.key_head_dim, group.value_head_dim)
 
         # conv left-context: the last (kernel-1) timesteps of the conv input stream.
         self.conv_states = torch.zeros(
@@ -76,6 +81,7 @@ class LinearStatePool:
             dtype=ssm_state_dtype(),
             device=device,
         )
+        self._rec_dtype = self.recurrent_states.dtype
         self._local_index = {layer_id: i for i, layer_id in enumerate(group.layer_ids)}
 
         self._slot_specs = tuple(slot_states)
@@ -144,15 +150,15 @@ class LinearStatePool:
     def rebuild(self, num_slots: int) -> None:
         """Reallocate the conv + recurrent state tensors for ``num_slots`` slots IN PLACE.
 
-        Geometry (layers, conv dim, head dims) and dtypes are taken from the existing
-        tensors; only the slot count changes. Object identity is preserved so cached
+        Geometry (layers, conv dim, head dims) and dtypes are the ones recorded at
+        construction (never read off the tensors, which a failed rebuild leaves None); only the slot count changes. Object identity is preserved so cached
         references (ctx.linear_state_pool) stay valid. Idle-only and destructive: every
         live/snapshot state is dropped, so the caller must guarantee no running request
         holds a slot and the radix tree owning donated snapshots is discarded too.
         """
-        n_layers, _, local_conv_dim, km1 = self.conv_states.shape
-        _, _, local_v_heads, key_head_dim, value_head_dim = self.recurrent_states.shape
-        conv_dtype, rec_dtype = self.conv_states.dtype, self.recurrent_states.dtype
+        n_layers, local_conv_dim, km1 = self._conv_shape
+        _, local_v_heads, key_head_dim, value_head_dim = self._rec_shape
+        conv_dtype, rec_dtype = self._conv_dtype, self._rec_dtype
         device = self._device
         self.conv_states = None
         self.recurrent_states = None

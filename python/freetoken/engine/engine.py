@@ -606,18 +606,7 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
         )
-        warmup_lengths = []
-        if config.attention_backend.split(",")[0] == "triton":
-            warmup_lengths.extend((80, 128))
-        from freetoken.layers.moe import _SMALL_PREFILL_ROWS
-        if (
-            _SMALL_PREFILL_ROWS > 0
-            and self.moe_offload_cache is not None
-            and self.moe_offload_cache.quant_format == "nvfp4"
-        ):
-            # Decode graph capture and long saved-prefix warming do not execute
-            # the short-tail prefill kernels. Compile/load those before serving.
-            warmup_lengths.append(_SMALL_PREFILL_ROWS)
+        warmup_lengths = self._boot_warmup_lengths(config)
         if warmup_lengths:
             self._warmup_prefill(lengths=warmup_lengths)
         # Heavy private state is deliberately last: target weights, trusted pools, graphs, and
@@ -2998,6 +2987,23 @@ class Engine:
         return SpecForwardOutput(decision, next_tokens_gpu, hidden)
 
     @torch.inference_mode()
+    def _boot_warmup_lengths(self, config) -> list[int]:
+        """The prefill lengths boot warms, shared with wake's self-check (engine/sleep.py) so a
+        wake exercises exactly the kernels boot compiled and nothing boot never ran."""
+        warmup_lengths = []
+        if config.attention_backend.split(",")[0] == "triton":
+            warmup_lengths.extend((80, 128))
+        from freetoken.layers.moe import _SMALL_PREFILL_ROWS
+        if (
+            _SMALL_PREFILL_ROWS > 0
+            and self.moe_offload_cache is not None
+            and self.moe_offload_cache.quant_format == "nvfp4"
+        ):
+            # Decode graph capture and long saved-prefix warming do not execute
+            # the short-tail prefill kernels. Compile/load those before serving.
+            warmup_lengths.append(_SMALL_PREFILL_ROWS)
+        return warmup_lengths
+
     def _warmup_prefill(self, *, lengths: Sequence[int] = (80, 128)) -> None:
         """Compile the Triton prefill path before the first real request.
 

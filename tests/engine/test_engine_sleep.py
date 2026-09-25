@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from freetoken.engine.engine import Engine
-from freetoken.engine.sleep import WAKE_MARGIN_BYTES, SleepRefused, WakeFailed
+from freetoken.engine.sleep import MAX_FAILED_WAKES, WAKE_MARGIN_BYTES, SleepRefused, WakeFailed
 from tests.moe.test_disk_banks import FakeDiskEngine
 
 EXPERT = (32 * 16 + 16 * 32) * 2  # bf16 bytes of one expert row across both banks
@@ -67,6 +67,7 @@ class SleepEngine(FakeDiskEngine):
         self.original = {lid: {n: self.moe_offload_cache.bank_sources[n][lid].clone()
                                for n in self.bank_schema} for lid in range(4)}
         self.config.spec_decode = SimpleNamespace(enabled=False, graph_widths=())
+        self.config.attention_backend = "triton"
         self.kv_cache = FakeKV()
         self._pool_cls = SimpleNamespace(min_kv_tokens=lambda config: config.page_size)
         self.linear_state_pool = FakeLinear(9)
@@ -85,6 +86,7 @@ class SleepEngine(FakeDiskEngine):
         self.game_bytes = 0
         self.recaptures: list = []
         self.warmups = 0
+        self.warmup_lengths: list = []
         self.spec_captures = 0
         self.budget_snapshots = 0
         self.sleep_snapshot = None
@@ -104,6 +106,7 @@ class SleepEngine(FakeDiskEngine):
 
     def _warmup_prefill(self, **kwargs):
         self.warmups += 1
+        self.warmup_lengths.append(tuple(kwargs.get("lengths", ())))
 
     def _capture_spec_graphs_at_boot(self):
         self.spec_captures += 1
@@ -119,6 +122,7 @@ class SleepEngine(FakeDiskEngine):
     _refresh_seq_state = Engine._refresh_seq_state
     _graph_bs_for_recapture = Engine._graph_bs_for_recapture
     _rearm_spec_graphs = Engine._rearm_spec_graphs
+    _boot_warmup_lengths = Engine._boot_warmup_lengths
 
 
 def residency(eng):
@@ -227,10 +231,13 @@ def test_a_wake_that_cannot_go_back_to_sleep_raises_wake_failed(tmp_path, monkey
     eng = SleepEngine(tmp_path)
     eng.sleep()
 
+    def oom(*args, **kwargs):
+        raise RuntimeError("CUDA out of memory")
+
     def boom(*args, **kwargs):
         raise RuntimeError("boom")
 
-    eng._recapture_graphs = boom
+    eng._recapture_graphs = oom
     monkeypatch.setattr(eng.moe_offload_cache, "release_slots", boom)
     with pytest.raises(WakeFailed):
         eng.wake()
@@ -270,7 +277,7 @@ def test_the_mtp_draft_head_and_ladder_go_to_sleep_and_come_back(tmp_path, monke
     built = []
 
     class Head:
-        def __init__(self, engine, spec):
+        def __init__(self, engine, spec, **kwargs):
             built.append((engine, spec))
 
     class Ladder:
@@ -335,7 +342,7 @@ def test_mtp_graphs_are_not_captured_while_a_spilled_layer_defers_the_graphs(tmp
     # A layer the governor spilled while asleep keeps decode eager (graphs deferred), exactly as
     # a live spill does; capturing the MTP widths against a disk layer would bake the disk
     # gather's host sync, so they stay armed and capture lazily after the recall.
-    monkeypatch.setattr("freetoken.engine.spec_draft.SpecDraftHead", lambda engine, spec: object())
+    monkeypatch.setattr("freetoken.engine.spec_draft.SpecDraftHead", lambda engine, spec, **kw: object())
     eng = SleepEngine(tmp_path)
     eng.spec_draft = SimpleNamespace(close=lambda: None)
     eng.config.spec_decode = SimpleNamespace(enabled=True, graph_widths=())
@@ -368,3 +375,226 @@ def test_overlap_stays_off_after_a_wake_until_the_asleep_spill_is_recalled(tmp_p
     assert not eng.moe_offload_cache.prefill_overlap  # a DISK layer is still there
     eng._move_layer(rep["layer"], "pinned")  # the governor's recall, as today
     assert eng.moe_offload_cache.prefill_overlap
+
+
+def oom(*args, **kwargs):
+    raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB")
+
+
+def test_a_wake_that_fails_with_something_other_than_oom_is_wake_failed(tmp_path):
+    # A CUDA fault is not a shortage a game can fix by quitting: no way back is tried, the
+    # scheduler latches failed and the watchdog restarts the server.
+    eng = SleepEngine(tmp_path)
+    eng.sleep()
+
+    def fault(*args, **kwargs):
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    eng._recapture_graphs = fault
+    with pytest.raises(WakeFailed, match="illegal memory access"):
+        eng.wake()
+
+
+def test_repeated_oom_wakes_end_in_wake_failed(tmp_path):
+    eng = SleepEngine(tmp_path)
+    eng.sleep()
+    eng._recapture_graphs = oom
+    for _ in range(MAX_FAILED_WAKES - 1):
+        with pytest.raises(SleepRefused, match="went back to sleep"):
+            eng.wake()
+    with pytest.raises(WakeFailed, match="in a row"):
+        eng.wake()
+
+
+def test_a_successful_wake_starts_the_failed_wake_count_again(tmp_path):
+    eng = SleepEngine(tmp_path)
+    eng.sleep()
+    eng._recapture_graphs = oom
+    for _ in range(MAX_FAILED_WAKES - 1):
+        with pytest.raises(SleepRefused):
+            eng.wake()
+    del eng._recapture_graphs
+    eng.wake()
+    eng.sleep()
+    eng._recapture_graphs = oom
+    with pytest.raises(SleepRefused, match="went back to sleep"):
+        eng.wake()
+
+
+def test_sleep_drops_the_exl3_pointer_tables_before_the_slots_go(tmp_path, monkeypatch):
+    # The packed tables hold references to the slot tensors; left in place, release_slots
+    # frees nothing and sleep reports VRAM it never handed back.
+    eng = SleepEngine(tmp_path)
+    cache = eng.moe_offload_cache
+    cache.exl3_scratch = SimpleNamespace(mgemm_tables={"gate_up": object()})
+    seen = []
+    real = cache.release_slots
+
+    def release():
+        seen.append(dict(cache.exl3_scratch.mgemm_tables))
+        real()
+
+    monkeypatch.setattr(cache, "release_slots", release)
+    eng.sleep()
+    assert seen == [{}]
+
+
+def test_the_wake_self_check_runs_the_boot_warmup_lengths(tmp_path, monkeypatch):
+    eng = SleepEngine(tmp_path)
+    eng.sleep()
+    eng.wake()
+    assert eng.warmup_lengths == [(80, 128)]  # triton backend, bf16 experts: the boot's set
+    monkeypatch.setattr("freetoken.layers.moe._SMALL_PREFILL_ROWS", 16)
+    eng.moe_offload_cache.quant_format = "nvfp4"
+    eng.sleep()
+    eng.wake()
+    assert eng.warmup_lengths[-1] == (80, 128, 16)
+    eng.config.attention_backend = "fa,triton"
+    eng.moe_offload_cache.quant_format = "bf16"
+    eng.sleep()
+    eng.wake()
+    assert eng.warmups == 2  # boot warmed nothing on this backend, so the wake runs nothing
+
+
+def test_already_awake_reports_the_real_free_bytes(tmp_path):
+    eng = SleepEngine(tmp_path)
+    rep = eng.wake()
+    assert rep["note"] == "already awake"
+    assert rep["vram_free_bytes"] == eng._sync_get_memory()[0] > 0
+
+
+def test_sleep_without_any_ssd_copy_says_so_plainly(tmp_path):
+    eng = SleepEngine(tmp_path)
+    eng.expert_disk_copy = None
+    eng.moe_offload_cache.expert_disk_copy = None
+    with pytest.raises(SleepRefused) as err:
+        eng.sleep()
+    assert "no SSD expert copy is configured" in str(err.value)
+    assert "four minutes" not in str(err.value)
+    assert eng.graph_runner.destroyed == 0
+
+
+def test_the_draft_head_wakes_with_its_pre_sleep_kv_width_and_seed(tmp_path, monkeypatch):
+    # After an idle sleep engine.max_seq_len reads the one-page pool (and on a dynamic pool the
+    # pre-sleep geometry can be below boot): the draft KV must come back at the width it had.
+    built = []
+
+    class Head:
+        def __init__(self, engine, spec, *, seed=None, num_pages=None):
+            built.append((seed, num_pages, engine.max_seq_len))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("freetoken.engine.spec_draft.SpecDraftHead", Head)
+    eng = SleepEngine(tmp_path)
+    eng.spec_draft = SimpleNamespace(close=lambda: None, num_pages=33, seed=1234)
+    eng.config.spec_decode = SimpleNamespace(enabled=True, graph_widths=())
+    eng.sleep()
+    eng.wake()
+    assert built == [(1234, 33, 1024)]
+
+
+def test_sleep_while_an_awake_spill_already_defers_the_graphs(tmp_path):
+    # A governor spill while awake already built an eager runner and parked the boot sizes; the
+    # snapshot must carry those, not the eager runner's empty list, and the wake keeps them
+    # deferred while the layer is still on the SSD.
+    eng = SleepEngine(tmp_path)
+    eng._move_layer(3, "disk")
+    eng._deferred_graph_bs = list(eng._graph_bs_for_recapture())
+    eng._recapture_graphs(eng.config, eng._deferred_graph_bs, 0)
+    assert eng._graphs_deferred and eng.graph_runner.graph_bs_list == []
+    eng.recaptures.clear()
+    eng.sleep()
+    assert eng.sleep_snapshot.graph_bs == [1]
+    eng.wake()
+    assert eng.recaptures == [([1], True)]
+    assert eng._graphs_deferred == "deferred until no disk layers"
+    assert residency(eng) == ["gpu_owned", "pinned", "gpu_owned", "disk"]
+
+
+def test_a_wake_that_fails_part_way_through_the_layers_goes_back_to_sleep(tmp_path, monkeypatch):
+    eng = SleepEngine(tmp_path)
+    eng.sleep()
+    real = eng._move_layer
+    moves = []
+
+    def move(layer_id, target):
+        moves.append((layer_id, target))
+        if (layer_id, target) == (2, "gpu_owned"):
+            oom()
+        real(layer_id, target)
+
+    monkeypatch.setattr(eng, "_move_layer", move)
+    with pytest.raises(SleepRefused, match="went back to sleep"):
+        eng.wake()
+    # layer 0 had come home: the way back sends it to the SSD again
+    assert moves == [(0, "gpu_owned"), (2, "gpu_owned"), (0, "disk")]
+    assert residency(eng) == ["disk", "pinned", "disk", "pinned"]
+    assert eng.moe_offload_cache.cache_size == 0 and eng.num_pages == 1
+    monkeypatch.setattr(eng, "_move_layer", real)
+    assert eng.wake()["asleep"] is False
+    assert residency(eng) == ["gpu_owned", "pinned", "gpu_owned", "pinned"]
+
+
+def test_a_wake_that_fails_after_the_draft_head_is_built_closes_it(tmp_path, monkeypatch):
+    closed = []
+
+    class Head:
+        def __init__(self, engine, spec, **kwargs):
+            pass
+
+        def close(self):
+            closed.append(self)
+
+    monkeypatch.setattr("freetoken.engine.spec_draft.SpecDraftHead", Head)
+    eng = SleepEngine(tmp_path)
+    eng.spec_draft = SimpleNamespace(close=lambda: None)
+    eng.config.spec_decode = SimpleNamespace(enabled=True, graph_widths=())
+    eng.sleep()
+    eng._capture_spec_graphs_at_boot = oom
+    with pytest.raises(SleepRefused, match="went back to sleep"):
+        eng.wake()
+    assert len(closed) == 1 and eng.spec_draft is None
+    del eng._capture_spec_graphs_at_boot
+    eng.wake()
+    assert isinstance(eng.spec_draft, Head) and len(closed) == 1
+
+
+def test_a_wake_oom_inside_a_real_pool_rebuild_recovers_to_sleep(tmp_path, monkeypatch):
+    # The real MHA and GDN pools, not the fakes: an OOM inside LinearStatePool.rebuild leaves
+    # its tensors None, and the forced way back to sleep must still re-make both pools.
+    from freetoken.distributed.info import DistributedInfo
+    from freetoken.kvcache.linear_state_pool import LinearStatePool
+    from freetoken.kvcache.mha_pool import MHAKVCache
+    from freetoken.models.config import LinearGatedDeltaGroupConfig
+
+    monkeypatch.setattr("freetoken.kvcache.mha_pool.get_tp_info", lambda: DistributedInfo(rank=0, size=1))
+    eng = SleepEngine(tmp_path)
+    eng.kv_cache = MHAKVCache(num_kv_heads=2, num_layers=4, head_dim=8, num_pages=101, page_size=16,
+                              dtype=torch.bfloat16, device=torch.device("cpu"), layer_ids=(1, 3))
+    eng.kv_cache.attach_page_table = lambda table: None
+    group = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=(0, 2), num_key_heads=2, num_value_heads=4,
+        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate="silu",
+    )
+    eng.linear_state_pool = LinearStatePool(group=group, num_slots=9, dtype=torch.bfloat16,
+                                            device=torch.device("cpu"), tp_size=1)
+    eng.sleep()
+    assert eng.kv_cache._kv_buffer.shape[2] == 2 and eng.linear_state_pool.num_slots == 1
+    real = torch.zeros
+    armed = [True]
+
+    def zeros(*args, **kwargs):
+        if armed[0]:
+            armed[0] = False
+            oom()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "zeros", zeros)
+    with pytest.raises(SleepRefused, match="went back to sleep"):
+        eng.wake()
+    assert eng.linear_state_pool.conv_states.shape[1] == 1
+    assert eng.kv_cache._kv_buffer.shape[2] == 2
+    assert eng.wake()["asleep"] is False
+    assert eng.linear_state_pool.conv_states.shape[1] == 9 and eng.kv_cache._kv_buffer.shape[2] == 101
