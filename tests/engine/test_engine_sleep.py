@@ -704,3 +704,52 @@ def test_card_free_bytes_is_none_off_cuda(tmp_path):
 
     assert sleep_mod._card_free_bytes(SleepEngine(tmp_path)) is None
     assert sleep_mod._nvml_free_bytes("GPU-00000000-0000-0000-0000-000000000000") is None
+
+
+def test_an_asleep_spill_whose_staging_allocation_fails_rolls_the_layer_back(tmp_path, monkeypatch):
+    # Codex round 2 on PR #19: rebind_layer flips the residency to disk before it allocates the
+    # SSD staging buffer, so a failed allocation left a half-moved layer the next spill skipped.
+    eng = SleepEngine(tmp_path)
+    eng.sleep()
+    cache = eng.moe_offload_cache
+    before = {n: cache.bank_sources[n][3] for n in eng.bank_schema}
+
+    def no_staging():
+        raise torch.OutOfMemoryError("staging")
+
+    monkeypatch.setattr(cache, "_get_disk_staging", no_staging)
+    eng.rebuild_teardown_started = False
+    with pytest.raises(SleepRefused):
+        eng.step_memory(axis="ram", direction="down", rebuild=eng.asleep_rebuild)
+    assert residency(eng)[3] == "pinned"
+    assert not eng.rebuild_teardown_started  # rolled back cleanly: the step is only rejected
+    assert all(cache.bank_sources[n][3] is before[n] for n in eng.bank_schema)
+    assert 3 not in cache._disk_readers
+    assert eng.sleep_snapshot.spilled_while_asleep == []
+    monkeypatch.undo()
+    rep = eng.step_memory(axis="ram", direction="down", rebuild=eng.asleep_rebuild)
+    assert rep["applied"] == "pinned->disk" and rep["layer"] == 3  # the retry really moves it
+    eng.wake()
+    assert residency(eng) == ["gpu_owned", "pinned", "gpu_owned", "disk"]
+
+
+def test_an_asleep_spill_that_cannot_roll_back_marks_the_teardown(tmp_path, monkeypatch):
+    eng = SleepEngine(tmp_path)
+    eng.sleep()
+    cache = eng.moe_offload_cache
+    real = cache.rebind_layer
+
+    def no_staging():
+        raise torch.OutOfMemoryError("staging")
+
+    def rebind(layer_id, res, banks=None):
+        if res == "pinned":
+            raise RuntimeError("rollback broke")
+        return real(layer_id, res, banks)
+
+    monkeypatch.setattr(cache, "_get_disk_staging", no_staging)
+    monkeypatch.setattr(cache, "rebind_layer", rebind)
+    eng.rebuild_teardown_started = False
+    with pytest.raises(torch.OutOfMemoryError):
+        eng.step_memory(axis="ram", direction="down", rebuild=eng.asleep_rebuild)
+    assert eng.rebuild_teardown_started  # the scheduler latches failed; the watchdog restarts

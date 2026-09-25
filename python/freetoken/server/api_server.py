@@ -502,7 +502,7 @@ class FrontendManager:
             return None
         task = self._wake_task
         if task is None or task.done():
-            task = self._wake_task = asyncio.ensure_future(dispatch_sleep(self, action="wake", timeout=timeout))
+            task = self._wake_task = asyncio.ensure_future(self._shared_wake(timeout))
         try:
             result = await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
         except asyncio.TimeoutError:
@@ -512,6 +512,28 @@ class FrontendManager:
         if result.get("status") in ("loading", "failed", "stopping"):
             return f"server unavailable: engine is {result['status']}"
         return f"server is asleep and could not wake: {result.get('error') or result.get('status')}"
+
+    async def _shared_wake(self, timeout: float) -> Dict[str, Any]:
+        """The body of the shared wake task. A governor step (or a rebuild) can shut the gate
+        between ensure_awake scheduling this task and its first turn; dispatching then would
+        send the wake into a busy scheduler slot, which rejects it, and the chat got a 503
+        (Codex round 2 on PR #19). So wait the running operation out first, bounded by the
+        caller's wait, and re-check before sending: no await sits between the last check here
+        and dispatch_sleep's own lifecycle check and _open_maintenance."""
+        deadline = self.monotonic() + timeout
+        while self.maintenance_state == "rebuilding":
+            left = deadline - self.monotonic()
+            if left <= 0:
+                return {"status": "timeout", "error": "timed out waiting for a running operation"}
+            try:
+                await asyncio.wait_for(self.rebuild_done.wait(), timeout=left)
+            except asyncio.TimeoutError:
+                return {"status": "timeout", "error": "timed out waiting for a running operation"}
+            # rebuild_done can be set and a new operation opened before this task resumes:
+            # loop and re-check rather than trust the event.
+        if not self.asleep:
+            return {"status": "ok", "asleep": False, "note": "already awake"}
+        return await dispatch_sleep(self, action="wake", timeout=max(deadline - self.monotonic(), 0.0))
 
     async def _wake_and_allocate(self, timeout: float) -> int:
         reason = await self.ensure_awake(max(timeout, WAKE_WAIT_S))

@@ -250,3 +250,43 @@ async def test_a_stop_sealed_before_the_chats_wake_task_runs_refuses_the_wake():
     assert reason == "server unavailable: engine is stopping"
     with pytest.raises(AdmissionClosedError, match="stopping"):
         await m.new_user_async()
+
+
+@pytest.mark.anyio
+async def test_a_step_queued_before_the_chats_wake_task_runs_is_waited_out_first():
+    """Codex round 2 on PR #19: a governor step opened between ensure_awake scheduling the wake
+    and the wake task's first turn shut the gate; the wake dispatched anyway, the scheduler's
+    busy slot rejected it and the chat got a 503. The wake must wait for the step, then send."""
+    m = manager(asleep=True)
+    sent = wire_scheduler(m)
+    inner = m.send_one
+    open_at_send = []
+
+    async def send_one(msg):
+        open_at_send.append(sorted(op["kind"] for op in m.maintenance_ops.values()))
+        await inner(msg)
+
+    m.send_one = send_one
+    chat = asyncio.ensure_future(m.wait_until_serving())
+    await asyncio.sleep(0)  # the chat runs once: ensure_awake schedules the shared wake task
+    assert m._wake_task is not None and not m._wake_task.done()
+    api._open_maintenance(m, "step-1", "step")  # the governor's step lands first
+    await settle(10)
+    assert sent == [] and not chat.done()  # the wake waits for the step
+    api._close_maintenance(m, "step-1", failed=False)
+    assert await asyncio.wait_for(chat, 5) is None
+    assert [msg.action for msg in sent] == ["wake"] and open_at_send == [["wake"]]
+    assert m.asleep is False and m.maintenance_state == "serving"
+
+
+@pytest.mark.anyio
+async def test_a_wake_that_waited_out_a_step_is_bounded_by_the_wait():
+    m = manager(asleep=True)
+    sent = wire_scheduler(m)
+    api._open_maintenance(m, "step-1", "step")
+    m.maintenance_state = "serving"  # the chat's check passed just before the step shut the gate
+    task = asyncio.ensure_future(m.ensure_awake(0.2))
+    await asyncio.sleep(0)
+    m.maintenance_state = "rebuilding"
+    reason = await asyncio.wait_for(task, 5)
+    assert "took longer" in reason and sent == []

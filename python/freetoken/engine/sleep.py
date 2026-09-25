@@ -499,6 +499,39 @@ def asleep_rebuild(
     for layer_id, _target in moves:
         if engine.moe_offload_cache.layer_residency[layer_id] == "disk":
             continue  # already there: nothing moved, nothing for the wake to remember
-        engine._move_layer(layer_id, "disk")
+        _spill_or_roll_back(engine, layer_id)
         snap.spilled_while_asleep.append(layer_id)
         engine._report_maintenance_progress("asleep:spill", f"layer {layer_id} -> SSD")
+
+
+def _spill_or_roll_back(engine, layer_id: int) -> None:
+    """One asleep pinned -> disk move that either lands or leaves the layer as it was.
+
+    rebind_layer switches the residency to ``disk`` before it builds the layer's reader (the
+    SSD staging buffer is allocated lazily there), so a failed staging allocation used to leave
+    a half-moved layer: residency ``disk``, no reader, host bank still allocated. Later spills
+    skipped it as "already there" and the wake could not bring it back. Codex round 2 on PR #19.
+    Here the layer is rebound to its old residency and banks and the step reports rejected; if
+    even that fails the engine is torn (rebuild_teardown_started) and the step latches failed,
+    so the watchdog restarts the server instead of serving on a broken layer."""
+    cache = engine.moe_offload_cache
+    before = cache.layer_residency[layer_id]
+    banks = {n: cache.bank_sources[n][layer_id] for n in cache.bank_schema}
+    try:
+        engine._move_layer(layer_id, "disk")
+    except Exception as exc:
+        if cache.layer_residency[layer_id] == before:
+            raise  # nothing moved: the old layer is intact
+        try:
+            cache.rebind_layer(layer_id, before, banks)
+            engine._gpu_owned_layer_ids = cache.gpu_owned_layer_ids
+            engine._stash_vram_ledger_inputs(cache.bank_sources, engine._gpu_owned_layer_ids)
+            spilled = getattr(engine, "_ram_spilled_layers", None)
+            if spilled and layer_id in spilled:
+                spilled.remove(layer_id)
+        except Exception:
+            engine.rebuild_teardown_started = True
+            raise exc from None
+        raise SleepRefused(
+            f"asleep: layer {layer_id} could not spill to the SSD ({exc!r}); left {before}"
+        ) from exc
