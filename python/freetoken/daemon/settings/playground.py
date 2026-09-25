@@ -288,6 +288,9 @@ SAMPLING = (("temperature", "Creativity (temperature)", 0.0, 2.0, False),
             ("top_p", "Top-p", 0.0, 1.0, False),
             ("top_k", "Top-k", 0, 200, True))
 STOPPED = "Stopped."
+# How long put-back waits for a model the test put away to leave /running before loading the
+# model from before; a cancelled NInfer/FreeToken load was still listed a few seconds after Stop.
+SETTLE_S = 20.0
 YIELDED = "Another app asked for a different model, so the test stopped to let it through."
 
 
@@ -333,18 +336,24 @@ class PlaygroundRunner:
 
     def __init__(self, panel: Any, *, chat: Any = None, probe: Any = None,
                  spawn: Callable[..., None] | None = None, clock: Callable[[], float] = time.monotonic,
-                 wall: Callable[[], float] = time.time) -> None:
+                 wall: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep) -> None:
         self.panel, self.switcher = panel, panel.switcher
         self.chat = chat if chat is not None else SwitcherChat()
         self.probe = probe if probe is not None else SwitcherProbe()
         self._spawn = spawn or _thread
-        self._clock, self._wall = clock, wall
+        self._clock, self._wall, self._sleep = clock, wall, sleep
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self.job: dict[str, Any] | None = None
         self._session = ""
         self._loading: str | None = None
         self._ours: str | None = None  # the model this test loaded last
+        # Every model this test asked the switcher to load, finished or not. After a Stop,
+        # llama-swap still lists a cancelled load as "starting" for a while (seen live
+        # 2026-09-25: put-back then read the test's own Twin load as "an app is using Twin"
+        # and left the card empty), so the re-checks before a load skip these unless another
+        # app has a request in flight on them.
+        self._started: set[str] = set()
         self._own_last: dict[str, float] = {}
         self._aliases: dict[str, set[str]] = {}
         self._labels: dict[str, str] = {}
@@ -393,8 +402,33 @@ class PlaygroundRunner:
         running = self.switcher.running()
         if running is None or is_down(running):
             return False, None
-        other = sorted(m for m, state in running.items() if state in LOADED_STATES and m != model_id)
+        other = self._foreign(running, model_id)
         return True, other[0] if other else None
+
+    def _foreign(self, running: dict[str, str], model_id: str | None, kept: set[str] = frozenset()) -> list[str]:
+        """Models starting or ready other than model_id that another app may be using: one this
+        test started counts only when another app has a request in flight on it (or the
+        in-flight list cannot be read), or when its put-away was refused (kept)."""
+        out = []
+        for m, state in running.items():
+            if state not in LOADED_STATES or m == model_id:
+                continue
+            if m in self._started and m not in kept and self._others_using(m) is False:
+                continue  # the test's own load, still being stopped
+            out.append(m)
+        return sorted(out)
+
+    def _settle(self, models: set[str]) -> dict[str, str] | None:
+        """Read /running until none of models is starting or ready, for at most SETTLE_S; the
+        last read is returned (None or down when the switcher cannot tell)."""
+        deadline = self._clock() + SETTLE_S
+        while True:
+            running = self.switcher.running()
+            if running is None or is_down(running) or not models:
+                return running
+            if not any(running.get(m) in LOADED_STATES for m in models) or self._clock() >= deadline:
+                return running
+            self._sleep(0.5)
 
     def _card(self) -> str | None:
         running = self.switcher.running()
@@ -556,6 +590,7 @@ class PlaygroundRunner:
                 reset()
             self._session = SESSION_PREFIX + uuid.uuid4().hex[:10]
             self._ours = None
+            self._started = set()
             job = {**plan, "id": self._session[len(SESSION_PREFIX):], "status": "running",
                    "startedAt": _now_iso(), "finishedAt": None, "message": "", "restore": ""}
             self.job = job
@@ -673,6 +708,7 @@ class PlaygroundRunner:
             raise _Halt("yielded", f"Another app started using {self._name(other)}, so the test stopped to let it through.")
         with self._lock:
             self._loading = model
+            self._started.add(model)
             stopping = self._stop.is_set()
         if stopping:
             with self._lock:
@@ -781,15 +817,23 @@ class PlaygroundRunner:
                 return False, " ".join(words)
             loaded = sorted(model for model, state in running.items() if state in LOADED_STATES)
             left = None
+            gone: set[str] = set()  # the test's own models put away here
+            kept: set[str] = set()  # the test's own models another app is using
             for model in loaded:
                 on_test = bool(test) and model == test["model"]
-                if not (on_test or model == self._ours):
+                # A load of ours still "starting" here was stopped or cut short: never keep it.
+                cut_short = model in self._started and running[model] == "starting"
+                if not (on_test or cut_short or model == self._ours):
                     continue  # another app's model
-                if not on_test and (model == before or not put_back):
+                if not (on_test or cut_short) and (model == before or not put_back):
                     continue  # our setup on saved settings, and it may stay
                 if self._put_away(model) == "unloaded":
+                    gone.add(model)
                     self._ours = None if self._ours == model else self._ours
-                elif on_test:
+                else:
+                    kept.add(model)
+                    if not on_test:
+                        continue
                     left = model
                     self.panel.note_test_leftover(model, test["preset"])
                     words.append(f"{self._name(model)} is still on test settings because an app is using it. "
@@ -805,13 +849,14 @@ class PlaygroundRunner:
             if before == left:
                 return True, " ".join(words)
             # Read the card again right before loading: the list above is from before the
-            # put-away and the hash wait, and another app may have started a model since.
-            now = self.switcher.running()
+            # put-away and the hash wait, and another app may have started a model since. A
+            # model the test put away is given SETTLE_S to leave the list first.
+            now = self._settle(gone)
             if now is None or is_down(now):
                 words.append(f"Can't tell what's loaded right now, so {self._name(before)} was not loaded again. "
                              "Check the Models tab.")
                 return False, " ".join(words)
-            other = sorted(m for m, state in now.items() if state in LOADED_STATES and m != before)
+            other = self._foreign(now, before, kept)
             if now.get(before) in LOADED_STATES and not other:
                 words.append(f"{self._name(before)} is loaded on its saved settings, as before.")
             elif not put_back:

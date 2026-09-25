@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 from pathlib import Path
 
 from .app import HELPER_VERSION, create_app, default_paths
 from .process_manager import ProcessManager
 from .profiles_manager import ProfilesManager
+
+logger = logging.getLogger("freetoken.daemon.settings.server")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -31,11 +34,20 @@ def start_panel(app) -> None:
     releasing "next time" holds once their model unloads (panel.py). recover() runs before
     sync_config() because sync rewrites the switcher file from the registry, and the marker
     tells recover which model was on test settings. A failing recover must never stop the
-    helper: the Right-now strip still shows what is loaded."""
+    helper: the Right-now strip still shows what is loaded, and the marker's model is noted
+    as a leftover so the strip says it may still sit on test settings (the marker stays, so
+    the next helper start tries again)."""
+    panel = app.state.panel
     try:
         app.state.playground.recover()
     except Exception:  # noqa: BLE001
-        pass
+        logger.exception("Test-tab recovery failed at helper start; the marker is kept for the next start")
+        try:
+            marker = panel.read_test_marker()
+            if marker:
+                panel.note_test_leftover(str(marker.get("model") or ""), marker.get("preset"))
+        except Exception:  # noqa: BLE001
+            logger.exception("The test marker could not be read after the failed recovery")
     app.state.panel.sync_config()
     app.state.panel.start_hold_watcher()
 

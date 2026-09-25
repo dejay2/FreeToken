@@ -9,7 +9,11 @@ const PG_HISTORY_KEY = 'ft-test-history-v1';
 const PG_HISTORY_MAX = 20;
 const PG_ANSWER_KEEP = 20000;
 const PG_ACTIVE = ['running', 'stopping', 'restoring'];
-const pg = { options: null, job: null, timer: null, plan: null, history: [], shown: null, wired: false };
+// Ids of tests "Clear history" forgot: the helper still reports the last finished job as
+// current, and without this the next poll put it straight back into the history.
+const PG_CLEARED_KEY = 'ft-test-cleared-v1';
+const PG_OFFLINE = "Couldn't reach the settings page. Try again.";
+const pg = { options: null, job: null, timer: null, plan: null, planRequest: null, history: [], cleared: [], shown: null, wired: false, resultsHtml: '' };
 
 function pgEsc(value) { return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 function fmtMs(ms) {
@@ -40,16 +44,16 @@ function tokensWords(n, approx, reused) {
   return `${approx ? '~' : ''}${Number(n).toLocaleString('en-GB')} tokens${reused ? ` (${Number(reused).toLocaleString('en-GB')} reused)` : ''}`;
 }
 
-// [key, label, lower is better (true), higher is better (false), never judged (null)]
+// [key, label, lower is better (true) / higher is better (false) / never judged (null), technical name (tooltip)]
 const PG_METRICS = [
-  ['loadMs', 'Loading (not counted)', null],
-  ['firstWordMs', 'First word after', true],
-  ['writeTps', 'Writing speed', false],
-  ['totalMs', 'Whole answer', true],
-  ['promptTokens', 'Prompt size', null],
-  ['completionTokens', 'Answer size', null],
-  ['guessPct', 'Guesses kept', false],
-  ['finishReason', 'Stopped because', null],
+  ['loadMs', 'Loading (not counted)', null, 'model load time (ms), not part of the answer'],
+  ['firstWordMs', 'First word after', true, 'TTFT: time to first token (ms)'],
+  ['writeTps', 'Writing speed', false, 'decode tok/s (engine-reported, or ~measured from the stream)'],
+  ['totalMs', 'Whole answer', true, 'total latency (ms), request start to last token'],
+  ['promptTokens', 'Prompt size', null, 'prompt_tokens (cached_tokens reused from the prompt cache)'],
+  ['completionTokens', 'Answer size', null, 'completion_tokens (~ when counted from the stream)'],
+  ['guessPct', 'Guesses kept', false, 'speculative decoding acceptance rate (accepted / proposed draft tokens)'],
+  ['finishReason', 'Stopped because', null, 'finish_reason'],
 ];
 function metricValue(side, key) {
   const s = (side && side.stats) || {};
@@ -86,7 +90,7 @@ function betterSide(a, b, key) {
   return (metric[2] ? x < y : x > y) ? a.key : b.key;
 }
 function speedRows(side, other) {
-  return PG_METRICS.map(([key, label]) => ({ key, label, text: metricText(side, key), better: !!other && betterSide(side, other, key) === side.key }));
+  return PG_METRICS.map(([key, label, , title]) => ({ key, label, title, text: metricText(side, key), better: !!other && betterSide(side, other, key) === side.key }));
 }
 
 const PG_STEP_ICON = { waiting: '○', running: '◐', done: '✓', failed: '✗', skipped: '–' };
@@ -110,6 +114,11 @@ function statusWords(job) {
   if (!job) return '';
   const base = PG_STATUS_WORDS[job.status] || String(job.status);
   return job.message && job.message !== base ? `${base} ${job.message}` : base;
+}
+function statusHtml(job, shown) {
+  if (!shown) return pgEsc(statusWords(job));
+  const back = job ? ' <button class="button small" type="button" data-pg-back>Back to the current test</button>' : '';
+  return `Earlier test from ${pgEsc(shown.at || '')}${back}`;
 }
 
 function historyRecord(job) {
@@ -141,6 +150,13 @@ function saveHistory(storage, list) {
   }
   try { storage.removeItem(PG_HISTORY_KEY); } catch (_) {}
   return [];
+}
+function loadCleared(storage) {
+  try { const value = JSON.parse(storage.getItem(PG_CLEARED_KEY) || '[]'); return Array.isArray(value) ? value.map(String) : []; } catch (_) { return []; }
+}
+function saveCleared(storage, ids) {
+  try { storage.setItem(PG_CLEARED_KEY, JSON.stringify(ids)); } catch (_) {}
+  return ids;
 }
 
 /* ---------- browser ---------- */
@@ -191,24 +207,40 @@ function pgRenderPlan() {
   $('pg-plan-warnings').innerHTML = lines.warnings.map((w) => `<p class="hint warn">${pgEsc(w)}</p>`).join('');
   box.hidden = false;
 }
+function pgClearPlan() { pg.plan = null; pg.planRequest = null; pgRenderPlan(); }
+// Start confirms the plan that was shown, never the form as it stands now: the planned
+// request is kept beside the plan, and any edit to the form takes the plan down again.
+function pgFormEdited() { if (pg.plan) pgClearPlan(); }
 async function pgRun() {
   pgShowError('');
-  const { response, body } = await pgPost('/api/playground/plan', pgRequest());
-  if (!response.ok) { pg.plan = null; pgRenderPlan(); pgShowError(panelErrorText(body, "Couldn't plan the test.")); return; }
-  pg.plan = body;
+  const request = pgRequest();
+  let result;
+  try { result = await pgPost('/api/playground/plan', request); } catch (_) { pgClearPlan(); pgShowError(PG_OFFLINE); return; }
+  const { response, body } = result;
+  if (!response.ok) { pgClearPlan(); pgShowError(panelErrorText(body, "Couldn't plan the test.")); return; }
+  pg.plan = body; pg.planRequest = request;
   pgRenderPlan();
 }
 async function pgStart() {
   if (!pg.plan) return;
-  const { response, body } = await pgPost('/api/playground/runs', { ...pgRequest(), expectBefore: pg.plan.before, confirm: true });
+  const planned = { ...(pg.planRequest || pgRequest()), expectBefore: pg.plan.before, confirm: true };
+  let result;
+  // The request may have reached the helper even when the answer did not come back, so a
+  // Start attempt always polls afterwards.
+  try { result = await pgPost('/api/playground/runs', planned); } catch (_) { pgShowError(PG_OFFLINE); return; } finally { pgSchedule(); }
+  const { response, body } = result;
   if (!response.ok) {
     if (body && body.plan) { pg.plan = body.plan; pgRenderPlan(); }
     pgShowError(panelErrorText(body, "Couldn't start the test."));
     return;
   }
-  pg.plan = null; pgRenderPlan(); pg.shown = null; pg.job = body; pgRenderJob(); pgSchedule();
+  pgClearPlan(); pg.shown = null; pg.job = body; pgRenderJob();
 }
-async function pgStop() { const { body } = await pgPost('/api/playground/runs/current/stop'); if (body && body.status) { pg.job = body; pgRenderJob(); } }
+async function pgStop() {
+  let result;
+  try { result = await pgPost('/api/playground/runs/current/stop'); } catch (_) { pgShowError(PG_OFFLINE); return; }
+  if (result.body && result.body.status) { pg.job = result.body; pgRenderJob(); }
+}
 function pgSchedule() { clearTimeout(pg.timer); pg.timer = setTimeout(pgPoll, PG_POLL_MS); }
 async function pgPoll() {
   clearTimeout(pg.timer);
@@ -218,10 +250,10 @@ async function pgPoll() {
   pg.job = result.body.status === 'idle' ? null : result.body;
   pgRenderJob();
   if (pg.job && PG_ACTIVE.includes(pg.job.status)) pgSchedule();
-  else if (pg.job) { pgRemember(pg.job); if (pg.options) pgLoadOptions(); }
+  else if (pg.job) { pgRemember(pg.job); if (pg.options) pgLoadOptions().catch(() => {}); }
 }
 function pgRemember(job) {
-  if (!job || !job.id || PG_ACTIVE.includes(job.status) || pg.history.some((row) => row.id === job.id)) return;
+  if (!job || !job.id || PG_ACTIVE.includes(job.status) || pg.cleared.includes(String(job.id)) || pg.history.some((row) => row.id === job.id)) return;
   const next = historyAdd(pg.history, historyRecord(job));
   const store = pgStore();
   pg.history = store ? saveHistory(store, next) : next;
@@ -231,12 +263,37 @@ function pgResultsHtml(record) {
   const sides = record.sides || [];
   return sides.map((side) => {
     const other = sides.find((s) => s.key !== side.key);
-    const rows = speedRows(side, other).map((row) => `<tr><th scope="row">${pgEsc(row.label)}</th><td>${pgEsc(row.text)}${row.better ? ' <span class="pg-better">better</span>' : ''}</td></tr>`).join('');
+    const rows = speedRows(side, other).map((row) => `<tr><th scope="row" title="${pgEsc(row.title)}">${pgEsc(row.label)}</th><td>${pgEsc(row.text)}${row.better ? ' <span class="pg-better">better</span>' : ''}</td></tr>`).join('');
     const thinking = side.reasoning ? `<details class="pg-thinking"><summary>Thinking</summary><div class="pg-answer">${pgEsc(side.reasoning)}</div></details>` : '';
     const error = side.error ? `<p class="error">${pgEsc(side.error)}</p>` : '';
     const answer = side.answer ? pgEsc(side.answer) : '<span class="muted">(no answer yet)</span>';
     return `<article class="pg-result" data-side="${pgEsc(side.key)}"><h3>${pgEsc(sideTitle(side))}</h3><table class="pg-speed">${rows}</table>${error}${thinking}<div class="pg-answer">${answer}</div></article>`;
   }).join('');
+}
+// Rewriting #pg-results on every poll closed each Thinking box and reset the answers' scroll
+// (review item 3). The results are rewritten only when their text changed, and each side's
+// details.open and answer scroll are carried over; a box scrolled to the bottom stays at the
+// bottom so it keeps following the stream.
+function pgResultsState(box) {
+  const state = {};
+  for (const article of box.querySelectorAll('.pg-result')) {
+    const details = article.querySelector('details.pg-thinking');
+    state[article.dataset.side] = { open: !!(details && details.open),
+      scroll: Array.from(article.querySelectorAll('.pg-answer')).map((el) => ({ top: el.scrollTop, atBottom: el.scrollTop > 0 && el.scrollTop + el.clientHeight >= el.scrollHeight - 2 })) };
+  }
+  return state;
+}
+function pgResultsRestore(box, state) {
+  for (const article of box.querySelectorAll('.pg-result')) {
+    const kept = state[article.dataset.side];
+    if (!kept) continue;
+    const details = article.querySelector('details.pg-thinking');
+    if (details) details.open = kept.open;
+    Array.from(article.querySelectorAll('.pg-answer')).forEach((el, i) => {
+      const was = kept.scroll[i];
+      if (was && (was.atBottom || was.top)) el.scrollTop = was.atBottom ? el.scrollHeight : was.top;
+    });
+  }
 }
 function pgRenderJob() {
   const record = pg.shown || pg.job;
@@ -244,8 +301,15 @@ function pgRenderJob() {
   $('pg-run').disabled = active;
   $('pg-stop').hidden = !(active && pg.job.status === 'running');
   $('pg-steps').innerHTML = record && record.steps ? record.steps.map((step) => `<li class="pg-step ${pgEsc(step.state)}">${pgEsc(stepLine(step))}</li>`).join('') : '';
-  $('pg-status').textContent = pg.shown ? `Earlier test from ${pg.shown.at || ''}` : statusWords(pg.job);
-  $('pg-results').innerHTML = record ? pgResultsHtml(record) : '';
+  $('pg-status').innerHTML = statusHtml(pg.job, pg.shown);
+  const html = record ? pgResultsHtml(record) : '';
+  if (html !== pg.resultsHtml) {
+    const box = $('pg-results');
+    const kept = pgResultsState(box);
+    box.innerHTML = html;
+    pg.resultsHtml = html;
+    pgResultsRestore(box, kept);
+  }
   $('pg-restore').textContent = record ? (record.restore || '') : '';
 }
 function pgRenderHistory() {
@@ -267,8 +331,12 @@ function pgExport() {
 }
 async function pgClear() {
   if (!(await askConfirm('Clear every earlier test from this browser?', 'Clear'))) return;
+  const ids = pg.history.map((row) => String(row.id));
+  if (pg.job && pg.job.id) ids.push(String(pg.job.id));
+  pg.cleared = [...new Set([...ids, ...pg.cleared])].slice(0, PG_HISTORY_MAX + 1);
   const store = pgStore();
   pg.history = store ? saveHistory(store, []) : [];
+  if (store) saveCleared(store, pg.cleared);
   pg.shown = null;
   pgRenderHistory(); pgRenderJob();
 }
@@ -280,8 +348,11 @@ function pgWire() {
   $('pg-b-on').addEventListener('change', () => { $('pg-b-fields').disabled = !$('pg-b-on').checked; });
   $('pg-run').addEventListener('click', pgRun);
   $('pg-start').addEventListener('click', pgStart);
-  $('pg-plan-cancel').addEventListener('click', () => { pg.plan = null; pgRenderPlan(); });
+  $('pg-plan-cancel').addEventListener('click', pgClearPlan);
   $('pg-stop').addEventListener('click', pgStop);
+  $('test-view').addEventListener('input', pgFormEdited);
+  $('test-view').addEventListener('change', pgFormEdited);
+  $('pg-status').addEventListener('click', (event) => { if (event.target.closest('[data-pg-back]')) { pg.shown = null; pgRenderJob(); } });
   $('pg-export').addEventListener('click', pgExport);
   $('pg-clear').addEventListener('click', pgClear);
   $('pg-history').addEventListener('click', (event) => {
@@ -295,11 +366,13 @@ async function pgOpen() {
   pgWire();
   const store = pgStore();
   pg.history = store ? loadHistory(store) : [];
+  pg.cleared = store ? loadCleared(store) : pg.cleared;
   pgRenderHistory();
-  await pgLoadOptions();
-  await pgPoll();
+  // The current test is polled even when the option list cannot be read.
+  try { await pgLoadOptions(); } catch (_) { pgShowError(PG_OFFLINE); } finally { await pgPoll(); }
 }
 
 if (typeof module !== 'undefined') module.exports = { fmtMs, fmtGuess, fmtRate, guessWords, stopWords, tokensWords, metricText, betterSide,
-  speedRows, stepLine, planLines, statusWords, historyRecord, historyAdd, historyMarkdown, sideTitle, loadHistory, saveHistory,
-  PG_HISTORY_KEY, PG_HISTORY_MAX, pg };
+  speedRows, stepLine, planLines, statusWords, statusHtml, historyRecord, historyAdd, historyMarkdown, sideTitle, loadHistory, saveHistory,
+  loadCleared, saveCleared, pgResultsHtml, pgResultsState, pgResultsRestore, pgRenderJob, pgRenderPlan, pgRun, pgStart, pgStop, pgPoll,
+  pgOpen, pgWire, pgRemember, pgClear, PG_HISTORY_KEY, PG_HISTORY_MAX, PG_CLEARED_KEY, PG_OFFLINE, pg };

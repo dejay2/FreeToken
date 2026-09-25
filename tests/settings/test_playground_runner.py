@@ -595,3 +595,104 @@ def test_helper_restart_with_the_state_unknown_notes_the_leftover(tmp_path, monk
     service, runner = env.build()
     assert runner.recover() == "unknown" and env.switcher.calls == []
     assert service.test_leftover == {"model": "quasar-27b", "preset": "Fast"} and service.read_test_marker() is None
+
+
+# ---- live bug 2026-09-25: put-back after Stop read the test's own cancelled load as another app's ----
+
+def _stop_while_loading(env, model, sticky_reads):
+    """Stop lands during the load of model; llama-swap keeps listing that cancelled load as
+    "starting" for the next sticky_reads reads of /running (None: for good)."""
+    real = env.switcher.running
+    left = {"n": 0, "on": False}
+
+    def running():
+        states = real()
+        if left["on"] and (sticky_reads is None or left["n"] < sticky_reads):
+            left["n"] += 1
+            states = {**states, model: "starting"}
+        return states
+
+    def on_load(model_id):
+        if model_id == model:
+            env.switcher.states = {model: "starting"}
+            env.runner.stop()
+            left["on"] = True
+
+    env.switcher.running = running
+    env.switcher.on_load = on_load
+
+
+@pytest.mark.parametrize("sticky", [3, None])
+def test_put_back_after_stop_ignores_the_tests_own_cancelled_load(tmp_path, monkeypatch, sticky):
+    env = make(tmp_path, monkeypatch, loaded={"quasar-27b": "ready"})
+    _stop_while_loading(env, "twin-27b", sticky)
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "twin-27b"}]})
+    assert job["status"] == "stopped" and job["message"] == "Stopped."
+    assert env.switcher.calls[-1] == ("load", "quasar-27b")
+    assert job["restore"].startswith(f"{QUASAR} is loaded again on its saved settings")
+    assert env.switcher.states == {"quasar-27b": "ready"}
+
+
+def test_put_back_after_stop_still_yields_to_another_apps_model(tmp_path, monkeypatch):
+    env = make(tmp_path, monkeypatch, loaded={"quasar-27b": "ready"})
+    def on_load(model_id):
+        if model_id == "twin-27b":
+            env.runner.stop()
+            env.switcher.states = {"fable-27b": "starting"}  # another app asked for Fable
+
+    env.switcher.on_load = on_load
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "twin-27b"}]})
+    assert job["status"] == "stopped"
+    assert job["restore"] == f"{QUASAR} was not loaded again, because an app is using {FABLE}."
+    assert ("load", "quasar-27b") not in env.switcher.calls and env.switcher.states == {"fable-27b": "starting"}
+
+
+def test_put_back_after_stop_yields_when_another_app_waits_on_the_same_model(tmp_path, monkeypatch):
+    env = make(tmp_path, monkeypatch, loaded={"quasar-27b": "ready"})
+    _stop_while_loading(env, "twin-27b", None)
+    real = env.probe.inflight
+
+    def inflight():
+        if env.runner.job and env.runner.job["status"] in ("stopping", "restoring"):
+            env.probe.rows = [{"model": "twin-27b", "req_headers": {"X-Session-ID": "claude-code"}}]
+        return real()
+
+    env.probe.inflight = inflight
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "twin-27b"}]})
+    assert job["status"] == "stopped"
+    assert job["restore"] == f"{QUASAR} was not loaded again, because an app is using {TWIN}."
+    assert ("load", "quasar-27b") not in env.switcher.calls
+
+
+def test_b_loads_although_as_put_away_model_is_still_listed(tmp_path, monkeypatch):
+    """Same confusion between setups: A's model, put away by B's first step, still shows on
+    /running; B's re-check before its load must not read it as another app's."""
+    env = make(tmp_path, monkeypatch)
+    real = env.switcher.running
+
+    def running():
+        states = real()
+        if ("unload", "fable-27b") in env.switcher.calls and ("load", "twin-27b") not in env.switcher.calls:
+            states = {**states, "fable-27b": "ready"}
+        return states
+
+    env.switcher.running = running
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b"}, {"model": "twin-27b"}]})
+    assert job["status"] == "done" and ("load", "twin-27b") in env.switcher.calls
+
+
+def test_b_still_yields_when_another_app_asks_for_as_model(tmp_path, monkeypatch):
+    env = make(tmp_path, monkeypatch)
+    real = env.switcher.running
+
+    def running():
+        states = real()
+        if ("unload", "fable-27b") in env.switcher.calls and ("load", "twin-27b") not in env.switcher.calls:
+            env.probe.rows = [{"model": "fable-27b", "req_headers": {"X-Session-ID": "claude-code"}}]
+            states = {**states, "fable-27b": "starting"}
+        return states
+
+    env.switcher.running = running
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b"}, {"model": "twin-27b"}]})
+    assert job["status"] == "yielded" and ("load", "twin-27b") not in env.switcher.calls
+    assert job["message"] == f"Another app started using {FABLE}, so the test stopped to let it through."

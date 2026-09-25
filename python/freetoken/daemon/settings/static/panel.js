@@ -214,7 +214,7 @@ function removedNote(body) {
   return [`Removed ${body.name || body.id}.`, body.files && body.files.message, body.profile && body.profile.message, piNote(body.pi)].filter(Boolean).join(' ');
 }
 if (typeof module !== 'undefined') module.exports = { fmtGB, stateWord, sourceText, dialSourceFor, verdictWords, fitSummary, ramSummary, restartQuestion, nowStripHtml, modelsTableHtml, panelErrorText,
-  loadQuestion, unloadQuestion, registryProblemHtml, panelSave, answerRestart, answerConfirm, startNow, loadModel, unloadModel, panel,
+  loadQuestion, unloadQuestion, registryProblemHtml, panelSave, answerRestart, answerConfirm, startNow, loadModel, unloadModel, panel, applyView,
   idProblem, detectionText, planSummary, downloadLine, removeQuestion, removeFilesNote, removeOkLabel, ramProblem, piNote, addedNote, removedNote,
   addState, openAdd, closeAdd, addCheckPath, addValidate, addPlan, addPathEdited, addRepoEdited, wirePanel, addDownload, addCancelDownload, pollAddJob, addSave, openRemove, answerRemove };
 
@@ -379,6 +379,8 @@ function viewNote(body) {
   return `${body.engineLabel}${body.runtimeLabel ? ` (${body.runtimeLabel})` : ''} · ${body.id} · ${stateWord(body.state)}`;
 }
 function applyView(body, url) {
+  // A slow view answer arriving after a switch to the Test tab must not paint the editor over it.
+  if (panel.main === 'test') return;
   state.view = { ...body, url };
   panel.revision = body.revision || panel.revision;
   state.settings = JSON.parse(JSON.stringify(body.settings || {}));

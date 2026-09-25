@@ -91,7 +91,9 @@ def test_helper_start_recovers_before_it_syncs():
     assert calls == ["recover", "sync", "watch"]
 
 
-def test_a_failing_recover_never_stops_the_helper():
+def test_a_failing_recover_never_stops_the_helper(caplog):
+    """Review item 4: a recover() that raises is logged, and the marker's model is noted as a
+    leftover so the Right-now strip still says it sits on test settings."""
     calls = []
 
     def boom():
@@ -100,6 +102,26 @@ def test_a_failing_recover_never_stops_the_helper():
     app = SimpleNamespace(state=SimpleNamespace(
         playground=SimpleNamespace(recover=boom),
         panel=SimpleNamespace(sync_config=lambda: calls.append("sync"),
-                              start_hold_watcher=lambda: calls.append("watch"))))
+                              start_hold_watcher=lambda: calls.append("watch"),
+                              read_test_marker=lambda: {"model": "quasar-27b", "preset": "Fast"},
+                              note_test_leftover=lambda model, preset: calls.append(("leftover", model, preset)))))
+    with caplog.at_level("ERROR", logger="freetoken.daemon.settings.server"):
+        start_panel(app)
+    assert calls == [("leftover", "quasar-27b", "Fast"), "sync", "watch"]
+    assert any("switcher down" in record.exc_text for record in caplog.records if record.exc_text)
+
+
+def test_a_failing_recover_without_a_marker_notes_nothing():
+    calls = []
+
+    def boom():
+        raise OSError("switcher down")
+
+    app = SimpleNamespace(state=SimpleNamespace(
+        playground=SimpleNamespace(recover=boom),
+        panel=SimpleNamespace(sync_config=lambda: calls.append("sync"),
+                              start_hold_watcher=lambda: calls.append("watch"),
+                              read_test_marker=lambda: None,
+                              note_test_leftover=lambda model, preset: calls.append(("leftover", model, preset)))))
     start_panel(app)
     assert calls == ["sync", "watch"]

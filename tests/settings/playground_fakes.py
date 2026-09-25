@@ -190,7 +190,7 @@ def make(tmp_path, monkeypatch, loaded=None, doc=None, with_routes=False, static
             artifact_size=lambda path: 19_782_132_224, spawn=lambda fn, *args: fn(*args),
             clock=clock, sleep=clock.advance)
         runner = PlaygroundRunner(service, chat=chat, probe=probe, spawn=lambda fn, *args: fn(*args),
-                                  clock=clock, wall=clock.wall)
+                                  clock=clock, wall=clock.wall, sleep=clock.advance)
         return service, runner
 
     service, runner = build()
