@@ -208,11 +208,15 @@ class SwitcherChat:
 
 class SwitcherProbe:
     """What llama-swap knows about other apps' requests (no patch needed: /api/events opens with
-    an in-flight snapshot, and /api/metrics/activity lists requests newest first)."""
+    an in-flight snapshot, and /api/metrics/activity lists requests newest first), and the
+    test's own careful load and unload (patches P8 and P7), which never cancel another app."""
 
     def __init__(self, base_url: str | None = None, *, timeout: float = 5.0,
                  urlopen: Callable[..., Any] = urllib.request.urlopen) -> None:
         self.base_url, self.timeout, self._urlopen = _base_url(base_url), timeout, urlopen
+        self._load_lock = threading.Lock()
+        self._load_sock: socket.socket | None = None
+        self._load_cancelled = False
 
     def inflight(self) -> list[dict[str, Any]] | None:
         """The rows of the first in-flight snapshot on /api/events, or None when unknown
@@ -267,6 +271,64 @@ class SwitcherProbe:
         except OSError:
             return "failed"
 
+    def load_if_free(self, model_id: str, session: str = "", *, timeout: float = 900.0) -> None:
+        """Load model_id only when nothing else is on the card or on its way there (FreeToken
+        llama-swap patch P8, POST /api/models/load/{model}?ifFree=1: decided on llama-swap's
+        run loop with admission, so it never supersedes another app's load, one parked in
+        the memory gate included). Blocks until ready. Raises SwitcherError: code "busy"
+        (409: something else is loading or in use, nothing was cancelled), "cancelled"
+        (cancel_load() ended it), "switcher_down", or llama-swap's own code (P1/P2).
+
+        cancel_load() from another thread shuts this request's socket down: llama-swap then
+        drops only this request's claim on the load (OnCancel). The load itself goes on if
+        another app joined it; otherwise nobody holds it and P7's if-idle unload stops it."""
+        parts = urllib.parse.urlsplit(self.base_url)
+        path = f"/api/models/load/{urllib.parse.quote(model_id, safe='')}?ifFree=1"
+        with self._load_lock:
+            if self._load_cancelled:
+                raise SwitcherError(0, "cancelled", "the load was stopped")
+        conn = http.client.HTTPConnection(parts.hostname or "127.0.0.1", parts.port or 80, timeout=timeout)
+        try:
+            try:
+                conn.connect()
+                with self._load_lock:
+                    self._load_sock = conn.sock
+                    cancelled = self._load_cancelled
+                if cancelled:
+                    raise SwitcherError(0, "cancelled", "the load was stopped")
+                headers = {SESSION_HEADER: session} if session else {}
+                conn.request("POST", path, body=b"", headers=headers)
+                response = conn.getresponse()
+                data = response.read()
+            except (OSError, http.client.HTTPException) as exc:
+                if self._load_cancelled:
+                    raise SwitcherError(0, "cancelled", "the load was stopped") from None
+                raise SwitcherError(0, "switcher_down", f"the model switcher did not answer ({exc})") from None
+        finally:
+            with self._load_lock:
+                self._load_sock = None
+            conn.close()
+        if response.status == 200:
+            return
+        failed = _chat_error(response.status, data)
+        raise SwitcherError(response.status, "load_failed" if failed.code == "chat_failed" else failed.code,
+                            failed.message)
+
+    def cancel_load(self) -> None:
+        """Ends load_if_free's request (from any thread); holds until reset_load()."""
+        with self._load_lock:
+            self._load_cancelled = True
+            sock = self._load_sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def reset_load(self) -> None:
+        with self._load_lock:
+            self._load_cancelled = False
+
     def last_used(self, model_id: str) -> float | None:
         """Epoch seconds of the newest activity row for the model, or None when there is none
         or the switcher did not answer."""
@@ -293,6 +355,11 @@ STOPPED = "Stopped."
 # model from before; a cancelled NInfer/FreeToken load was still listed a few seconds after Stop.
 SETTLE_S = 20.0
 YIELDED = "Another app asked for a different model, so the test stopped to let it through."
+NOT_FREE = "Another app is loading or using a model right now, so the test stopped to let it through."
+# After Stop cancels the test's own load request, llama-swap drops the request's claim on its
+# own run loop a moment later; until then P7 still reads the load as held. Put-back asks again
+# this many times, half a second apart, before treating a cut-short load as another app's.
+CUT_SHORT_RETRIES = 4
 
 
 class PlaygroundError(RuntimeError):
@@ -395,7 +462,12 @@ class PlaygroundRunner:
             return "unknown"
         if busy:
             return "busy"
-        return self.probe.unload_if_idle(model_id)
+        result = self.probe.unload_if_idle(model_id)
+        leftover = self.panel.test_leftover
+        if result == "unloaded" and leftover is not None and leftover.get("model") == model_id:
+            # The model left on test settings is gone, so its next load is on saved settings.
+            self.panel.test_leftover = None
+        return result
 
     def _other_on_card(self, model_id: str | None) -> tuple[bool, str | None]:
         """Re-read right before a load: (known, the model another app has starting or ready,
@@ -491,7 +563,7 @@ class PlaygroundRunner:
         return {"key": key, "model": model_id, "name": model["name"], "engine": model["engine"], "preset": preset,
                 "runPreset": self.panel.test_preset_key(model_id, preset),
                 "settingsLabel": f"preset “{preset}”" if preset else "Saved settings",
-                "sampling": sampling, "answer": "", "reasoning": "", "stats": None, "loadMs": None, "loadFailed": False, "error": None}
+                "sampling": sampling, "answer": "", "reasoning": "", "stats": None, "loadMs": None, "loadFailed": False, "completed": False, "error": None}
 
     # ---- the plan ----
     def _steps(self, sides: list[dict[str, Any]], before: str | None, held: bool, warmup: bool, put_back: bool,
@@ -535,7 +607,13 @@ class PlaygroundRunner:
         doc = self._doc()
         request = self._request(body, doc)
         before = self._card()
-        held = before is not None and before in self.panel.held_models()
+        # A model an earlier test left on test settings (another app blocked its put-away) runs
+        # those settings although the file says saved ones: like a "next time" hold, it must be
+        # reloaded before a saved-settings answer. The leftover note is cleared only once the
+        # model is put away (_put_away), never by begin_test.
+        leftover = self.panel.test_leftover
+        held = before is not None and (before in self.panel.held_models()
+                                       or (leftover is not None and leftover.get("model") == before))
         engines = {m["id"]: m["engine"] for m in doc["models"]}
         if before is not None:
             busy = self._others_using(before)
@@ -586,9 +664,9 @@ class PlaygroundRunner:
             except PanelError as exc:  # another test holds the panel's guard
                 raise PlaygroundError(exc.status, exc.payload["code"], exc.payload["message"]) from None
             self._stop.clear()
-            reset = getattr(self.chat, "reset", None)
-            if reset is not None:
-                reset()
+            for reset in (getattr(self.chat, "reset", None), getattr(self.probe, "reset_load", None)):
+                if reset is not None:
+                    reset()
             self._session = SESSION_PREFIX + uuid.uuid4().hex[:10]
             self._ours = None
             self._started = set()
@@ -607,9 +685,10 @@ class PlaygroundRunner:
         return self.snapshot()
 
     def stop(self) -> dict[str, Any]:
-        """Ends the current step: closes the answer stream, or unloads the model being loaded
-        (P1 cancels a half-finished swap on unload), so a 2.5 min FreeToken load never makes
-        Stop wait. Put-back still runs."""
+        """Ends the current step: closes the answer stream, or cancels the test's own load
+        request, so a 2.5 min FreeToken load never makes Stop wait. Nothing is unloaded here:
+        a plain unload would also cancel another app that joined the same load. Put-back then
+        stops the load with P7's if-idle unload only when no other request depends on it."""
         with self._lock:
             if self.job is None or self.job["status"] != "running":
                 return self.snapshot()
@@ -618,7 +697,7 @@ class PlaygroundRunner:
             loading = self._loading
         self.chat.abort()
         if loading is not None:
-            self._spawn(self.switcher.unload, loading)
+            self.probe.cancel_load()
         return self.snapshot()
 
     # ---- the walk ----
@@ -717,12 +796,18 @@ class PlaygroundRunner:
             raise _Halt("stopped", STOPPED)
         started = self._clock()
         try:
-            self.switcher.load(model)
+            # P8 if-free load: never supersedes another app's load, one waiting in the memory
+            # gate included (P1 latest-wins would cancel it).
+            self.probe.load_if_free(model, self._session)
         except SwitcherError as exc:
             if self._stop.is_set():
                 raise _Halt("stopped", STOPPED) from None
             if exc.code == "model_superseded":
                 raise _Halt("yielded", YIELDED) from None
+            if exc.code == "busy":
+                raise _Halt("yielded", NOT_FREE) from None
+            if exc.code == "switcher_down":
+                raise _Halt("failed", "The model switcher is not running.") from None
             raise _Halt("failed", f"Loading {side['name']} failed: {exc.message or exc.code}") from None
         except OSError:
             raise _Halt("failed", "The model switcher is not running.") from None
@@ -736,9 +821,10 @@ class PlaygroundRunner:
         with self._lock:
             side["loadMs"] = (side["loadMs"] or 0) + max(0, round((self._clock() - started) * 1000))
         if self._stop.is_set():
-            # Stop's unload can reach llama-swap before P6 has registered this load, and the
-            # load then simply finishes: put the model away again.
-            if self.switcher.unload(model):
+            # Stop's cancel can land after the load finished: put the model away again, but
+            # only if no other app's request depends on it (P7); otherwise it stays, and
+            # put-back says so.
+            if self._put_away(model) == "unloaded":
                 self._ours = None
             raise _Halt("stopped", STOPPED)
 
@@ -774,19 +860,29 @@ class PlaygroundRunner:
             tracker.ended = self._clock()
             self._own_last[side["model"]] = self._wall()
         stopped = self._stop.is_set()
+        # FreeToken streams {"error": ...} then [DONE] when a request fails after the 200
+        # (python/freetoken/server/openai_api.py): that [DONE] is not a finished answer.
+        error = None if stopped else tracker.error
         # Spec, error table "Answer error / cut off": a stream that ends without a finish
         # reason or [DONE] fails the test.
-        cut = not stopped and not tracker.done and tracker.finish_reason is None
+        cut = not stopped and error is None and not tracker.done and tracker.finish_reason is None
         if not warmup:
             self._publish(side, tracker, final=True, cancelled=stopped)
             with self._lock:
                 names = self._aliases.get(side["model"], {side["model"]})
-                if tracker.served_model and tracker.served_model not in names:
+                if error is not None:
+                    side["error"] = f"The engine reported an error: {error['message']}"
+                elif tracker.served_model and tracker.served_model not in names:
                     side["error"] = f"The answer came from {tracker.served_model}, not {side['name']}."
                 elif cut:
                     side["error"] = "The answer ended without a finish signal."
+                # The page compares two answers only when both finished cleanly.
+                side["completed"] = not stopped and side["error"] is None and tracker.finish_reason is not None
         if stopped:
             raise _Halt("stopped", STOPPED)
+        if error is not None:
+            code = f" ({error['code']})" if error.get("code") else ""
+            raise _Halt("failed", f"{side['name']} could not answer: {error['message']}{code}")
         if cut:
             raise _Halt("failed", f"{side['name']} could not answer: the answer was cut off before it finished.")
 
@@ -831,7 +927,13 @@ class PlaygroundRunner:
                     continue  # another app's model
                 if not (on_test or cut_short) and (model == before or not put_back):
                     continue  # our setup on saved settings, and it may stay
-                if self._put_away(model) == "unloaded":
+                result = self._put_away(model)
+                for _ in range(CUT_SHORT_RETRIES if cut_short else 0):
+                    if result != "busy":
+                        break
+                    self._sleep(0.5)
+                    result = self._put_away(model)
+                if result == "unloaded":
                     gone.add(model)
                     self._ours = None if self._ours == model else self._ours
                 else:
@@ -869,9 +971,16 @@ class PlaygroundRunner:
                 words.append(f"{self._name(before)} was not loaded again, because an app is using {self._name(other[0])}.")
             else:
                 started = self._clock()
+                reset = getattr(self.probe, "reset_load", None)
+                if reset is not None:
+                    reset()  # a Stop's cancel was for the test's load, not this one
                 try:
-                    self.switcher.load(before)
+                    self.probe.load_if_free(before, self._session)
                 except SwitcherError as exc:
+                    if exc.code == "busy":
+                        words.append(f"{self._name(before)} was not loaded again, because another app is loading "
+                                     "or using a model.")
+                        return True, " ".join(words)
                     if exc.code != "model_superseded":
                         raise
                     words.append(f"{self._name(before)} was not loaded again, because another app took the graphics card.")
@@ -895,9 +1004,11 @@ class PlaygroundRunner:
     def recover(self) -> str:
         """At helper start: a test running when the helper stopped may have left its model on
         test settings. Put it away when nobody uses it; otherwise leave it and say so on the
-        Right-now strip. Nothing on disk needs restoring: the registry was never written, and
-        sync_config() rewrites the switcher file right after this (holding a busy NInfer
-        model's running entry, as for any loaded model)."""
+        Right-now strip. The registry was never written; the switcher file is rewritten here
+        from it (set_test_settings(None, None), which holds a busy NInfer model's running entry
+        as for any loaded model) and the marker is removed only after that write succeeded. A
+        failed write keeps the marker, notes the leftover and raises, so start_panel logs it
+        and the next helper start tries again."""
         marker = self.panel.read_test_marker()
         if marker is None:
             return "none"
@@ -917,7 +1028,11 @@ class PlaygroundRunner:
             else:
                 self.panel.note_test_leftover(model, preset)
                 result = "left"
-        self.panel.clear_test_marker()
+        try:
+            self.panel.set_test_settings(None, None)  # removes the marker after the file is written
+        except Exception:
+            self.panel.note_test_leftover(model, preset)
+            raise
         return result
 
     # ---- the page's pick lists ----

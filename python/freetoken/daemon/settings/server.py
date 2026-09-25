@@ -5,7 +5,11 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import socket
+import threading
+import time
 from pathlib import Path
+from typing import Any, Callable
 
 from .app import HELPER_VERSION, create_app, default_paths
 from .process_manager import ProcessManager
@@ -52,6 +56,38 @@ def start_panel(app) -> None:
     app.state.panel.start_hold_watcher()
 
 
+def _accepts(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def start_panel_when_listening(app: Any, port: int, *, accepts: Callable[[int], bool] = _accepts,
+                               sleep: Callable[[float], None] = time.sleep,
+                               stop: threading.Event | None = None) -> threading.Thread:
+    """Run start_panel once this helper accepts connections on port, in a thread.
+
+    Recovery may put away a FreeToken model, and freetoken.sh's unload calls this helper's
+    /api/server/stop to stop the model server. Run before uvicorn listened, that call failed,
+    the adapter exited without stopping FreeToken, and recovery still reported success (PR
+    #18 review). uvicorn's lifespan startup also runs before it binds, so the wait is on the
+    port itself. stop ends the wait when the helper exits without ever listening."""
+    stop = stop or threading.Event()
+
+    def run() -> None:
+        while not accepts(port):
+            if stop.is_set():
+                return
+            sleep(0.2)
+        start_panel(app)
+
+    thread = threading.Thread(target=run, name="panel-start", daemon=True)
+    thread.start()
+    return thread
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     boot = Path(args.boot_file)
@@ -72,7 +108,9 @@ def main(argv: list[str] | None = None) -> int:
         version=HELPER_VERSION,
     )
     panel = app.state.panel
-    start_panel(app)
+    # Recovery and the first sync wait until the page answers (start_panel_when_listening).
+    exiting = threading.Event()
+    start_panel_when_listening(app, args.port, stop=exiting)
     # Start the memory governor with the helper, not only from a page-driven Start: a helper
     # restart adopts a model server that is already serving (helper 1.3.0), and without this
     # the adopted server ran with no governor at all (seen live 2026-09-07 18:06: status stuck
@@ -89,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
 
         uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info")
     finally:
+        exiting.set()
         panel.stop_hold_watcher()
         process_manager.stop_watchdog()
         process_manager.stop_governor()
@@ -96,4 +135,4 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-__all__ = ["main", "start_panel"]
+__all__ = ["main", "start_panel", "start_panel_when_listening"]

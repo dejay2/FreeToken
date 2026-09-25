@@ -49,6 +49,10 @@ class AnswerTracker:
     finish_reason: str | None = None
     served_model: str | None = None
     done: bool = False
+    # {"message", "code"} from an error envelope in the stream; FreeToken sends
+    # {"error": {"message", "type", "code"}} (or a plain string) and then [DONE] when a request
+    # fails after the 200 (python/freetoken/server/openai_api.py).
+    error: dict[str, Any] | None = None
 
     @property
     def answer_text(self) -> str:
@@ -72,6 +76,15 @@ class AnswerTracker:
         except ValueError:
             return
         if not isinstance(payload, dict):
+            return
+        if payload.get("error"):
+            raw = payload["error"]
+            if isinstance(raw, dict):
+                message, code = raw.get("message"), raw.get("code")
+            else:
+                message, code = raw, None
+            self.error = {"message": str(message or "the engine reported an error")[:300],
+                          "code": None if code is None else str(code)}
             return
         if isinstance(payload.get("model"), str):
             self.served_model = payload["model"]

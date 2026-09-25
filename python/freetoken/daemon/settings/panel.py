@@ -1363,8 +1363,9 @@ class PanelService:
                 raise PanelError(409, "busy", RESTART_PENDING_MESSAGE)
             if self._actions:
                 raise PanelError(409, "busy", PANEL_BUSY_MESSAGE)
+            # test_leftover is not cleared here: the model may still run test settings. The
+            # runner clears it once it puts that model away (playground.py _put_away).
             self.test_running = True
-            self.test_leftover = None
 
     def end_test(self) -> None:
         with self._lock:

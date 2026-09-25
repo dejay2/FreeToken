@@ -197,8 +197,9 @@ def test_stop_during_load_cancels_it_and_puts_back(tmp_path, monkeypatch):
     env.switcher.on_load = lambda m: env.runner.stop() if m == "fable-27b" else None
     job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b", "preset": "Three"}, {"model": "quasar-27b"}]})
     assert job["status"] == "stopped" and job["message"] == "Stopped."
+    # PR #18 review: Stop cancels only the test's own load request, never a plain unload.
     assert env.switcher.calls == [("unload", "quasar-27b"), ("load", "fable-27b"),
-                                  ("unload", "fable-27b"), ("load", "quasar-27b")]
+                                  ("cancel", "fable-27b"), ("load", "quasar-27b")]
     states = [(step["kind"], step["state"]) for step in job["steps"]]
     assert states[:3] == [("unload", "done"), ("settings", "done"), ("load", "failed")]
     assert all(state == "skipped" for kind, state in states[3:-1]) and states[-1] == ("restore", "done")
@@ -436,18 +437,18 @@ def test_a_new_test_clears_the_last_stop(tmp_path, monkeypatch):
 
 
 def test_a_stop_before_the_load_registers_puts_the_model_away_again(tmp_path, monkeypatch):
-    """Item 5: Stop's unload reached llama-swap before P6 registered the load, so the load
-    finished; the model is put away again even when put-back would leave it."""
+    """Item 5: Stop's cancel reached llama-swap before P6 registered the load, so the load
+    finished; the model is put away again (P7 if-idle) even when put-back would leave it."""
     env = make(tmp_path, monkeypatch)
 
     def stop_too_early(model_id):
-        env.switcher.loading = None  # the swap is not registered yet: the unload cancels nothing
+        env.switcher.loading = None  # the swap is not registered yet: the cancel ends nothing
         env.runner.stop()
 
     env.switcher.on_load = stop_too_early
     job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b"}], "putBack": False})
     assert job["status"] == "stopped" and env.switcher.states == {}
-    assert env.switcher.calls == [("load", "fable-27b"), ("unload", "fable-27b"), ("unload", "fable-27b")]
+    assert env.switcher.calls == [("load", "fable-27b"), ("unload", "fable-27b")]
 
 
 def test_stop_during_the_hash_wait_is_stopped_not_failed(tmp_path, monkeypatch):

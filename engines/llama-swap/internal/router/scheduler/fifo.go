@@ -100,6 +100,16 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 		return
 	}
 
+	// FreeToken patch P8: an if-free request never preempts. The check runs
+	// here, on the run loop, before admission, so nothing can start between it
+	// and the decision below.
+	if req.IfFree {
+		if other := s.otherActivity(req.Model); other != "" {
+			s.rejectAdmission(req, NotFreeError{Model: req.Model, Other: other})
+			return
+		}
+	}
+
 	if !s.admit(req) {
 		return
 	}
@@ -346,8 +356,50 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 // request for modelID: one being served (inFlight), or one admitted and
 // waiting in the queue or on a swap (reserved), or a swap to it in progress
 // (active). Runs on the run loop like every other FIFO method.
+//
+// FreeToken patch P8: a swap whose waiters have all gone (a P6 load whose
+// caller cancelled it) holds nobody, so it no longer counts: an if-idle unload
+// may stop it. Every live waiter is also counted in reserved.
 func (s *FIFO) Busy(modelID string) bool {
-	return s.inFlight[modelID] > 0 || s.reserved[modelID] > 0 || s.active[modelID] != nil
+	if s.inFlight[modelID] > 0 || s.reserved[modelID] > 0 {
+		return true
+	}
+	sw := s.active[modelID]
+	return sw != nil && len(sw.waiters) > 0
+}
+
+// FreeToken patch P8: otherActivity names a model other than target that is
+// running (starting, ready or stopping), being swapped in (including a swap
+// parked in the memory gate, which has no process state yet), queued, or
+// holding requests; "" when there is none. Sorted, so the answer is stable.
+func (s *FIFO) otherActivity(target string) string {
+	var others []string
+	for id := range s.effects.RunningModels() {
+		others = append(others, id)
+	}
+	for id := range s.active {
+		others = append(others, id)
+	}
+	for id, n := range s.reserved {
+		if n > 0 {
+			others = append(others, id)
+		}
+	}
+	for id, n := range s.inFlight {
+		if n > 0 {
+			others = append(others, id)
+		}
+	}
+	for _, q := range s.queued {
+		others = append(others, q.Model)
+	}
+	sort.Strings(others)
+	for _, id := range others {
+		if id != target {
+			return id
+		}
+	}
+	return ""
 }
 
 // OnShutdown grants err to every waiter still held by the scheduler.

@@ -29,7 +29,7 @@ commit above, copy only the wanted change, re-run the tests, and add a line belo
   ctx.Err() without starting when its ctx is already cancelled at the start decision, as
   ProcessCommand's run loop now does. It also gained optional `ensureGate`/`ensureExit` hooks, which
   are nil in upstream tests.
-- P5, P6, P7: none; upstream router and server tests pass unchanged.
+- P5, P6, P7, P8: none; upstream router and server tests pass unchanged.
 
 ## Our patches
 
@@ -44,6 +44,7 @@ Every changed spot carries a `// FreeToken patch Pn:` comment.
 | P5 | selective reload, part 2: a config reload reconfigures the local router in place (unchanged entries keep their process and requests; changed/removed ones are stopped via OnUnload; matrix or router-kind changes rebuild as upstream) through `server.Rebuild`; the retired Server shuts down everything but the kept router (`ShutdownExceptLocal`); a stale plan is refused (`ErrStaleReconfigure`); reloads coalesce instead of being dropped; `--check-config` (= `-validate`); `GET /api/config/hash` | llama-swap.go, freetoken_reload.go, internal/router/{base.go,reconfigure.go}, internal/server/{server.go,freetoken_api.go} |
 | P6 | `POST /api/models/load/{model}`: load through the scheduler (P1/P2 apply), answer when ready or failed (200 `{"model","state":"ready"}`, 409 model_superseded, 503 not_enough_memory, 404 unknown or not local) | internal/router/load.go, internal/server/{server.go,freetoken_api.go} |
 | P7 | unload only if idle: `POST /api/models/unload/{model}?ifIdle=1` stops the model only when the scheduler holds no request for it (in flight, queued, waiting on a swap, or a swap to it running), else 409 code `busy` and nothing stops; the check and the stop run in one run-loop step, atomic with admission; a request still before the run loop is not seen (it reloads the model after the stop instead of being killed); a router without the check answers 501; plain unload unchanged | internal/router/{unload_idle.go,base.go}, internal/router/scheduler/fifo.go, internal/server/apigroup.go |
+| P8 | `POST /api/models/load/{model}?ifFree=1`: load only when nothing else is on the card or on its way there; refused at admission on the run loop (409 code `busy`, nothing admitted or cancelled) when another model is running, being swapped in (a swap parked in the memory gate counts, though it has no process state yet), queued or holding requests; the target itself does not count; a router without it answers 501. P7's `Busy` no longer counts a swap whose waiters have all gone (a P6 load whose caller cancelled), so an if-idle unload can stop it | internal/router/load.go, internal/router/scheduler/{scheduler.go,fifo.go,if_free.go}, internal/server/freetoken_api.go |
 
 Notes (final review fixes, 2026-09-24):
 

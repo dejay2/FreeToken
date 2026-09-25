@@ -140,11 +140,32 @@ class FakeChat:
 
 class FakeProbe:
     """busy: models llama-swap's P7 if-idle unload refuses (a request it holds that the
-    in-flight read did not show). on_inflight runs on every in-flight read."""
+    in-flight read did not show). not_free: models whose P8 if-free load is refused (another
+    app is loading or using a model). on_inflight runs on every in-flight read. cancel_load
+    ends the switcher's current load like the real socket shutdown (sticky until reset_load)."""
 
     def __init__(self, switcher=None) -> None:
         self.rows, self.used, self.unknown = [], {}, False
         self.switcher, self.busy, self.on_inflight = switcher, set(), None
+        self.not_free, self.load_cancelled, self.load_sessions = set(), False, []
+
+    def load_if_free(self, model_id, session=""):
+        self.load_sessions.append(session)
+        if self.load_cancelled:
+            raise SwitcherError(0, "cancelled", "the load was stopped")
+        if model_id in self.not_free:
+            self.switcher.calls.append(("not_free", model_id))
+            raise SwitcherError(409, "busy", f"model {model_id} was not loaded because another model is loading or in use")
+        self.switcher.load(model_id)
+
+    def cancel_load(self):
+        self.load_cancelled = True
+        if self.switcher.loading is not None:
+            self.switcher.calls.append(("cancel", self.switcher.loading))
+            self.switcher.cancelled.add(self.switcher.loading)
+
+    def reset_load(self):
+        self.load_cancelled = False
 
     def inflight(self):
         if self.on_inflight is not None:

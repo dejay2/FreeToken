@@ -124,6 +124,10 @@ type HandlerReq struct {
 	Admit      chan error
 	Respond    chan HandlerResp
 	PositionCh chan int
+	// FreeToken patch P8: IfFree refuses the request at admission (NotFreeError,
+	// nothing admitted, nothing cancelled) unless no other model is running,
+	// loading, waiting in the memory gate, queued or holding requests.
+	IfFree bool
 }
 
 // HandlerResp is the routing decision returned to a HandlerReq's caller: either

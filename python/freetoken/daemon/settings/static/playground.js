@@ -79,13 +79,19 @@ function metricText(side, key) {
     default: return stopWords(s.finishReason);
   }
 }
+// Finish reasons of an answer that ran to its end. Only two such answers are compared.
+const PG_COMPLETED = ['stop', 'length', 'tool_calls'];
+function sideCompleted(side) {
+  if (!side || side.error || side.completed === false) return false;
+  return PG_COMPLETED.includes((side.stats || {}).finishReason);
+}
 function betterSide(a, b, key) {
   const metric = PG_METRICS.find((row) => row[0] === key);
   if (!metric || metric[2] == null || !a || !b) return null;
-  // A stopped answer's numbers are not a fair race, and an engine-reported writing speed is not
-  // comparable with one measured from the chunks: no tag for either.
+  // A stopped, failed or cut-off answer's numbers are not a fair race, and an engine-reported
+  // writing speed is not comparable with one measured from the chunks: no tag for either.
+  if (!sideCompleted(a) || !sideCompleted(b)) return null;
   const sa = a.stats || {}; const sb = b.stats || {};
-  if (sa.finishReason === 'cancelled' || sb.finishReason === 'cancelled') return null;
   if (key === 'writeTps' && sa.writeSource !== sb.writeSource) return null;
   const rawA = metricValue(a, key); const rawB = metricValue(b, key);
   if (rawA == null || rawB == null) return null;
@@ -132,7 +138,8 @@ function historyRecord(job) {
   return { id: job.id, at: job.startedAt, prompt: job.prompt, system: job.system || '', status: job.status,
     message: job.message || '', restore: job.restore || '',
     sides: (job.sides || []).map((s) => ({ key: s.key, model: s.model, name: s.name, preset: s.preset || null,
-      settingsLabel: s.settingsLabel, sampling: s.sampling, loadMs: s.loadMs, stats: s.stats, error: s.error || null,
+      settingsLabel: s.settingsLabel, sampling: s.sampling, loadMs: s.loadMs, loadFailed: !!s.loadFailed,
+      completed: !!s.completed, stats: s.stats, error: s.error || null,
       answer: cut(s.answer), reasoning: cut(s.reasoning) })) };
 }
 function historyAdd(list, record, max = PG_HISTORY_MAX) { return [record, ...(list || []).filter((row) => row.id !== record.id)].slice(0, max); }

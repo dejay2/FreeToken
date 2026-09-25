@@ -102,7 +102,18 @@ func (s *Server) handleAPILoadModel(w http.ResponseWriter, r *http.Request) {
 		swaputil.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
 		return
 	}
-	if err := loader.Load(r.Context(), realName); err != nil {
+	load := loader.Load
+	// FreeToken patch P8: ?ifFree=1 loads only when nothing else is on the card
+	// or on its way there (409 code "busy" otherwise, nothing cancelled).
+	if r.URL.Query().Get("ifFree") == "1" {
+		free, ok := s.local.(router.FreeLoader)
+		if !ok {
+			swaputil.SendResponse(w, r, http.StatusNotImplemented, "this router cannot load only if free")
+			return
+		}
+		load = free.LoadIfFree
+	}
+	if err := load(r.Context(), realName); err != nil {
 		swaputil.SendError(w, r, err)
 		return
 	}

@@ -50,8 +50,9 @@ assert.equal(p.tokensWords(12, true), '~12 tokens');
 def test_better_tag_needs_a_real_difference():
     _node(r"""
 const a = {key: 'A', loadMs: 20000, stats: {firstWordMs: 400, writeTps: 40, writeSource: 'engine', totalMs: 12000,
-  guesses: {keptPct: 71, kept: 1, proposed: 1}}};
-const b = {key: 'B', loadMs: null, stats: {firstWordMs: 410, writeTps: 30, writeSource: 'engine', totalMs: 16000, guesses: null}};
+  guesses: {keptPct: 71, kept: 1, proposed: 1}, finishReason: 'stop'}};
+const b = {key: 'B', loadMs: null, stats: {firstWordMs: 410, writeTps: 30, writeSource: 'engine', totalMs: 16000, guesses: null,
+  finishReason: 'length'}};
 assert.equal(p.betterSide(a, b, 'writeTps'), 'A');
 assert.equal(p.betterSide(a, b, 'totalMs'), 'A');
 assert.equal(p.betterSide(a, b, 'firstWordMs'), null);   // 2.4% apart: no tag
