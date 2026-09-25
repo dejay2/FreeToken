@@ -160,6 +160,48 @@ def test_exl3_bytes_match_engine_formula():
         "exl3", 2560, 640, SimpleNamespace(exl3_expert_k=3))
 
 
+def test_exl3_garbled_bits_gives_an_unknown_size_not_a_crash(tmp_path):
+    """Fix round 1, Critical: int(float(None)) used to raise uncaught out of describe_config
+    (and therefore out of read_model), breaking panel._model_limit_errors' all-models loop for
+    every model on the page over one bad EXL3 entry. None/non-numeric/out-of-range bits must
+    leave the estimate unknown instead of guessing K=2."""
+    base = {"architectures": ["Qwen4ExpForConditionalGeneration"],
+            "text_config": {"hidden_size": 2560, "moe_intermediate_size": 640, "num_experts": 512,
+                             "num_hidden_layers": 48, "num_experts_per_tok": 10}}
+    for bad_bits in (None, "unknown", 12.5):
+        cfg = {**base, "quantization_config": {"quant_method": "exl3", "bits": bad_bits}}
+        info = model_info.describe_config(cfg, "q")
+        assert info.expert_format == "exl3"
+        assert info.expert_format_label == "EXL3 (unknown bits)"
+        assert info.bytes_per_expert is None
+        assert info.bytes_per_layer is None
+        assert info.total_expert_bytes is None
+        assert "exl3_expert_k" not in info.extra
+        assert "exl3_bits_error" in info.extra
+
+
+def test_a_garbled_exl3_model_does_not_break_reading_the_others(tmp_path):
+    """The shape of panel._model_limit_errors' loop: read_model() over several registered
+    models, one of which has a garbled EXL3 bits value, must not raise and must still size the
+    healthy models correctly."""
+    garbled = tmp_path / "Garbled-EXL3"
+    garbled.mkdir()
+    (garbled / "config.json").write_text(json.dumps({
+        "architectures": ["Qwen4ExpForConditionalGeneration"],
+        "quantization_config": {"quant_method": "exl3", "bits": None},
+        "text_config": {"hidden_size": 2560, "moe_intermediate_size": 640, "num_experts": 512,
+                        "num_hidden_layers": 48, "num_experts_per_tok": 10},
+    }), encoding="utf-8")
+    (garbled / "model.safetensors").write_bytes(struct.pack("<Q", 2) + b"{}")
+
+    nvfp4 = _qwen_like(tmp_path / "Qwen-Like")
+
+    infos = [read_model(str(folder)) for folder in (garbled, nvfp4)]
+
+    assert infos[0].found and infos[0].expert_format == "exl3" and infos[0].bytes_per_expert is None
+    assert infos[1].found and infos[1].expert_format == "nvfp4" and infos[1].bytes_per_expert == 2_772_480
+
+
 def test_ple_bytes_skips_the_unconverted_exl3_trellis_table():
     """turboderp's ngram_embedding.safetensors is not FreeToken's PLE table; only the converted
     freetoken-ple-*.safetensors shards (no such metadata marker) should be counted."""

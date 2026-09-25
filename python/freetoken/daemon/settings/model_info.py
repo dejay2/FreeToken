@@ -163,6 +163,25 @@ def expert_bytes(fmt: str, H: int, I: int, *, k: int = 2) -> int:
     return int(BYTES_PER_EXPERT[fmt](H, I))
 
 
+def _exl3_expert_k(quant: dict[str, Any]) -> int | None:
+    """The routed-expert code width K from a checkpoint's ``bits`` (bpw) figure.
+
+    Returns ``None`` when ``bits`` is missing, null, non-numeric, or gives a K outside a sane
+    1..8 range -- a garbled value must size the estimate as unknown rather than silently guess
+    K=2 (fix round 1, Critical: ``int(float(None))`` used to raise uncaught here and propagate
+    out of ``read_model`` into ``panel._model_limit_errors``' all-models loop, breaking registry
+    save/validate for every model on the page over one bad EXL3 entry).
+    """
+    bits = quant.get("bits", 2)
+    try:
+        k = int(float(bits))
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= k <= 8:
+        return None
+    return k
+
+
 @dataclass
 class ModelInfo:
     path: str
@@ -308,11 +327,18 @@ def describe_config(
             quant = quant if isinstance(quant, dict) else {}
             # bits is a per-checkpoint bpw figure (e.g. 3.05 for Qwen Flash, 2.05 for GLM-5.3);
             # the routed-expert code width K is its integer part.
-            k = int(float(quant.get("bits", 2)))
-            info.extra["exl3_expert_k"] = k
-            info.expert_format_label = f"EXL3 ({k}-bit experts)"
-            if info.hidden_size and info.moe_intermediate_size:
-                info.bytes_per_expert = expert_bytes(fmt, info.hidden_size, info.moe_intermediate_size, k=k)
+            k = _exl3_expert_k(quant)
+            if k is None:
+                info.expert_format_label = "EXL3 (unknown bits)"
+                info.extra["exl3_bits_error"] = (
+                    f"quantization_config.bits = {quant.get('bits')!r} is not a usable EXL3 K "
+                    "(1..8); the expert size is unknown."
+                )
+            else:
+                info.extra["exl3_expert_k"] = k
+                info.expert_format_label = f"EXL3 ({k}-bit experts)"
+                if info.hidden_size and info.moe_intermediate_size:
+                    info.bytes_per_expert = expert_bytes(fmt, info.hidden_size, info.moe_intermediate_size, k=k)
         else:
             info.expert_format_label = FORMAT_LABELS.get(fmt, fmt or "unknown")
             if fmt in BYTES_PER_EXPERT and info.hidden_size and info.moe_intermediate_size:
