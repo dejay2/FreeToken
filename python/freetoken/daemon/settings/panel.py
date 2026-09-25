@@ -94,6 +94,8 @@ STALE_GRACE_S = 10.0
 # A failed restart stays on the Right-now strip this long, or until the next save/load/unload.
 RESTART_SHOWN_S = 600.0
 RESTART_STALE_MESSAGE = "The switcher didn't pick up the new settings; the old ones are still in use. Check the switcher log."
+TEST_RUNNING_MESSAGE = "A test is running on the Test tab. Wait for it to finish, or stop it there."
+TEST_MARKER = "playground-test.json"
 
 IDENTITY_GROUP = "This model"
 IDENTITY_DIALS: tuple[Dial, ...] = (
@@ -337,6 +339,13 @@ class PanelService:
         self.last_restart: dict[str, Any] | None = None
         self._last_restart_at: float | None = None
         self._last_write: float | None = None
+        # Test tab (part 3). The overlay is what the switcher and FreeToken's adapter see during
+        # a test: the test model on one preset alone. It lives in memory and is never written to
+        # the registry; the marker lets a restarted helper find a model left on test settings.
+        self.test_running = False
+        self.test_settings: dict[str, Any] | None = None
+        self.test_leftover: dict[str, Any] | None = None
+        self.test_marker_path = self.holds_path.with_name(TEST_MARKER)
 
     # ---- small helpers ----
     def _ask(self) -> tuple[list[str] | None, bool]:
@@ -439,6 +448,7 @@ class PanelService:
         if when_loaded not in (None, "restart", "next-time"):
             raise RegistryValidationError([{"field": "whenLoaded", "message": "Choose restart or next-time."}])
         with self._lock:
+            self._guard_test()
             current, current_revision = self.store.load()
             if revision != current_revision:
                 raise StaleRevision("The model list was changed somewhere else.")
@@ -549,6 +559,7 @@ class PanelService:
         the file's entry; the hold watcher writes the new entry once it unloads. This also
         mends a crash between store.save and the holds write in _save. A loaded model whose
         entry cannot be found (the file was not written by the panel) is refused instead."""
+        doc = self._for_switcher(doc)
         known, down = state if state is not None else self._ask()
         holds = self._live_holds(known, down)
         old_text = self.writer.current_text()
@@ -589,13 +600,9 @@ class PanelService:
         # Bounded wait (Task 7 review): if the switcher's rebuild fails for a reason
         # --check-config misses, its hash never changes; loading then would start the model on
         # the old settings, so give up with a plain message instead.
-        expected = config_sha256(text)
-        deadline = self._clock() + self.restart_wait_s
-        while self.switcher.config_hash() != expected:
-            if self._clock() >= deadline:
-                self._restart_done(model_ids, False, RESTART_STALE_MESSAGE)
-                return
-            self._sleep(0.5)
+        if not self.wait_for_switcher(text):
+            self._restart_done(model_ids, False, RESTART_STALE_MESSAGE)
+            return
         for model_id in model_ids:
             try:
                 self.switcher.load(model_id)
@@ -619,6 +626,7 @@ class PanelService:
 
     def import_live(self, when_loaded: str | None = None) -> dict[str, Any]:
         with self._lock:
+            self._guard_test()
             if self.store.exists():
                 raise ImportRefused("The control panel already has its model list. Restore a backup to go back.")
             text = self.writer.current_text()
@@ -673,6 +681,7 @@ class PanelService:
         the registry and swap the file in: a refusal now changes nothing, where before the
         registry was already restored when the switcher refused the file (final review)."""
         with self._lock:
+            self._guard_test()
             doc = self.store.read_backup(name)
             text, holds = self._plan_rewrite(doc)
             staged = self.writer.check(text) if text != self.writer.current_text() else None
@@ -935,9 +944,20 @@ class PanelService:
         last = self.last_restart
         if last is not None and self._last_restart_at is not None and self._clock() - self._last_restart_at >= RESTART_SHOWN_S:
             last = None
+        # Test tab: a leftover (model still on test settings) is shown until it unloads.
+        loaded_now = {row["id"] for row in rows if row["state"] in LOADED_STATES}
+        leftover = self.test_leftover
+        if leftover is not None and up and leftover["model"] not in loaded_now:
+            self.test_leftover = leftover = None
+        test = None
+        if self.test_running:
+            overlay = self.test_settings or {}
+            test = {"running": True, "model": overlay.get("model"),
+                    "name": names.get(overlay.get("model"), overlay.get("model")), "preset": overlay.get("preset")}
         return {"switcher": {"up": up, "running": rows, "stale": up and self._switcher_stale()},
                 "card": self._card_probe(), "windowsFreeBytes": self._windows_free(), "cushionGB": floor,
-                "held": sorted(self._read_holds()), "lastRestart": last}
+                "held": sorted(self._read_holds()), "lastRestart": last, "test": test,
+                "testLeftover": None if leftover is None else {**leftover, "name": names.get(leftover["model"], leftover["model"])}}
 
     def models(self) -> dict[str, Any]:
         doc, revision = self.store.load()
@@ -960,6 +980,7 @@ class PanelService:
         return {"revision": revision, "switcherUp": up, "models": rows}
 
     def load(self, model_id: str) -> dict[str, Any]:
+        self._guard_test()
         doc, _ = self.store.load()
         find_model(doc, model_id)
         try:
@@ -972,6 +993,7 @@ class PanelService:
         return {"id": model_id, "state": "ready"}
 
     def unload(self, model_id: str) -> dict[str, Any]:
+        self._guard_test()
         doc, _ = self.store.load()
         find_model(doc, model_id)
         if not self.switcher.unload(model_id):
@@ -981,6 +1003,7 @@ class PanelService:
 
     def effective(self, model_id: str) -> dict[str, Any]:
         doc, _ = self.store.load()
+        doc = self._for_switcher(doc)  # the FreeToken adapter reads the test settings during a test
         model = find_model(doc, model_id)
         if model["engine"] != "freetoken":
             raise PanelError(409, "not_freetoken", f"{model_id} is not a FreeToken model.")
@@ -1285,6 +1308,106 @@ class PanelService:
         # Pi (slow /mnt/c) after the lock is released, like add_model.
         result["pi"] = self._run_pi(pi)
         return result
+
+    # ---- test tab (part 3) ----
+    def _guard_test(self) -> None:
+        if self.test_running:
+            raise PanelError(409, "test_running", TEST_RUNNING_MESSAGE)
+
+    def begin_test(self) -> None:
+        with self._lock:
+            self._guard_test()
+            self.test_running = True
+            self.test_leftover = None
+
+    def end_test(self) -> None:
+        with self._lock:
+            self.test_running = False
+
+    def held_models(self) -> list[str]:
+        return sorted(self._read_holds())
+
+    def _for_switcher(self, doc: Mapping[str, Any]) -> Mapping[str, Any]:
+        """doc as the switcher and the FreeToken adapter should see it: during a test the test
+        model runs the chosen preset alone, without the model's own overrides (a preset is a
+        full snapshot of the settings it was saved from, see preset_action "add")."""
+        test = self.test_settings
+        if not test:
+            return doc
+        out = copy.deepcopy(dict(doc))
+        try:
+            model = find_model(out, test["model"])
+        except KeyError:
+            return doc
+        model["activePreset"], model["overrides"] = test["preset"], {}
+        return out
+
+    def test_preset_key(self, model_id: str, preset: str | None) -> str | None:
+        """preset, or None when running it would give exactly the saved settings (same switcher
+        entry and, for FreeToken, the same profile settings), so no restart is needed."""
+        if not preset:
+            return None
+        doc, _ = self.store.load()
+        model = find_model(doc, model_id)
+        trial = copy.deepcopy(doc)
+        tried = find_model(trial, model_id)
+        tried["activePreset"], tried["overrides"] = preset, {}
+        same_entry = (extract_model_blocks(render_config(doc, {})).get(model_id)
+                      == extract_model_blocks(render_config(trial, {})).get(model_id))
+        same_profile = model["engine"] != "freetoken" or \
+            freetoken_profile_settings(doc, model) == freetoken_profile_settings(trial, tried)
+        return None if same_entry and same_profile else preset
+
+    def set_test_settings(self, model_id: str | None, preset: str | None) -> str:
+        """Point the switcher at the test settings, or clear them (model_id or preset None), and
+        return the text now in the file. Never writes the registry. The marker is written
+        before the file when setting, and removed after the file when clearing, so a crash in
+        between always leaves a marker for recover()."""
+        with self._lock:
+            doc, _ = self.store.load()
+            if model_id is not None and preset:
+                if preset not in (find_model(doc, model_id).get("presets") or {}):
+                    raise KeyError(preset)
+                self.test_settings = {"model": model_id, "preset": preset}
+                self._write_test_marker()
+            else:
+                self.test_settings = None
+            text, holds = self._plan_rewrite(doc)
+            if self.writer.write(text):
+                self._mark_written()
+            self._write_holds(holds)
+            if self.test_settings is None:
+                self.clear_test_marker()
+            return text
+
+    def _write_test_marker(self) -> None:
+        self.test_marker_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.test_marker_path.with_name(self.test_marker_path.name + ".tmp")
+        temporary.write_text(json.dumps({**(self.test_settings or {}), "at": _now_iso()}) + "\n", encoding="utf-8")
+        os.replace(temporary, self.test_marker_path)
+
+    def read_test_marker(self) -> dict[str, Any] | None:
+        try:
+            data = json.loads(self.test_marker_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) and data.get("model") else None
+
+    def clear_test_marker(self) -> None:
+        self.test_marker_path.unlink(missing_ok=True)
+
+    def note_test_leftover(self, model_id: str, preset: str | None) -> None:
+        self.test_leftover = {"model": model_id, "preset": preset}
+
+    def wait_for_switcher(self, text: str) -> bool:
+        """True once the switcher reports text's hash (P5); False after restart_wait_s."""
+        expected = config_sha256(text)
+        deadline = self._clock() + self.restart_wait_s
+        while self.switcher.config_hash() != expected:
+            if self._clock() >= deadline:
+                return False
+            self._sleep(0.5)
+        return True
 
     # ---- holds and start-up ----
     def release_finished_holds(self) -> list[str]:
