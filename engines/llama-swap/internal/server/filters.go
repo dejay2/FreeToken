@@ -152,6 +152,12 @@ func applyFilters(body []byte, requested, useModelName string, f config.Filters)
 		}
 		b := clampBounds[key]
 		x := v.Float()
+		// A JSON number cannot be NaN; an out-of-range literal (1e999) parses
+		// to +-Inf and is clamped like any other value. NaN is skipped so
+		// it can never reach the int64 conversion below.
+		if math.IsNaN(x) {
+			continue
+		}
 		var bound float64
 		switch {
 		case x < b[0]:
@@ -162,7 +168,7 @@ func applyFilters(body []byte, requested, useModelName string, f config.Filters)
 			continue
 		}
 		var out any = bound
-		if bound == math.Trunc(bound) {
+		if !math.IsInf(bound, 0) && bound == math.Trunc(bound) {
 			out = int64(bound)
 		}
 		if body, err = sjson.SetBytes(body, key, out); err != nil {

@@ -1,6 +1,8 @@
 package config
 
 import (
+	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -143,7 +145,9 @@ func sanitizeParams(raw map[string]any) (map[string]any, []string, map[string]bo
 
 // FreeToken patch P4: SanitizedClampParams returns the clamp keys in sorted
 // order and their [min, max] bounds, dropping protected params, entries that
-// are not exactly two numbers, and inverted ranges.
+// are not exactly two numbers, NaN bounds and inverted ranges. Config load
+// refuses all of those (ValidateClampParams); this is the second line for
+// Filters built in code.
 func (f Filters) SanitizedClampParams() ([]string, map[string][2]float64) {
 	if len(f.ClampParams) == 0 {
 		return nil, nil
@@ -152,7 +156,7 @@ func (f Filters) SanitizedClampParams() ([]string, map[string][2]float64) {
 	keys := make([]string, 0, len(f.ClampParams))
 	for key, pair := range f.ClampParams {
 		key = strings.TrimSpace(key)
-		if key == "" || slices.Contains(ProtectedParams, key) || len(pair) != 2 || pair[0] > pair[1] {
+		if clampEntryProblem(key, pair) != "" {
 			continue
 		}
 		bounds[key] = [2]float64{pair[0], pair[1]}
@@ -163,4 +167,44 @@ func (f Filters) SanitizedClampParams() ([]string, map[string][2]float64) {
 	}
 	sort.Strings(keys)
 	return keys, bounds
+}
+
+// FreeToken patch P4: ValidateClampParams refuses clampParams entries the
+// filter would otherwise drop without a word: an empty or protected key, not
+// exactly two numbers, a NaN bound (YAML .nan; every comparison with NaN is
+// false, so it clamped nothing), or min > max. Infinite bounds (.inf/-.inf)
+// are allowed and mean "no limit on that side". Keys are not checked against
+// a list of known request parameters: like setParams and stripParams, a key
+// is any gjson path the upstream may accept (e.g. chat_template_kwargs.x),
+// and the control panel generates ours from its NInfer dial table.
+func (f Filters) ValidateClampParams() error {
+	keys := make([]string, 0, len(f.ClampParams))
+	for key := range f.ClampParams {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if problem := clampEntryProblem(strings.TrimSpace(key), f.ClampParams[key]); problem != "" {
+			return fmt.Errorf("clampParams %q: %s", key, problem)
+		}
+	}
+	return nil
+}
+
+// FreeToken patch P4: clampEntryProblem says why one clampParams entry is
+// unusable, or "" when it is fine.
+func clampEntryProblem(key string, pair []float64) string {
+	switch {
+	case key == "":
+		return "empty parameter name"
+	case slices.Contains(ProtectedParams, key):
+		return "protected parameter cannot be clamped"
+	case len(pair) != 2:
+		return fmt.Sprintf("want [min, max], got %d numbers", len(pair))
+	case math.IsNaN(pair[0]) || math.IsNaN(pair[1]):
+		return "bound is NaN"
+	case pair[0] > pair[1]:
+		return fmt.Sprintf("min %v is above max %v", pair[0], pair[1])
+	}
+	return ""
 }

@@ -4,7 +4,9 @@ package router
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -220,4 +222,91 @@ func TestBase_MemGate_UnloadThenPickOtherOnlyOtherRuns(t *testing.T) {
 	if got := pb.State(); got != process.StateReady {
 		t.Errorf("b state=%s want ready", got)
 	}
+}
+
+// FreeToken patch P2: a request that fails in or after the memory gate (503
+// from the gate, a failed start, or a client that gives up while parked in
+// the gate) must hand back its concurrency reservation. With
+// concurrencyLimit 1 a leaked reservation turns the next request into an
+// instant 429, so the second request below reaching 200 proves the release.
+func TestBase_MemGate_ReservationReleased(t *testing.T) {
+	newGated := func(t *testing.T, wait time.Duration) (*Group, *fakeProcess, *atomic.Bool, chan struct{}) {
+		a := newFakeProcess("a")
+		conf := config.Config{
+			HealthCheckTimeout: 5,
+			Routing: groupRouting(map[string]config.GroupConfig{
+				"g": {Swap: true, Members: []string{"a"}},
+			}),
+			Models: map[string]config.ModelConfig{"a": {RamNeedGB: 60, ConcurrencyLimit: 1}},
+		}
+		g := newTestGroup(t, conf, map[string]process.Process{"a": a})
+		room := &atomic.Bool{}
+		probe, called := gatedProbe(room)
+		g.memGate = &memgate.Gate{Probe: probe, FloorGB: 6, Wait: wait, Poll: 5 * time.Millisecond}
+		return g, a, room, called
+	}
+	secondSucceeds := func(t *testing.T, g *Group, a *fakeProcess, room *atomic.Bool) {
+		t.Helper()
+		room.Store(true)
+		w, done := serveAsync(g, "a")
+		select {
+		case <-a.runStarted:
+			a.markReady()
+		case <-done: // answered without a start: the 429 of a leaked reservation
+		case <-time.After(5 * time.Second):
+			t.Fatal("second request neither started a nor answered")
+		}
+		waitSignal(t, done, "second request")
+		if w.Code != http.StatusOK {
+			t.Fatalf("second request: code=%d want 200 (a leaked reservation answers 429) body=%q", w.Code, w.Body.String())
+		}
+	}
+
+	t.Run("gate refuses with 503", func(t *testing.T) {
+		g, a, room, _ := newGated(t, 30*time.Millisecond)
+		w, done := serveAsync(g, "a")
+		waitProcessed(t, g.testProcessed, 1)
+		waitSignal(t, done, "first request")
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("first request: code=%d want 503", w.Code)
+		}
+		waitProcessed(t, g.testProcessed, 1) // its SwapDone
+		secondSucceeds(t, g, a, room)
+	})
+
+	t.Run("start fails after the gate", func(t *testing.T) {
+		g, a, room, _ := newGated(t, time.Hour)
+		room.Store(true)
+		a.mu.Lock()
+		a.ensureErr = errors.New("boom")
+		a.mu.Unlock()
+		w, done := serveAsync(g, "a")
+		waitProcessed(t, g.testProcessed, 1)
+		waitSignal(t, done, "first request")
+		if w.Code == http.StatusOK {
+			t.Fatalf("first request: code=200, want the start error")
+		}
+		waitProcessed(t, g.testProcessed, 1) // its SwapDone
+		a.mu.Lock()
+		a.ensureErr = nil
+		a.mu.Unlock()
+		secondSucceeds(t, g, a, room)
+	})
+
+	t.Run("client cancels while parked in the gate", func(t *testing.T) {
+		g, a, room, called := newGated(t, time.Hour)
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+		go func() {
+			g.ServeHTTP(httptest.NewRecorder(), newRequestCtx(ctx, "a"))
+			close(done)
+		}()
+		waitProcessed(t, g.testProcessed, 1)
+		waitSignal(t, called, "memory gate probe")
+		cancel()
+		waitSignal(t, done, "cancelled request")
+		waitProcessed(t, g.testProcessed, 1) // OnCancel
+		// The parked swap is still in flight; the second request joins it.
+		secondSucceeds(t, g, a, room)
+	})
 }

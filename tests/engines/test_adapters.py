@@ -302,3 +302,67 @@ def test_freetoken_profile_refuses_a_model_the_panel_does_not_know(helper, tmp_p
                        env=env_for(helper, tmp_path), capture_output=True, text=True, timeout=30)
     assert r.returncode != 0 and "does not know" in r.stderr
     assert "POST /api/server/start" not in helper.calls
+
+
+def _stray(tmp_path, name: str, body: str) -> Path:
+    """A script whose process name (comm) is ``name``: ``#!/bin/bash`` keeps the script's own
+    basename as comm, where ``#!/usr/bin/env bash`` would turn it into "bash"."""
+    p = tmp_path / name
+    p.write_text("#!/bin/bash\n" + body)
+    p.chmod(0o755)
+    return p
+
+
+def _pgrep(name: str) -> bool:
+    return subprocess.run(["pgrep", "-x", name], capture_output=True).returncode == 0
+
+
+def _wait_for(pred, seconds: float = 5.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.05)
+    return pred()
+
+
+def test_ninfer_kills_a_stray_that_ignores_term_then_starts(helper, tmp_path):
+    name = f"fnt{os.getpid() % 1000000}"  # pgrep -x matches comm, which is cut at 15 chars
+    stray = _stray(tmp_path, name, "trap '' TERM\nwhile :; do sleep 0.1; done\n")
+    # Detached (the launching shell exits), so once killed it is reaped by init, not left
+    # as a zombie of this test that pgrep would still see.
+    subprocess.run(["bash", "-c", f"setsid {stray} >/dev/null 2>&1 &"], check=True)
+    assert _wait_for(lambda: _pgrep(name)), "stray did not start"
+    eng = fake_engine(tmp_path)
+    env = env_for(helper, tmp_path) | {"NINFER_PROCESS_NAME": name, "NINFER_TERM_WAIT": "1"}
+    proc = subprocess.Popen([ADAPTERS / "ninfer.sh", eng, "/a.ninfer", "quasar-27b"], env=env,
+                            stderr=subprocess.PIPE, text=True)
+    try:
+        assert _wait_for(lambda: (tmp_path / "argv").exists(), 20), "runtime was not started after the KILL"
+        assert not _pgrep(name), "the TERM-ignoring stray must be gone"
+    finally:
+        subprocess.run(["pkill", "-KILL", "-x", name])
+        proc.terminate()
+        _, err = proc.communicate(timeout=5)
+    assert f"stopping a {name} started outside llama-swap" in err
+    assert "refusing" not in err
+
+
+def test_ninfer_refuses_when_a_stray_survives_kill(helper, tmp_path):
+    name = f"fnz{os.getpid() % 1000000}"
+    # A zombie: it has exited, but this test (its parent) has not reaped it, so it keeps its
+    # name in the process table and no TERM or KILL removes it. That is the "would not stop"
+    # case the adapter must refuse on rather than start a second NInfer beside it.
+    zombie = subprocess.Popen([_stray(tmp_path, name, "exit 0\n")])
+    try:
+        assert _wait_for(lambda: _pgrep(name)), "zombie not visible to pgrep"
+        time.sleep(0.2)
+        eng = fake_engine(tmp_path)
+        env = env_for(helper, tmp_path) | {"NINFER_PROCESS_NAME": name, "NINFER_TERM_WAIT": "1"}
+        r = subprocess.run([ADAPTERS / "ninfer.sh", eng, "/a.ninfer", "quasar-27b"], env=env,
+                           capture_output=True, text=True, timeout=30)
+    finally:
+        zombie.wait(5)
+    assert r.returncode != 0
+    assert f"{name} would not stop; refusing" in r.stderr
+    assert not (tmp_path / "argv").exists()

@@ -1,7 +1,9 @@
 package config
 
 import (
+	"math"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -369,16 +371,53 @@ func TestFilters_SanitizedClampParams(t *testing.T) {
 	f := Filters{ClampParams: map[string][]float64{
 		"top_k":       {0, 20},
 		"temperature": {0, 2},
-		"model":       {0, 1}, // protected: dropped
-		"bad_len":     {1},    // not a pair: dropped
-		"inverted":    {5, 1}, // min > max: dropped
+		"model":       {0, 1},           // protected: dropped
+		"bad_len":     {1},              // not a pair: dropped
+		"inverted":    {5, 1},           // min > max: dropped
+		"nan":         {math.NaN(), 1},  // NaN bound: dropped
+		"open":        {1, math.Inf(1)}, // infinite bound: kept
 	}}
 	keys, bounds := f.SanitizedClampParams()
-	want := []string{"temperature", "top_k"}
+	want := []string{"open", "temperature", "top_k"}
 	if !slices.Equal(keys, want) {
 		t.Fatalf("keys=%v want %v", keys, want)
 	}
 	if bounds["top_k"] != [2]float64{0, 20} {
 		t.Errorf("top_k bounds=%v", bounds["top_k"])
+	}
+}
+
+// FreeToken patch P4: config load refuses clampParams entries the filter
+// would drop, and accepts open-ended (infinite) bounds.
+func TestLoadConfig_ClampParamsValidation(t *testing.T) {
+	load := func(entry string) error {
+		_, err := LoadConfigFromReader(strings.NewReader(`
+models:
+  m:
+    cmd: echo hi
+    proxy: http://127.0.0.1:9999
+    filters:
+      clampParams:
+        ` + entry + `
+`))
+		return err
+	}
+	for _, bad := range []string{
+		`top_k: [0, .nan]`,
+		`top_k: [.nan, 1]`,
+		`top_k: [5, 1]`,
+		`top_k: [1]`,
+		`top_k: [1, 2, 3]`,
+		`model: [0, 1]`,
+		`" ": [0, 1]`,
+	} {
+		if err := load(bad); err == nil || !strings.Contains(err.Error(), "clampParams") {
+			t.Errorf("%s: err=%v, want a clampParams error", bad, err)
+		}
+	}
+	for _, good := range []string{`top_k: [0, 20]`, `max_tokens: [1, .inf]`, `x: [-.inf, 0]`, `t: [1, 1]`} {
+		if err := load(good); err != nil {
+			t.Errorf("%s: %v", good, err)
+		}
 	}
 }

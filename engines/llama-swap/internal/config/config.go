@@ -237,9 +237,13 @@ func (c Config) TailcatEnabled() bool {
 // FreeToken patch P2: MemoryGateConfig. Probe "windows" enables the gate
 // (WSL: asks Windows for free RAM); "" or "none" disables it.
 type MemoryGateConfig struct {
-	Probe       string  `yaml:"probe"`
-	FloorGB     float64 `yaml:"floorGB"`     // default 6
-	WaitSeconds int     `yaml:"waitSeconds"` // default 300
+	Probe string `yaml:"probe"`
+	// FloorGB is the cushion kept free after the load. nil (unset) = 6;
+	// an explicit 0 = no cushion (free >= need is enough); negative is
+	// refused at load. It used to be a plain float64 where 0 silently
+	// became 6, so a panel value of 0 did not do what it said.
+	FloorGB     *float64 `yaml:"floorGB"`
+	WaitSeconds int      `yaml:"waitSeconds"` // default 300
 	// HelperURL, when set (e.g. http://127.0.0.1:2031), lets the gate skip
 	// its wait when the FreeToken settings helper reports a server llama-swap
 	// did not start; the adapter stops that server after the gate. "" = off.
@@ -266,6 +270,17 @@ type FifoConfig struct {
 	// FreeToken patch P1: when true (the default), a request for a different
 	// model cancels an in-flight swap whose target has not become ready.
 	LatestWins *bool `yaml:"latestWins"`
+}
+
+// FreeToken patch P2: DefaultFloorGB is the cushion used when floorGB is unset.
+const DefaultFloorGB = 6.0
+
+// FreeToken patch P2: EffectiveFloorGB is floorGB, or DefaultFloorGB when unset.
+func (m MemoryGateConfig) EffectiveFloorGB() float64 {
+	if m.FloorGB == nil {
+		return DefaultFloorGB
+	}
+	return *m.FloorGB
 }
 
 // FreeToken patch P1: LatestWinsEnabled reports the effective latestWins value.
