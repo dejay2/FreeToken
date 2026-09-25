@@ -55,6 +55,16 @@ For reference, NVFP4 Qwen3.8-Flash-Next on the same box measured a warm short-ch
 not a same-day A/B: the EXL3 boots used a smaller KV pool on b4/b5 and the NVFP4 figure is two
 weeks older, so read it as "EXL3 is not slower on short chats", not as a ratio.
 
+## NVFP4 on this branch (b10b, 21:40)
+
+The daily NVFP4 model booted from the branch (d925882) with the daily shape (two chats, graphs
+bs 2, int8 dense, vision, PLE disk, parking, pin budget 62 GB): ready in 62 s, PLE disk still
+`wait-sync`, 8/8 correct, decode 60-68 tok/s after the first answer, picture "Red circle" in
+1.7 s. The first answer after the cold boot ran at 2.1 tok/s (TTFT 7 s) while the slot cache
+warmed, the known cold-boot effect (playground-acceptance-2026-09-25.md saw ~11 tok/s at a
+tighter cushion); not compared against a same-day base boot. MTP was not enabled (it is off in
+the daily profile).
+
 ## MTP (b9)
 
 Depth 2, spec graphs on, PLE mmap: boot 276 s (spec graph capture 141 s; widths 2 and 3 stayed
@@ -73,7 +83,7 @@ Precision gate on sampled rows: median relative RMS 0.0265, p99 0.0308, max 0.03
 
 ## Not measured
 
-- Same-day NVFP4 A/B and the long workloads (8k chat, cold 7k TTFT, warm-turn TTFT).
+- Same-day NVFP4 speed A/B against base and the long workloads (8k chat, cold 7k TTFT, warm-turn TTFT).
 - Two chats at once, and the 262k context at depth.
 - Starting and stopping through the settings page and llama-swap (after merge).
 - Which EXL3 kernel makes the graph launch block the host under wait-sync.
