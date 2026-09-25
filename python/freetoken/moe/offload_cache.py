@@ -835,6 +835,11 @@ class OffloadMoeCache:
         self.id_of_slot = torch.empty((0,), dtype=torch.int32, device=self.device)
         self.usage = torch.empty((0,), dtype=torch.int64, device=self.device)
         self._reset_prefetch()
+        # The disk backend's device staging rows (top_k x batch rows, 28 MB+ on the daily
+        # nvfp4 boot, regrown by big batches) are GPU memory too; the next disk forward
+        # re-creates them lazily. Dropped before empty_cache so the release covers them.
+        self._disk_device_scratch = None
+        self._hit_d2d_fallback_logged = False  # geometry changed, as in rebuild
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
             torch.cuda.empty_cache()
@@ -1559,10 +1564,22 @@ class OffloadMoeCache:
         self.stat_steps_layer[layer_id] += 1
 
     def bytes_per_expert_row(self) -> int:
-        """Exact H2D bytes in one registered expert row across all cache banks."""
+        """Exact H2D bytes in one registered expert row across all cache banks.
+
+        While asleep (:meth:`release_slots` emptied ``bank_caches``) the row cost is still
+        known from the host banks: the same row shape the slot cache is rebuilt from, so the
+        settings page's per-slot cost does not read 0 during a sleep."""
+        if self.bank_caches:
+            return sum(
+                tensor[0].numel() * tensor.element_size()
+                for tensor in self.bank_caches.values()
+            )
+        if not self.bank_sources:
+            return 0
         return sum(
-            tensor[0].numel() * tensor.element_size()
-            for tensor in self.bank_caches.values()
+            per_layer[self._first_streaming_layer][0].numel()
+            * per_layer[self._first_streaming_layer].element_size()
+            for per_layer in self.bank_sources.values()
         )
 
     def actual_h2d_bytes(self) -> int:

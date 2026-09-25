@@ -91,6 +91,22 @@ def test_moe_bytes_per_expert_sums_bank_rows():
     assert ub["kv_bytes_per_token"] == 0
 
 
+def test_moe_bytes_per_expert_from_host_banks_while_asleep():
+    # Sleep (release_slots) empties bank_caches; the host banks still carry the row shape the
+    # cache is rebuilt from, so the per-slot cost stays honest. Layer 0 is GPU-owned here
+    # (its bank is a (1, ...) placeholder of another dtype) and must be skipped.
+    sources = {
+        "gate_up": [torch.empty((1, 4), dtype=torch.float32), torch.empty((64, 512), dtype=torch.bfloat16)],
+        "down": [torch.empty((1, 4), dtype=torch.float32), torch.empty((64, 256), dtype=torch.bfloat16)],
+    }
+    eng = SimpleNamespace(
+        kv_cache=None,
+        moe_offload_cache=SimpleNamespace(bank_caches={}, bank_sources=sources, _first_streaming_layer=1),
+        linear_state_pool=None,
+    )
+    assert compute_cache_unit_bytes(eng)["moe_bytes_per_expert"] == 1024 + 512
+
+
 def test_mamba_bytes_per_slot_from_pool_method():
     eng = SimpleNamespace(
         kv_cache=None,

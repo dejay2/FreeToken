@@ -38,11 +38,15 @@ def helper():
 
 def test_freetoken_adopts_its_own_sleeping_server_without_rebooting(helper, tmp_path):
     helper.state, helper.model_path = "sleeping", "/m/B"
-    proc = subprocess.Popen([ADAPTERS / "freetoken.sh", "/m/B"], env=env_for(helper, tmp_path))
+    proc = subprocess.Popen([ADAPTERS / "freetoken.sh", "/m/B"], env=env_for(helper, tmp_path),
+                            stderr=subprocess.PIPE, text=True)
     time.sleep(1.5)
     assert proc.poll() is None  # still guarding the model, not exited or crashed
     proc.terminate()
     proc.wait(20)
+    err = proc.stderr.read()
+    assert "already sleeping /m/B; adopting it" in err  # M8: the log names the real state
+    assert "already serving" not in err
     assert "POST /api/server/start" not in helper.calls
     # Adopting it must not touch the sleeping server: a Stop is the one thing that would throw
     # away the fast wake. The stop is the SIGTERM's, so exactly one.

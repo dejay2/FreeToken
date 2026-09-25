@@ -468,17 +468,31 @@ class FrontendManager:
         self.stats.on_new_user(uid)
         return uid
 
+    def _gate_wait_s(self, timeout: float) -> float:
+        """How long a chat waits on the shut gate. A wake in flight is a long "rebuild" (the
+        starter waits WAKE_WAIT_S), so a chat that arrives while one runs waits as long as the
+        chat that started it, not the default 120 s (review M2)."""
+        if any(op.get("kind") == "wake" for op in self.maintenance_ops.values()):
+            return max(timeout, WAKE_WAIT_S)
+        return timeout
+
     async def _wait_rebuild_and_allocate(self, timeout: float = 120.0) -> int:
+        wait_s = self._gate_wait_s(timeout)
         try:
-            await asyncio.wait_for(self.rebuild_done.wait(), timeout=timeout)
+            await asyncio.wait_for(self.rebuild_done.wait(), timeout=wait_s)
         except asyncio.TimeoutError as exc:
             raise AdmissionClosedError(
-                f"server unavailable: cache rebuild timed out after {timeout}s"
+                f"server unavailable: cache rebuild timed out after {wait_s}s"
             ) from exc
         if self.maintenance_state in ("loading", "failed", "stopping"):
             raise AdmissionClosedError(
                 f"server unavailable: engine is {self.maintenance_state}"
             )
+        if self.asleep:
+            # The operation waited out was a /v1/sleep (or a wake that did not clear the
+            # flag): the card is gone, so admitting now would hand the chat to a sleeping
+            # scheduler. Wake first (review M1).
+            return await self._wake_and_allocate(timeout)
         return self._allocate_user()
 
     async def ensure_awake(self, timeout: float = WAKE_WAIT_S) -> str | None:
@@ -512,10 +526,11 @@ class FrontendManager:
         box (2026-09-07 18:15) 10 of 55 hammer requests failed during the RAM-axis spills. Only
         loading / failed / stopping (and a wait that outlives ``timeout``) are refusals."""
         if self.maintenance_state == "rebuilding":
+            wait_s = self._gate_wait_s(timeout)
             try:
-                await asyncio.wait_for(self.rebuild_done.wait(), timeout=timeout)
+                await asyncio.wait_for(self.rebuild_done.wait(), timeout=wait_s)
             except asyncio.TimeoutError:
-                return f"server unavailable: cache rebuild timed out after {timeout}s"
+                return f"server unavailable: cache rebuild timed out after {wait_s}s"
         if self.maintenance_state == "serving" and self.asleep:
             # A chat to a sleeping model wakes it (design section 2.5); a refused wake (a game
             # holds the card) is the 503 reason, in words Jay can act on.
@@ -1339,7 +1354,16 @@ async def wake_route(timeout: float = WAKE_WAIT_S):
     reason = await state.wait_until_serving(timeout)
     if reason is None:
         return {"status": "ok", "asleep": False, "woke": was_asleep, **state.sleep_info}
-    return JSONResponse({"status": "rejected", "asleep": state.asleep, "error": reason}, status_code=503)
+    # The status word is the engine's real state when that is what refused (loading / failed /
+    # stopping), "timeout" when the wait ran out, and "rejected" only for a refused wake (a
+    # game holds the card) -- review M6.
+    if state.maintenance_state in ("loading", "failed", "stopping"):
+        status = state.maintenance_state
+    elif "timed out" in reason or "took longer" in reason:
+        status = "timeout"
+    else:
+        status = "rejected"
+    return JSONResponse({"status": status, "asleep": state.asleep, "error": reason}, status_code=503)
 
 
 @app.get("/v1/cache/residency")

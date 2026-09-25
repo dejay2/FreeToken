@@ -64,3 +64,25 @@ def test_a_second_release_frees_nothing():
     cache = _cache()
     cache.release_slots()
     assert cache.release_slots() == 0
+
+
+def test_release_drops_the_disk_staging_rows_and_the_fallback_latch():
+    """M3: the disk backend's device scratch is GPU memory too, and the d2d-fallback log latch
+    resets as it does on rebuild (the geometry changed)."""
+    cache = _cache()
+    cache._disk_device_scratch = {"gate_up": torch.empty(10, 8, 8), "down": torch.empty(10, 8, 8)}
+    cache._hit_d2d_fallback_logged = True
+    cache.release_slots()
+    assert cache._disk_device_scratch is None
+    assert cache._hit_d2d_fallback_logged is False
+
+
+def test_row_bytes_survive_a_sleep():
+    """M5: the settings page's per-slot cost must not read 0 while the slot cache is gone."""
+    cache = _cache()
+    before = cache.bytes_per_expert_row()
+    assert before == ROW * 2
+    cache.release_slots()
+    assert cache.bytes_per_expert_row() == before
+    cache.rebuild(16)
+    assert cache.bytes_per_expert_row() == before

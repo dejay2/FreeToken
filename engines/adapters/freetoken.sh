@@ -156,7 +156,7 @@ if { [ "$state" = serving ] || [ "$state" = sleeping ]; } && [ "$job_now" = - ] 
   fi
 fi
 if [ "$adopt" = 1 ]; then
-  log "already serving $MODEL_PATH; adopting it"
+  log "already $state $MODEL_PATH; adopting it"
 else
   # Also stop when only a job is in flight: a page or watchdog boot that has not bound its
   # port yet reads "unreachable", and a new ModelPath saved under it could boot the wrong model.
