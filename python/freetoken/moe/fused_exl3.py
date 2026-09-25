@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 import torch
 
 from freetoken.kernel import exl3 as _exl3_kernel
+from freetoken.kernel import exl3_launch as _launch
 from freetoken.kernel.exl3_mgemm import EXL3_MGEMM_MAX_INDICES
 from freetoken.moe.exl3_ops import DEFAULT_EXL3_EXPERT_OP, EXL3_EXPERT_OPS
 from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl
@@ -462,33 +463,36 @@ def _reconstruct_decode(
     work_gate_up = scratch.reconstruct_work
     work_down = scratch.reconstruct_work.view(scratch.intermediate_size, scratch.hidden_size)
     for local in range(scratch.chunk_experts):
-        _exl3_kernel.reconstruct(
-            gate_trellis[local],
-            gate_suh[local],
-            gate_svh[local],
-            k=scratch.k,
-            codebook=_EXL3_CODEBOOK,
-            out=scratch.gate_up[local, : scratch.intermediate_size, :],
-            work=work_gate_up,
-        )
-        _exl3_kernel.reconstruct(
-            up_trellis[local],
-            up_suh[local],
-            up_svh[local],
-            k=scratch.k,
-            codebook=_EXL3_CODEBOOK,
-            out=scratch.gate_up[local, scratch.intermediate_size :, :],
-            work=work_gate_up,
-        )
-        _exl3_kernel.reconstruct(
-            down_trellis[local],
-            down_suh[local],
-            down_svh[local],
-            k=scratch.k,
-            codebook=_EXL3_CODEBOOK,
-            out=scratch.down[local],
-            work=work_down,
-        )
+        with _launch.scope("reconstruct.gate"):
+            _exl3_kernel.reconstruct(
+                gate_trellis[local],
+                gate_suh[local],
+                gate_svh[local],
+                k=scratch.k,
+                codebook=_EXL3_CODEBOOK,
+                out=scratch.gate_up[local, : scratch.intermediate_size, :],
+                work=work_gate_up,
+            )
+        with _launch.scope("reconstruct.up"):
+            _exl3_kernel.reconstruct(
+                up_trellis[local],
+                up_suh[local],
+                up_svh[local],
+                k=scratch.k,
+                codebook=_EXL3_CODEBOOK,
+                out=scratch.gate_up[local, scratch.intermediate_size :, :],
+                work=work_gate_up,
+            )
+        with _launch.scope("reconstruct.down"):
+            _exl3_kernel.reconstruct(
+                down_trellis[local],
+                down_suh[local],
+                down_svh[local],
+                k=scratch.k,
+                codebook=_EXL3_CODEBOOK,
+                out=scratch.down[local],
+                work=work_down,
+            )
 
 
 def _reconstruct_chunk(
@@ -513,33 +517,36 @@ def _reconstruct_chunk(
     work_down = scratch.reconstruct_work.view(intermediate_size, hidden_size)
 
     for local, slot in enumerate(slots):
-        _exl3_kernel.reconstruct(
-            gate_trellis[slot],
-            gate_suh[slot],
-            gate_svh[slot],
-            k=scratch.k,
-            codebook=_EXL3_CODEBOOK,
-            out=scratch.gate_up[local, :intermediate_size, :],
-            work=work_gate_up,
-        )
-        _exl3_kernel.reconstruct(
-            up_trellis[slot],
-            up_suh[slot],
-            up_svh[slot],
-            k=scratch.k,
-            codebook=_EXL3_CODEBOOK,
-            out=scratch.gate_up[local, intermediate_size:, :],
-            work=work_gate_up,
-        )
-        _exl3_kernel.reconstruct(
-            down_trellis[slot],
-            down_suh[slot],
-            down_svh[slot],
-            k=scratch.k,
-            codebook=_EXL3_CODEBOOK,
-            out=scratch.down[local],
-            work=work_down,
-        )
+        with _launch.scope("reconstruct.gate"):
+            _exl3_kernel.reconstruct(
+                gate_trellis[slot],
+                gate_suh[slot],
+                gate_svh[slot],
+                k=scratch.k,
+                codebook=_EXL3_CODEBOOK,
+                out=scratch.gate_up[local, :intermediate_size, :],
+                work=work_gate_up,
+            )
+        with _launch.scope("reconstruct.up"):
+            _exl3_kernel.reconstruct(
+                up_trellis[slot],
+                up_suh[slot],
+                up_svh[slot],
+                k=scratch.k,
+                codebook=_EXL3_CODEBOOK,
+                out=scratch.gate_up[local, intermediate_size:, :],
+                work=work_gate_up,
+            )
+        with _launch.scope("reconstruct.down"):
+            _exl3_kernel.reconstruct(
+                down_trellis[slot],
+                down_suh[slot],
+                down_svh[slot],
+                k=scratch.k,
+                codebook=_EXL3_CODEBOOK,
+                out=scratch.down[local],
+                work=work_down,
+            )
 
 
 def _run_bf16_experts(
@@ -741,7 +748,43 @@ def fused_experts_exl3(
     and a caller-owned BF16 activation workspace.  Prefill uses the packed grouped-by-expert
     form in bounded tiles; both phases fall back to reconstruction when the packed wheel cannot
     serve the requested compiled shape or route capacity.
+
+    Every EXL3 launch inside is labelled ``L<layer>.routed.<prefill|decode>/...`` for the
+    launch trace and strict-stream errors (kernel/exl3_launch.py).
     """
+    phase = "prefill" if is_prefill else "decode"
+    with _launch.scope(f"L{'?' if layer_id is None else layer_id}.routed.{phase}"):
+        return _fused_experts_exl3(
+            hidden_states,
+            banks,
+            topk_weights,
+            topk_ids,
+            is_prefill=is_prefill,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            swiglu_limit=swiglu_limit,
+            hidden_act_alpha=hidden_act_alpha,
+            scratch=scratch,
+            expert_op=expert_op,
+            layer_id=layer_id,
+        )
+
+
+def _fused_experts_exl3(
+    hidden_states: torch.Tensor,
+    banks,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    is_prefill: bool,
+    activation: str,
+    apply_router_weight_on_input: bool,
+    swiglu_limit: float | None,
+    hidden_act_alpha: float,
+    scratch: Exl3Scratch,
+    expert_op: str,
+    layer_id: int | None,
+) -> torch.Tensor:
     if not isinstance(scratch, Exl3Scratch):
         raise ValueError("fused_experts_exl3 requires an Exl3Scratch workspace")
     require_exl3_gpu_only(device=hidden_states.device)

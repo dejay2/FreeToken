@@ -36,6 +36,8 @@ from typing import Literal, Sequence
 
 import torch
 
+from freetoken.kernel import exl3_launch as _launch
+
 
 # The wheel's exl3_gemm_kernel.cuh uses MAX_INDICES=128 for the pointer-index list.  This
 # is a route-list capacity, not a size_m/token-row limit: the same kernel loops size_m in
@@ -479,25 +481,34 @@ def _raw_mgemm(
         extension_weights = weights.to(dtype=torch.float16).view(1, 1).contiguous()
     elif weights is not None and not broadcast_input:
         extension_weights = weights.to(dtype=torch.float16).view(1, -1).contiguous()
-    extension.exl3_mgemm(
-        a,
-        ptr_trellis,
-        c,
-        ptr_suh,
-        a_had,
-        ptr_svh,
-        indices,
-        extension_weights,
-        tables.k,
-        -1,
-        0,
-        1,
-        -1,
-        -1,
-        0,
-        int(num_tokens),
-        None,
-        None,
+    _launch.launch(
+        "exl3_mgemm",
+        lambda: extension.exl3_mgemm(
+            a,
+            ptr_trellis,
+            c,
+            ptr_suh,
+            a_had,
+            ptr_svh,
+            indices,
+            extension_weights,
+            tables.k,
+            -1,
+            0,
+            1,
+            -1,
+            -1,
+            0,
+            int(num_tokens),
+            None,
+            None,
+        ),
+        device=tables.device,
+        m=int(total_rows),
+        k=int(input_features),
+        n=int(output_features),
+        bits=int(tables.k),
+        label=f"mgemm.{projection}",
     )
     if broadcast_input:
         result = c[0]

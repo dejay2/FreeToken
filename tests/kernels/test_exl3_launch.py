@@ -1,0 +1,367 @@
+"""The EXL3 launch choke point (kernel/exl3_launch.py): cross-stream serialisation, strict
+mode and the trace file. CPU tests drive it through the ``_OPS`` seam with fake streams, so
+the ordering rules are checked without a card."""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from freetoken.kernel import exl3_launch as L
+
+
+class FakeStream:
+    def __init__(self, name, log, capturing=False):
+        self.name, self.log, self.capturing = name, log, capturing
+
+    def wait_event(self, event):
+        self.log.append(("wait", self.name, event.recorded_on))
+
+    def synchronize(self):
+        self.log.append(("sync", self.name))
+
+    def __repr__(self):
+        return f"FakeStream({self.name})"
+
+
+class FakeEvent:
+    def __init__(self, log):
+        self.log, self.recorded_on = log, None
+
+    def record(self, stream):
+        self.recorded_on = stream.name
+        self.log.append(("record", stream.name))
+
+
+class FakeOps:
+    def __init__(self):
+        self.log = []
+        self.current = None
+
+    def applies(self, device):
+        return True
+
+    def current_stream(self, device):
+        return self.current
+
+    def is_capturing(self, stream):
+        return stream.capturing
+
+    def new_event(self):
+        return FakeEvent(self.log)
+
+
+@pytest.fixture
+def ops(monkeypatch):
+    fake = FakeOps()
+    monkeypatch.setattr(L, "_OPS", fake)
+    monkeypatch.delenv(L.STRICT_ENV, raising=False)
+    monkeypatch.delenv(L.TRACE_ENV, raising=False)
+    L._reset_for_tests()
+    yield fake
+    L._reset_for_tests()
+
+
+DEV = torch.device("cuda", 0)
+
+
+def _go(ops, stream, op="exl3_gemm", label=None, m=4, k=128, n=256, bits=5):
+    ops.current = stream
+    return L.launch(op, lambda: ops.log.append(("kernel", stream.name, op)), device=DEV,
+                    m=m, k=k, n=n, bits=bits, label=label)
+
+
+def test_same_stream_launches_add_no_waits(ops):
+    s = FakeStream("engine", ops.log)
+    _go(ops, s)
+    _go(ops, s, op="exl3_mgemm")
+    assert ops.log == [("kernel", "engine", "exl3_gemm"), ("kernel", "engine", "exl3_mgemm")]
+
+
+def test_switching_stream_waits_on_the_previous_stream_before_launching(ops):
+    engine, sched = FakeStream("engine", ops.log), FakeStream("sched", ops.log)
+    _go(ops, engine)
+    _go(ops, sched)
+    _go(ops, engine)
+    assert ops.log == [
+        ("kernel", "engine", "exl3_gemm"),
+        ("record", "engine"), ("wait", "sched", "engine"), ("kernel", "sched", "exl3_gemm"),
+        ("record", "sched"), ("wait", "engine", "sched"), ("kernel", "engine", "exl3_gemm"),
+    ]
+
+
+def test_devices_are_tracked_separately(ops):
+    a, b = FakeStream("a", ops.log), FakeStream("b", ops.log)
+    ops.current = a
+    L.launch("exl3_gemm", lambda: None, device=torch.device("cuda", 0), m=1, k=1, n=1, bits=5)
+    ops.current = b
+    L.launch("exl3_gemm", lambda: None, device=torch.device("cuda", 1), m=1, k=1, n=1, bits=5)
+    assert ops.log == []
+
+
+def test_fork_inside_one_capture_becomes_a_graph_edge(ops):
+    c1 = FakeStream("cap1", ops.log, capturing=True)
+    c2 = FakeStream("cap2", ops.log, capturing=True)
+    _go(ops, c1)
+    _go(ops, c2)
+    assert ("record", "cap1") in ops.log and ("wait", "cap2", "cap1") in ops.log
+
+
+def test_no_wait_between_an_eager_and_a_captured_launch(ops):
+    # CUDA forbids a capturing stream waiting on an event recorded outside the capture (needs
+    # cudaEventWaitExternal) and the reverse merges the capture: both directions skip.
+    eager = FakeStream("engine", ops.log)
+    cap = FakeStream("capture", ops.log, capturing=True)
+    _go(ops, eager)
+    _go(ops, cap)
+    cap.capturing = False  # capture ended
+    other = FakeStream("other", ops.log, capturing=True)
+    _go(ops, other)
+    assert [e for e in ops.log if e[0] in ("record", "wait")] == []
+
+
+def test_cpu_tensors_bypass_the_stream_rules():
+    calls = []
+    L.launch("exl3_gemm", lambda: calls.append(1), device=torch.device("cpu"),
+             m=1, k=1, n=1, bits=5)
+    assert calls == [1]
+
+
+def test_strict_mode_rejects_a_second_eager_stream_before_launching(ops, monkeypatch):
+    monkeypatch.setenv(L.STRICT_ENV, "1")
+    engine, sched = FakeStream("engine", ops.log), FakeStream("sched", ops.log)
+    _go(ops, engine)
+    with L.scope("picture"), pytest.raises(RuntimeError) as err:
+        _go(ops, sched, label="blocks.0.mlp.linear_fc1", m=64, k=1152, n=4352)
+    msg = str(err.value)
+    assert "exl3_gemm" in msg and "picture/blocks.0.mlp.linear_fc1" in msg
+    assert "m=64 k=1152 n=4352" in msg
+    assert ("kernel", "sched", "exl3_gemm") not in ops.log
+    _go(ops, engine)  # the home stream keeps working
+
+
+def test_strict_mode_allows_captured_launches_on_the_capture_stream(ops, monkeypatch):
+    monkeypatch.setenv(L.STRICT_ENV, "1")
+    engine = FakeStream("engine", ops.log)
+    cap = FakeStream("capture", ops.log, capturing=True)
+    _go(ops, engine)
+    _go(ops, cap)
+    assert ("kernel", "capture", "exl3_gemm") in ops.log
+
+
+def test_strict_off_by_default_serialises_instead(ops):
+    engine, sched = FakeStream("engine", ops.log), FakeStream("sched", ops.log)
+    _go(ops, engine)
+    _go(ops, sched)
+    assert ("kernel", "sched", "exl3_gemm") in ops.log
+
+
+def test_trace_writes_begin_end_and_syncs_eager_launches(ops, monkeypatch, tmp_path):
+    path = tmp_path / "exl3.trace"
+    monkeypatch.setenv(L.TRACE_ENV, str(path))
+    engine = FakeStream("engine", ops.log)
+    with L.scope("L3.routed"):
+        _go(ops, engine, op="exl3_mgemm", label="mgemm.gate", m=30, k=2560, n=640, bits=3)
+    # the END line is written only after the stream synchronised (the kernel finished)
+    assert ops.log == [("kernel", "engine", "exl3_mgemm"), ("sync", "engine")]
+    lines = path.read_text().splitlines()
+    assert len(lines) == 2
+    assert " BEGIN op=exl3_mgemm label=L3.routed/mgemm.gate m=30 k=2560 n=640 bits=3 " in lines[0]
+    assert "capturing=no" in lines[0] and "stream=" in lines[0] and "pid=" in lines[0]
+    assert " END op=exl3_mgemm " in lines[1] and "ms=" in lines[1]
+    float(lines[0].split()[0])  # monotonic timestamp first
+
+
+def test_trace_does_not_sync_while_capturing(ops, monkeypatch, tmp_path):
+    path = tmp_path / "exl3.trace"
+    monkeypatch.setenv(L.TRACE_ENV, str(path))
+    _go(ops, FakeStream("capture", ops.log, capturing=True))
+    assert ("sync", "capture") not in ops.log
+    assert "capturing=yes" in path.read_text()
+
+
+def test_trace_leaves_a_begin_without_end_when_the_launch_fails(ops, monkeypatch, tmp_path):
+    path = tmp_path / "exl3.trace"
+    monkeypatch.setenv(L.TRACE_ENV, str(path))
+    ops.current = FakeStream("engine", ops.log)
+
+    def boom():
+        raise ValueError("bad shape")
+
+    with pytest.raises(ValueError):
+        L.launch("exl3_gemm", boom, device=DEV, m=1, k=1, n=1, bits=5, label="x")
+    text = path.read_text()
+    assert " BEGIN " in text and " FAIL " in text and " END " not in text
+
+
+def test_trace_logs_the_cross_stream_wait(ops, monkeypatch, tmp_path):
+    path = tmp_path / "exl3.trace"
+    monkeypatch.setenv(L.TRACE_ENV, str(path))
+    _go(ops, FakeStream("engine", ops.log))
+    _go(ops, FakeStream("sched", ops.log))
+    assert " WAIT " in path.read_text()
+
+
+def test_scopes_nest_and_unwind():
+    with L.scope("a"):
+        with L.scope("b"):
+            assert L._full_label("c") == "a/b/c"
+        assert L._full_label(None) == "a"
+    assert L._full_label(None) == "?"
+
+
+# --------------------------------------------------------------------------------------
+# Wiring: every ExLlamaV3 GPU launch FreeToken makes reaches the choke point, labelled.
+
+
+@pytest.fixture
+def recorded(monkeypatch):
+    calls = []
+
+    def fake_launch(op, fn, *, device, m, k, n, bits, label=None):
+        calls.append({"op": op, "device": torch.device(device), "m": m, "k": k, "n": n,
+                      "bits": bits, "label": L._full_label(label)})
+        return fn()
+
+    monkeypatch.setattr(L, "launch", fake_launch)
+    return calls
+
+
+def test_dense_gemm_goes_through_the_choke_point(monkeypatch, recorded):
+    from freetoken.kernel import exl3_linear as el
+
+    wheel = []
+
+    class Ext:
+        @staticmethod
+        def exl3_gemm(*args):
+            wheel.append(len(recorded))  # called INSIDE launch, after it was recorded
+
+    monkeypatch.setattr(el, "_load_ext", lambda: Ext)
+    x16 = torch.zeros(3, 128, dtype=torch.float16)
+    trellis = torch.zeros(8, 16, 48, dtype=torch.int16)
+    y16 = torch.zeros(3, 256, dtype=torch.float16)
+    with L.scope("model.layers.0.attn.q_proj"):
+        el._exl3_gemm(x16, trellis, y16, torch.zeros(128).half(), x16.clone(), torch.zeros(256).half())
+    assert wheel == [1]
+    assert recorded == [{"op": "exl3_gemm", "device": torch.device("cpu"), "m": 3, "k": 128,
+                         "n": 256, "bits": 3, "label": "model.layers.0.attn.q_proj"}]
+
+
+def test_reconstruct_goes_through_the_choke_point(monkeypatch, recorded):
+    from freetoken.kernel import exl3 as exl3_kernel
+
+    wheel = []
+
+    class Ext:
+        @staticmethod
+        def reconstruct_had_slice(work, trellis, suh, svh, k, _flag, mul1, _zero):
+            wheel.append((k, mul1))
+
+    monkeypatch.setattr(exl3_kernel, "_exllamav3_ext", Ext)
+    work = torch.zeros(128, 256, dtype=torch.float16)
+    with L.scope("L2.routed.decode"), L.scope("reconstruct.down"):
+        exl3_kernel._reconstruct_had_slice(work, None, None, None, k=2, mul1=True)
+    assert wheel == [(2, True)]
+    assert recorded[0]["op"] == "reconstruct" and recorded[0]["label"] == "L2.routed.decode/reconstruct.down"
+    assert (recorded[0]["k"], recorded[0]["n"], recorded[0]["bits"]) == (128, 256, 2)
+
+
+def test_mgemm_goes_through_the_choke_point(monkeypatch, recorded):
+    from freetoken.kernel import exl3_mgemm as mg
+
+    wheel = []
+
+    class Ext:
+        @staticmethod
+        def exl3_gemm_num_kernel_shapes():
+            return 1
+
+        @staticmethod
+        def exl3_gemm_shape_compat(*args):
+            return True
+
+        @staticmethod
+        def exl3_mgemm(a, *args):
+            wheel.append(tuple(a.shape))
+
+    monkeypatch.setattr(mg, "_load_extension", lambda: Ext)
+    slots, H, I, K = 2, 128, 256, 3
+    banks = (
+        torch.zeros(slots, H // 16, I // 16, 16 * K, dtype=torch.int16),
+        torch.zeros(slots, H, dtype=torch.float16), torch.zeros(slots, I, dtype=torch.float16),
+        torch.zeros(slots, H // 16, I // 16, 16 * K, dtype=torch.int16),
+        torch.zeros(slots, H, dtype=torch.float16), torch.zeros(slots, I, dtype=torch.float16),
+        torch.zeros(slots, I // 16, H // 16, 16 * K, dtype=torch.int16),
+        torch.zeros(slots, I, dtype=torch.float16), torch.zeros(slots, H, dtype=torch.float16),
+    )
+    ptrs = tuple(torch.zeros(slots, dtype=torch.int64) for _ in banks)
+    tables = mg.Exl3MgemmBanks(banks, ptrs, k=K)
+    with L.scope("L5.routed.prefill"):
+        mg.exl3_mgemm_projection(torch.zeros(4, H, dtype=torch.bfloat16), tables,
+                                 torch.zeros(1, dtype=torch.int64), projection="up")
+    assert wheel == [(1, 4, H)]
+    assert recorded == [{"op": "exl3_mgemm", "device": torch.device("cpu"), "m": 4, "k": H,
+                         "n": I, "bits": K, "label": "L5.routed.prefill/mgemm.up"}]
+
+
+def test_routed_experts_label_their_layer_and_phase(monkeypatch):
+    from freetoken.moe import fused_exl3
+
+    seen = []
+    monkeypatch.setattr(fused_exl3, "_fused_experts_exl3",
+                        lambda *a, **kw: seen.append((L._full_label(None), kw["layer_id"])) or "out")
+    got = fused_exl3.fused_experts_exl3(None, (), None, None, is_prefill=True, activation="silu",
+                                        apply_router_weight_on_input=False, swiglu_limit=None,
+                                        hidden_act_alpha=1.0, scratch=None, layer_id=7)
+    assert got == "out" and seen == [("L7.routed.prefill", 7)]
+
+
+def _labelled_tree():
+    from freetoken.kernel.exl3_linear import Exl3ColMerged, Exl3Linear
+    from freetoken.layers.base import BaseOP, OPList
+
+    class Attn(BaseOP):
+        def __init__(self):
+            self.qkv = Exl3ColMerged(128, [("q", 128), ("k", 128)])
+            self.o_proj = Exl3Linear(256, 128)
+
+    class Layer(BaseOP):
+        def __init__(self):
+            self.attn = Attn()
+
+    class Model(BaseOP):
+        def __init__(self):
+            self.layers = OPList([Layer(), Layer()])
+            self.lm_head = Exl3Linear(128, 256)
+
+    return Model()
+
+
+def test_workspace_preparation_labels_every_dense_op_with_its_module_path():
+    from freetoken.kernel import exl3_linear as el
+
+    model = _labelled_tree()
+    el.prepare_exl3_dense_workspace(model, torch.device("cpu"), _reset=True)
+    try:
+        assert model.layers.op_list[1].attn.qkv.k.label == "layers.1.attn.qkv.k"
+        assert model.layers.op_list[0].attn.o_proj.label == "layers.0.attn.o_proj"
+        assert model.lm_head.label == "lm_head"
+        # labels are not state: they must never show up as weights
+        assert all(not key.endswith("label") for key in model.state_dict())
+    finally:
+        el._WORKSPACES.pop(torch.device("cpu"), None)
+
+
+def test_dense_gemm_launch_carries_the_op_label(monkeypatch):
+    from freetoken.kernel import exl3_linear as el
+
+    model = _labelled_tree()
+    el.prepare_exl3_dense_workspace(model, torch.device("cpu"), _reset=True)
+    seen = []
+    monkeypatch.setattr(el, "_exl3_gemm", lambda *a: seen.append(L._full_label(None)))
+    try:
+        model.layers.op_list[1].attn.o_proj._gemm(torch.zeros(2, 256, dtype=torch.bfloat16))
+    finally:
+        el._WORKSPACES.pop(torch.device("cpu"), None)
+    assert seen == ["layers.1.attn.o_proj"]

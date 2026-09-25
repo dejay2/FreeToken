@@ -1197,19 +1197,22 @@ class MTPExl3GPUExpertRunner:
         if topk_weights.device != self.device or topk_ids.device != self.device:
             raise ValueError("MTP routing tensors must use the runner device")
 
+        from freetoken.kernel import exl3_launch
+
         step = self.tile_rows
-        parts = [
-            mgemm.fused_experts_exl3_mgemm(
-                hidden_states[lo : lo + step],
-                self.tables,
-                topk_weights[lo : lo + step],
-                topk_ids[lo : lo + step],
-                activation="silu",
-                swiglu_limit=None,
-                scratch=self.scratch,
-            )
-            for lo in range(0, tokens, step)
-        ]
+        with exl3_launch.scope("mtp.routed"):
+            parts = [
+                mgemm.fused_experts_exl3_mgemm(
+                    hidden_states[lo : lo + step],
+                    self.tables,
+                    topk_weights[lo : lo + step],
+                    topk_ids[lo : lo + step],
+                    activation="silu",
+                    swiglu_limit=None,
+                    scratch=self.scratch,
+                )
+                for lo in range(0, tokens, step)
+            ]
         result = parts[0] if len(parts) == 1 else torch.cat(parts)
 
         self.stats.calls += 1

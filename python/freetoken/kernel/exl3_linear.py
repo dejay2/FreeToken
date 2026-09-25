@@ -10,7 +10,10 @@ Known limit: the wheel's one-token GEMV only covers K 2-4 (exl3_gemv.cu:115-122)
 dense layers of the 3.05bpw build take the general GEMM kernel.
 
 The wheel routines are reached through two seams (_exl3_gemm, _reconstruct_into) so CPU tests
-can substitute the pure-torch oracle in kernel/exl3.py.
+can substitute the pure-torch oracle in kernel/exl3.py. Both reach the card only through
+kernel/exl3_launch.py, the one choke point that serialises EXL3 launches across streams and
+carries the strict-stream and trace debug modes; each op's ``label`` (its module path, set by
+``label_exl3_linears``) names it there.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from freetoken.kernel import exl3 as _exl3
+from freetoken.kernel import exl3_launch as _launch
 from freetoken.layers.base import BaseOP, OPList, _concat_prefix
 
 GEMM_MAX_ROWS = 144
@@ -39,7 +43,13 @@ def _load_ext():
 def _exl3_gemm(x16, trellis, y16, suh, xh, svh) -> None:
     # Signature verified on the 5090's 1.4.6 wheel in Task 0: exl3_gemm(A, B, C, suh, A_had,
     # svh, force_shape_idx, mcg, mul1, force_num_sms). Adapt here only if Task 0 differs.
-    _load_ext().exl3_gemm(x16, trellis, y16, suh, xh, svh, -1, False, True, 0)
+    ext = _load_ext()
+    _launch.launch(
+        "exl3_gemm",
+        lambda: ext.exl3_gemm(x16, trellis, y16, suh, xh, svh, -1, False, True, 0),
+        device=x16.device, m=int(x16.shape[0]), k=int(x16.shape[1]), n=int(y16.shape[1]),
+        bits=int(trellis.shape[-1]) // 16,
+    )
 
 
 def _reconstruct_into(op: "Exl3Linear", out: torch.Tensor, work: torch.Tensor) -> torch.Tensor:
@@ -96,6 +106,8 @@ class Exl3Linear(BaseOP):
         self.out_features = int(out_features)
         self.k = int(k_hint)
         self.allow_reconstruct = bool(allow_reconstruct)
+        # Module path for EXL3 launch traces and strict-stream errors (label_exl3_linears).
+        self.label: str | None = None
         self.trellis = torch.empty(in_features // 16, out_features // 16, 16 * self.k, dtype=torch.int16)
         self.suh = torch.empty(in_features, dtype=torch.float16)
         self.svh = torch.empty(out_features, dtype=torch.float16)
@@ -155,7 +167,8 @@ class Exl3Linear(BaseOP):
         xh = ws.xh[: rows * self.in_features].view(rows, self.in_features)
         y16 = ws.y16[: rows * self.out_features].view(rows, self.out_features)
         x16.copy_(x2)
-        _exl3_gemm(x16, self.trellis, y16, self.suh, xh, self.svh)
+        with _launch.scope(self.label):
+            _exl3_gemm(x16, self.trellis, y16, self.suh, xh, self.svh)
         # A fresh bf16 tensor: y16 is shared by every EXL3 linear on this card.
         return y16.to(torch.bfloat16)
 
@@ -166,11 +179,12 @@ class Exl3Linear(BaseOP):
         if rows > GEMM_MAX_ROWS and self.allow_reconstruct:
             ws = self._workspace(x2.device)
             n = self.in_features * self.out_features
-            w = _reconstruct_into(
-                self,
-                ws.recon_out[:n].view(self.out_features, self.in_features),
-                ws.recon_work[:n].view(self.in_features, self.out_features),
-            )
+            with _launch.scope(self.label):
+                w = _reconstruct_into(
+                    self,
+                    ws.recon_out[:n].view(self.out_features, self.in_features),
+                    ws.recon_work[:n].view(self.in_features, self.out_features),
+                )
             y = F.linear(x2.to(torch.bfloat16), w, self.bias)
         else:
             if rows <= GEMM_MAX_ROWS:
@@ -240,6 +254,36 @@ def iter_exl3_linears(root) -> Iterator[Exl3Linear]:
                     stack.extend(v for v in value if isinstance(v, BaseOP))
 
 
+def label_exl3_linears(root, prefix: str = "") -> int:
+    """Give every reachable ``Exl3Linear`` its module path as ``label`` (first path wins).
+
+    Labels name the op in EXL3 launch traces and strict-stream errors (kernel/exl3_launch.py).
+    Returns the number of ops labelled."""
+    seen: set[int] = set()
+    stack = [(root, prefix)]
+    count = 0
+    while stack:
+        node, path = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, Exl3Linear):
+            node.label = path or type(node).__name__
+            count += 1
+        children = []
+        if isinstance(node, OPList):
+            children.extend((op, _concat_prefix(path, str(i))) for i, op in enumerate(node.op_list))
+        if isinstance(node, BaseOP):
+            for name, value in vars(node).items():
+                if isinstance(value, BaseOP):
+                    children.append((value, _concat_prefix(path, name)))
+                elif isinstance(value, (list, tuple)):
+                    children.extend((v, _concat_prefix(path, f"{name}.{i}"))
+                                    for i, v in enumerate(value) if isinstance(v, BaseOP))
+        stack.extend(reversed(children))
+    return count
+
+
 def _need(root) -> tuple[int, int, int] | None:
     ops = list(iter_exl3_linears(root))
     if not ops:
@@ -254,6 +298,7 @@ def prepare_exl3_dense_workspace(root, device, *, _reset: bool = False):
     need = _need(root)
     if need is None:
         return None
+    label_exl3_linears(root)
     key = _dev_key(device)
     if _reset:
         _WORKSPACES.pop(key, None)
@@ -290,5 +335,5 @@ def require_exl3_dense_workspace_fits(root, device) -> None:
 
 
 __all__ = ["Exl3ColMerged", "Exl3DenseWorkspace", "Exl3LMHead", "Exl3Linear", "GEMM_MAX_ROWS",
-           "iter_exl3_linears", "prepare_exl3_dense_workspace", "require_exl3_dense_workspace_fits",
+           "iter_exl3_linears", "label_exl3_linears", "prepare_exl3_dense_workspace", "require_exl3_dense_workspace_fits",
            "validate_exl3_parts"]
