@@ -34,6 +34,8 @@ unknown state could otherwise pull a model out from under a chat.
 
 from __future__ import annotations
 
+import collections
+import concurrent.futures
 import copy
 import datetime as _dt
 import errno
@@ -58,7 +60,7 @@ from .dials import (DIAL_BY_NAME, DIALS, GROUP_INFO, MODEL_AWARE_DIALS, Dial, ad
                     validate_settings)
 from .download import AddUnsupported, DownloadConflict, InvalidRepository
 from .memory_fit import EstimateUnavailable, SettingsValidationError
-from .model_detect import PART_RE, detect, model_files
+from .model_detect import PART_RE, OwnershipUnknown, detect, model_files, referenced_files
 from .model_info import read_model
 from .pi_sync import PiSync
 from .profiles_manager import ProfileError, ProfileValidationError
@@ -325,6 +327,11 @@ class PanelService:
         # default boot file when the removed model's profile was the active one.
         self.profile_deleted = profile_deleted
         self._lock = threading.RLock()
+        # Pi changes run after the panel lock is released (slow /mnt/c), but in the order the
+        # registry committed them: queued under the panel lock, run one at a time under
+        # _pi_lock by whichever caller gets there first (review, PR #17).
+        self._pi_queue: collections.deque[tuple[Callable[[], dict[str, Any]], concurrent.futures.Future]] = collections.deque()
+        self._pi_lock = threading.Lock()
         self._stop = threading.Event()
         self._watcher: threading.Thread | None = None
         self.last_restart: dict[str, Any] | None = None
@@ -401,13 +408,34 @@ class PanelService:
             errors += [{**error, "where": model["id"]} for error in validate_settings(effective, info)]
         return errors
 
+    def _queue_pi(self, step: Callable[[], dict[str, Any]]) -> concurrent.futures.Future:
+        """Call with the panel lock held, right after the registry save, so the queue holds
+        Pi changes in commit order."""
+        done: concurrent.futures.Future = concurrent.futures.Future()
+        self._pi_queue.append((step, done))
+        return done
+
+    def _run_pi(self, done: concurrent.futures.Future) -> dict[str, Any]:
+        """Call without the panel lock: runs every queued Pi change (this caller's and any
+        committed before it) in order, then answers this caller's."""
+        with self._pi_lock:
+            while self._pi_queue:
+                step, future = self._pi_queue.popleft()
+                try:
+                    future.set_result(step())
+                except BaseException as exc:  # noqa: BLE001 - handed to its own caller
+                    future.set_exception(exc)
+        return done.result()
+
     # ---- the one save path ----
     def _save(self, mutate: Callable[[dict], dict], revision: str | None, when_loaded: str | None,
               extra: Callable[[dict, dict], dict] | None = None,
-              before_commit: Callable[[], None] | None = None) -> dict[str, Any]:
+              before_commit: Callable[[list[str] | None], None] | None = None) -> dict[str, Any]:
         """``before_commit`` runs after every check (registry, model limits, --check-config)
         and right before the registry is written: remove_model puts a loaded model away there,
-        so a remove that the checks refuse never unloads it first (review round)."""
+        so a remove that the checks refuse never unloads it first (review round). It is given
+        this save's own switcher answer (loaded ids, or None when unknown), the last one taken
+        before the write, so it decides on that and not on an earlier look (review, PR #17)."""
         if when_loaded not in (None, "restart", "next-time"):
             raise RegistryValidationError([{"field": "whenLoaded", "message": "Choose restart or next-time."}])
         with self._lock:
@@ -459,7 +487,7 @@ class PanelService:
             staged = self.writer.check(new_text) if new_text != old_text else None
             try:
                 if before_commit is not None:
-                    before_commit()
+                    before_commit(known)
                 self._unload_for_restart(proposed, restarting)
                 new_revision = self.store.save(proposed, expected_revision=current_revision)
             except BaseException:
@@ -1083,11 +1111,12 @@ class PanelService:
             result = self._save(mutate, current_revision, None)
             engines = {m["id"]: m["engine"] for m in doc["models"]}
             result.update(status="added", id=model_id, name=name, adjusted=adjusted)
+            pi = self._queue_pi(lambda: _after_save(
+                "Pi add", lambda: self.pi.add(model_id, name, entry["engine"], engines),
+                {"status": "not_updated", "notes": []}, "The model was added, but Pi's list could not be updated"))
         # Pi's files live on /mnt/c, which is slow: written after the lock is released, from
         # values captured inside it, so other panel requests are not held up (review round).
-        result["pi"] = _after_save("Pi add", lambda: self.pi.add(model_id, name, entry["engine"], engines),
-                                   {"status": "not_updated", "notes": []},
-                                   "The model was added, but Pi's list could not be updated")
+        result["pi"] = self._run_pi(pi)
         return result
 
     def _check_deletable(self, doc: Mapping[str, Any], model: Mapping[str, Any], files: list[str]) -> None:
@@ -1099,7 +1128,10 @@ class PanelService:
             raise PanelError(409, "files_missing", f"{name}'s files were not found, so there is nothing to delete. "
                                                    "Remove it without deleting files.")
         home = Path(os.path.realpath(Path.home()))
-        targets = [Path(os.path.realpath(item)) for item in files]
+        # A symlink loses only the link, so the path checked is the link's own place, not
+        # where it points (review round, PR #17).
+        targets = [Path(os.path.realpath(Path(item).parent)) / Path(item).name if Path(item).is_symlink()
+                   else Path(os.path.realpath(item)) for item in files]
         for original, real in zip(files, targets):
             if real == home or real in home.parents or real == Path("/"):
                 raise PanelError(409, "files_unsafe", f"{original} is your home folder or above it, so nothing was deleted.")
@@ -1108,11 +1140,21 @@ class PanelService:
                     raise PanelError(409, "files_unsafe", f"{original} does not look like a model folder, so nothing was deleted.")
             elif not (real.name.endswith(".ninfer") or PART_RE.match(real.name)):
                 raise PanelError(409, "files_unsafe", f"{original} is not a NInfer file, so nothing was deleted.")
+            elif Path(original).is_dir() and not Path(original).is_symlink():
+                # NInfer files are single files; a folder with a part's name is not one to rmtree.
+                raise PanelError(409, "files_unsafe", f"{original} is a folder, not a NInfer file, so nothing was deleted.")
         used: list[tuple[Path, str]] = []
         for other in doc["models"]:
             if other["id"] == model["id"]:
                 continue
-            paths = model_files(other["engine"], other["artifact"]) or [expand(other["artifact"])]
+            # Every file the other model's header names, even when it cannot load right now
+            # (a missing part): a shared part must never go with this model (review round, PR #17).
+            try:
+                paths = referenced_files(other["engine"], other["artifact"])
+            except OwnershipUnknown:
+                raise PanelError(409, "files_unknown", f"{other['name']}'s files could not be read, so it is not "
+                                                       "clear which files it uses and nothing was removed. Remove "
+                                                       f"{name} without deleting files, or fix {other['name']} first.") from None
             used += [(Path(os.path.realpath(path)), other["name"]) for path in paths]
         for real in targets:
             for other_path, other_name in used:
@@ -1121,9 +1163,10 @@ class PanelService:
                                                           f"Remove it without deleting files, or remove {other_name} first.")
 
     @staticmethod
-    def _delete_files(files: list[str]) -> dict[str, Any]:
+    def _delete_files(files: list[str], engine: str = "freetoken") -> dict[str, Any]:
         """A symlinked entry or folder loses only the link: the files it points to may be
-        another copy's, or on a drive the panel was never asked to touch (review round)."""
+        another copy's, or on a drive the panel was never asked to touch (review round). A
+        NInfer model is files only: nothing of it is ever removed as a folder."""
         gone, links, failed = [], [], []
         for item in files:
             path = Path(item)
@@ -1134,6 +1177,9 @@ class PanelService:
                 elif path.is_file():
                     path.unlink()
                 elif path.is_dir():
+                    if engine == "ninfer":
+                        failed.append(f"{path} (a folder, not a NInfer file; it was kept)")
+                        continue
                     shutil.rmtree(path)
                 gone.append(str(path))
             except OSError as exc:
@@ -1192,11 +1238,16 @@ class PanelService:
                                                           "so it was not removed. Try again in a moment.")
             unloaded = False
 
-            def put_away() -> None:
+            def put_away(final: list[str] | None) -> None:
                 # Runs inside _save once every check has passed, so a remove the checks refuse
-                # (a limit, --check-config) never pulls the model out first (review round).
+                # (a limit, --check-config) never pulls the model out first (review round). The
+                # decision uses _save's own, final switcher answer: the model may have been
+                # loaded since the look above, and an unknown state refuses (review, PR #17).
                 nonlocal unloaded
-                if model_id in known:
+                if final is None:
+                    raise PanelError(503, "switcher_unknown", f"Can't tell whether {name} is loaded right now, "
+                                                              "so it was not removed. Try again in a moment.")
+                if model_id in final:
                     if not self.switcher.unload(model_id):
                         raise PanelError(503, "unload_failed", f"Couldn't put {name} away, so nothing was removed. "
                                                                "Try again in a moment.")
@@ -1220,13 +1271,14 @@ class PanelService:
             result["profile"] = _after_save("profile delete", lambda: self._drop_profile(model),
                                             {"deleted": False},
                                             "Its FreeToken settings profile could not be deleted")
-            result["files"] = _after_save("file delete", lambda: self._delete_files(files),
+            result["files"] = _after_save("file delete", lambda: self._delete_files(files, model["engine"]),
                                           {"deleted": False, "paths": [], "links": []},
                                           "The model was removed, but its files could not be deleted") if delete_files else None
+            pi = self._queue_pi(lambda: _after_save(
+                "Pi remove", lambda: self.pi.remove(model_id),
+                {"status": "not_updated", "notes": []}, "The model was removed, but Pi's list could not be updated"))
         # Pi (slow /mnt/c) after the lock is released, like add_model.
-        result["pi"] = _after_save("Pi remove", lambda: self.pi.remove(model_id),
-                                   {"status": "not_updated", "notes": []},
-                                   "The model was removed, but Pi's list could not be updated")
+        result["pi"] = self._run_pi(pi)
         return result
 
     # ---- holds and start-up ----

@@ -155,3 +155,25 @@ def test_command_line(tmp_path, capsys):
     assert "ninfer runtime=ninfer" in capsys.readouterr().out
     (tmp_path / "notes.txt").write_text("x", encoding="utf-8")
     assert md.main([str(tmp_path / "notes.txt")]) == 1
+
+
+def test_a_symlinked_entry_is_only_the_link(tmp_path):
+    """review, PR #17: removing alias.ninfer -> original.ninfer must not take original's parts."""
+    original = write_v3(tmp_path / "original.ninfer", parts=1)
+    alias = tmp_path / "alias.ninfer"
+    alias.symlink_to(original.name)
+    assert md.model_files("ninfer", str(alias)) == [str(alias)]
+
+
+def test_referenced_files_do_not_need_the_model_to_load(tmp_path):
+    entry = write_v3(tmp_path / "other.ninfer", part_names=["shared.ninfer.part-0001", "other.ninfer.part-0001"])
+    (tmp_path / "other.ninfer.part-0001").unlink()
+    found = md.referenced_files("ninfer", str(entry))
+    assert str(tmp_path / "shared.ninfer.part-0001") in found and str(tmp_path / "other.ninfer.part-0001") in found
+    entry.write_bytes(md.V3_MAGIC + b"\xff" * 64)
+    try:
+        md.referenced_files("ninfer", str(entry))
+    except md.OwnershipUnknown:
+        pass
+    else:
+        raise AssertionError("an unreadable header must not count as referencing nothing")

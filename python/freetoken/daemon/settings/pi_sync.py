@@ -27,6 +27,8 @@ import datetime as _dt
 import getpass
 import json
 import os
+import threading
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -35,6 +37,21 @@ COPIED_FIELDS = ("reasoning", "input", "cost", "contextWindow", "maxTokens", "th
 FALLBACK = {"reasoning": True, "input": ["text"], "contextWindow": 131072, "maxTokens": 32768,
             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}}
 BACKUPS_KEPT = 20
+CHANGED_WORDS = "Pi's files changed while updating; try again."
+# One lock per Pi folder, shared by every PiSync in this process: two changes that overlap
+# would otherwise both read the same files and the second write would drop the first's model
+# (review, PR #17). Pi itself (or Jay's editor) is caught by the re-read before each replace.
+_LOCKS: dict[str, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _folder_lock(folder: Path) -> threading.Lock:
+    with _LOCKS_GUARD:
+        return _LOCKS.setdefault(os.path.abspath(folder), threading.Lock())
+
+
+class _Changed(Exception):
+    """A file no longer holds the bytes this change read."""
 
 
 def default_agent_dir() -> Path:
@@ -127,9 +144,20 @@ class PiSync:
     def _change(self, edit: Callable[[list, dict], list[str]]) -> dict[str, Any]:
         """Read both files, apply ``edit`` to copies, and write only what changed, after backing
         both files up. Every failure answers "not_updated"; nothing is written before the
-        files have been read and parsed and the provider found."""
+        files have been read and parsed and the provider found. Changes to one Pi folder run
+        one at a time; a file that changes under a change (Pi, an editor) gets the edit again
+        on its new content once, then "not_updated"."""
         if not self.enabled:
             return _result("not_updated", "Pi sync is off on this helper.")
+        with _folder_lock(self.agent_dir):
+            for _attempt in range(2):
+                try:
+                    return self._change_once(edit)
+                except _Changed:
+                    continue
+        return _result("not_updated", CHANGED_WORDS)
+
+    def _change_once(self, edit: Callable[[list, dict], list[str]]) -> dict[str, Any]:
         raw: dict[Path, bytes] = {}
         try:
             for path in (self.models_path, self.settings_path):
@@ -159,45 +187,64 @@ class PiSync:
         if not writes:
             return _result("unchanged", "Pi already matched.", notes)
         written: list[Path] = []
+        temps: list[Path] = []
+        rendered = {path: _render(doc, texts[path], raw[path].startswith(codecs.BOM_UTF8)) for path, doc in writes}
         try:
             stamp = self._now().strftime("%Y%m%d-%H%M%S-%f")
             for path in (self.models_path, self.settings_path):
                 path.with_name(f"{path.name}.bak-{stamp}").write_bytes(raw[path])
-            for path, doc in writes:
-                self._atomic_write(path, _render(doc, texts[path], raw[path].startswith(codecs.BOM_UTF8)))
+            # Both files are checked before the first replace (so a change under us never
+            # leaves models.json new and settings.json old), and each again right before its own.
+            for path in (self.models_path, self.settings_path):
+                self._unchanged(path, raw[path])
+            for path, _doc in writes:
+                self._unchanged(path, raw[path])
+                self._atomic_write(path, rendered[path], temps)
                 written.append(path)
             self._prune()
+        except _Changed:
+            self._restore(raw, written, temps)
+            raise
         except OSError as exc:
             # A half-applied change (models.json new, settings.json old) would leave Pi listing
             # a model it cannot enable; put back what this change replaced, from its own bytes.
-            restored = self._restore(raw, written)
+            restored = self._restore(raw, written, temps)
             state = "Pi was left as it was" if restored else f"restore it from the backups in {self.agent_dir}"
             return _result("not_updated", f"Pi's files could not be written ({exc.strerror or exc}); {state}.", notes)
         return _result("updated", "Pi's model list was updated.", notes)
 
-    def _restore(self, raw: Mapping[Path, bytes], written: list[Path]) -> bool:
-        """Undo this change's writes (best effort) and drop any temp file; True when all undone."""
+    @staticmethod
+    def _unchanged(path: Path, original: bytes) -> None:
+        if path.read_bytes() != original:
+            raise _Changed(str(path))
+
+    def _restore(self, raw: Mapping[Path, bytes], written: list[Path], temps: list[Path]) -> bool:
+        """Undo this change's writes (best effort) and drop its own temp files; True when all undone."""
         ok = True
         for path in written:
             try:
-                self._atomic_write(path, raw[path])
+                self._atomic_write(path, raw[path], temps)
             except OSError:
                 ok = False
-        for path in (self.models_path, self.settings_path):
+        for temporary in temps:
             try:
-                self._temp_path(path).unlink(missing_ok=True)
+                temporary.unlink(missing_ok=True)
             except OSError:
                 pass
         return ok
 
     @staticmethod
     def _temp_path(path: Path) -> Path:
-        return path.with_name(path.name + ".tmp-freetoken")
+        # Unique per write: a fixed name could be another writer's half-written temp.
+        return path.with_name(f"{path.name}.tmp-freetoken-{os.getpid()}-{uuid.uuid4().hex}")
 
     @classmethod
-    def _atomic_write(cls, path: Path, data: bytes) -> None:
+    def _atomic_write(cls, path: Path, data: bytes, temps: list[Path] | None = None) -> None:
         temporary = cls._temp_path(path)
-        temporary.write_bytes(data)
+        if temps is not None:
+            temps.append(temporary)
+        with open(temporary, "xb") as fh:
+            fh.write(data)
         os.replace(temporary, path)
 
     def _prune(self) -> None:
@@ -208,4 +255,4 @@ class PiSync:
                 (self.agent_dir / name).unlink(missing_ok=True)
 
 
-__all__ = ["BACKUPS_KEPT", "COPIED_FIELDS", "FALLBACK", "PROVIDER", "PiSync", "default_agent_dir"]
+__all__ = ["BACKUPS_KEPT", "CHANGED_WORDS", "COPIED_FIELDS", "FALLBACK", "PROVIDER", "PiSync", "default_agent_dir"]

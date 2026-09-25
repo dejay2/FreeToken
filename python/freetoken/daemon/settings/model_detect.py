@@ -106,7 +106,8 @@ def _v2(entry: Path, head: bytes, size: int) -> dict[str, Any]:
     return {"version": 2, "runtime": RUNTIME_BY_VERSION[2], "files": [str(entry)], "bytes": size}
 
 
-def _v3(entry: Path, directory: bytes, size: int) -> dict[str, Any]:
+def _part_names(directory: bytes) -> list[str]:
+    """The part names a v3 directory lists, checked for shape only (nothing on disk is looked at)."""
     try:
         doc = json.loads(directory.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
@@ -115,11 +116,18 @@ def _v3(entry: Path, directory: bytes, size: int) -> dict[str, Any]:
     if (not isinstance(records, list) or not records or not isinstance(records[0], dict)
             or records[0].get("path") is not None):
         raise NotAModel(DAMAGED_WORDS)
-    files, total = [str(entry)], size
+    names: list[str] = []
     for record in records[1:]:
         name = record.get("path") if isinstance(record, dict) else None
         if not isinstance(name, str) or not _SIBLING_RE.fullmatch(name):
             raise NotAModel(DAMAGED_WORDS)
+        names.append(name)
+    return names
+
+
+def _v3(entry: Path, directory: bytes, size: int) -> dict[str, Any]:
+    files, total = [str(entry)], size
+    for name in _part_names(directory):
         part = entry.with_name(name)
         try:
             total += part.stat().st_size
@@ -136,12 +144,19 @@ def _v3(entry: Path, directory: bytes, size: int) -> dict[str, Any]:
     return {"version": 3, "runtime": RUNTIME_BY_VERSION[3], "files": files, "bytes": total}
 
 
+class OwnershipUnknown(ValueError):
+    """A registered model's files cannot be listed (its NInfer header cannot be read)."""
+
+
 def model_files(engine: str, artifact: str) -> list[str]:
     """Everything that belongs to a model on disk: a NInfer entry plus its v3 parts, or a
-    FreeToken folder. Paths that do not exist are left out."""
+    FreeToken folder. Paths that do not exist are left out. A symlinked NInfer entry is only
+    the link: its target's parts belong to whatever the target is (review round, PR #17)."""
     path = Path(os.path.expanduser(artifact))
     if engine != "ninfer":
         return [str(path)] if path.is_dir() else []
+    if path.is_symlink():
+        return [str(path)]
     try:
         return read_ninfer(path)["files"]
     except NotAModel:
@@ -149,6 +164,51 @@ def model_files(engine: str, artifact: str) -> list[str]:
         found = [path] if path.is_file() else []
         found += sorted(path.parent.glob(glob.escape(path.name) + ".part-[0-9][0-9][0-9][0-9]"))
         return [str(item) for item in found]
+
+
+def _listed_parts(entry: Path) -> list[str]:
+    """The part names an entry's header lists, whether or not those parts exist. Raises
+    OSError (unreadable) or NotAModel (a NInfer header that cannot be parsed)."""
+    with entry.open("rb") as fh:
+        head = fh.read(V3_HEADER.size)
+        if head[:8] != V3_MAGIC:
+            return []  # v2 (one file) or not NInfer at all: it references nothing else
+        if len(head) < V3_HEADER.size:
+            raise NotAModel(DAMAGED_WORDS)
+        _, json_bytes, _ = V3_HEADER.unpack(head)
+        if not 0 < json_bytes <= MAX_DIRECTORY_BYTES:
+            raise NotAModel(DAMAGED_WORDS)
+        directory = fh.read(json_bytes)
+    if len(directory) != json_bytes:
+        raise NotAModel(DAMAGED_WORDS)
+    return _part_names(directory)
+
+
+def referenced_files(engine: str, artifact: str) -> list[str]:
+    """Every path a registered model may read, for deciding what another model's delete must
+    not touch. Unlike model_files this does not need the model to be loadable: a v3 header's
+    part list counts even when a listed part is missing, and a symlinked entry counts both its
+    own folder and its target's. Raises OwnershipUnknown when an entry exists but its header
+    cannot be read, because then which parts it uses cannot be known (review round, PR #17)."""
+    path = Path(os.path.expanduser(artifact))
+    if engine != "ninfer":
+        return [str(path)]
+    entries = [path]
+    if path.is_symlink():
+        entries.append(Path(os.path.realpath(path)))
+    out: list[str] = [str(path)]
+    for entry in entries:
+        out += [str(item) for item in sorted(entry.parent.glob(glob.escape(entry.name) + ".part-[0-9][0-9][0-9][0-9]"))]
+        if not entry.exists():
+            continue
+        try:
+            names = _listed_parts(entry)
+        except (OSError, NotAModel) as exc:
+            raise OwnershipUnknown(str(path)) from exc
+        out += [str(entry.with_name(name)) for name in names]
+        if path.is_symlink():
+            out += [str(path.with_name(name)) for name in names]
+    return list(dict.fromkeys(out))
 
 
 def suggest_id(stem: str, taken: Iterable[str]) -> str:
@@ -258,7 +318,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
-    "DAMAGED_WORDS", "MAX_DIRECTORY_BYTES", "NINFER_SUFFIX", "NOT_SUPPORTED", "NotAModel", "PART_MAGIC",
+    "DAMAGED_WORDS", "MAX_DIRECTORY_BYTES", "NINFER_SUFFIX", "NOT_SUPPORTED", "NotAModel", "OwnershipUnknown", "PART_MAGIC",
     "PART_RE", "PART_WORDS", "RUNTIME_BY_VERSION", "V2_MAGIC", "V2_PREFIX", "V3_HEADER", "V3_MAGIC",
-    "detect", "main", "model_files", "read_ninfer", "suggest_id", "suggest_name", "suggest_ram_gb",
+    "detect", "main", "model_files", "read_ninfer", "referenced_files", "suggest_id", "suggest_name", "suggest_ram_gb",
 ]

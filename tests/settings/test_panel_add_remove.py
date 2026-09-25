@@ -549,3 +549,109 @@ def test_a_removed_model_leaves_no_hold_behind_while_the_switcher_is_up(box):
     assert box.switcher.calls == [("unload", "quasar-27b")]
     assert "quasar-27b" not in json.loads(box.service.holds_path.read_text())
     assert "quasar-27b" not in extract_model_blocks(box.cfg.read_text()) and answer.json()["held"] == []
+
+
+# ---- review, PR #17 ----
+def test_pi_changes_run_in_the_order_the_list_was_changed(box):
+    """An add whose Pi write is slow, then a remove of the same model: Pi must not see the
+    remove first (it would end up listing a model the panel no longer has)."""
+    order, entered, release = [], threading.Event(), threading.Event()
+
+    def slow_add(*_a, **_k):
+        entered.set()
+        release.wait(5)
+        order.append("add")
+        return {"status": "updated", "message": "", "notes": []}
+
+    def quick_remove(*_a, **_k):
+        order.append("remove")
+        return {"status": "updated", "message": "", "notes": []}
+    box.service.pi = SimpleNamespace(add=slow_add, remove=quick_remove)
+    write_v2(box.ninfer / "small_9b.ninfer")
+    rev = box.store.load()[1]
+    adder = threading.Thread(target=box.service.add_model,
+                             args=(str(box.ninfer / "small_9b.ninfer"), "small_9b", "Small 9B", 6, rev))
+    adder.start()
+    assert entered.wait(5)
+    answers = []
+    remover = threading.Thread(target=lambda: answers.append(
+        box.service.remove_model("small_9b", False, box.store.load()[1])))
+    remover.start()
+    time.sleep(0.3)
+    assert order == [], "the remove's Pi change ran before the add's"
+    release.set()
+    adder.join(5)
+    remover.join(5)
+    assert order == ["add", "remove"] and answers[0]["pi"]["status"] == "updated"
+
+
+def switcher_answers(box, *answers):
+    """running() gives these answers in turn (the last one repeats)."""
+    seq = list(answers)
+
+    def running():
+        value = seq.pop(0) if len(seq) > 1 else seq[0]
+        return None if value is None else dict(value)
+    box.switcher.running = running
+
+
+def test_remove_puts_away_a_model_loaded_since_the_first_look(box):
+    switcher_answers(box, {}, {"quasar-27b": "ready"})
+    answer = remove(box, "quasar-27b")
+    assert answer.status_code == 200, answer.text
+    assert box.switcher.calls == [("unload", "quasar-27b")]
+
+
+def test_remove_is_refused_when_the_final_look_is_unknown(box):
+    rev = box.store.load()[1]
+    switcher_answers(box, {}, None)
+    answer = box.client.post("/api/panel/models/quasar-27b/remove", json={"revision": rev})
+    assert answer.status_code == 503 and answer.json()["code"] == "switcher_unknown", answer.text
+    assert "quasar-27b" in ids(box) and box.switcher.calls == []
+
+
+def test_removing_a_symlinked_alias_keeps_the_originals_parts(box):
+    original = write_v3(box.ninfer / "original.ninfer", parts=1)
+    alias = box.ninfer / "alias.ninfer"
+    alias.symlink_to(original.name)
+    assert add(box, alias, id="alias", name="Alias").status_code == 200
+    answer = remove(box, "alias", deleteFiles=True)
+    assert answer.status_code == 200, answer.text
+    assert not alias.is_symlink() and original.is_file() and (box.ninfer / "original.ninfer.part-0001").is_file()
+    assert answer.json()["files"]["paths"] == [str(alias)]
+
+
+def test_a_part_listed_by_a_model_that_cannot_load_is_still_protected(box):
+    write_v3(box.ninfer / "small_9b.ninfer", parts=1)
+    assert add(box, box.ninfer / "small_9b.ninfer").status_code == 200
+    write_v3(box.ninfer / "other.ninfer", part_names=["small_9b.ninfer.part-0001", "other.ninfer.part-0001"])
+    (box.ninfer / "other.ninfer.part-0001").unlink()  # other cannot load now, but still reads small_9b's part
+    doc, rev = box.store.load()
+    doc["models"].append({**find_model(doc, "twin-27b"), "id": "other", "name": "Other",
+                          "artifact": "~/ninfer-work/models/other.ninfer"})
+    box.store.save(doc, expected_revision=rev)
+    answer = remove(box, "small_9b", deleteFiles=True)
+    assert answer.status_code == 409 and answer.json()["code"] == "files_shared", answer.text
+    assert (box.ninfer / "small_9b.ninfer.part-0001").is_file() and "small_9b" in ids(box)
+
+
+def test_delete_is_refused_when_another_models_files_cannot_be_read(box):
+    write_v3(box.ninfer / "small_9b.ninfer", parts=1)
+    assert add(box, box.ninfer / "small_9b.ninfer").status_code == 200
+    (box.ninfer / "twin_nvfp4.ninfer").write_bytes(b"NINFER\x00\x03" + b"\xff" * 64)  # header unreadable
+    answer = remove(box, "small_9b", deleteFiles=True)
+    assert answer.status_code == 409 and answer.json()["code"] == "files_unknown", answer.text
+    assert "Twin" in answer.json()["message"] or "twin" in answer.json()["message"].lower()
+    assert (box.ninfer / "small_9b.ninfer.part-0001").is_file() and "small_9b" in ids(box)
+
+
+def test_a_folder_named_like_a_part_is_never_deleted(box):
+    write_v2(box.ninfer / "small_9b.ninfer")
+    assert add(box, box.ninfer / "small_9b.ninfer").status_code == 200
+    (box.ninfer / "small_9b.ninfer").write_bytes(b"broken")  # damaged: parts found by name
+    odd = box.ninfer / "small_9b.ninfer.part-0001"
+    odd.mkdir()
+    (odd / "keep.txt").write_text("x")
+    answer = remove(box, "small_9b", deleteFiles=True)
+    assert answer.status_code == 409 and answer.json()["code"] == "files_unsafe", answer.text
+    assert (odd / "keep.txt").is_file() and "small_9b" in ids(box)

@@ -412,3 +412,50 @@ def test_latest_add_reports_the_newest_wizard_download(tmp_path):
     job = m.start_add("owner/repo", **r)
     finish(m, job)
     assert m.latest_add()["id"] == job.job_id and m.latest_add()["kind"] == "add"
+
+
+def test_folder_placement_without_renameat2_never_uses_a_check_then_rename(tmp_path, monkeypatch):
+    """review, PR #17: an empty folder made between the check and the rename was silently replaced."""
+    import pathlib
+
+    monkeypatch.setattr(sys, "platform", "darwin")  # the path taken when RENAME_NOREPLACE is missing
+    source, target = tmp_path / "staging", tmp_path / "Tiny-Llama"
+    source.mkdir()
+    (source / "config.json").write_bytes(b"{}")
+    target.mkdir()  # the user's empty folder, made right after any existence check
+    real_exists = pathlib.Path.exists
+
+    def racing_exists(self, *args, **kwargs):
+        # A check-then-rename looks before the folder is made; the lie stands in for that window.
+        return False if self == target else real_exists(self, *args, **kwargs)
+    monkeypatch.setattr(pathlib.Path, "exists", racing_exists)
+    with pytest.raises(FileExistsError):
+        dl._rename_noreplace(source, target)
+    assert list(target.iterdir()) == [] and (source / "config.json").is_file()
+
+
+def test_folder_placement_without_renameat2_moves_files_and_backs_out_on_a_clash(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    source, target = tmp_path / "staging", tmp_path / "Model"
+    (source / "sub").mkdir(parents=True)
+    (source / "a.safetensors").write_bytes(b"a")
+    (source / "sub" / "b.json").write_bytes(b"b")
+    dl._rename_noreplace(source, target)
+    assert (target / "a.safetensors").read_bytes() == b"a" and (target / "sub" / "b.json").read_bytes() == b"b"
+    assert not source.exists()
+
+    source.mkdir()
+    for name in ("a.json", "b.json"):
+        (source / name).write_bytes(name.encode())
+    real_claim = dl._claim_file
+
+    def clash(src, dst):
+        if dst.name == "b.json":
+            dst.write_bytes(b"someone else's")  # appears inside the new folder meanwhile
+        real_claim(src, dst)
+    monkeypatch.setattr(dl, "_claim_file", clash)
+    with pytest.raises(FileExistsError):
+        dl._rename_noreplace(source, tmp_path / "Model2")
+    assert (source / "a.json").read_bytes() == b"a.json" and (source / "b.json").read_bytes() == b"b.json"
+    assert [p.name for p in (tmp_path / "Model2").iterdir()] == ["b.json"]
+    assert (tmp_path / "Model2" / "b.json").read_bytes() == b"someone else's"

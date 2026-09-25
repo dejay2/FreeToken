@@ -381,9 +381,11 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
     ``os.rename`` onto an *empty* directory silently replaces it on Linux, so an exists() check
     followed by a rename leaves a window in which a folder created by the user is lost. Linux
     has renameat2(RENAME_NOREPLACE), which makes the refusal atomic; it is reached through
-    ctypes because ``os`` has no wrapper. A filesystem that does not support the flag (EINVAL
-    on some FUSE and 9p mounts, ENOSYS on old kernels) falls back to the check-then-rename,
-    which is still what Windows ``os.rename`` does natively (it refuses an existing target).
+    ctypes because ``os`` has no wrapper. Windows ``os.rename`` refuses an existing target
+    natively. Anywhere else without the flag (EINVAL on some FUSE and 9p mounts, ENOSYS on old
+    kernels, other POSIX systems) a folder is placed by ``_move_into_new_folder``: an atomic
+    ``os.mkdir`` claims the name, then each file goes in without overwriting. A check-then-
+    rename was used here before, and a folder made in between was replaced (review, PR #17).
     """
     if sys.platform.startswith("linux"):
         try:
@@ -402,9 +404,78 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
                 raise FileExistsError(code, os.strerror(code), str(destination))
             if code not in (errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP):
                 raise OSError(code, os.strerror(code), str(source), None, str(destination))
-    if destination.exists() or destination.is_symlink():
-        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(destination))
-    os.rename(source, destination)
+    if sys.platform == "win32":
+        os.rename(source, destination)  # refuses an existing name (FileExistsError) by itself
+        return
+    if source.is_dir() and not source.is_symlink():
+        _move_into_new_folder(source, destination)
+        return
+    _claim_file(source, destination)
+    source.unlink(missing_ok=True)
+
+
+def _claim_file(source: Path, destination: Path) -> None:
+    """Put one file at ``destination`` without ever replacing what is there.
+
+    ``os.link`` refuses an existing name (a plain rename would silently replace it). A
+    filesystem that cannot hard-link (EPERM on WSL's drvfs mounts, EXDEV across volumes)
+    gets the same guarantee from an exclusive create of the name followed by a replace of
+    that placeholder, which is ours. With a hard link, ``source`` is left for the caller.
+    """
+    try:
+        os.link(source, destination)
+    except FileExistsError:
+        raise
+    except OSError:
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)  # FileExistsError if taken
+        os.close(fd)
+        try:
+            os.replace(source, destination)
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+
+
+def _move_into_new_folder(source: Path, destination: Path) -> None:
+    """Move folder ``source`` to the new name ``destination`` with no overwrite-capable rename:
+    ``os.mkdir`` claims the name atomically (FileExistsError if it is taken), each file is
+    linked or exclusively created inside it, and anything that clashes puts everything back."""
+    os.mkdir(destination)
+    placed: list[tuple[Path, Path]] = []  # (source file, placed file)
+    folders: list[Path] = [destination]
+    try:
+        for root, dirs, names in os.walk(source):
+            here = destination / Path(root).relative_to(source)
+            for name in sorted(dirs):
+                if (Path(root) / name).is_symlink():
+                    names.append(name)  # a link to a folder is moved as a link, never walked
+                    continue
+                os.mkdir(here / name)
+                folders.append(here / name)
+            dirs[:] = [d for d in dirs if not (Path(root) / d).is_symlink()]
+            for name in sorted(names):
+                src, dst = Path(root) / name, here / name
+                if src.is_symlink():
+                    os.symlink(os.readlink(src), dst)  # FileExistsError if the name was taken
+                else:
+                    _claim_file(src, dst)
+                placed.append((src, dst))
+    except BaseException:
+        for src, dst in reversed(placed):
+            try:
+                if src.exists() or src.is_symlink():
+                    dst.unlink()
+                else:
+                    os.replace(dst, src)
+            except OSError:
+                pass
+        for folder in reversed(folders):
+            try:
+                folder.rmdir()  # only when empty: whatever someone else put there stays
+            except OSError:
+                pass
+        raise
+    shutil.rmtree(source, ignore_errors=True)
 
 
 class _DropTokenAcrossHosts(HTTPRedirectHandler):
@@ -1224,25 +1295,8 @@ class DownloadManager:
 
     @staticmethod
     def _claim_and_move(source: Path, destination: Path) -> None:
-        """Put one file at ``destination`` without ever replacing what is there.
-
-        ``os.link`` refuses an existing name (a plain rename would silently replace it). A
-        filesystem that cannot hard-link (EPERM on WSL's drvfs mounts, EXDEV across volumes)
-        gets the same guarantee from an exclusive create of the name followed by a replace of
-        that placeholder, which is ours.
-        """
-        try:
-            os.link(source, destination)
-        except FileExistsError:
-            raise
-        except OSError:
-            fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)  # FileExistsError if taken
-            os.close(fd)
-            try:
-                os.replace(source, destination)
-            except BaseException:
-                destination.unlink(missing_ok=True)
-                raise
+        """Put one file at ``destination`` without ever replacing what is there (_claim_file)."""
+        _claim_file(source, destination)
 
     @classmethod
     def _place(cls, job: DownloadJob) -> None:

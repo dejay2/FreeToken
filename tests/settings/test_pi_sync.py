@@ -160,11 +160,13 @@ def test_a_failed_second_write_puts_the_first_file_back(tmp_path, monkeypatch):
     original = {name: (folder / name).read_bytes() for name in ("models.json", "settings.json")}
     real = PiSync._atomic_write.__func__
 
-    def flaky(cls, path, data):
+    def flaky(cls, path, data, temps=None):
         if path.name == "settings.json":
-            (folder / "settings.json.tmp-freetoken").write_bytes(data)  # the temp file got written...
+            temporary = cls._temp_path(path)
+            temps.append(temporary)
+            temporary.write_bytes(data)  # the temp file got written...
             raise PermissionError(13, "Permission denied")  # ...but the replace did not
-        real(cls, path, data)
+        real(cls, path, data, temps)
 
     monkeypatch.setattr(PiSync, "_atomic_write", classmethod(flaky))
     result = PiSync(folder, now=Clock()).add("small-9b", "Small", "ninfer", ENGINES)
@@ -172,7 +174,7 @@ def test_a_failed_second_write_puts_the_first_file_back(tmp_path, monkeypatch):
     assert "left as it was" in result["message"]
     assert (folder / "models.json").read_bytes() == original["models.json"]
     assert (folder / "settings.json").read_bytes() == original["settings.json"]
-    assert not list(folder.glob("*.tmp-freetoken"))
+    assert not list(folder.glob("*.tmp-freetoken*"))
 
 
 def test_bytes_that_are_not_utf8_are_never_rewritten(tmp_path):
@@ -218,3 +220,84 @@ def test_a_single_line_file_stays_single_line(tmp_path):
 def test_sync_off_says_so(tmp_path):
     result = PiSync(tmp_path, enabled=False).add("x", "X", "ninfer", {})
     assert result == {"status": "not_updated", "message": "Pi sync is off on this helper.", "notes": []}
+
+
+# ---- review, PR #17: overlapping changes, files changed underneath, temp names ----
+def test_overlapping_changes_both_land(tmp_path):
+    """Two adds at once: without one-at-a-time changes both read the same files and the second
+    write drops the first's model while both say "updated"."""
+    import threading
+
+    folder = write_pi(tmp_path / "agent")
+    arrived = threading.Barrier(2, timeout=0.5)
+
+    def now():
+        try:
+            arrived.wait()  # both changes in the middle at once, if nothing keeps them apart
+        except threading.BrokenBarrierError:
+            pass
+        return dt.datetime.now()
+
+    results = {}
+
+    def run(model_id):
+        results[model_id] = PiSync(folder, now=now).add(model_id, model_id, "ninfer", ENGINES)
+    threads = [threading.Thread(target=run, args=(m,)) for m in ("a-9b", "b-9b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert [r["status"] for r in results.values()] == ["updated", "updated"], results
+    models, settings = load(folder)
+    ids = [m["id"] for m in models["providers"][PROVIDER]["models"]]
+    assert "a-9b" in ids and "b-9b" in ids
+    assert f"{PROVIDER}/a-9b" in settings["enabledModels"] and f"{PROVIDER}/b-9b" in settings["enabledModels"]
+
+
+def other_provider_edit(folder: Path, name: str) -> None:
+    path = folder / "models.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["providers"][name] = {"models": [{"id": name}]}
+    path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+
+
+def test_an_edit_made_underneath_is_kept_and_the_change_is_made_again(tmp_path):
+    folder = write_pi(tmp_path / "agent")
+    calls = []
+
+    def now():
+        calls.append(1)
+        if len(calls) == 1:
+            other_provider_edit(folder, "mine")  # Jay (or Pi) edits another provider meanwhile
+        return dt.datetime(2026, 9, 25, 12, 0, len(calls))
+
+    result = PiSync(folder, now=now).add("small-9b", "Small", "ninfer", ENGINES)
+    assert result["status"] == "updated", result
+    models, _ = load(folder)
+    assert models["providers"]["mine"] == {"models": [{"id": "mine"}]}
+    assert models["providers"][PROVIDER]["models"][-1]["id"] == "small-9b"
+
+
+def test_files_that_keep_changing_are_not_updated(tmp_path):
+    folder = write_pi(tmp_path / "agent")
+    count = []
+
+    def now():
+        count.append(1)
+        other_provider_edit(folder, f"edit{len(count)}")
+        return dt.datetime(2026, 9, 25, 12, 0, len(count))
+
+    result = PiSync(folder, now=now).add("small-9b", "Small", "ninfer", ENGINES)
+    assert result["status"] == "not_updated" and result["message"] == "Pi's files changed while updating; try again."
+    models, _ = load(folder)
+    assert "edit2" in models["providers"] and "small-9b" not in [m["id"] for m in models["providers"][PROVIDER]["models"]]
+    assert not list(folder.glob("*.tmp-freetoken*"))
+
+
+def test_another_writers_temp_file_is_never_used(tmp_path):
+    folder = write_pi(tmp_path / "agent")
+    stray = folder / "models.json.tmp-freetoken"
+    stray.write_bytes(b"someone else's half-written file")
+    assert PiSync(folder, now=Clock()).add("small-9b", "Small", "ninfer", ENGINES)["status"] == "updated"
+    assert stray.read_bytes() == b"someone else's half-written file"
+    assert [p.name for p in folder.glob("*.tmp-freetoken*")] == ["models.json.tmp-freetoken"]
