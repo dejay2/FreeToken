@@ -62,6 +62,11 @@ class LinearStatePool:
         self._conv_dtype = dtype
 
         n_layers, local_conv_dim, local_v_heads = _linear_local_dims(group, tp_size)
+        # Recorded so rebuild never reads geometry off the tensors: a rebuild that OOMs leaves
+        # them None, and the failed wake's way back to sleep (engine/sleep.py release_to_sleep
+        # force_pools) must still be able to re-make the pool.
+        self._conv_shape = (n_layers, local_conv_dim, group.conv_kernel_dim - 1)
+        self._rec_shape = (n_layers, local_v_heads, group.key_head_dim, group.value_head_dim)
 
         # conv left-context: the last (kernel-1) timesteps of the conv input stream.
         self.conv_states = torch.zeros(
@@ -76,6 +81,7 @@ class LinearStatePool:
             dtype=ssm_state_dtype(),
             device=device,
         )
+        self._rec_dtype = self.recurrent_states.dtype
         self._local_index = {layer_id: i for i, layer_id in enumerate(group.layer_ids)}
 
         self._slot_specs = tuple(slot_states)
@@ -94,6 +100,12 @@ class LinearStatePool:
         # flows between them by demand. Unused by the op harness (which assigns slots by hand).
         self.padding_slot = 0
         self._free_slots: list[int] = list(range(1, num_slots))
+        # Slots held for the engine's lifetime by a non-request owner (the MTP state ladder's
+        # rollback snapshot). reclaim_all_slots must not hand them out again: a CacheManager
+        # rebuild after the ladder's rebind would otherwise give the ladder's slot to the next
+        # request, and speculative verification would overwrite its snapshot (PR #19 review).
+        # rebuild() drops them, since it replaces the tensors; the owner re-reserves.
+        self._reserved_slots: list[int] = []
 
     def _alloc_slot_states(self, num_slots: int) -> dict[str, torch.Tensor]:
         return {
@@ -135,24 +147,33 @@ class LinearStatePool:
             )
         return [self._free_slots.pop() for _ in range(n)]
 
+    def alloc_reserved(self, n: int = 1) -> list[int]:
+        """``alloc`` for a long-lived owner outside the request path: the slots survive
+        ``reclaim_all_slots`` (they stay out of the free list) until the next ``rebuild``."""
+        slots = self.alloc(n)
+        self._reserved_slots.extend(slots)
+        return slots
+
     def reclaim_all_slots(self) -> None:
-        """Restore the free-list to all non-padding slots. Idle-only: the caller (e.g. a
-        CacheManager rebuild that discards the tree owning donated snapshots) must guarantee no
-        running request holds a slot, otherwise live state would be handed out twice."""
-        self._free_slots = list(range(1, self._num_slots))
+        """Restore the free-list to all non-padding, non-reserved slots. Idle-only: the caller
+        (e.g. a CacheManager rebuild that discards the tree owning donated snapshots) must
+        guarantee no running request holds a slot, otherwise live state would be handed out
+        twice."""
+        reserved = set(self._reserved_slots)
+        self._free_slots = [s for s in range(1, self._num_slots) if s not in reserved]
 
     def rebuild(self, num_slots: int) -> None:
         """Reallocate the conv + recurrent state tensors for ``num_slots`` slots IN PLACE.
 
-        Geometry (layers, conv dim, head dims) and dtypes are taken from the existing
-        tensors; only the slot count changes. Object identity is preserved so cached
+        Geometry (layers, conv dim, head dims) and dtypes are the ones recorded at
+        construction (never read off the tensors, which a failed rebuild leaves None); only the slot count changes. Object identity is preserved so cached
         references (ctx.linear_state_pool) stay valid. Idle-only and destructive: every
         live/snapshot state is dropped, so the caller must guarantee no running request
         holds a slot and the radix tree owning donated snapshots is discarded too.
         """
-        n_layers, _, local_conv_dim, km1 = self.conv_states.shape
-        _, _, local_v_heads, key_head_dim, value_head_dim = self.recurrent_states.shape
-        conv_dtype, rec_dtype = self.conv_states.dtype, self.recurrent_states.dtype
+        n_layers, local_conv_dim, km1 = self._conv_shape
+        _, local_v_heads, key_head_dim, value_head_dim = self._rec_shape
+        conv_dtype, rec_dtype = self._conv_dtype, self._rec_dtype
         device = self._device
         self.conv_states = None
         self.recurrent_states = None
@@ -171,6 +192,7 @@ class LinearStatePool:
         self.slot_states = self._alloc_slot_states(num_slots)
         self._num_slots = num_slots
         self._free_slots = list(range(1, num_slots))
+        self._reserved_slots = []
 
     def free(self, slots) -> None:
         """Return slot ids to the free-list. Accepts an int, list, or 1-D tensor."""

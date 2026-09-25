@@ -95,3 +95,11 @@ _Avoid:_ live-tail backup, cache rollback, shared final page
 The future user-facing loop that makes MTP guesses, checks them with the target, keeps an accepted prefix, corrects a rejection under normal sampling, and returns the resulting tokens to the client. It is not approved by the private fast-checker spike.
 
 _Avoid:_ shadow checking, MTP feasibility probe
+
+## Sleep
+
+FreeToken giving the graphics card back while the model stays in PC memory. The model is still
+"loaded" (the switcher says ready); a chat or Wake brings it back in about half a minute instead
+of a two-and-a-half-minute load. Unload is still the way to free the PC memory too.
+
+_Avoid:_ suspend, hibernate, unload

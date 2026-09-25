@@ -322,7 +322,9 @@ class PanelService:
     def __init__(self, *, store, writer, switcher, profiles, boot_file: Callable[[], BootFile],
                  default_boot: Callable[[], Path], estimate_service, card_probe=None, windows_free_probe=None,
                  holds_path=None, artifact_size=None, spawn=None, clock=time.monotonic, sleep=time.sleep,
-                 restart_wait_s: float = 30.0, downloads=None, pi=None, add_roots=None, profile_deleted=None) -> None:
+                 restart_wait_s: float = 30.0, downloads=None, pi=None, add_roots=None, profile_deleted=None,
+                 freetoken_state: Callable[[], Any] | None = None,
+                 freetoken_control: Callable[[str], dict[str, Any]] | None = None) -> None:
         self.store, self.writer, self.switcher, self.profiles = store, writer, switcher, profiles
         self._boot_file, self._default_boot, self.estimate_service = boot_file, default_boot, estimate_service
         self._card_probe = card_probe or _default_card_probe
@@ -337,6 +339,12 @@ class PanelService:
         # Called with profiles.delete()'s result so the app can move the helper back to its
         # default boot file when the removed model's profile was the active one.
         self.profile_deleted = profile_deleted
+        # Sleep (docs/superpowers/specs/2026-09-25-freetoken-sleep-design.md section 2.5): the
+        # FreeToken server's public state word ("sleeping" while the card is given back) and its
+        # /v1/sleep | /v1/wake, both through the helper's ProcessManager. Either may be None:
+        # the route tests hand in a manager that predates sleep, and then every row reads awake.
+        self._freetoken_state = freetoken_state
+        self._freetoken_control = freetoken_control
         self._lock = threading.RLock()
         # Pi changes run after the panel lock is released (slow /mnt/c), but in the order the
         # registry committed them: queued under the panel lock, run one at a time under
@@ -967,15 +975,36 @@ class PanelService:
         text = self.writer.current_text()
         return live is not None and text is not None and live != config_sha256(text)
 
+    # ---- sleep (the loaded FreeToken model gives the card back, stays in PC memory) ----
+    def _sleep_word(self) -> str:
+        """"asleep" or "awake" for the loaded FreeToken model (one server, one port)."""
+        try:
+            state = self._freetoken_state() if self._freetoken_state is not None else None
+        except Exception:  # noqa: BLE001 - an unreachable helper probe reads as awake
+            state = None
+        return "asleep" if state == "sleeping" else "awake"
+
+    def _mark_sleep(self, rows: list[dict[str, Any]], engines: Mapping[str, str]) -> None:
+        """Add ``sleep`` to every row: the FreeToken row llama-swap reports ``ready`` gets
+        "asleep" or "awake", every other row null. A sleeping FreeToken is still "ready" to
+        the switcher (no llama-swap patch, spec section 2.5), so the word comes from the
+        server's own state, asked once per listing."""
+        loaded = [row for row in rows if engines.get(row["id"]) == "freetoken" and row.get("state") == "ready"]
+        word = self._sleep_word() if loaded else None
+        for row in rows:
+            row["sleep"] = word if row in loaded else None
+
     def now(self) -> dict[str, Any]:
         running = self.switcher.running()
         up = running is not None and not is_down(running)
         try:
             doc, _ = self.store.load()
             names, floor = {m["id"]: m["name"] for m in doc["models"]}, doc["system"]["floorGB"]
+            engines = {m["id"]: m["engine"] for m in doc["models"]}
         except RegistryError:
-            names, floor = {}, None
+            names, floor, engines = {}, None, {}
         rows = [{"id": m, "name": names.get(m, m), "state": s} for m, s in sorted((running or {}).items())]
+        self._mark_sleep(rows, engines)
         last = self.last_restart
         if last is not None and self._last_restart_at is not None and self._clock() - self._last_restart_at >= RESTART_SHOWN_S:
             last = None
@@ -1012,7 +1041,42 @@ class PanelService:
                 "state": running.get(model["id"], "stopped") if up else "unknown",
                 "held": model["id"] in holds,
             })
+        self._mark_sleep(rows, {m["id"]: m["engine"] for m in doc["models"]})
         return {"revision": revision, "switcherUp": up, "models": rows}
+
+    def sleep_model(self, model_id: str, action: str) -> dict[str, Any]:
+        """Sleep or wake the loaded FreeToken model. Sleep keeps it loaded (llama-swap still
+        says "ready"), so this goes to the helper's server proxy, never to the switcher."""
+        doc, _ = self.store.load()
+        model = find_model(doc, model_id)
+        if model["engine"] != "freetoken":
+            raise PanelError(409, "not_freetoken", "Only FreeToken models can sleep.")
+        running = self.switcher.running()
+        if running is None or is_down(running) or running.get(model_id) != "ready":
+            raise PanelError(409, "not_loaded", f"{model['name']} is not loaded, so there is nothing to {action}.")
+        if self._freetoken_control is None:
+            raise PanelError(503, "helper_missing", "The settings helper cannot reach FreeToken.")
+        # Refused while a Test-tab run holds the card, like load and unload.
+        self._begin_action()
+        try:
+            result = self._freetoken_control(action)
+        finally:
+            self._end_action()
+        status = result.get("status")
+        if status == "ok":
+            return {"id": model_id, "sleep": "asleep" if action == "sleep" else "awake", "result": result}
+        # The server's own words (api_server /v1/sleep|/v1/wake): "busy" while a chat runs,
+        # "rejected" carries the reason (a game holding the card), "timeout" after the 330 s
+        # helper wait (process_manager.sleep_server), "unreachable" when nothing answered.
+        if status == "busy":
+            message = "A chat is still running. Try again when it finishes."
+        elif status == "unreachable":
+            message = "FreeToken is not answering."
+        elif status == "timeout":
+            message = f"FreeToken took too long to {action}. Check the Server tab in a minute."
+        else:
+            message = str(result.get("error") or f"Could not {action} {model['name']}.")
+        raise PanelError({"busy": 409, "timeout": 504}.get(status, 503), f"{action}_{status or 'failed'}", message)
 
     def _begin_action(self) -> None:
         """The test guard for a panel load/unload, checked under the lock begin_test takes, and
@@ -1700,6 +1764,14 @@ def create_panel_router(service: PanelService) -> APIRouter:
     @router.post("/models/{model_id}/unload")
     async def unload(model_id: str):
         return await call(service.unload, model_id)
+
+    @router.post("/models/{model_id}/sleep")
+    async def sleep_model(model_id: str):
+        return await call(service.sleep_model, model_id, "sleep")
+
+    @router.post("/models/{model_id}/wake")
+    async def wake_model(model_id: str):
+        return await call(service.sleep_model, model_id, "wake")
 
     @router.get("/models/{model_id}/effective")
     async def effective(model_id: str):

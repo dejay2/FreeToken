@@ -15,6 +15,16 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 
+def public_state(state: Any) -> str:
+    """maintenance_state as the outside world sees it: "sleeping" while the engine has given
+    the card back and is otherwise serving (docs/superpowers/specs/2026-09-25-freetoken-sleep-design.md).
+    The helper's watchdog, governor and adapters read this word from /v1/cache/status."""
+    mstate = getattr(state, "maintenance_state", "serving")
+    if mstate == "serving" and getattr(state, "asleep", False):
+        return "sleeping"
+    return mstate
+
+
 def build_health(state: Any, version: str) -> dict:
     """Full-lifecycle health doc: loading -> ok -> error."""
     instance_id = getattr(state, "instance_id", None)
@@ -28,7 +38,7 @@ def build_health(state: Any, version: str) -> dict:
     if fatal:
         return {"status": "error", "message": fatal, "instance_id": instance_id, "inference": inference}
 
-    mstate = getattr(state, "maintenance_state", "serving")
+    mstate = public_state(state)
     config = getattr(state, "config", None)
     model = getattr(config, "served_model_name", None)
 
@@ -56,6 +66,8 @@ def build_health(state: Any, version: str) -> dict:
         "version": version,
         "inference": inference,
     }
+    if mstate == "sleeping":
+        doc["sleep"] = dict(getattr(state, "sleep_info", None) or {})
     if isinstance(maintenance, dict) and maintenance.get("age_s") is not None:
         doc["maintenance_age_s"] = maintenance["age_s"]
         doc["maintenance_phase"] = maintenance.get("phase")
@@ -67,7 +79,9 @@ def build_health(state: Any, version: str) -> dict:
 # out by the chat routes' gate (a few seconds of slowness), so it still counts as ready. A
 # rebuild stuck past its deadline turns /health (and so /ready) to "error" through
 # check_maintenance, the same verdict the chat gate reaches.
-_READY_MAINTENANCE = ("serving", "rebuilding")
+# A sleeping engine is ready too: a chat wakes it (design section 2.5), and llama-swap must keep
+# treating a sleeping FreeToken as loaded, not start it again.
+_READY_MAINTENANCE = ("serving", "rebuilding", "sleeping")
 
 
 def is_ready(health: dict) -> bool:

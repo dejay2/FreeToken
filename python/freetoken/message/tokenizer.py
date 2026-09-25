@@ -200,6 +200,26 @@ class KVDynamicStatusMsg(BaseTokenizerMsg):
 
 
 @dataclass
+class CacheSleepMsg(BaseTokenizerMsg):
+    # api -> tokenizer worker (passthrough to CacheSleepBackendMsg).
+    request_id: str
+    action: str  # "sleep" | "wake"
+
+
+@dataclass
+class CacheSleepResultMsg(BaseTokenizerMsg):
+    # scheduler -> detokenizer worker (passthrough to CacheSleepReply).
+    request_id: str
+    action: str
+    status: str  # "ok" | "rejected" | "busy" | "unsupported" | "failed"
+    asleep: bool = False  # the engine's state AFTER this operation, whatever its status
+    released_bytes: int = 0
+    vram_free_bytes: int = 0
+    elapsed_s: float = 0.0
+    error: str | None = None
+
+
+@dataclass
 class CacheResidencyMsg(BaseTokenizerMsg):
     request_id: str
 

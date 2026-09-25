@@ -606,18 +606,7 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
         )
-        warmup_lengths = []
-        if config.attention_backend.split(",")[0] == "triton":
-            warmup_lengths.extend((80, 128))
-        from freetoken.layers.moe import _SMALL_PREFILL_ROWS
-        if (
-            _SMALL_PREFILL_ROWS > 0
-            and self.moe_offload_cache is not None
-            and self.moe_offload_cache.quant_format == "nvfp4"
-        ):
-            # Decode graph capture and long saved-prefix warming do not execute
-            # the short-tail prefill kernels. Compile/load those before serving.
-            warmup_lengths.append(_SMALL_PREFILL_ROWS)
+        warmup_lengths = self._boot_warmup_lengths(config)
         if warmup_lengths:
             self._warmup_prefill(lengths=warmup_lengths)
         # Heavy private state is deliberately last: target weights, trusted pools, graphs, and
@@ -663,6 +652,36 @@ class Engine:
             # the verify widths, then the DRAFT head's own chain and commit graphs, then the
             # ladder's replay rungs (which need the verify warm-ups' stash to have run).
             self._capture_spec_graphs_at_boot()
+
+    # ---- sleep (engine/sleep.py; docs/superpowers/specs/2026-09-25-freetoken-sleep-design.md) ----
+    # A CLASS default like _gpu_owned_layer_ids: Engine.__new__ stubs in the tests read it.
+    # None means awake; this is the one source of truth the scheduler reads.
+    sleep_snapshot = None
+
+    def sleep_preflight(self) -> None:
+        from .sleep import check_can_sleep
+
+        check_can_sleep(self)
+
+    # inference_mode like rebuild_runtime_cache: the pools, banks and graphs these re-make are
+    # the same tensors, and the scheduler's forwards run under it.
+    @torch.inference_mode()
+    def sleep(self) -> dict:
+        from .sleep import sleep_engine
+
+        return sleep_engine(self)
+
+    @torch.inference_mode()
+    def wake(self) -> dict:
+        from .sleep import wake_engine
+
+        return wake_engine(self)
+
+    @torch.inference_mode()
+    def asleep_rebuild(self, **kwargs) -> None:
+        from .sleep import asleep_rebuild
+
+        asleep_rebuild(self, **kwargs)
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -2373,20 +2392,7 @@ class Engine:
 
         torch.cuda.synchronize(self.device)
         self._report_maintenance_progress("rebuild:validated")
-        # Preserve the CUDA-graph batch-size set resolved at startup. The auto heuristic keys
-        # off free memory, which is far smaller now that the caches are resident (post-cache
-        # free << startup pre-load free), so re-deriving it here would silently drop large
-        # batch sizes after the first rebuild. Reusing the already-resolved list keeps the
-        # captured coverage identical (the fit-check above guarantees the graph headroom fits).
-        # While DISK layers exist the live runner was built with no graphs (below), so the
-        # boot-resolved set is parked in _deferred_graph_bs and read back from there. Keyed on
-        # the deferral marker, not on list truthiness: a boot that disabled graphs has an
-        # empty list that must stay empty (None would re-derive the auto set).
-        if getattr(self, "_graphs_deferred", None):
-            prior_graph_bs = self._deferred_graph_bs
-        else:
-            prior_graph_bs = self.graph_runner.graph_bs_list
-            self._deferred_graph_bs = list(prior_graph_bs)
+        prior_graph_bs = self._graph_bs_for_recapture()
         # Point of no return for the scheduler's rollback logic: from here the live graphs and
         # pools start being freed. A failure BEFORE this flag flips leaves the engine serving
         # untouched (no rollback needed); after it, only a rebuild restores service.
@@ -2419,12 +2425,45 @@ class Engine:
         self._report_maintenance_progress("rebuild:pools")
         # 3. Refresh max_seq_len (+ generic page table) for the new token budget.
         self._refresh_seq_state(config)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
         # 4. Re-capture CUDA graphs against the new tensors (reset_capture above re-armed
         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
         gc.collect()
         free_min = self._sync_get_memory()[0]
         self._report_maintenance_progress("rebuild:capture")
+        self._recapture_graphs(config, prior_graph_bs, free_min)
+        # Re-arm the speculative widths on BOTH branches. Until 2026-09-08 this sat inside the
+        # capture branch only, so the spill that deferred the graphs dropped the runner and the
+        # recall found nothing to re-arm: with MTP on, every later decode step ran eager
+        # (measured 20 tok/s against 50 before the spill, RTX 5090, depth 3). Arming while the
+        # graphs are deferred is harmless: _capture_decode_graph checks can_use_cuda_graph first.
+        self._rearm_spec_graphs()
+        self._report_maintenance_progress("rebuild:captured")
+
+    def _graph_bs_for_recapture(self) -> list[int]:
+        """The CUDA-graph batch sizes resolved at boot, for a re-capture after a teardown.
+
+        The auto heuristic keys off free memory, which is far smaller once the caches are
+        resident (post-cache free << startup pre-load free), so re-deriving it after a rebuild
+        would silently drop large batch sizes. Reusing the already-resolved list keeps the
+        captured coverage identical (the caller's fit-check guarantees the graph headroom fits).
+        While DISK layers exist the live runner was built with no graphs, so the boot-resolved
+        set is parked in ``_deferred_graph_bs`` and read back from there. Keyed on the deferral
+        marker, not on list truthiness: a boot that disabled graphs has an empty list that must
+        stay empty (None would re-derive the auto set). Shared by rebuild_runtime_cache and
+        sleep (engine/sleep.py).
+        """
+        if getattr(self, "_graphs_deferred", None):
+            return self._deferred_graph_bs
+        prior = self.graph_runner.graph_bs_list
+        self._deferred_graph_bs = list(prior)
+        return prior
+
+    def _recapture_graphs(self, config, prior_graph_bs, free_min: int) -> None:
+        """Build a fresh GraphRunner against the current tensors: no graphs while any MoE layer
+        is on the SSD (a disk layer forces eager decode), else the boot-resolved sizes.
+        Extracted unchanged from rebuild_runtime_cache step 4 so wake (engine/sleep.py) takes
+        the identical path."""
+        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
         has_disk = self.moe_offload_cache is not None and getattr(self.moe_offload_cache, "has_disk_layers", False)
         if has_disk:
             self.graph_runner = GraphRunner(
@@ -2450,7 +2489,7 @@ class Engine:
                 device=self.device,
                 model=self.model,
                 attn_backend=self.attn_backend,
-                cuda_graph_bs=prior_graph_bs,  # reuse the startup-resolved set (see above)
+                cuda_graph_bs=prior_graph_bs,  # reuse the startup-resolved set
                 cuda_graph_max_bs=config.cuda_graph_max_bs,
                 free_memory=free_min,
                 max_seq_len=aligned_max_seq_len,
@@ -2459,13 +2498,6 @@ class Engine:
                 moe_offload_cache=self.moe_offload_cache,
                 mrope=config.model_config.model_is_mrope,
             )
-        # Re-arm the speculative widths on BOTH branches. Until 2026-09-08 this sat inside the
-        # capture branch only, so the spill that deferred the graphs dropped the runner and the
-        # recall found nothing to re-arm: with MTP on, every later decode step ran eager
-        # (measured 20 tok/s against 50 before the spill, RTX 5090, depth 3). Arming while the
-        # graphs are deferred is harmless: _capture_decode_graph checks can_use_cuda_graph first.
-        self._rearm_spec_graphs()
-        self._report_maintenance_progress("rebuild:captured")
 
     def _rearm_spec_graphs(self) -> None:
         """Re-arm (not re-capture) the speculative verify widths armed at boot.
@@ -2955,6 +2987,23 @@ class Engine:
         return SpecForwardOutput(decision, next_tokens_gpu, hidden)
 
     @torch.inference_mode()
+    def _boot_warmup_lengths(self, config) -> list[int]:
+        """The prefill lengths boot warms, shared with wake's self-check (engine/sleep.py) so a
+        wake exercises exactly the kernels boot compiled and nothing boot never ran."""
+        warmup_lengths = []
+        if config.attention_backend.split(",")[0] == "triton":
+            warmup_lengths.extend((80, 128))
+        from freetoken.layers.moe import _SMALL_PREFILL_ROWS
+        if (
+            _SMALL_PREFILL_ROWS > 0
+            and self.moe_offload_cache is not None
+            and self.moe_offload_cache.quant_format == "nvfp4"
+        ):
+            # Decode graph capture and long saved-prefix warming do not execute
+            # the short-tail prefill kernels. Compile/load those before serving.
+            warmup_lengths.append(_SMALL_PREFILL_ROWS)
+        return warmup_lengths
+
     def _warmup_prefill(self, *, lengths: Sequence[int] = (80, 128)) -> None:
         """Compile the Triton prefill path before the first real request.
 

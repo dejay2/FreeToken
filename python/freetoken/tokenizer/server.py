@@ -34,6 +34,10 @@ from freetoken.message import (
     CacheResidencyMsg,
     CacheResidencyReply,
     CacheResidencyResultMsg,
+    CacheSleepBackendMsg,
+    CacheSleepMsg,
+    CacheSleepReply,
+    CacheSleepResultMsg,
     CacheStepBackendMsg,
     CacheStepMsg,
     CacheStepReply,
@@ -385,6 +389,8 @@ _CONTROL_MSG_TYPES = (
     CacheRebuildResultMsg,
     CacheResidencyMsg,
     CacheResidencyResultMsg,
+    CacheSleepMsg,
+    CacheSleepResultMsg,
     CacheStepMsg,
     CacheStepResultMsg,
     ErrorReplyMsg,
@@ -513,6 +519,21 @@ def _forward_control_msg(m, send_backend, send_frontend) -> bool:
                 axis=m.axis,
                 direction=m.direction,
                 ram_tight=m.ram_tight,
+            )
+        )
+    elif isinstance(m, CacheSleepMsg):
+        send_backend.put(CacheSleepBackendMsg(request_id=m.request_id, action=m.action))
+    elif isinstance(m, CacheSleepResultMsg):
+        send_frontend.put(
+            CacheSleepReply(
+                request_id=m.request_id,
+                action=m.action,
+                status=m.status,
+                asleep=m.asleep,
+                released_bytes=m.released_bytes,
+                vram_free_bytes=m.vram_free_bytes,
+                elapsed_s=m.elapsed_s,
+                error=m.error,
             )
         )
     elif isinstance(m, CacheResidencyMsg):

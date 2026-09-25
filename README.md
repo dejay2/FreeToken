@@ -225,6 +225,22 @@ uncached. A parked hit must beat the live GPU match by one page in RAM mode or 4
 mode (the measured transfer break-even), and restore leaves one GPU page for the current turn's
 tail; otherwise FreeToken uses an ordinary cold prefill.
 
+### Sleep (free the graphics card, keep the model loaded)
+
+`POST /v1/sleep` gives the card back for a game while the model stays in PC memory: the
+GPU-owned expert layers go to the SSD expert copy, the shared slot cache, KV pool, GDN state,
+CUDA graphs and the MTP draft head are freed, and conversations are parked to RAM first. The
+dense weights stay on the card (phase 1). The next chat, or `POST /v1/wake`, brings it back;
+a wake is refused, and the model stays asleep, while another program holds the card.
+`/health`, `/ready` and `/v1/cache/status` report `sleeping`. The settings helper proxies the
+pair as `POST /api/server/sleep|wake`, and the control panel shows **Sleep** / **Wake** next to
+**Unload** on the loaded FreeToken model (status "Asleep (graphics card free)"); llama-swap
+still sees it as loaded, and loading any other model unloads it fully. While asleep the memory
+governor only spills expert layers to the SSD under Windows RAM pressure, and the crash watchdog
+treats a sleeping server as alive. Design and measured numbers:
+`docs/superpowers/specs/2026-09-25-freetoken-sleep-design.md`,
+`docs/research/freetoken-sleep-acceptance-*.md`.
+
 ### Still-picture (vision) serving
 
 Vision support is opt-in and disabled by default. Enable it with environment variables or launcher flags:

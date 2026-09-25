@@ -1,0 +1,174 @@
+{
+  "model": "Qwen3.8-Flash-Next-NVFP4",
+  "server": "http://127.0.0.1:2020",
+  "started": "2026-09-25 11:09:09",
+  "prompt": "List the first twelve prime numbers, then explain in three sentences why there are infinitely many primes.",
+  "tokens": 200,
+  "baseline_gib": 1.6,
+  "max_asleep_gib": 7.5,
+  "max_wake_s": 45.0,
+  "health_at_start": {
+    "status": "ok",
+    "model": "Qwen3.8-Flash-Next-NVFP4",
+    "instance_id": "7cd81138-aee4-40dd-ad8b-ce70568ac903",
+    "uptime_s": 0,
+    "maintenance": "serving",
+    "version": "0.1.2",
+    "inference": {
+      "active_requests": 0,
+      "phase": "idle",
+      "progress_idle_s": 0.0,
+      "prefill_tokens": 0,
+      "deadline_s": 600.0,
+      "stuck": false
+    }
+  },
+  "summary": {
+    "cycles_run": 2,
+    "cycles_passed": 2,
+    "sleep_s": {
+      "min": 0.92,
+      "median": 0.99,
+      "max": 1.05
+    },
+    "wake_s": {
+      "min": 8.14,
+      "median": 8.34,
+      "max": 8.54
+    },
+    "chat_after_sleep_s": {
+      "min": 12.55,
+      "median": 12.66,
+      "max": 12.78
+    },
+    "wake_inside_chat_s": {
+      "min": 8.29,
+      "median": 8.44,
+      "max": 8.59
+    },
+    "card_awake_gib": {
+      "min": 27.95,
+      "median": 28.88,
+      "max": 29.82
+    },
+    "card_asleep_gib": {
+      "min": 7.23,
+      "median": 7.25,
+      "max": 7.26
+    },
+    "win_free_ram_gb_asleep": {
+      "min": 10.11,
+      "median": 10.22,
+      "max": 10.34
+    },
+    "cold_boot_s": 115.0,
+    "wake_vs_cold_boot": "8.54 s wake vs 115.0 s cold boot (13.5x faster)"
+  },
+  "cycles": [
+    {
+      "cycle": 1,
+      "same_output": true,
+      "same_as": "a1",
+      "tokens": 199,
+      "a1_s": 31.01,
+      "a2_s": 4.26,
+      "sleep_http": 200,
+      "sleep_s": 1.05,
+      "sleep_reply": {
+        "status": "ok",
+        "action": "sleep",
+        "asleep": true,
+        "released_bytes": 23863222272,
+        "vram_free_bytes": 26846691328,
+        "elapsed_s": 1.03,
+        "error": null
+      },
+      "state_asleep": "sleeping",
+      "health_sleep_block": {
+        "since": 1790330986.319867,
+        "released_bytes": 23863222272,
+        "vram_free_bytes": 26846691328,
+        "sleep_s": 1.03
+      },
+      "card_awake_gib": 29.82,
+      "card_asleep_gib": 7.23,
+      "card_after_wake_gib": 27.93,
+      "win_free_ram_gb_awake": 10.42,
+      "win_free_ram_gb_asleep": 10.34,
+      "win_free_ram_gb_after_chat": 9.67,
+      "win_free_ram_gb_after_wake": 10.23,
+      "chat_after_sleep_s": 12.55,
+      "wake_inside_chat_s": 8.29,
+      "sleep2_http": 200,
+      "wake_http": 200,
+      "wake_s": 8.14,
+      "wake_reply": {
+        "status": "ok",
+        "asleep": false,
+        "woke": true,
+        "woke_at": 1790331012.0942345,
+        "last_wake_s": 8.14
+      },
+      "outputs": {
+        "a1": "",
+        "a2": "",
+        "b": ""
+      },
+      "fail_reasons": [],
+      "pass": true
+    },
+    {
+      "cycle": 2,
+      "same_output": true,
+      "same_as": "a1",
+      "tokens": 199,
+      "a1_s": 4.29,
+      "a2_s": 4.19,
+      "sleep_http": 200,
+      "sleep_s": 0.92,
+      "sleep_reply": {
+        "status": "ok",
+        "action": "sleep",
+        "asleep": true,
+        "released_bytes": 24061157376,
+        "vram_free_bytes": 26825719808,
+        "elapsed_s": 0.91,
+        "error": null
+      },
+      "state_asleep": "sleeping",
+      "health_sleep_block": {
+        "since": 1790331022.7589614,
+        "released_bytes": 24061157376,
+        "vram_free_bytes": 26825719808,
+        "sleep_s": 0.91
+      },
+      "card_awake_gib": 27.95,
+      "card_asleep_gib": 7.26,
+      "card_after_wake_gib": 27.92,
+      "win_free_ram_gb_awake": 10.13,
+      "win_free_ram_gb_asleep": 10.11,
+      "win_free_ram_gb_after_chat": 9.56,
+      "win_free_ram_gb_after_wake": 9.51,
+      "chat_after_sleep_s": 12.78,
+      "wake_inside_chat_s": 8.59,
+      "sleep2_http": 200,
+      "wake_http": 200,
+      "wake_s": 8.54,
+      "wake_reply": {
+        "status": "ok",
+        "asleep": false,
+        "woke": true,
+        "woke_at": 1790331049.291654,
+        "last_wake_s": 8.54
+      },
+      "outputs": {
+        "a1": "",
+        "a2": "",
+        "b": ""
+      },
+      "fail_reasons": [],
+      "pass": true
+    }
+  ],
+  "pass": true
+}

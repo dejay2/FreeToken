@@ -155,10 +155,13 @@ class CrashWatchdog(threading.Thread):
         except Exception as exc:  # noqa: BLE001 - unreachable is the signal we watch for
             document = {"state": "unreachable", "error": str(exc)}
         state = document.get("state") if isinstance(document, dict) else "unreachable"
-        if state == "serving":
+        if state in ("serving", "sleeping"):
+            # A sleeping server is alive and holds the model (sleep design section 2.5): it is
+            # adopted and kept armed exactly like a serving one, so a process that dies asleep
+            # is still restarted, and one that merely sleeps never is.
             with self._lock:
                 if not self.armed:
-                    logger.info("crash watchdog: adopted a serving model server")
+                    logger.info("crash watchdog: adopted a %s model server", state)
                 self.armed = True
                 self.misses = 0
                 self.gave_up = False

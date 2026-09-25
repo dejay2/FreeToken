@@ -76,6 +76,11 @@ class HybridSWAKVCache(BaseKVCachePool):
             "full": self.full_kv_pool,
             "swa": self.swa_kv_pool,
         }
+        # Recorded so rebuild never reads geometry off the buffers: a rebuild that OOMs leaves
+        # them None, and the failed wake's way back to sleep (engine/sleep.py release_to_sleep
+        # force_pools) must still be able to re-make the pool.
+        self._full_geom = self._group_geometry(self.full_kv_pool)
+        self._swa_geom = self._group_geometry(self.swa_kv_pool)
         self.layers_mapping = self._build_layers_mapping(num_layers, specs)
         if self._swa_paged:
             self._init_swa_paged_state()
@@ -271,15 +276,14 @@ class HybridSWAKVCache(BaseKVCachePool):
         ``page_size`` (the full group's inner dim) and group geometry are read from the
         existing buffers; ``layers_mapping`` is unchanged. Object identity is preserved.
         """
-        page_size = self.full_kv_pool.buffer.shape[3]
+        page_size = self._page_size
         self._full_num_tokens = num_full_pages * page_size
         self._swa_num_tokens = num_swa_tokens if num_swa_tokens is not None else self._full_num_tokens
-        # Capture geometry, then DROP all references to the old buffers before allocating
-        # the replacements so empty_cache() can actually reclaim them. Otherwise the old
-        # and new KV buffers are live simultaneously and the rebuild can OOM even when the
-        # target geometry alone would fit.
-        full_geom = self._group_geometry(self.full_kv_pool)
-        swa_geom = self._group_geometry(self.swa_kv_pool)
+        # Geometry recorded at construction, then DROP all references to the old buffers
+        # before allocating the replacements so empty_cache() can actually reclaim them.
+        # Otherwise the old and new KV buffers are live simultaneously and the rebuild can OOM
+        # even when the target geometry alone would fit.
+        full_geom, swa_geom = self._full_geom, self._swa_geom
         self.full_kv_pool = None
         self.swa_kv_pool = None
         self._storages = {}

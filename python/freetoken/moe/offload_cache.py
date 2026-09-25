@@ -811,6 +811,40 @@ class OffloadMoeCache:
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
 
+    def release_slots(self) -> int:
+        """Sleep: free the GPU slot cache and return the bytes it held.
+
+        Every streaming expert copy on the card goes; the host banks (``bank_sources``), the
+        GPU-owned layers' ``resident_banks`` and the per-layer bookkeeping stay, so
+        :meth:`rebuild` brings the cache back cold at any size. :meth:`rebuild`'s own floor
+        (``num_experts`` slots: 512 x 2,772,480 B = 1.32 GiB for Qwen3.8-Flash-Next, per
+        docs/research/memory-audit-qwen38-rtx5090.md; 2x that with prefill overlap) is why
+        sleep needs this instead. Between forwards only, like ``rebuild``
+        (docs/superpowers/specs/2026-09-25-freetoken-sleep-design.md section 3.2).
+        ``prefill_overlap`` is left as it was so a later ``rebuild`` re-creates the double
+        buffers; ``evict_slots``/``src_indices`` keep their old (tiny, int32) size, as
+        ``rebuild`` reallocates them. A second call finds nothing on the card and returns 0.
+        """
+        freed = sum(int(t.numel()) * t.element_size() for t in self.bank_caches.values())
+        self._teardown_prefill_overlap()  # its views alias the slot cache
+        self.banks = []
+        self.bank_caches = {}
+        self.cache_size = 0
+        self._build_fused_copy_plan()  # no banks: resets the descriptors and returns
+        self.slot_for_id.fill_(-1)
+        self.id_of_slot = torch.empty((0,), dtype=torch.int32, device=self.device)
+        self.usage = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._reset_prefetch()
+        # The disk backend's device staging rows (top_k x batch rows, 28 MB+ on the daily
+        # nvfp4 boot, regrown by big batches) are GPU memory too; the next disk forward
+        # re-creates them lazily. Dropped before empty_cache so the release covers them.
+        self._disk_device_scratch = None
+        self._hit_d2d_fallback_logged = False  # geometry changed, as in rebuild
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+            torch.cuda.empty_cache()
+        return freed
+
     def set_alphas(
         self, gate_up_alpha: torch.Tensor | None, down_alpha: torch.Tensor | None
     ) -> None:
@@ -1530,10 +1564,22 @@ class OffloadMoeCache:
         self.stat_steps_layer[layer_id] += 1
 
     def bytes_per_expert_row(self) -> int:
-        """Exact H2D bytes in one registered expert row across all cache banks."""
+        """Exact H2D bytes in one registered expert row across all cache banks.
+
+        While asleep (:meth:`release_slots` emptied ``bank_caches``) the row cost is still
+        known from the host banks: the same row shape the slot cache is rebuilt from, so the
+        settings page's per-slot cost does not read 0 during a sleep."""
+        if self.bank_caches:
+            return sum(
+                tensor[0].numel() * tensor.element_size()
+                for tensor in self.bank_caches.values()
+            )
+        if not self.bank_sources:
+            return 0
         return sum(
-            tensor[0].numel() * tensor.element_size()
-            for tensor in self.bank_caches.values()
+            per_layer[self._first_streaming_layer][0].numel()
+            * per_layer[self._first_streaming_layer].element_size()
+            for per_layer in self.bank_sources.values()
         )
 
     def actual_h2d_bytes(self) -> int:

@@ -344,6 +344,9 @@ class GovernorLoop(threading.Thread):
             self._tick_reclaim(enabled=False)
             return
         status = self.process_manager.server_status()
+        if status.get("reachable") and status.get("state") == "sleeping":
+            self._tick_asleep()
+            return
         if not status.get("reachable") or status.get("state") != "serving":
             if status.get("reachable") and status.get("state") == "rebuilding":
                 self._probe_ram()
@@ -412,6 +415,33 @@ class GovernorLoop(threading.Thread):
                 # The POST blocks for the whole rebuild; intervals count from completion.
                 self.policy.note_step_done(action.axis, time.monotonic())
                 stepped = True
+
+    def _tick_asleep(self) -> None:
+        """While the model sleeps the card belongs to a game: never step VRAM and never recall.
+
+        Only the RAM axis's down rung runs, and the engine lets it spill to the SSD and nothing
+        else (engine/sleep.py asleep_rebuild). FreeToken keeps about 58-61 GB of Windows RAM
+        while asleep, and on 2026-09-12 Windows memory pressure took the WSL disk down, so a
+        game squeezing RAM must still get expert layers out of its way (sleep design D8).
+        The card is never probed: nvidia-smi against a game's card is a wasted call, and its
+        reading would be about the game, not the model.
+        """
+        self._serving_since = None  # a wake starts a fresh boot-settle window, like a boot
+        free_ram = self._probe_ram()
+        self._tick_reclaim()
+        if free_ram is None:
+            return
+        # "ram" marked exhausted: an up step is neither chosen nor stamped (decide's contract),
+        # while the high-memory hold keeps running so the first recall after the wake is
+        # immediate. free_vram is 0 and the axis list excludes "vram", so it is never read.
+        actions = self.policy.decide(time.monotonic(), 0, free_ram, allow_down=True,
+                                     exhausted_up={"ram"}, axes=("ram",))
+        for action in actions:
+            if action.direction != "down":
+                continue
+            self._execute_action(action, 0, free_ram)
+            # The POST blocks for the whole rebuild; intervals count from completion.
+            self.policy.note_step_done(action.axis, time.monotonic())
 
     def _tick_reclaim(self, *, enabled: bool = True) -> None:
         """Cache probes never call cache/step or alter layer-placement timers."""

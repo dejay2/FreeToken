@@ -1,0 +1,226 @@
+{
+  "model": "Qwen3.8-Flash-Next-NVFP4",
+  "server": "http://127.0.0.1:2020",
+  "started": "2026-09-25 10:17:06",
+  "prompt": "List the first twelve prime numbers, then explain in three sentences why there are infinitely many primes.",
+  "tokens": 200,
+  "baseline_gib": 1.6,
+  "max_asleep_gib": 7.5,
+  "max_wake_s": 45.0,
+  "health_at_start": {
+    "status": "ok",
+    "model": "Qwen3.8-Flash-Next-NVFP4",
+    "instance_id": "00040987-9d69-465d-bf0a-925076ae4259",
+    "uptime_s": 8,
+    "maintenance": "serving",
+    "version": "0.1.2",
+    "inference": {
+      "active_requests": 0,
+      "phase": "idle",
+      "progress_idle_s": 0.0,
+      "prefill_tokens": 5952,
+      "deadline_s": 600.0,
+      "stuck": false
+    }
+  },
+  "summary": {
+    "cycles_run": 3,
+    "cycles_passed": 3,
+    "sleep_s": {
+      "min": 0.86,
+      "median": 0.87,
+      "max": 1.15
+    },
+    "wake_s": {
+      "min": 7.92,
+      "median": 8.09,
+      "max": 8.79
+    },
+    "chat_after_sleep_s": {
+      "min": 12.43,
+      "median": 12.56,
+      "max": 13.2
+    },
+    "wake_inside_chat_s": {
+      "min": 8.34,
+      "median": 8.46,
+      "max": 9.12
+    },
+    "card_awake_gib": {
+      "min": 27.97,
+      "median": 27.98,
+      "max": 29.98
+    },
+    "card_asleep_gib": {
+      "min": 7.28,
+      "median": 7.29,
+      "max": 7.29
+    },
+    "win_free_ram_gb_asleep": {
+      "min": 9.41,
+      "median": 9.44,
+      "max": 9.74
+    },
+    "cold_boot_s": 114.0,
+    "wake_vs_cold_boot": "8.79 s wake vs 114.0 s cold boot (13.0x faster)"
+  },
+  "cycles": [
+    {
+      "cycle": 1,
+      "same_output": true,
+      "same_as": "a1",
+      "tokens": 199,
+      "a1_s": 22.57,
+      "a2_s": 4.1,
+      "sleep_http": 200,
+      "sleep_s": 1.15,
+      "sleep_reply": {
+        "status": "ok",
+        "action": "sleep",
+        "asleep": true,
+        "released_bytes": 23853162496,
+        "vram_free_bytes": 26846691328,
+        "elapsed_s": 1.14,
+        "error": null
+      },
+      "state_asleep": "sleeping",
+      "health_sleep_block": {
+        "since": 1790327855.066358,
+        "released_bytes": 23853162496,
+        "vram_free_bytes": 26846691328,
+        "sleep_s": 1.14
+      },
+      "card_awake_gib": 29.98,
+      "card_asleep_gib": 7.28,
+      "card_after_wake_gib": 27.96,
+      "win_free_ram_gb_awake": 9.81,
+      "win_free_ram_gb_asleep": 9.74,
+      "win_free_ram_gb_after_chat": 9.14,
+      "win_free_ram_gb_after_wake": 9.38,
+      "chat_after_sleep_s": 12.56,
+      "wake_inside_chat_s": 8.46,
+      "sleep2_http": 200,
+      "wake_http": 200,
+      "wake_s": 7.92,
+      "wake_reply": {
+        "status": "ok",
+        "asleep": false,
+        "woke": true,
+        "woke_at": 1790327880.231431,
+        "last_wake_s": 7.91
+      },
+      "outputs": {
+        "a1": "",
+        "a2": "",
+        "b": ""
+      },
+      "fail_reasons": [],
+      "pass": true
+    },
+    {
+      "cycle": 2,
+      "same_output": true,
+      "same_as": "a1",
+      "tokens": 199,
+      "a1_s": 4.04,
+      "a2_s": 4.09,
+      "sleep_http": 200,
+      "sleep_s": 0.87,
+      "sleep_reply": {
+        "status": "ok",
+        "action": "sleep",
+        "asleep": true,
+        "released_bytes": 24146571264,
+        "vram_free_bytes": 26825719808,
+        "elapsed_s": 0.86,
+        "error": null
+      },
+      "state_asleep": "sleeping",
+      "health_sleep_block": {
+        "since": 1790327890.4283705,
+        "released_bytes": 24146571264,
+        "vram_free_bytes": 26825719808,
+        "sleep_s": 0.86
+      },
+      "card_awake_gib": 27.97,
+      "card_asleep_gib": 7.29,
+      "card_after_wake_gib": 27.96,
+      "win_free_ram_gb_awake": 9.4,
+      "win_free_ram_gb_asleep": 9.41,
+      "win_free_ram_gb_after_chat": 9.05,
+      "win_free_ram_gb_after_wake": 9.45,
+      "chat_after_sleep_s": 12.43,
+      "wake_inside_chat_s": 8.34,
+      "sleep2_http": 200,
+      "wake_http": 200,
+      "wake_s": 8.09,
+      "wake_reply": {
+        "status": "ok",
+        "asleep": false,
+        "woke": true,
+        "woke_at": 1790327915.627115,
+        "last_wake_s": 8.08
+      },
+      "outputs": {
+        "a1": "",
+        "a2": "",
+        "b": ""
+      },
+      "fail_reasons": [],
+      "pass": true
+    },
+    {
+      "cycle": 3,
+      "same_output": true,
+      "same_as": "a1",
+      "tokens": 199,
+      "a1_s": 4.06,
+      "a2_s": 4.08,
+      "sleep_http": 200,
+      "sleep_s": 0.86,
+      "sleep_reply": {
+        "status": "ok",
+        "action": "sleep",
+        "asleep": true,
+        "released_bytes": 24158760960,
+        "vram_free_bytes": 26825719808,
+        "elapsed_s": 0.85,
+        "error": null
+      },
+      "state_asleep": "sleeping",
+      "health_sleep_block": {
+        "since": 1790327925.4824579,
+        "released_bytes": 24158760960,
+        "vram_free_bytes": 26825719808,
+        "sleep_s": 0.85
+      },
+      "card_awake_gib": 27.98,
+      "card_asleep_gib": 7.29,
+      "card_after_wake_gib": 29.29,
+      "win_free_ram_gb_awake": 9.41,
+      "win_free_ram_gb_asleep": 9.44,
+      "win_free_ram_gb_after_chat": 9.19,
+      "win_free_ram_gb_after_wake": 10.52,
+      "chat_after_sleep_s": 13.2,
+      "wake_inside_chat_s": 9.12,
+      "sleep2_http": 200,
+      "wake_http": 200,
+      "wake_s": 8.79,
+      "wake_reply": {
+        "status": "ok",
+        "asleep": false,
+        "woke": true,
+        "woke_at": 1790327952.5732942,
+        "last_wake_s": 8.79
+      },
+      "outputs": {
+        "a1": "",
+        "a2": "",
+        "b": ""
+      },
+      "fail_reasons": [],
+      "pass": true
+    }
+  ],
+  "pass": true
+}

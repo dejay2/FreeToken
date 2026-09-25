@@ -74,6 +74,14 @@ def ladder_graph_enabled(env: "Mapping[str, str] | None" = None) -> bool:
     return raw == "1"
 
 
+def _reserve_slot(pool) -> int:
+    """The ladder's snapshot slot, reserved so a CacheManager rebuild's reclaim_all_slots
+    (after sleep, wake or a governor step) cannot hand it to a request. Pools without the
+    reservation API (test fakes) fall back to a plain alloc."""
+    reserve = getattr(pool, "alloc_reserved", None)
+    return (reserve(1) if reserve is not None else pool.alloc(1))[0]
+
+
 class SpecStateLadder:
     """Snapshot / stash / replay for one request's linear state across a speculative step.
 
@@ -168,7 +176,7 @@ class SpecStateLadder:
                 self._ngram_len + max_width, dtype=states.dtype, device=device
             )
 
-        self.slot = pool.alloc(1)[0]
+        self.slot = _reserve_slot(pool)
         self._live: int | None = None
         self._width = 0
 
@@ -181,7 +189,7 @@ class SpecStateLadder:
         # ``rebuild`` REPLACED the pool's state tensors, so every recorded replay is pointing at
         # freed storage. Drop them; the next settle re-records against the new addresses.
         self._drop_graphs()
-        self.slot = self.pool.alloc(1)[0]
+        self.slot = _reserve_slot(self.pool)
         self._live = None
         self._width = 0
 

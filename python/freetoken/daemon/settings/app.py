@@ -239,6 +239,11 @@ def create_app(
             estimate_service=app.state.estimate_service,
             downloads=download_manager,
             pi=PiSync(),
+            # Sleep: the panel's Sleep/Wake buttons and "Asleep" word go through the same
+            # server proxy as /api/server/sleep|wake. getattr is load-bearing: route tests
+            # hand in recording managers that predate sleep (see Task 7 of the sleep plan).
+            freetoken_state=lambda: process_manager.server_status().get("state"),
+            freetoken_control=getattr(process_manager, "sleep_server", None),
         )
     app.state.panel = panel
     if panel.downloads is None:
@@ -570,8 +575,13 @@ def create_app(
 
     @app.post("/api/server/{action}", status_code=202)
     async def server_action(action: str, body: ServerActionBody | None = None):
+        if action in {"sleep", "wake"}:
+            # Sleep keeps the process: no lifecycle job (sleep design section 3.4). The reply
+            # is the model server's own, with its status code; 503 when nothing answered.
+            result = await run_in_threadpool(process_manager.sleep_server, action)
+            return JSONResponse(result, status_code=int(result.get("httpStatus") or 503))
         if action not in {"start", "stop", "restart"}:
-            raise HTTPException(status_code=422, detail="action must be start, stop, or restart")
+            raise HTTPException(status_code=422, detail="action must be start, stop, restart, sleep or wake")
         body = body or ServerActionBody()
         if body.settings is not None and action == "stop":
             raise HTTPException(status_code=422, detail="settings are accepted only for start or restart")

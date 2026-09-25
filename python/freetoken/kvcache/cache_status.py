@@ -36,12 +36,22 @@ def compute_cache_unit_bytes(engine: "Engine") -> Dict[str, int]:
         return int(kv), int(swa)
 
     def _moe() -> int:
-        banks = getattr(engine.moe_offload_cache, "bank_caches", None)
-        if not banks:
+        cache = engine.moe_offload_cache
+        banks = getattr(cache, "bank_caches", None)
+        if banks:
+            # Each bank cache is (cache_size, *row_shape); one slot's bytes = row bytes summed
+            # over the format's banks (== cache_budget.expert_bytes_per_slot on the source rows).
+            return int(sum(t[0].numel() * t.element_size() for t in banks.values()))
+        # Asleep: release_slots emptied the slot cache, but the host banks still carry the row
+        # shape the cache is rebuilt from, so the per-slot cost stays honest during a sleep.
+        sources = getattr(cache, "bank_sources", None)
+        if not sources:
             return 0
-        # Each bank cache is (cache_size, *row_shape); one slot's bytes = row bytes summed over
-        # the format's banks (== cache_budget.expert_bytes_per_slot on the source rows).
-        return int(sum(t[0].numel() * t.element_size() for t in banks.values()))
+        layer = int(getattr(cache, "_first_streaming_layer", 0))
+        return int(sum(
+            per_layer[layer][0].numel() * per_layer[layer].element_size()
+            for per_layer in sources.values()
+        ))
 
     def _mamba() -> int:
         pool = engine.linear_state_pool
