@@ -16,6 +16,7 @@ from freetoken.daemon.settings.dials import (
     stored_count,
     validate_settings,
 )
+from freetoken.daemon.settings import model_info
 from freetoken.daemon.settings.model_info import SUPPORTED_ARCHITECTURES, expert_format, read_model
 from freetoken.daemon.settings.process_manager import ProcessManager
 from freetoken.daemon.settings.profiles_manager import ProfilesManager
@@ -136,6 +137,37 @@ def test_expert_format_detection():
     assert expert_format({"quantization_config": {"quant_method": "fp8", "weight_block_size": [128, 128]}}) == "fp8_block"
     assert expert_format({"quantization_config": {"quant_method": "mxfp4"}}) == "mxfp4"
     assert expert_format({"quantization_config": {"quant_method": "mystery"}}) == ""
+
+
+def test_exl3_expert_format_and_size(tmp_path):
+    cfg = {"architectures": ["Qwen4ExpForConditionalGeneration"],
+           "quantization_config": {"quant_method": "exl3", "bits": 3.05, "head_bits": 5},
+           "text_config": {"hidden_size": 2560, "moe_intermediate_size": 640, "num_experts": 512,
+                           "num_hidden_layers": 48, "num_experts_per_tok": 10}}
+    assert model_info.expert_format(cfg) == "exl3"
+    info = model_info.describe_config(cfg, "q")
+    assert info.expert_format_label == "EXL3 (3-bit experts)"
+    assert info.bytes_per_expert == 3 * 160 * 40 * 48 * 2 + 2 * (2560 + 640) * 2 + (640 + 2560) * 2
+    assert info.extra["exl3_expert_k"] == 3
+
+
+def test_exl3_bytes_match_engine_formula():
+    from types import SimpleNamespace
+
+    from freetoken.moe.offload_cache import bank_bytes_per_expert  # torch import is fine in tests
+
+    assert model_info.expert_bytes("exl3", 2560, 640, k=3) == bank_bytes_per_expert(
+        "exl3", 2560, 640, SimpleNamespace(exl3_expert_k=3))
+
+
+def test_ple_bytes_skips_the_unconverted_exl3_trellis_table():
+    """turboderp's ngram_embedding.safetensors is not FreeToken's PLE table; only the converted
+    freetoken-ple-*.safetensors shards (no such metadata marker) should be counted."""
+    header = json.dumps({
+        "ngram_embedding.head_offsets": {"dtype": "I64", "shape": [1], "data_offsets": [0, 8]},
+        "__metadata__": {"format": "exl3_ngram_trellis", "version": "1"},
+    }).encode("utf-8")
+    assert model_info.ple_bytes_from_header(header) == 0
 
 
 def test_supported_architectures_mirror_the_engine_registry():

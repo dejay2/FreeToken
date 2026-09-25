@@ -119,6 +119,28 @@ def test_folders_follow_freetokens_model_registry(tmp_path):
     assert "no .safetensors" in md.detect(str(bare))["reason"]
 
 
+def test_exl3_folder_warns_when_the_word_table_is_not_converted(tmp_path):
+    folder = write_folder(
+        tmp_path / "Qwen-EXL3",
+        "Qwen4ExpForConditionalGeneration",
+        num_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        quantization_config={"quant_method": "exl3", "bits": 3.05, "head_bits": 5},
+    )
+    meta = json.dumps({"__metadata__": {"format": "exl3_ngram_trellis", "version": "1"}}).encode("utf-8")
+    (folder / "ngram_embedding.safetensors").write_bytes(struct.pack("<Q", len(meta)) + meta)
+
+    found = md.detect(str(folder))
+    assert found["kind"] == "freetoken"
+    assert "EXL3 word table not converted yet" in found["reason"]
+    assert "scripts/exl3/convert_ngram_table.py" in found["reason"]
+
+    (folder / "freetoken-ple.index.json").write_text("{}", encoding="utf-8")
+    clean = md.detect(str(folder))
+    assert clean["kind"] == "freetoken" and clean["reason"] == ""
+
+
 def test_ids_are_safe_and_unique():
     assert md.suggest_id("Quasar 27B NVFP4", []) == "quasar-27b-nvfp4"
     assert md.suggest_id("quasar_27b_nvfp4", ["quasar_27b_nvfp4", "quasar_27b_nvfp4-2"]) == "quasar_27b_nvfp4-3"
