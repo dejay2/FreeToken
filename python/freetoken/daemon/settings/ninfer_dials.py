@@ -214,8 +214,12 @@ CATALOGUE: tuple[NinferSetting, ...] = (
        "Leave empty. The switcher does not send it, so a password stops chats through the one address.",
        "The switcher shows each model's start command in its status list, so a password here is "
        "also visible there."),
+    # serve_options.cpp:260 takes any non-negative --device and only fails later, at CUDA
+    # start-up, after the switcher has waited for memory. The serving PC has one card (RTX
+    # 5090), and the switcher runs one model at a time on it, so 0 is the only value that can
+    # start; the old 0..7 range let a typo save and then fail at every load.
     _s("device", "number", 0, "", ADV, "Graphics card number",
-       "Which card to use when there are several.", minimum=0, maximum=7),
+       "Which card to use. This PC has one graphics card, so this stays 0.", minimum=0, maximum=0),
 )
 
 BY_NAME: dict[str, NinferSetting] = {setting.name: setting for setting in CATALOGUE}
@@ -269,14 +273,22 @@ def canonical(setting: NinferSetting, value: Any) -> Any:
         raise ValueError("needs a number")
     if isinstance(value, bool):
         raise ValueError("must be a number")
-    if setting.dial.numeric_kind == "float":
+    # float()/int() raise with Python's own words ("invalid literal for int() with base 10"),
+    # which reached the page through validate(); plain words instead (stage A deferred minor).
+    try:
         number = float(value)
-        if not math.isfinite(number):
-            raise ValueError("must be a number")
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("must be a number") from None
+    if not math.isfinite(number):
+        raise ValueError("must be a number")
+    if setting.dial.numeric_kind == "float":
         return number
-    if isinstance(value, float) and not value.is_integer():
+    if not number.is_integer():
         raise ValueError("must be a whole number")
-    return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return int(number)
 
 
 def canonical_settings(settings: Mapping[str, Any]) -> dict[str, Any]:

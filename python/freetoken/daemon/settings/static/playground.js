@@ -257,6 +257,10 @@ async function pgStop() {
 function pgSchedule() { clearTimeout(pg.timer); pg.timer = setTimeout(pgPoll, PG_POLL_MS); }
 async function pgPoll() {
   clearTimeout(pg.timer);
+  // Paused away from the Test tab (pgOpen polls again on the way back) and while the browser
+  // tab is hidden (stage A deferred minor: a running test was polled every 500 ms regardless).
+  if (typeof panel !== 'undefined' && panel.main !== 'test') return;
+  if (typeof document !== 'undefined' && document.hidden) { pgSchedule(); return; }
   let result;
   try { result = await json('/api/playground/runs/current'); } catch (_) { pgSchedule(); return; }
   if (!result.response.ok) { pgSchedule(); return; }

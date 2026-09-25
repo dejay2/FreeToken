@@ -171,7 +171,7 @@ global.json = async (url, options = {}) => {
   assert.equal(puts.length, 2);
   assert.equal(puts[1].whenLoaded, 'next-time');
   assert.deepEqual(puts[1].system, {floorGB: 8});
-  assert.ok(notes.includes('Saved. The loaded model keeps its old settings until its next load.'), notes.join(' / '));
+  assert.ok(notes.includes('Saved. Q keeps its old settings until its next load.'), notes.join(' / '));
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """)
 
@@ -233,7 +233,8 @@ global.document = {hidden: false, querySelectorAll: () => [], querySelector: () 
 global.state = {view: null};
 global.setNotice = () => {};
 const posts = [];
-global.json = async (url, options = {}) => { if (options.method === 'POST') posts.push(url); return {response: {ok: true, status: 200}, body: {models: [], switcher: {up: true}}}; };
+let rows = [{id: 'a', name: 'Alpha', state: 'ready'}, {id: 'b', name: 'Beta', state: 'stopped'}];
+global.json = async (url, options = {}) => { if (options.method === 'POST') posts.push(url); return {response: {ok: true, status: 200}, body: {models: rows, switcher: {up: true}}}; };
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 (async () => {
   p.panel.models = [{id: 'a', name: 'Alpha', state: 'ready'}, {id: 'b', name: 'Beta', state: 'stopped'}];
@@ -249,7 +250,8 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
   p.answerConfirm(true);
   await second;
   assert.deepEqual(posts, ['/api/panel/models/b/load']);
-  p.panel.models = [{id: 'a', name: 'Alpha', state: 'ready'}];  // the refresh after a load replaced the list
+  rows = [{id: 'a', name: 'Alpha', state: 'ready'}];
+  p.panel.models = rows;  // the refresh after a load replaced the list
   const third = p.unloadModel('a');
   await tick();
   assert.equal($('confirm-ask-text').textContent, 'Put away Alpha? Anything using it will stop.');
@@ -420,7 +422,8 @@ def test_remove_asks_with_delete_files_off_and_cancel_sends_nothing():
     _node(_FAKE_PAGE + r"""
 global.state = {view: {kind: 'model', id: 'q', name: 'QUASAR', state: 'ready', artifact: '~/ninfer-work/models/q.ninfer', url: '/api/panel/views/model/q'}, settings: {}, saved: {}};
 global.json = async (url, options = {}) => {
-  if (options.method === 'POST') posts.push({url, body: JSON.parse(options.body || '{}')});
+  if (options.method !== 'POST') return {response: {ok: true, status: 200}, body: {revision: 'r1', models: [], switcherUp: true}};
+  posts.push({url, body: JSON.parse(options.body || '{}')});
   return {response: {ok: true, status: 200}, body: {status: 'removed', id: 'q', name: 'QUASAR', revision: 'r2', files: null,
     pi: {status: 'updated', notes: []}, models: [], switcher: {up: true, running: []}}};
 };

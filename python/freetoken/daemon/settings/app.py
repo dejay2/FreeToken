@@ -217,7 +217,6 @@ def create_app(
     started = time.monotonic()
     app = FastAPI(title="FreeToken Settings Helper", version=version)
     app.state.boot_file = boot
-    app.state.default_boot_file = default_boot
     app.state.process_manager = process_manager
     app.state.profiles = profiles
     app.state.log_path = log
@@ -235,7 +234,6 @@ def create_app(
             switcher=SwitcherClient(),
             profiles=profiles,
             boot_file=lambda: app.state.boot_file,
-            default_boot=lambda: app.state.default_boot_file,
             estimate_service=app.state.estimate_service,
             downloads=download_manager,
             pi=PiSync(),

@@ -56,6 +56,14 @@ function ramSummary(ram) {
   const short = Number(ram.windowsFreeGB) - Number(ram.needGB) < Number(ram.cushionGB);
   return `PC memory: needs ${need}; Windows has ${Number(ram.windowsFreeGB).toFixed(1)} GB free and keeps a ${ram.cushionGB} GB cushion.${short ? ' The switcher will wait for memory before loading.' : ''}`;
 }
+// "Next time" note after a save: every model that keeps its old settings is named (stage A
+// deferred minor: the note said "The loaded model" even when several were held).
+function heldNote(affected) {
+  const names = (affected || []).map((row) => row.name || row.id).filter(Boolean);
+  if (!names.length) return 'Saved. The loaded model keeps its old settings until its next load.';
+  const list = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+  return names.length === 1 ? `Saved. ${list} keeps its old settings until its next load.` : `Saved. ${list} keep their old settings until their next load.`;
+}
 function restartQuestion(affected, nextTimeAllowed) {
   const rows = affected || [];
   const names = rows.map((row) => row.name || row.id).join(', ');
@@ -126,18 +134,22 @@ function backupWhen(name) {
   if (!m) return name;
   return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6])).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
+// Each button says what comes back (the whole model list: every model and its settings) and
+// when that copy was saved; the newest is first and says so (stage A deferred minor: "Restore
+// the copy from …" did not say what it restores).
 function backupListHtml(backups) {
-  return (backups || []).map((name) => `<li><button class="button small" type="button" data-restore="${panelEsc(name)}">Restore the copy from ${panelEsc(backupWhen(name))}</button></li>`).join('');
+  return (backups || []).map((name, index) => `<li><button class="button small" type="button" data-restore="${panelEsc(name)}">Bring back the model list as it was on ${panelEsc(backupWhen(name))}${index === 0 ? ' (newest copy)' : ''}</button></li>`).join('');
 }
+function restoredNote(name) { return `The model list is back as it was on ${backupWhen(name)}.`; }
 // The fix-it box on Models. Missing or damaged, the backups are offered (spec: Error handling);
 // a missing list also offers a fresh copy of today's settings (final review item 3).
 function registryProblemHtml(body) {
   const backups = backupListHtml(body.backups);
   if (body.status === 'missing') {
-    const restore = backups ? `<p class="small">Or bring back a saved copy of the panel's own list:</p><ul class="backups">${backups}</ul>` : '';
+    const restore = backups ? `<p class="small">Or bring back a saved copy of the panel's own model list (every model and its settings). The newest copy is first:</p><ul class="backups">${backups}</ul>` : '';
     return `<div class="panel-head"><div><h2>Set up the control panel</h2><p class="small">This copies today's models and settings from ${panelEsc(body.configPath)} and the helper's start-up file into the panel's own list. The old switcher file is kept as a backup.</p></div><button class="button primary" id="import-now" type="button">Copy today's settings</button></div>${restore}`;
   }
-  return `<div class="panel-head"><div><h2>The model list is damaged</h2><p class="small">${panelEsc(body.message || '')}</p><p class="small">Nothing was changed. Restore the last good backup:</p></div></div>${backups ? `<ul class="backups">${backups}</ul>` : '<p class="empty">No backups were found.</p>'}`;
+  return `<div class="panel-head"><div><h2>The model list is damaged</h2><p class="small">${panelEsc(body.message || '')}</p><p class="small">Nothing was changed. Pick a saved copy of the model list (every model and its settings) to bring back. The newest copy is first; the damaged file is kept aside, not deleted.</p></div></div>${backups ? `<ul class="backups">${backups}</ul>` : '<p class="empty">No backups were found.</p>'}`;
 }
 // ---- Stage B: add and remove (spec section 7) ----
 const ADD_ID_RE = /^[a-z0-9][a-z0-9._-]{0,62}$/; // registry.MODEL_ID_RE (a test keeps them equal)
@@ -228,7 +240,8 @@ function removedNote(body) {
 if (typeof module !== 'undefined') module.exports = { fmtGB, stateWord, rowState, sleepButtonHtml, sleepModel, sourceText, dialSourceFor, verdictWords, fitSummary, ramSummary, restartQuestion, nowStripHtml, modelsTableHtml, panelErrorText,
   loadQuestion, unloadQuestion, registryProblemHtml, panelSave, answerRestart, answerConfirm, startNow, loadModel, unloadModel, panel, applyView,
   idProblem, detectionText, planSummary, downloadLine, removeQuestion, removeFilesNote, removeOkLabel, ramProblem, piNote, addedNote, removedNote,
-  addState, openAdd, closeAdd, addCheckPath, addValidate, addPlan, addPathEdited, addRepoEdited, wirePanel, addDownload, addCancelDownload, pollAddJob, addSave, openRemove, answerRemove };
+  addState, openAdd, closeAdd, addCheckPath, addValidate, addPlan, addPathEdited, addRepoEdited, wirePanel, addDownload, addCancelDownload, pollAddJob, addSave, openRemove, answerRemove,
+  heldNote, backupListHtml, restoredNote, restoreBackup, whereName, unplacedErrors, leaveGuard, viewDirty, presetButtons, loadModels };
 
 /* ---------- browser side: uses index.html's state, json, $, setNotice and dial renderer ---------- */
 const postJson = (url, payload) => json(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload ?? {}) });
@@ -237,9 +250,15 @@ function registryProblem(response, body) { return response.status === 409 && (bo
 async function backToRegistryProblem(body) { setNotice(panelErrorText(body, 'The model list needs attention.'), 'bad'); clearView(); await loadRegistry(); showMain('models'); }
 // 422 rows whose field has no dial on screen (the preset name, the System block, another
 // model's limit) would otherwise vanish: say them in the notice instead.
+// A row about another model names that model (stage A deferred minor): the server sends its
+// name in `where`; an id is swapped for the name the Models list knows, just in case.
+function whereName(where, rows) {
+  const row = (rows || []).find((item) => item.id === where);
+  return row && row.name ? row.name : where;
+}
 function unplacedErrors(errors) {
   const shown = new Set(Array.from(document.querySelectorAll('[data-error]')).map((node) => node.dataset.error));
-  return (Array.isArray(errors) ? errors : []).filter((row) => row && !shown.has(row.field)).map((row) => `${row.where ? `${row.where}: ` : ''}${row.message || 'A value is not allowed.'}`);
+  return (Array.isArray(errors) ? errors : []).filter((row) => row && !shown.has(row.field)).map((row) => `${row.where ? `${whereName(row.where, panel.models)}: ` : ''}${row.message || 'A value is not allowed.'}`);
 }
 function dialSource(name) { return dialSourceFor(state.view, state.settings, name); }
 function panelExtraDirty() { const view = state.view; return !!(view && view.kind === 'model' && (view.activePreset || null) !== (view.savedPreset || null)); }
@@ -265,7 +284,10 @@ function resetDial(name) {
   markChanged(name);
 }
 function showEditor(on) { $('models-view').hidden = on; $('editor').hidden = !on; $('save').hidden = !on; }
-function leaveGuard() { if (state.view && changedNames().length) { setNotice('Save or undo your changes first.', 'warn'); return false; } return true; }
+// A preset picked but not saved counts as a change too (stage A deferred minor): leaving used
+// to drop it without a word.
+function viewDirty() { return !!(state.view && (changedNames().length || panelExtraDirty())); }
+function leaveGuard() { if (viewDirty()) { setNotice('Save or undo your changes first. Picking a preset counts as a change until you press Save.', 'warn'); return false; } return true; }
 function clearView() { state.view = null; state.settings = {}; state.saved = {}; state.dials = []; state.groups = []; state.model = null; }
 
 function showMain(name) {
@@ -311,7 +333,7 @@ async function importLive(whenLoaded = null) {
 async function restoreBackup(name) {
   const { response, body } = await postJson('/api/panel/registry/restore', { backup: name });
   if (!response.ok) { setNotice(panelErrorText(body, 'Could not restore the backup.'), 'bad'); await loadRegistry(); return; }
-  setNotice('Backup restored.', 'good');
+  setNotice(restoredNote(name), 'good');
   await loadRegistry();
   await loadModels();
 }
@@ -368,6 +390,9 @@ async function sleepModel(id, action) {
   loadNow(); loadModels();
 }
 async function loadModel(id) {
+  // The list on screen can be up to 5 s old (or older while a load runs): read it again so the
+  // question names what is loaded now (stage A deferred minor: a stale snapshot).
+  await loadModels();
   const question = loadQuestion(id, panel.models);
   if (question && !(await askConfirm(question, 'Carry on'))) return;
   setNotice(`Loading ${id}… FreeToken models take a few minutes.`);
@@ -439,8 +464,15 @@ function renderPresetPicker() {
   const view = state.view;
   $('preset-picker').innerHTML = `<option value="">No preset</option>${(view.presets || []).map((name) => `<option value="${panelEsc(name)}">${panelEsc(name)}</option>`).join('')}`;
   $('preset-picker').value = view.activePreset || '';
-  $('preset-rename').disabled = !view.activePreset;
-  $('preset-delete').disabled = !view.activePreset;
+  presetButtons();
+}
+// Rename and Delete need a preset: setBusy(false) turned every editor button back on, these
+// two included, with no preset picked (stage A deferred minor). index.html's setBusy calls this.
+function presetButtons() {
+  const view = state.view;
+  const none = !(view && view.kind === 'model' && view.activePreset);
+  $('preset-rename').disabled = !!state.busy || none;
+  $('preset-delete').disabled = !!state.busy || none;
 }
 async function pickPreset() {
   const value = $('preset-picker').value;
@@ -655,6 +687,9 @@ async function pollAddJob(gen = addState.pollGen) {
   clearTimeout(addState.timer); addState.timer = null;
   const job = addState.job;
   if (!job) return;
+  // Hidden browser tab: ask nothing, look again later (stage A deferred minor). The download
+  // itself runs in the helper either way.
+  if (typeof document !== 'undefined' && document.hidden) { if (!$('add-wizard').hidden) addState.timer = setTimeout(() => pollAddJob(gen), ADD_POLL_MS); return; }
   let answer;
   try {
     answer = await json(`/api/panel/add/downloads/${encodeURIComponent(job.id)}`);
@@ -715,8 +750,13 @@ async function addSave() {
 async function openRemove() {
   const view = state.view;
   if (!view || view.kind !== 'model' || panel.busy || !leaveGuard()) return;
-  const row = (panel.models || []).find((item) => item.id === view.id) || { id: view.id, name: view.name };
-  $('remove-ask-text').textContent = removeQuestion(row, isLoadedState(view.state));
+  // view.state is from when the settings opened, maybe minutes ago: read the list again so
+  // "It is loaded now" is true now (stage A deferred minor).
+  await loadModels();
+  if (state.view !== view || panel.busy) return;
+  const fresh = (panel.models || []).find((item) => item.id === view.id);
+  const row = fresh || { id: view.id, name: view.name };
+  $('remove-ask-text').textContent = removeQuestion(row, isLoadedState(fresh ? fresh.state : view.state));
   $('remove-files').checked = false; // spec: "also delete the model files" is off by default, every time
   $('remove-files-note').textContent = removeFilesNote(view);
   $('remove-ask-ok').textContent = removeOkLabel(false);
@@ -817,7 +857,7 @@ async function panelPut(url, options) {
   const { response, body } = await json(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ revision: panel.revision, whenLoaded: options.whenLoaded || null, ...draftBody() }) });
   if (response.status === 409 && body.code === 'choose_restart') {
     const choice = await askRestart(body.affected || [], body.nextTimeAllowed !== false);
-    if (choice) return { ...options, whenLoaded: choice, anyway: true };
+    if (choice) return { ...options, whenLoaded: choice, anyway: true, affected: body.affected || [] };
     setNotice('Nothing was saved.');
     return null;
   }
@@ -835,7 +875,7 @@ async function panelPut(url, options) {
   panel.revision = body.revision;
   let note = 'Saved.';
   if (body.restarting && body.restarting.length) note = `Saved. Restarting ${body.restarting.join(', ')} with the new settings…`;
-  else if (options.whenLoaded === 'next-time') note = 'Saved. The loaded model keeps its old settings until its next load.';
+  else if (options.whenLoaded === 'next-time') note = heldNote(options.affected);
   else if (body.inherits && body.inherits.length) note = `Saved. Used by: ${body.inherits.join(', ')}.`;
   state.saved = JSON.parse(JSON.stringify(state.settings));
   await reopenView();

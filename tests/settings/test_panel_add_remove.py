@@ -58,7 +58,7 @@ def box(tmp_path, monkeypatch):
                                 disk_free=lambda _: 10 ** 12)
     service = PanelService(
         store=store, writer=writer, switcher=switcher, profiles=profiles,
-        boot_file=lambda: BootFile(boot), default_boot=lambda: boot, estimate_service=FakeEstimates(),
+        boot_file=lambda: BootFile(boot), estimate_service=FakeEstimates(),
         card_probe=lambda: {"totalBytes": 32 * GIB, "usedBytes": 2 * GIB}, windows_free_probe=lambda: 40 * GIB,
         spawn=lambda fn, *args: None, sleep=lambda _: None,
         downloads=downloads, pi=PiSync(pi_dir), add_roots={"folder": models, "ninfer": ninfer},
