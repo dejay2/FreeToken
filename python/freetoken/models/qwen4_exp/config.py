@@ -31,9 +31,11 @@ class Qwen4VisionConfig:
     in_channels: int
     hidden_act: str
     deepstack_visual_indexes: Tuple[int, ...]
-    # True when the tower's own linears arrive EXL3-packed (turboderp builds); a later task
-    # adds exl3_k derived from quantization_config's vision_bits. False for every other build.
+    # True when the tower's own linears arrive EXL3-packed (turboderp builds).
     exl3: bool = False
+    # Trellis K of every packed vision linear (quantization_config's vision_bits; the
+    # 3.05bpw_h5_ng5 build ships vision_bits: 5). Only meaningful when exl3 is True.
+    exl3_k: int = 5
 
 
 @dataclass(frozen=True)
@@ -158,7 +160,7 @@ def _ignored(patterns, module_name: str) -> bool:
     return any(fnmatch(module_name, pat) for pat in patterns)
 
 
-def _parse_vision_config(hf_config: Any, exl3: bool = False) -> Qwen4VisionConfig | None:
+def _parse_vision_config(hf_config: Any, exl3: bool = False, exl3_k: int = 5) -> Qwen4VisionConfig | None:
     vision = getattr(hf_config, "vision_config", None)
     if vision is None or not vision_load_enabled():
         return None
@@ -178,6 +180,7 @@ def _parse_vision_config(hf_config: Any, exl3: bool = False) -> Qwen4VisionConfi
             int(i) for i in (getattr(vision, "deepstack_visual_indexes", None) or ())
         ),
         exl3=exl3,
+        exl3_k=exl3_k,
     )
 
 
@@ -228,6 +231,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
     linear_storage = "bf16"
     exl3_expert_k = 2
     vision_exl3 = False
+    vision_exl3_k = 5
     get = _quant_get(hf_config)
     if get is None:
         expert_quant = attn_quant = dense_quant = lm_head_quant = "none"
@@ -254,6 +258,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
             linear_storage = "exl3"
             exl3_expert_k = int(float(get("bits")))
             vision_exl3 = True
+            vision_exl3_k = int(get("vision_bits") or 5)
         else:
             is_fp4 = "fp4" in algo
             ignore = list(get("ignore") or [])
@@ -299,7 +304,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         (mrope_half + 1) // 3,
         mrope_half // 3,
     )
-    vision_config = _parse_vision_config(hf_config, exl3=vision_exl3)
+    vision_config = _parse_vision_config(hf_config, exl3=vision_exl3, exl3_k=vision_exl3_k)
     full_rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=rotary_dim,

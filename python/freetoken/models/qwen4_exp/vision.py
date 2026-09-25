@@ -12,6 +12,17 @@ from freetoken.utils.torch_utils import torch_dtype
 from .config import Qwen4VisionConfig
 
 
+def _vision_linear(config: Qwen4VisionConfig, fin: int, fout: int) -> BaseOP:
+    """``Exl3Linear`` for a packed EXL3 checkpoint's tower, ``LinearReplicated`` otherwise."""
+    if getattr(config, "exl3", False):
+        from freetoken.kernel.exl3_linear import Exl3Linear
+
+        # 3.05bpw_h5_ng5 vision linears are K=5 (vision_bits); layer-stream copies need the
+        # workspace block's shapes to equal the loaded ones, so the hint must be exact.
+        return Exl3Linear(fin, fout, has_bias=True, k_hint=int(getattr(config, "exl3_k", 5)))
+    return LinearReplicated(fin, fout, has_bias=True)
+
+
 def _copy_component_state_(target: BaseOP, source: BaseOP) -> None:
     """Copy one CPU component into an existing GPU workspace in place."""
     target_state = target.state_dict()
@@ -103,12 +114,13 @@ class Qwen4VisionAttention(BaseOP):
     def __init__(self, config: Qwen4VisionConfig):
         self.num_heads = config.num_heads
         self.head_dim = config.hidden_size // config.num_heads
+        # The checkpoint ships this fused projection bf16 even when the rest of the tower is
+        # EXL3-packed (turboderp builds keep packed q/k/v parts alongside it -- see
+        # weight.py's _EXL3_VISION_QKV_PART_RE, which drops the packed parts by name).
         self.qkv = LinearReplicated(
             config.hidden_size, config.hidden_size * 3, has_bias=True
         )
-        self.proj = LinearReplicated(
-            config.hidden_size, config.hidden_size, has_bias=True
-        )
+        self.proj = _vision_linear(config, config.hidden_size, config.hidden_size)
 
     def forward(
         self,
@@ -146,12 +158,8 @@ class Qwen4VisionAttention(BaseOP):
 
 class Qwen4VisionMLP(BaseOP):
     def __init__(self, config: Qwen4VisionConfig):
-        self.linear_fc1 = LinearReplicated(
-            config.hidden_size, config.intermediate_size, has_bias=True
-        )
-        self.linear_fc2 = LinearReplicated(
-            config.intermediate_size, config.hidden_size, has_bias=True
-        )
+        self.linear_fc1 = _vision_linear(config, config.hidden_size, config.intermediate_size)
+        self.linear_fc2 = _vision_linear(config, config.intermediate_size, config.hidden_size)
         self.hidden_act = config.hidden_act
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -183,8 +191,8 @@ class Qwen4VisionPatchMerger(BaseOP):
     def __init__(self, config: Qwen4VisionConfig, use_postshuffle_norm: bool = False):
         merged = config.hidden_size * config.spatial_merge_size**2
         self.norm = _LayerNorm(merged if use_postshuffle_norm else config.hidden_size)
-        self.linear_fc1 = LinearReplicated(merged, merged, has_bias=True)
-        self.linear_fc2 = LinearReplicated(merged, config.out_hidden_size, has_bias=True)
+        self.linear_fc1 = _vision_linear(config, merged, merged)
+        self.linear_fc2 = _vision_linear(config, merged, config.out_hidden_size)
         self.use_postshuffle_norm = use_postshuffle_norm
         self.merged = merged
 

@@ -73,6 +73,35 @@ def test_load_rejects_malformed_parts(bad, match):
         op.load_state_dict(state, prefix="p")
 
 
+def test_load_requires_bias_key_when_op_has_one():
+    op = el.Exl3Linear(128, 256, has_bias=True)
+    state = {f"p.{n}": t for n, t in _parts(128, 256, 3).items()}  # no "p.bias"
+    with pytest.raises(KeyError, match="bias"):
+        op.load_state_dict(dict(state), prefix="p")
+
+
+@pytest.mark.parametrize("bad_bias", [
+    torch.randn(256, 1).half(),  # not 1-D
+    torch.randn(255).half(),     # wrong length
+])
+def test_load_rejects_malformed_bias(bad_bias):
+    op = el.Exl3Linear(128, 256, has_bias=True)
+    state = {f"p.{n}": t for n, t in _parts(128, 256, 3).items()}
+    state["p.bias"] = bad_bias
+    with pytest.raises(ValueError, match="bias"):
+        op.load_state_dict(dict(state), prefix="p")
+
+
+def test_load_casts_bias_to_bf16_working_dtype():
+    # The vision tower's packed linears ship fp16 bias (3.05bpw_h5_ng5 headers); the module's
+    # compute dtype is bf16 throughout forward(), so load_state_dict must cast on load.
+    op = el.Exl3Linear(128, 256, has_bias=True)
+    state = {f"p.{n}": t for n, t in _parts(128, 256, 3).items()}
+    state["p.bias"] = torch.randn(256).half()
+    op.load_state_dict(dict(state), prefix="p")
+    assert op.bias.dtype == torch.bfloat16
+
+
 @pytest.mark.parametrize("rows", [1, 2, 144, 145, 300])
 def test_forward_matches_reference(cpu_wheel, rows):
     op, state = _loaded(128, 256, 3, bias=True)

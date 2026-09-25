@@ -100,7 +100,13 @@ class Exl3Linear(BaseOP):
         self.suh = torch.empty(in_features, dtype=torch.float16)
         self.svh = torch.empty(out_features, dtype=torch.float16)
         self.mul1 = torch.empty((), dtype=torch.int32)
-        self.bias = torch.empty(out_features) if has_bias else None
+        # Explicit bf16 -- the module's working dtype (GEMM output, reconstructed weight) --
+        # independent of the ambient default dtype and of whatever precision the checkpoint
+        # ships the bias in (the vision tower's packed linears ship fp16, 3.05bpw_h5_ng5
+        # headers; load_state_dict casts on load, see there). Keeping both the fresh and the
+        # loaded tensor in the same dtype also keeps the layer-stream workspace copy
+        # (_copy_component_state_'s dtype check) happy regardless of checkpoint precision.
+        self.bias = torch.empty(out_features, dtype=torch.bfloat16) if has_bias else None
 
     def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
         parts = {}
@@ -116,7 +122,18 @@ class Exl3Linear(BaseOP):
         self.svh = parts["svh"].contiguous()
         self.mul1 = parts["mul1"]
         if self.bias is not None:
-            self.bias = state_dict.pop(_concat_prefix(prefix, "bias"))
+            key = _concat_prefix(prefix, "bias")
+            if key not in state_dict:
+                raise KeyError(f"EXL3 linear {prefix!r} is missing bias ({key})")
+            bias = state_dict.pop(key)
+            if bias.dim() != 1 or bias.shape[0] != self.out_features:
+                raise ValueError(
+                    f"EXL3 linear {prefix!r} bias {key!r} must be 1-D [{self.out_features}], "
+                    f"got {tuple(bias.shape)}"
+                )
+            # Cast to the module's bf16 working dtype (see __init__): a checkpoint may ship
+            # bias in another precision (the vision tower's packed linears ship fp16).
+            self.bias = bias.to(torch.bfloat16)
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
 

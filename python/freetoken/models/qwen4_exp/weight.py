@@ -157,9 +157,17 @@ def _exl3_rename(name: str) -> str:
     return name
 
 
-def _rename(raw_name: str, *, include_vision: bool = False) -> str | None:
+# EXL3 vision: the checkpoint ships packed q/k/v projections (attn.{q,k,v}_proj.{trellis,suh,
+# svh,mul1,bias}) alongside a bf16 attn.qkv.{weight,bias} that the tower actually loads (task 7,
+# spec 2026-09-25 section 5). The packed parts are dead weight -- drop them by name.
+_EXL3_VISION_QKV_PART_RE = re.compile(r"^(model\.)?visual\.blocks\.\d+\.attn\.[qkv]_proj\.")
+
+
+def _rename(raw_name: str, *, include_vision: bool = False, exl3: bool = False) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
     if raw_name.startswith("mtp."):
+        return None
+    if exl3 and include_vision and _EXL3_VISION_QKV_PART_RE.match(raw_name):
         return None
     if raw_name.startswith("model.visual."):
         return "visual." + raw_name[len("model.visual.") :] if include_vision else None
@@ -271,7 +279,7 @@ def iter_weights(
                     safetensors.safe_open(file, framework="pt", device="cpu")
                 )
             for raw_name in raw_names:
-                name = _rename(raw_name, include_vision=include_vision)
+                name = _rename(raw_name, include_vision=include_vision, exl3=exl3)
                 if name is None:
                     continue
                 if exl3:
@@ -284,7 +292,7 @@ def iter_weights(
                 if name.startswith("visual."):
                     from freetoken.models.vision_weight import require_dense_vision_weight
 
-                    require_dense_vision_weight(name, tensor)
+                    require_dense_vision_weight(name, tensor, exl3=exl3)
                 yielded = True
                 fused = _try_fuse(name, tensor, fuse_buf, fusions)
                 if fused is not None:
