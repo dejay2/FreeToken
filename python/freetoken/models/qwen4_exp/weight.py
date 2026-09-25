@@ -725,6 +725,15 @@ def _safetensors_header(path: str) -> tuple[dict, int]:
 
 def _ple_table_files(folder: str) -> list[str]:
     """Shards holding a piece of the n-gram table, from the index when there is one."""
+    # EXL3 checkpoints carry a trellis-packed table FreeToken does not serve; the one-time
+    # converter (scripts/exl3/convert_ngram_table.py) writes the FP8 table beside it and lists
+    # it here, leaving the checkpoint's own index untouched.
+    sidecar = os.path.join(folder, "freetoken-ple.index.json")
+    if os.path.exists(sidecar):
+        with open(sidecar, encoding="utf-8") as fh:
+            weight_map = json.load(fh)["weight_map"]
+        files = {shard for name, shard in weight_map.items() if _PLE_TABLE_INFIX in name}
+        return sorted(os.path.join(folder, shard) for shard in files)
     index = os.path.join(folder, "model.safetensors.index.json")
     if not os.path.exists(index):
         return sorted(iter_weight_files(folder))
@@ -737,6 +746,11 @@ def _ple_table_files(folder: str) -> list[str]:
 def _ple_layout(model_path: str, qwen4_args) -> PleLayout:
     """Parse and validate the PLE shards."""
     folder = download_hf_weight(model_path)
+    if (os.path.exists(os.path.join(folder, "ngram_embedding.safetensors"))
+            and not os.path.exists(os.path.join(folder, "freetoken-ple.index.json"))):
+        raise ValueError(
+            f"{folder} holds an EXL3 trellis n-gram table FreeToken does not serve; convert it once: "
+            f"python scripts/exl3/convert_ngram_table.py {folder}")
     parts: dict[int, tuple[str, int, int]] = {}  # shard index -> (path, file offset, bytes)
     scale: torch.Tensor | None = None
     rows = cols = 0
