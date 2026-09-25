@@ -85,3 +85,70 @@ def test_unknown_kv_dtype_raises_a_plain_error():
         assert "q9" in str(exc)
     else:
         raise AssertionError("expected a ValueError")
+
+
+# ---- startup refusal check (fit round 2, measured live 2026-09-25, RTX 5090, WSL) ----
+from freetoken.daemon.settings.ninfer_fit import startup_room  # noqa: E402
+
+CARD_5090 = 34_190_917_632  # cudaMemGetInfo total
+REFUSED_NEEDS = 13_177_821_184  # "requested Engine runtime reservation requires ..." at mc6
+REFUSED_AVAILABLE = 13_111_561_216  # "... only ... bytes are available for runtime capacity"
+
+
+def quasar_at(concurrency, dtype="int8", context=150000):
+    settings = quasar()
+    settings.update({"max-concurrency": concurrency, "kv-dtype": dtype, "max-context": context})
+    return estimate(settings, QUASAR_BYTES, card_total_bytes=CARD_5090)
+
+
+def test_room_matches_what_ninfer_reported_at_the_refusal():
+    assert startup_room(QUASAR_BYTES, CARD_5090) == REFUSED_AVAILABLE
+
+
+def test_mc6_int8_reproduces_the_refusal():
+    result = quasar_at(6)
+    assert result["runtimeReservationBytes"] == REFUSED_NEEDS
+    assert result["startupVerdict"] == "wont_fit"
+    assert result["startupMessage"].startswith("NInfer would refuse to start: it needs to set aside 12.3 GB")
+    assert "fewer chats" in result["startupMessage"]
+
+
+def test_mc4_and_mc5_start_and_match_the_logged_runtime():
+    # capacity | ... runtime 10.6 GiB (mc4) / 11.4 GiB (mc5), int8, at both 150000 and 100000.
+    for concurrency, logged, expected in ((4, 10.6, "fits"), (5, 11.4, "tight")):
+        for context in (150000, 100000):
+            result = quasar_at(concurrency, context=context)
+            assert abs(result["runtimeReservationBytes"] / GIB - logged) <= 0.1
+            assert result["startupVerdict"] == expected
+
+
+def test_fp8_plans_slightly_less_and_starts():
+    int8, fp8 = quasar_at(4), quasar_at(4, "fp8")
+    assert abs(fp8["runtimeReservationBytes"] / GIB - 10.4) <= 0.1  # logged runtime 10.4 GiB
+    assert 0 < int8["runtimeReservationBytes"] - fp8["runtimeReservationBytes"] < 0.3 * GIB
+    assert fp8["startupVerdict"] == "fits"
+    assert quasar_at(5, "fp8")["startupVerdict"] != "wont_fit"
+
+
+def test_reservation_does_not_depend_on_max_context():
+    assert quasar_at(4)["runtimeReservationBytes"] == quasar_at(4, context=100000)["runtimeReservationBytes"]
+
+
+def test_used_memory_tracks_the_measured_card_after_start():
+    # nvidia-smi card in use after start (MiB), 2026-09-25; includes that day's ~2.6 GB desktop.
+    for concurrency, dtype, mib in ((3, "int8", 30077), (4, "int8", 30484), (5, "int8", 30892), (4, "fp8", 30354)):
+        need = quasar_at(concurrency, dtype)["needBytes"]
+        assert abs(need - mib * 1024 ** 2) / (mib * 1024 ** 2) < 0.05
+
+
+def test_no_card_reading_leaves_the_startup_check_unknown():
+    result = estimate(quasar(), QUASAR_BYTES)
+    assert result["startupVerdict"] == "unknown" and result["runtimeRoomBytes"] is None
+    assert result["runtimeReservationBytes"] > 0
+
+
+def test_fill_the_card_only_refuses_when_the_minimum_does_not_fit():
+    settings = quasar()
+    settings["kv-capacity"] = 0
+    assert estimate(settings, QUASAR_BYTES, card_total_bytes=CARD_5090)["startupVerdict"] == "fits"
+    assert estimate(settings, QUASAR_BYTES, card_total_bytes=24 * GIB)["startupVerdict"] == "wont_fit"

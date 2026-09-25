@@ -703,7 +703,14 @@ class PanelService:
             else:
                 estimate = ninfer_fit.estimate(draft, size, card_total_bytes=total)
                 out.update(needBytes=estimate["needBytes"], components=estimate["components"], notes=estimate["notes"])
-                out["verdict"] = ninfer_fit.verdict(estimate["needBytes"], total)
+                # Two checks: the card memory in use once up (needBytes) and NInfer's own startup
+                # refusal on its up-front runtime reservation (fit round 2, 2026-09-25).
+                out.update(runtimeReservationBytes=estimate["runtimeReservationBytes"],
+                           runtimeRoomBytes=estimate["runtimeRoomBytes"])
+                out["verdict"] = ninfer_fit.worst_verdict(ninfer_fit.verdict(estimate["needBytes"], total),
+                                                          estimate["startupVerdict"])
+                if estimate["startupVerdict"] in ("wont_fit", "tight"):
+                    out["message"] = estimate["startupMessage"]
                 if not total:
                     out["message"] = "The graphics card could not be read."
         else:

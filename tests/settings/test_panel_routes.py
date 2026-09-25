@@ -818,3 +818,15 @@ def test_status_route_runs_in_the_threadpool(env):
     route = next(r for r in env.client.app.routes if getattr(r, "path", "") == "/api/status")
     assert not inspect.iscoroutinefunction(route.endpoint)
     assert env.client.get("/api/status").json()["helper"]["status"] == "up"
+
+
+def test_ninfer_fit_warns_when_ninfer_would_refuse_to_start(env):
+    # Fit round 2 (2026-09-25): the used-memory estimate can look fine while NInfer's up-front
+    # runtime reservation does not fit; the route must say "won't fit" with the plain reason.
+    seed(env)
+    view = env.client.get("/api/panel/views/model/quasar-27b").json()
+    settings = {**engine_settings(view), "max-concurrency": 8}
+    fit = env.client.post("/api/panel/models/quasar-27b/fit", json={"settings": settings, "identity": {}}).json()
+    assert fit["verdict"] == "wont_fit"
+    assert fit["runtimeReservationBytes"] > fit["runtimeRoomBytes"] > 0
+    assert fit["message"].startswith("NInfer would refuse to start")
