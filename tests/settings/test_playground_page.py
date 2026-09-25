@@ -121,7 +121,7 @@ const md = p.historyMarkdown({at: '2026-09-25T10:00:00Z', prompt: 'Line one\nLin
    stats: {firstWordMs: 400, writeTps: 41.3, writeSource: 'engine', totalMs: 12000, promptTokens: 30, completionTokens: 500,
            guesses: {proposed: 514, kept: 365, keptPct: 71}, finishReason: 'stop'}},
   {key: 'B', name: 'Fable', preset: null, settingsLabel: 'Saved settings', loadMs: null, stats: null, answer: ''}]});
-assert.match(md, /^## Test 2026-09-25T10:00:00Z\n\n> Line one\n> Line two\n/);
+assert.match(md, /^## Test [^\n]*Sep[^\n]*\n\n> Line one\n> Line two\n/);
 assert.match(md, /\| \| A · Fable · preset “Fast” \| B · Fable · Saved settings \|/);
 assert.match(md, /\| Writing speed \| 41\.3 tokens a second \| — \|/);
 assert.match(md, /\| Guesses kept \| 71% \(365 of 514 guesses\) \| not reported by this engine \|/);
@@ -164,3 +164,12 @@ const left = p.nowStripHtml({...base, testLeftover: {model: 'quasar-27b', name: 
 assert.match(left, /QUASAR is still on test settings \(preset “Fast”\) because an app was using it\. It goes back to its saved settings at its next load\./);
 assert.doesNotMatch(p.nowStripHtml(base), /test/i);
 """, module=PANEL_JS)
+
+
+def test_history_times_read_as_local_time_not_iso():
+    _node(r"""
+const when = p.pgWhen('2026-09-25T09:06:06Z');
+assert.ok(!when.includes('T09:06') && !when.endsWith('Z'), when);
+assert.ok(/Sep/.test(when), when);
+assert.equal(p.pgWhen('not a date'), 'not a date');
+""")

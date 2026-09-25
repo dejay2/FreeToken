@@ -211,7 +211,7 @@ p.pgWire();
 p.pg.job = { id: 'j2', status: 'running', steps: [], sides: [] };
 p.pg.shown = { id: 'j1', at: '2026-09-25T10:00:00Z', sides: [] };
 p.pgRenderJob();
-assert.match($('pg-status').innerHTML, /Earlier test from 2026-09-25T10:00:00Z/);
+assert.match($('pg-status').innerHTML, /Earlier test from [^<]*Sep/);
 assert.match($('pg-status').innerHTML, /<button[^>]*data-pg-back[^>]*>Back to the current test<\/button>/);
 const back = { dataset: {}, closest: (sel) => sel === '[data-pg-back]' ? back : null };
 $('pg-status').fire('click', back);

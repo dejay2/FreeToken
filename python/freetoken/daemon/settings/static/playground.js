@@ -55,6 +55,12 @@ const PG_METRICS = [
   ['guessPct', 'Guesses kept', false, 'speculative decoding acceptance rate (accepted / proposed draft tokens)'],
   ['finishReason', 'Stopped because', null, 'finish_reason'],
 ];
+// Plain local time for the history ("25 Sep, 09:06"); the stored value stays ISO for Export.
+function pgWhen(iso) {
+  const d = new Date(iso || '');
+  if (Number.isNaN(d.getTime())) return String(iso || '');
+  return d.toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
 function metricValue(side, key) {
   const s = (side && side.stats) || {};
   if (key === 'loadMs') return side ? side.loadMs : null;
@@ -118,7 +124,7 @@ function statusWords(job) {
 function statusHtml(job, shown) {
   if (!shown) return pgEsc(statusWords(job));
   const back = job ? ' <button class="button small" type="button" data-pg-back>Back to the current test</button>' : '';
-  return `Earlier test from ${pgEsc(shown.at || '')}${back}`;
+  return `Earlier test from ${pgEsc(pgWhen(shown.at))}${back}`;
 }
 
 function historyRecord(job) {
@@ -133,7 +139,7 @@ function historyAdd(list, record, max = PG_HISTORY_MAX) { return [record, ...(li
 function sideTitle(side) { return `${side.key} · ${side.name} · ${side.settingsLabel || (side.preset ? `preset “${side.preset}”` : 'Saved settings')}`; }
 function historyMarkdown(record) {
   const sides = record.sides || [];
-  const lines = [`## Test ${record.at || ''}`.trim(), '', ...String(record.prompt || '').split('\n').map((line) => `> ${line}`), ''];
+  const lines = [`## Test ${pgWhen(record.at)}`.trim(), '', ...String(record.prompt || '').split('\n').map((line) => `> ${line}`), ''];
   lines.push(`| | ${sides.map(sideTitle).join(' | ')} |`, `|---|${sides.map(() => '---').join('|')}|`);
   for (const [key, label] of PG_METRICS) lines.push(`| ${label} | ${sides.map((s) => metricText(s, key)).join(' | ')} |`);
   for (const s of sides) lines.push('', `### ${sideTitle(s)}`, '', s.error ? `(${s.error})` : '', String(s.answer || '').trim() || '(no answer)');
@@ -314,7 +320,7 @@ function pgRenderJob() {
 }
 function pgRenderHistory() {
   const list = pg.history;
-  $('pg-history').innerHTML = list.length ? list.map((row, i) => `<div class="pg-history-row"><div><strong>${pgEsc(row.at || '')}</strong> <span class="small">${pgEsc(String(row.prompt || '').slice(0, 80))}</span><div class="small">${(row.sides || []).map((s) => `${pgEsc(s.key)}: ${pgEsc(s.name)}, ${pgEsc(fmtRate(s.stats))}`).join(' · ')}</div></div><div class="actions"><button class="button small" type="button" data-pg-show="${i}">Show</button><button class="button small" type="button" data-pg-copy="${i}">Copy</button></div></div>`).join('') : '<p class="empty">No tests yet.</p>';
+  $('pg-history').innerHTML = list.length ? list.map((row, i) => `<div class="pg-history-row"><div><strong>${pgEsc(pgWhen(row.at))}</strong> <span class="small">${pgEsc(String(row.prompt || '').slice(0, 80))}</span><div class="small">${(row.sides || []).map((s) => `${pgEsc(s.key)}: ${pgEsc(s.name)}, ${pgEsc(fmtRate(s.stats))}`).join(' · ')}</div></div><div class="actions"><button class="button small" type="button" data-pg-show="${i}">Show</button><button class="button small" type="button" data-pg-copy="${i}">Copy</button></div></div>`).join('') : '<p class="empty">No tests yet.</p>';
 }
 async function pgCopy(i) {
   const record = pg.history[i];
@@ -372,7 +378,7 @@ async function pgOpen() {
   try { await pgLoadOptions(); } catch (_) { pgShowError(PG_OFFLINE); } finally { await pgPoll(); }
 }
 
-if (typeof module !== 'undefined') module.exports = { fmtMs, fmtGuess, fmtRate, guessWords, stopWords, tokensWords, metricText, betterSide,
+if (typeof module !== 'undefined') module.exports = { pgWhen, fmtMs, fmtGuess, fmtRate, guessWords, stopWords, tokensWords, metricText, betterSide,
   speedRows, stepLine, planLines, statusWords, statusHtml, historyRecord, historyAdd, historyMarkdown, sideTitle, loadHistory, saveHistory,
   loadCleared, saveCleared, pgResultsHtml, pgResultsState, pgResultsRestore, pgRenderJob, pgRenderPlan, pgRun, pgStart, pgStop, pgPoll,
   pgOpen, pgWire, pgRemember, pgClear, PG_HISTORY_KEY, PG_HISTORY_MAX, PG_CLEARED_KEY, PG_OFFLINE, pg };
