@@ -97,3 +97,76 @@ def test_now_shows_the_test_and_prunes_a_leftover_once_unloaded(env):
     assert now["test"] is None and now["testLeftover"]["preset"] == "Fast"
     env.switcher.states = {}
     assert env.client.get("/api/panel/now").json()["testLeftover"] is None
+
+
+def restart_quasar(env, revision):
+    from tests.settings.test_panel_routes import engine_settings
+    settings = engine_settings(env.client.get("/api/panel/views/model/quasar-27b").json())
+    settings["draft-tokens"] = 5
+    answer = env.client.put("/api/panel/models/quasar-27b", json={
+        "revision": revision, "settings": settings, "identity": {}, "activePreset": None, "whenLoaded": "restart"})
+    assert answer.status_code == 200 and answer.json()["restarting"] == ["quasar-27b"], answer.text
+
+
+@pytest.mark.parametrize("ending", ["loads", "stale", "raises"])
+def test_begin_test_is_refused_while_a_restart_is_pending(env, ending):
+    """Review item 2: a test started between a save's unload and its reload would load over
+    (or put away) the restarting model."""
+    from tests.settings.test_panel_routes import run_spawned
+    revision = seed(env, with_presets())
+    env.switcher.states = {"quasar-27b": "ready"}
+    restart_quasar(env, revision)
+    with pytest.raises(PanelError) as refused:
+        env.service.begin_test()
+    assert refused.value.status == 409 and refused.value.payload == {
+        "code": "busy", "message": "The control panel is restarting a model with its new settings. "
+                                   "Try again when it has finished."}
+    if ending == "stale":
+        env.service.restart_wait_s = 0
+        env.cfg.write_text(env.cfg.read_text() + "# moved\n")  # the switcher never reports this hash
+    if ending == "raises":
+        def boom(model_id, *, timeout=900.0):
+            raise RuntimeError("thread died")
+        env.switcher.load = boom
+        with pytest.raises(RuntimeError):
+            run_spawned(env)
+    else:
+        run_spawned(env)
+    env.service.begin_test()  # every ending of the reload clears the flag
+    assert env.service.test_running is True
+
+
+@pytest.mark.parametrize("action", ["load", "unload"])
+def test_begin_test_is_refused_during_a_panel_load_or_unload(env, action):
+    """Review item 10: the guard check and the test flag share the panel lock, and a load or
+    unload in progress keeps a test from starting over it."""
+    seed(env, with_presets())
+    env.switcher.states = {"twin-27b": "ready"} if action == "unload" else {}
+    seen = []
+    original = getattr(env.switcher, action)
+
+    def during(model_id, **kwargs):
+        try:
+            env.service.begin_test()
+            seen.append("started")
+        except PanelError as exc:
+            seen.append(exc.payload["code"])
+        return original(model_id, **kwargs)
+
+    setattr(env.switcher, action, during)
+    assert env.client.post(f"/api/panel/models/twin-27b/{action}").status_code == 200
+    assert seen == ["busy"]
+    env.service.begin_test()
+    assert env.service.test_running is True
+
+
+def test_wait_for_switcher_gives_up_on_stop(env):
+    import threading
+    seed(env, with_presets())
+    stop = threading.Event()
+    stop.set()
+    import time
+    env.service.restart_wait_s = 2.0
+    started = time.monotonic()
+    assert env.service.wait_for_switcher("something else", stop=stop) is False
+    assert time.monotonic() - started < 1.0  # not the full wait

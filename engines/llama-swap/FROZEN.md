@@ -29,7 +29,7 @@ commit above, copy only the wanted change, re-run the tests, and add a line belo
   ctx.Err() without starting when its ctx is already cancelled at the start decision, as
   ProcessCommand's run loop now does. It also gained optional `ensureGate`/`ensureExit` hooks, which
   are nil in upstream tests.
-- P5, P6: none; upstream router and server tests pass unchanged.
+- P5, P6, P7: none; upstream router and server tests pass unchanged.
 
 ## Our patches
 
@@ -43,6 +43,7 @@ Every changed spot carries a `// FreeToken patch Pn:` comment.
 | P5 | selective reload, part 1: the group router reconfigures in place (`PrepareReconfigure` -> `ReconfigPlan.Commit/Abort`); unchanged loaded models keep their process and in-flight requests, changed and removed models are stopped through `OnUnload`; each process gets its own child context of procCtx; swaps work from the table captured at `StartSwap`; matrix router has no planner factory and keeps upstream's full rebuild | internal/router/{reconfigure.go,base.go,group.go}, internal/router/scheduler/{scheduler.go,fifo.go} |
 | P5 | selective reload, part 2: a config reload reconfigures the local router in place (unchanged entries keep their process and requests; changed/removed ones are stopped via OnUnload; matrix or router-kind changes rebuild as upstream) through `server.Rebuild`; the retired Server shuts down everything but the kept router (`ShutdownExceptLocal`); a stale plan is refused (`ErrStaleReconfigure`); reloads coalesce instead of being dropped; `--check-config` (= `-validate`); `GET /api/config/hash` | llama-swap.go, freetoken_reload.go, internal/router/{base.go,reconfigure.go}, internal/server/{server.go,freetoken_api.go} |
 | P6 | `POST /api/models/load/{model}`: load through the scheduler (P1/P2 apply), answer when ready or failed (200 `{"model","state":"ready"}`, 409 model_superseded, 503 not_enough_memory, 404 unknown or not local) | internal/router/load.go, internal/server/{server.go,freetoken_api.go} |
+| P7 | unload only if idle: `POST /api/models/unload/{model}?ifIdle=1` stops the model only when the scheduler holds no request for it (in flight, queued, waiting on a swap, or a swap to it running), else 409 code `busy` and nothing stops; the check and the stop run in one run-loop step, atomic with admission; a request still before the run loop is not seen (it reloads the model after the stop instead of being killed); a router without the check answers 501; plain unload unchanged | internal/router/{unload_idle.go,base.go}, internal/router/scheduler/fifo.go, internal/server/apigroup.go |
 
 Notes (final review fixes, 2026-09-24):
 
@@ -153,3 +154,12 @@ Notes (tidy of deferred review minors, 2026-09-25):
   next NInfer load stops it through the helper and kills a stray `ninfer-serve` by name.
   Outside systemd the same adapters converge on the next load. Not fixed in Go: the forced
   exit would have to find and kill each process group itself.
+
+Notes (P7, 2026-09-25):
+
+- P7: added for the control panel's Test tab, which puts models away between its steps. Upstream
+  Unload kills in-flight requests (base.go Unload comment); a read of the in-flight list followed
+  by a plain unload left a window in which another app's new request could be admitted and then
+  killed. `FIFO.Busy` counts `inFlight`, `reserved` and `active`; the unload request carries
+  `ifIdle` and the run loop checks it just before `OnUnload`. Covered by
+  internal/router/unload_idle_test.go and internal/server/freetoken_unload_idle_test.go.

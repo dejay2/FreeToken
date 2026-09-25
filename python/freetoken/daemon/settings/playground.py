@@ -41,6 +41,7 @@ import re
 import socket
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -117,7 +118,9 @@ def parse_go_time(value: Any) -> float | None:
 
 class SwitcherChat:
     """One streamed chat at a time through the switcher. abort() may come from any thread: it
-    shuts the socket down, and the stream then simply ends."""
+    shuts the socket down, and the stream then simply ends. An abort stays in force until
+    reset() (called when a test starts), so a Stop that lands between two steps also ends the
+    next stream before it connects."""
 
     def __init__(self, base_url: str | None = None, *, timeout: float = 900.0) -> None:
         self.base_url, self.timeout = _base_url(base_url), timeout
@@ -129,9 +132,10 @@ class SwitcherChat:
         """Yield the raw SSE lines of one chat. Raises ChatFailed on a non-200 answer, on a
         refused connection (switcher_down) or when the connection drops (cut_off)."""
         parts = urllib.parse.urlsplit(self.base_url)
-        conn = http.client.HTTPConnection(parts.hostname or "127.0.0.1", parts.port or 80, timeout=self.timeout)
         with self._lock:
-            self._aborted = False
+            if self._aborted:
+                return
+        conn = http.client.HTTPConnection(parts.hostname or "127.0.0.1", parts.port or 80, timeout=self.timeout)
         try:
             try:
                 conn.connect()
@@ -182,6 +186,10 @@ class SwitcherChat:
                 self._sock = None
             conn.close()
 
+    def reset(self) -> None:
+        with self._lock:
+            self._aborted = False
+
     def abort(self) -> None:
         with self._lock:
             self._aborted = True
@@ -230,6 +238,29 @@ class SwitcherProbe:
         except (OSError, ValueError):
             return None
         return None
+
+    def unload_if_idle(self, model_id: str) -> str:
+        """Put model_id away only when no request is using it (FreeToken llama-swap patch P7,
+        POST /api/models/unload/{model}?ifIdle=1; the idle check and the stop are one step of
+        llama-swap's run loop, so a request admitted after the in-flight read is never killed).
+        "unloaded", "busy" (409 code busy: nothing was stopped) or "failed" (switcher down, or
+        a llama-swap without P7, which answers 501)."""
+        path = f"/api/models/unload/{urllib.parse.quote(model_id, safe='')}?ifIdle=1"
+        request = urllib.request.Request(self.base_url + path, method="POST", data=b"")
+        try:
+            with self._urlopen(request, timeout=240.0) as response:
+                return "unloaded" if response.status == 200 else "failed"
+        except urllib.error.HTTPError as exc:
+            if exc.code != 409:
+                return "failed"
+            try:
+                body = json.loads(exc.read().decode("utf-8", "replace") or "{}")
+            except ValueError:
+                return "failed"
+            error = body.get("error") if isinstance(body, dict) else None
+            return "busy" if isinstance(error, dict) and error.get("code") == "busy" else "failed"
+        except OSError:
+            return "failed"
 
     def last_used(self, model_id: str) -> float | None:
         """Epoch seconds of the newest activity row for the model, or None when there is none
@@ -339,6 +370,27 @@ class PlaygroundRunner:
         names = self._aliases.get(model_id, {model_id})
         return any(str(row.get("model")) in names
                    and not (self._session and _header(row, SESSION_HEADER) == self._session) for row in rows)
+
+    def _put_away(self, model_id: str) -> str:
+        """Unload model_id unless another app is using it: "unloaded", "busy", "unknown" (the
+        in-flight list could not be read) or "failed". The in-flight read gives the plain
+        "unknown" answer and skips the test's own session; the unload itself is P7's if-idle
+        unload, so a request that arrives after that read is refused as busy, not killed."""
+        busy = self._others_using(model_id)
+        if busy is None:
+            return "unknown"
+        if busy:
+            return "busy"
+        return self.probe.unload_if_idle(model_id)
+
+    def _other_on_card(self, model_id: str | None) -> tuple[bool, str | None]:
+        """Re-read right before a load: (known, the model another app has starting or ready,
+        other than model_id). Plan-time state is minutes old by then (a FreeToken load is 2.5 min)."""
+        running = self.switcher.running()
+        if running is None or is_down(running):
+            return False, None
+        other = sorted(m for m, state in running.items() if state in LOADED_STATES and m != model_id)
+        return True, other[0] if other else None
 
     def _card(self) -> str | None:
         running = self.switcher.running()
@@ -479,8 +531,12 @@ class PlaygroundRunner:
 
     # ---- start and stop ----
     def start(self, body: dict[str, Any]) -> dict[str, Any]:
+        # plan() reads the switcher and the in-flight list (seconds when llama-swap is slow),
+        # so it runs outside the lock; the job is checked again under it.
+        plan = self.plan(body)
         with self._lock:
-            plan = self.plan(body)
+            if self.job is not None and self.job["status"] in ACTIVE:
+                raise PlaygroundError(409, "test_running", "A test is already running.")
             if "expectBefore" in body and body.get("expectBefore") != plan["before"]:
                 raise PlaygroundError(409, "changed", "Something changed since the plan was shown. "
                                       "Check the new plan and press Start again.", {"plan": plan})
@@ -491,6 +547,9 @@ class PlaygroundRunner:
             except PanelError as exc:  # another test holds the panel's guard
                 raise PlaygroundError(exc.status, exc.payload["code"], exc.payload["message"]) from None
             self._stop.clear()
+            reset = getattr(self.chat, "reset", None)
+            if reset is not None:
+                reset()
             self._session = SESSION_PREFIX + uuid.uuid4().hex[:10]
             self._ours = None
             job = {**plan, "id": self._session[len(SESSION_PREFIX):], "status": "running",
@@ -578,13 +637,13 @@ class PlaygroundRunner:
         kind, model = step["kind"], step["model"]
         side = next(s for s in job["sides"] if s["key"] == step["side"])
         if kind == "unload":
-            busy = self._others_using(model)
-            if busy is None:
+            result = self._put_away(model)
+            if result == "unknown":
                 raise _Halt("failed", f"Couldn't check whether {self._name(model)} is busy, so the test stopped.")
-            if busy:
+            if result == "busy":
                 raise _Halt("yielded", f"{self._name(model)} started answering something for another app, "
                                        "so the test stopped to leave it alone.")
-            if not self.switcher.unload(model):
+            if result != "unloaded":
                 raise _Halt("failed", f"Couldn't put {self._name(model)} away.")
             if self._ours == model:
                 self._ours = None
@@ -593,7 +652,9 @@ class PlaygroundRunner:
                 text = self.panel.set_test_settings(model if step["preset"] else None, step["preset"])
             except (PanelError, SwitcherRefused, RegistryError, KeyError, OSError) as exc:
                 raise _Halt("failed", f"Couldn't write the test settings: {exc}") from None
-            if not self.panel.wait_for_switcher(text):
+            if not self.panel.wait_for_switcher(text, stop=self._stop):
+                if self._stop.is_set():
+                    raise _Halt("stopped", STOPPED)
                 raise _Halt("failed", "The switcher didn't pick up the test settings, so nothing was loaded.")
         elif kind == "load":
             self._load(side, model)
@@ -601,8 +662,18 @@ class PlaygroundRunner:
             self._answer(job, side, warmup=kind == "warmup")
 
     def _load(self, side: dict[str, Any], model: str) -> None:
+        known, other = self._other_on_card(None)
+        if not known:
+            raise _Halt("failed", f"Can't tell which model is loaded right now, so {side['name']} was not loaded.")
+        if other is not None:
+            raise _Halt("yielded", f"Another app started using {self._name(other)}, so the test stopped to let it through.")
         with self._lock:
             self._loading = model
+            stopping = self._stop.is_set()
+        if stopping:
+            with self._lock:
+                self._loading = None
+            raise _Halt("stopped", STOPPED)
         started = self._clock()
         try:
             self.switcher.load(model)
@@ -621,6 +692,10 @@ class PlaygroundRunner:
         with self._lock:
             side["loadMs"] = (side["loadMs"] or 0) + max(0, round((self._clock() - started) * 1000))
         if self._stop.is_set():
+            # Stop's unload can reach llama-swap before P6 has registered this load, and the
+            # load then simply finishes: put the model away again.
+            if self.switcher.unload(model):
+                self._ours = None
             raise _Halt("stopped", STOPPED)
 
     def _answer(self, job: dict[str, Any], side: dict[str, Any], *, warmup: bool) -> None:
@@ -635,6 +710,8 @@ class PlaygroundRunner:
             messages.append({"role": "user", "content": job["prompt"]})
             body = {"model": side["model"], "messages": messages, **side["sampling"]}
         body.update({"stream": True, "stream_options": {"include_usage": True}})
+        if self._stop.is_set():  # a Stop between steps: never start the stream
+            raise _Halt("stopped", STOPPED)
         tracker = AnswerTracker(started=self._clock())
         try:
             for line in self.chat.stream(body, self._session):
@@ -653,16 +730,21 @@ class PlaygroundRunner:
             tracker.ended = self._clock()
             self._own_last[side["model"]] = self._wall()
         stopped = self._stop.is_set()
+        # Spec, error table "Answer error / cut off": a stream that ends without a finish
+        # reason or [DONE] fails the test.
+        cut = not stopped and not tracker.done and tracker.finish_reason is None
         if not warmup:
             self._publish(side, tracker, final=True, cancelled=stopped)
             with self._lock:
                 names = self._aliases.get(side["model"], {side["model"]})
                 if tracker.served_model and tracker.served_model not in names:
                     side["error"] = f"The answer came from {tracker.served_model}, not {side['name']}."
-                elif not stopped and not tracker.done and tracker.finish_reason is None:
+                elif cut:
                     side["error"] = "The answer ended without a finish signal."
         if stopped:
             raise _Halt("stopped", STOPPED)
+        if cut:
+            raise _Halt("failed", f"{side['name']} could not answer: the answer was cut off before it finished.")
 
     def _publish(self, side: dict[str, Any], tracker: AnswerTracker, *, final: bool = False,
                  cancelled: bool = False) -> None:
@@ -679,22 +761,29 @@ class PlaygroundRunner:
         Jay said not to, or the switcher has not picked up the saved file."""
         before, put_back = job["before"], job["putBack"]
         words: list[str] = []
+        test = self.panel.test_settings
         try:
-            test = self.panel.test_settings
             running = self.switcher.running()
             if running is None or is_down(running):
-                self.panel.set_test_settings(None, None)
-                return False, "Can't tell what's loaded right now, so nothing was loaded again. Check the Models tab."
+                # The test model may still be loaded on test settings: say so on the strip (it
+                # clears itself once the model is seen unloaded) and let the switcher take the
+                # saved file before anything else happens.
+                if test:
+                    self.panel.note_test_leftover(test["model"], test["preset"])
+                text = self.panel.set_test_settings(None, None)
+                words.append("Can't tell what's loaded right now, so nothing was loaded again. Check the Models tab.")
+                if not is_down(running) and not self.panel.wait_for_switcher(text):
+                    words.append("The switcher hasn't picked up the saved settings yet.")
+                return False, " ".join(words)
             loaded = sorted(model for model, state in running.items() if state in LOADED_STATES)
             left = None
-            for model in list(loaded):
+            for model in loaded:
                 on_test = bool(test) and model == test["model"]
                 if not (on_test or model == self._ours):
                     continue  # another app's model
                 if not on_test and (model == before or not put_back):
                     continue  # our setup on saved settings, and it may stay
-                if self._others_using(model) is False and self.switcher.unload(model):
-                    loaded.remove(model)
+                if self._put_away(model) == "unloaded":
                     self._ours = None if self._ours == model else self._ours
                 elif on_test:
                     left = model
@@ -708,17 +797,32 @@ class PlaygroundRunner:
                 return False, " ".join(words)
             if before is None:
                 words.append("Nothing was loaded before the test.")
-            elif before == left:
-                pass
-            elif before in loaded:
+                return True, " ".join(words)
+            if before == left:
+                return True, " ".join(words)
+            # Read the card again right before loading: the list above is from before the
+            # put-away and the hash wait, and another app may have started a model since.
+            now = self.switcher.running()
+            if now is None or is_down(now):
+                words.append(f"Can't tell what's loaded right now, so {self._name(before)} was not loaded again. "
+                             "Check the Models tab.")
+                return False, " ".join(words)
+            other = sorted(m for m, state in now.items() if state in LOADED_STATES and m != before)
+            if now.get(before) in LOADED_STATES and not other:
                 words.append(f"{self._name(before)} is loaded on its saved settings, as before.")
             elif not put_back:
                 words.append(f"{self._name(before)} was not loaded again, as asked.")
-            elif loaded:
-                words.append(f"{self._name(before)} was not loaded again, because an app is using {self._name(loaded[0])}.")
+            elif other:
+                words.append(f"{self._name(before)} was not loaded again, because an app is using {self._name(other[0])}.")
             else:
                 started = self._clock()
-                self.switcher.load(before)
+                try:
+                    self.switcher.load(before)
+                except SwitcherError as exc:
+                    if exc.code != "model_superseded":
+                        raise
+                    words.append(f"{self._name(before)} was not loaded again, because another app took the graphics card.")
+                    return True, " ".join(words)
                 took = max(0, round((self._clock() - started) * 1000))
                 words.append(f"{self._name(before)} is loaded again on its saved settings ({_seconds(took)}).")
             return True, " ".join(words)
@@ -726,7 +830,11 @@ class PlaygroundRunner:
             try:
                 self.panel.set_test_settings(None, None)
             except Exception:  # noqa: BLE001
-                pass
+                # The file may still hold the test settings; the marker stays on disk for
+                # recover(), and the strip says which model is on them.
+                if test:
+                    self.panel.note_test_leftover(test["model"], test["preset"])
+                words.append("The test settings could not be taken out of the switcher file.")
             words.append(f"Putting things back didn't finish ({exc}). Check the Models tab.")
             return False, " ".join(words)
 
@@ -751,7 +859,7 @@ class PlaygroundRunner:
             self.panel.note_test_leftover(model, preset)
             result = "unknown"
         elif not is_down(running) and running.get(model) in LOADED_STATES:
-            if self._others_using(model) is False and self.switcher.unload(model):
+            if self._put_away(model) == "unloaded":
                 result = "unloaded"
             else:
                 self.panel.note_test_leftover(model, preset)

@@ -223,3 +223,36 @@ def test_parse_go_time():
     assert parse_go_time("2026-09-25T11:00:00+01:00") == parse_go_time("2026-09-25T10:00:00Z")
     assert parse_go_time("2026-09-25T10:00:00Z") == dt.datetime(2026, 9, 25, 10, tzinfo=dt.timezone.utc).timestamp()
     assert parse_go_time("nonsense") is None and parse_go_time(None) is None and parse_go_time("") is None
+
+
+def test_an_abort_before_the_stream_holds_until_reset(server):
+    """Review item 4: a Stop that lands between two steps must end the next stream too, so
+    stream() no longer clears the abort; reset() (a new test) does."""
+    routes, seen, url = server
+    routes[("POST", "/v1/chat/completions")] = lambda h: reply(h, 200, b"data: [DONE]\n\n", "text/event-stream")
+    chat = SwitcherChat(url)
+    chat.abort()
+    assert list(chat.stream({"model": "m"}, "s")) == [] and seen == []  # never connected
+    chat.reset()
+    assert [line.strip() for line in chat.stream({"model": "m"}, "s") if line.strip()] == ["data: [DONE]"]
+
+
+@pytest.mark.parametrize("status, body, result", [
+    (200, b"OK", "unloaded"),
+    (409, json.dumps({"src": "llama-swap", "error": {"message": "model m is answering a request, so it was not unloaded",
+                                                     "type": "invalid_request_error", "code": "busy"}}).encode(), "busy"),
+    (409, b'{"error": {"code": "conflict"}}', "failed"),
+    (501, b'{"error": {"code": "not_implemented"}}', "failed"),
+])
+def test_unload_if_idle_uses_p7(server, status, body, result):
+    routes, seen, url = server
+    routes[("POST", "/api/models/unload/Qwen3.8%2FFlash")] = lambda h: reply(h, status, body)
+    assert SwitcherProbe(url).unload_if_idle("Qwen3.8/Flash") == result
+    assert seen[0]["path"] == "/api/models/unload/Qwen3.8%2FFlash?ifIdle=1"
+
+
+def test_unload_if_idle_fails_when_the_switcher_is_down():
+    with socket.socket() as spare:
+        spare.bind(("127.0.0.1", 0))
+        port = spare.getsockname()[1]
+    assert SwitcherProbe(f"http://127.0.0.1:{port}").unload_if_idle("m") == "failed"

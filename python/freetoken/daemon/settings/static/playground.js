@@ -72,6 +72,11 @@ function metricText(side, key) {
 function betterSide(a, b, key) {
   const metric = PG_METRICS.find((row) => row[0] === key);
   if (!metric || metric[2] == null || !a || !b) return null;
+  // A stopped answer's numbers are not a fair race, and an engine-reported writing speed is not
+  // comparable with one measured from the chunks: no tag for either.
+  const sa = a.stats || {}; const sb = b.stats || {};
+  if (sa.finishReason === 'cancelled' || sb.finishReason === 'cancelled') return null;
+  if (key === 'writeTps' && sa.writeSource !== sb.writeSource) return null;
   const rawA = metricValue(a, key); const rawB = metricValue(b, key);
   if (rawA == null || rawB == null) return null;
   const x = Number(rawA); const y = Number(rawB);

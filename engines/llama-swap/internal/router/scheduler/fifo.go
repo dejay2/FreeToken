@@ -342,6 +342,14 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 	s.drainQueue()
 }
 
+// FreeToken patch P7: Busy reports whether the scheduler still holds any
+// request for modelID: one being served (inFlight), or one admitted and
+// waiting in the queue or on a swap (reserved), or a swap to it in progress
+// (active). Runs on the run loop like every other FIFO method.
+func (s *FIFO) Busy(modelID string) bool {
+	return s.inFlight[modelID] > 0 || s.reserved[modelID] > 0 || s.active[modelID] != nil
+}
+
 // OnShutdown grants err to every waiter still held by the scheduler.
 func (s *FIFO) OnShutdown(err error) {
 	for _, sw := range s.active {

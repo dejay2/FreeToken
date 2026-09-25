@@ -95,6 +95,9 @@ STALE_GRACE_S = 10.0
 RESTART_SHOWN_S = 600.0
 RESTART_STALE_MESSAGE = "The switcher didn't pick up the new settings; the old ones are still in use. Check the switcher log."
 TEST_RUNNING_MESSAGE = "A test is running on the Test tab. Wait for it to finish, or stop it there."
+RESTART_PENDING_MESSAGE = ("The control panel is restarting a model with its new settings. "
+                           "Try again when it has finished.")
+PANEL_BUSY_MESSAGE = "The control panel is loading or unloading a model right now. Try again when it has finished."
 TEST_MARKER = "playground-test.json"
 
 IDENTITY_GROUP = "This model"
@@ -343,6 +346,10 @@ class PanelService:
         # a test: the test model on one preset alone. It lives in memory and is never written to
         # the registry; the marker lets a restarted helper find a model left on test settings.
         self.test_running = False
+        # begin_test refuses while a save's restart (_reload_after_write) or a panel load/unload
+        # is still running: the test would put that model away or load over it.
+        self._restarts_pending = 0
+        self._actions = 0
         self.test_settings: dict[str, Any] | None = None
         self.test_leftover: dict[str, Any] | None = None
         self.test_marker_path = self.holds_path.with_name(TEST_MARKER)
@@ -511,7 +518,7 @@ class PanelService:
             self._clear_restart()
             self._ensure_profiles(proposed)
             if restarting:
-                self._spawn(self._reload_after_write, restarting, new_text)
+                self._spawn_reload(restarting, new_text)
             result = {"status": "saved", "revision": new_revision, "restarting": restarting, "held": sorted(holds)}
             if extra is not None:
                 result.update(extra(current, proposed))
@@ -596,7 +603,25 @@ class PanelService:
         self.last_restart = {"models": model_ids, "ok": ok, "at": _now_iso(), "message": message}
         self._last_restart_at = self._clock()
 
+    def _spawn_reload(self, model_ids: list[str], text: str) -> None:
+        """Start _reload_after_write, counted as a pending restart until it ends (every path)."""
+        with self._lock:
+            self._restarts_pending += 1
+        try:
+            self._spawn(self._reload_after_write, model_ids, text)
+        except BaseException:
+            with self._lock:
+                self._restarts_pending -= 1
+            raise
+
     def _reload_after_write(self, model_ids: list[str], text: str) -> None:
+        try:
+            self._reload_models(model_ids, text)
+        finally:
+            with self._lock:
+                self._restarts_pending -= 1
+
+    def _reload_models(self, model_ids: list[str], text: str) -> None:
         # Bounded wait (Task 7 review): if the switcher's rebuild fails for a reason
         # --check-config misses, its hash never changes; loading then would start the model on
         # the old settings, so give up with a plain message instead.
@@ -673,7 +698,7 @@ class PanelService:
             self._write_holds({})
             self._ensure_profiles(registry)
             if loaded:
-                self._spawn(self._reload_after_write, loaded, new_text)
+                self._spawn_reload(loaded, new_text)
             return {"status": "imported", "revision": revision, "warnings": warnings, "restarting": loaded}
 
     def restore(self, name: str) -> dict[str, Any]:
@@ -979,25 +1004,42 @@ class PanelService:
             })
         return {"revision": revision, "switcherUp": up, "models": rows}
 
+    def _begin_action(self) -> None:
+        """The test guard for a panel load/unload, checked under the lock begin_test takes, and
+        the action counted so begin_test refuses until it ends."""
+        with self._lock:
+            self._guard_test()
+            self._actions += 1
+
+    def _end_action(self) -> None:
+        with self._lock:
+            self._actions -= 1
+
     def load(self, model_id: str) -> dict[str, Any]:
-        self._guard_test()
-        doc, _ = self.store.load()
-        find_model(doc, model_id)
+        self._begin_action()
         try:
-            self.switcher.load(model_id)
-        except SwitcherError as exc:
-            raise PanelError(exc.status, exc.code, exc.message) from exc
-        except OSError as exc:
-            raise PanelError(503, "switcher_down", "The model switcher is not running.") from exc
+            doc, _ = self.store.load()
+            find_model(doc, model_id)
+            try:
+                self.switcher.load(model_id)
+            except SwitcherError as exc:
+                raise PanelError(exc.status, exc.code, exc.message) from exc
+            except OSError as exc:
+                raise PanelError(503, "switcher_down", "The model switcher is not running.") from exc
+        finally:
+            self._end_action()
         self._clear_restart()
         return {"id": model_id, "state": "ready"}
 
     def unload(self, model_id: str) -> dict[str, Any]:
-        self._guard_test()
-        doc, _ = self.store.load()
-        find_model(doc, model_id)
-        if not self.switcher.unload(model_id):
-            raise PanelError(503, "switcher_down", "The model switcher is not running.")
+        self._begin_action()
+        try:
+            doc, _ = self.store.load()
+            find_model(doc, model_id)
+            if not self.switcher.unload(model_id):
+                raise PanelError(503, "switcher_down", "The model switcher is not running.")
+        finally:
+            self._end_action()
         self._clear_restart()
         return {"id": model_id, "state": "stopped"}
 
@@ -1317,6 +1359,10 @@ class PanelService:
     def begin_test(self) -> None:
         with self._lock:
             self._guard_test()
+            if self._restarts_pending:
+                raise PanelError(409, "busy", RESTART_PENDING_MESSAGE)
+            if self._actions:
+                raise PanelError(409, "busy", PANEL_BUSY_MESSAGE)
             self.test_running = True
             self.test_leftover = None
 
@@ -1399,12 +1445,13 @@ class PanelService:
     def note_test_leftover(self, model_id: str, preset: str | None) -> None:
         self.test_leftover = {"model": model_id, "preset": preset}
 
-    def wait_for_switcher(self, text: str) -> bool:
-        """True once the switcher reports text's hash (P5); False after restart_wait_s."""
+    def wait_for_switcher(self, text: str, stop: threading.Event | None = None) -> bool:
+        """True once the switcher reports text's hash (P5); False after restart_wait_s, or as
+        soon as stop is set (the Test tab's Stop)."""
         expected = config_sha256(text)
         deadline = self._clock() + self.restart_wait_s
         while self.switcher.config_hash() != expected:
-            if self._clock() >= deadline:
+            if self._clock() >= deadline or (stop is not None and stop.is_set()):
                 return False
             self._sleep(0.5)
         return True

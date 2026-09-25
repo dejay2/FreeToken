@@ -102,7 +102,14 @@ known to work.
    - `test_plan_refuses_when_the_loaded_model_is_answering`,
      `test_plan_warns_when_the_loaded_model_was_used_recently` (Task 4);
    - `test_superseded_load_stops_and_does_not_load_over_the_other_app`,
-     `test_put_back_leaves_a_busy_test_model_and_holds_its_entry` (Task 5).
+     `test_put_back_leaves_a_busy_test_model_and_holds_its_entry` (Task 5);
+   - review fixes: `test_a_request_between_the_inflight_read_and_the_unload_is_not_killed`
+     (llama-swap P7, if-idle unload), `test_a_model_starting_during_an_answer_makes_the_next_load_yield`,
+     `test_a_model_starting_during_the_hash_wait_makes_the_load_yield`,
+     `test_put_back_does_not_load_over_a_model_started_during_its_hash_wait`,
+     `test_start_refused_while_a_panel_restart_is_pending`, and the panel's
+     `test_begin_test_is_refused_while_a_restart_is_pending` /
+     `test_begin_test_is_refused_during_a_panel_load_or_unload`.
 3. **Wrong model or wrong settings answering without a word.** The failure: an answer is
    taken from a model that is not the setup's, the load runs before the switcher has the
    test file, or put-back loads before the switcher has the saved file. Pinned by:
@@ -3441,7 +3448,7 @@ gh pr create --base mtp-upstream-merge --head feat/playground \
 
 ## How
 - The helper runs the test (daemon/settings/playground.py). Presets go through an in-memory overlay on the switcher file; the registry is never written. A marker file lets a restarted helper put a leftover test model away.
-- No llama-swap change (FROZEN.md untouched). It uses P1, P2, P5 and P6 as they are, plus the upstream /api/events in-flight snapshot and /api/metrics/activity.
+- One llama-swap patch, P7 (listed in engines/llama-swap/FROZEN.md): `POST /api/models/unload/{model}?ifIdle=1` stops a model only when no request is using it (409 `busy` otherwise), checked in the same run-loop step as the stop, so the test never kills another app's answer between its in-flight read and its unload. It also uses P1, P2, P5 and P6 as they are, plus the upstream /api/events in-flight snapshot and /api/metrics/activity. The box's llama-swap must be rebuilt from engines/ for P7; an older build ignores `?ifIdle=1` and unloads as before.
 
 ## Tests
 - `PYTHONPATH=python .venv/bin/python -m pytest tests/settings tests/daemon -q`: <counts>

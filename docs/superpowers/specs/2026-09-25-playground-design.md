@@ -179,10 +179,15 @@ because an app was using it. It goes back to its saved settings at its next load
    `before` changed, it answers 409 `changed` with the new plan. Then `panel.begin_test()`,
    a new job, and a thread.
 3. The thread walks the steps:
-   - `unload`: refused if another app is using that model now;
+   - `unload`: refused if another app is using that model now: the in-flight read first, then
+     llama-swap patch P7 (`POST /api/models/unload/{model}?ifIdle=1`, 409 `busy`), whose idle
+     check and stop are one run-loop step, so a request that arrives after the read is never
+     killed (status `yielded`);
    - `settings`: `panel.set_test_settings(model, preset)`, or clear it for saved settings,
      then `panel.wait_for_switcher(text)`;
-   - `load`: P6, timed into the setup's `loadMs`;
+   - `load`: `/running` is read again first (another app's model starting or ready →
+     `yielded`), then P6, timed into the setup's `loadMs`. A load that Stop's unload missed (it
+     arrived before P6 registered the load) is put away again;
    - `warmup`: an untimed short answer;
    - `answer`: checks `/running` says the model is `ready`, streams with
      `X-Session-ID: ft-test-<id>` and `stream_options.include_usage`, and publishes partial
@@ -192,7 +197,11 @@ because an app was using it. It goes back to its saved settings at its next load
    - the overlay is cleared and the file rewritten (a busy NInfer test model gets a hold
      through the existing `_plan_rewrite` rule);
    - the before-model is loaded again when asked and when no other app's model is on the
-     card;
+     card, read again right before the load (a P1 409 there: "… was not loaded again, because
+     another app took the graphics card.");
+   - when `/running` cannot be read, the test model is noted on the strip and the saved file
+     is still waited for; if clearing the overlay fails, the model is noted and the marker is
+     left for `recover()`;
    - `panel.end_test()`.
 5. The page polls `GET /api/playground/runs/current` every 0.5 s while the job is active.
    When the job ends it saves the job to history once (keyed by job id).
@@ -210,11 +219,12 @@ because an app was using it. It goes back to its saved settings at its next load
 | Loaded model used within 120 s | Warning in the plan; Start needs `confirm` | "QUASAR was used 40 seconds ago. The test will put it away." |
 | State changed between plan and Start | 409 `changed` with the new plan | "Something changed since the plan was shown. Check the new plan and press Start again." |
 | A test is already running | 409 `test_running` | "A test is already running." |
+| A panel restart (save with "restart now") or a panel load/unload is still running | Start refused (409 `busy`) | "The control panel is restarting a model with its new settings. Try again when it has finished." / "The control panel is loading or unloading a model right now. Try again when it has finished." |
 | Panel save / load / unload during a test | 409 `test_running` | "A test is running on the Test tab. Wait for it to finish, or stop it there." |
 | Switcher never picks up test settings (hash) | Step fails, nothing loads, put-back runs | "The switcher didn't pick up the test settings, so nothing was loaded." |
 | Load refused: not enough memory (P2 503) | Step fails, put-back runs | "Loading Fable failed: …" (switcher's message) |
 | Another app asks for a model mid-test (P1 409 `model_superseded`, or `/running` no longer shows ours) | Status `yielded`; put-back does not load over that app | "Another app asked for a different model, so the test stopped to let it through." |
-| Answer error / cut off | Status `failed`; put-back runs | "Fable could not answer: …" |
+| Answer error / cut off (no finish reason and no `[DONE]`) | Status `failed`; put-back runs | "Fable could not answer: …" / "Fable could not answer: the answer was cut off before it finished." |
 | Stop | Current stream closed or current load cancelled; status `stopped`; put-back runs | "Stopped." |
 | Put-back cannot unload a busy test model | Left loaded, hold for NInfer, strip note | "QUASAR is still on test settings because an app is using it…" |
 | Helper restarts mid-test | `recover()` at start (see data flow 6) | Strip note when it had to leave the model |

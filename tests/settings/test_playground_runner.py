@@ -337,3 +337,261 @@ def test_a_thread_that_cannot_start_ends_the_test(tmp_path, monkeypatch):
         env.runner.start({"prompt": "Hi", "sides": [{"model": "fable-27b"}], "confirm": True})
     job = env.runner.snapshot()
     assert job["status"] == "failed" and env.service.test_running is False
+
+
+# ---- review fixes ----
+
+def test_a_model_starting_during_an_answer_makes_the_next_load_yield(tmp_path, monkeypatch):
+    """Item 1: the card is read again right before each load."""
+    env = make(tmp_path, monkeypatch, loaded={"quasar-27b": "ready"})
+
+    def other_app(body):
+        if body["model"] == "fable-27b" and body["messages"] != WARMUP_MESSAGES:
+            env.switcher.states["quasar-27b"] = "starting"  # another app asked for QUASAR
+
+    env.chat.on_stream = other_app
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b"}, {"model": "twin-27b"}]})
+    assert job["status"] == "yielded"
+    assert job["message"] == f"Another app started using {QUASAR}, so the test stopped to let it through."
+    assert ("load", "twin-27b") not in env.switcher.calls
+    assert env.switcher.states == {"quasar-27b": "starting"}
+
+
+def test_a_model_starting_during_the_hash_wait_makes_the_load_yield(tmp_path, monkeypatch):
+    env = make(tmp_path, monkeypatch)
+    real = env.switcher.config_hash
+
+    def hash_then_other_app():
+        env.switcher.states.setdefault("twin-27b", "starting")
+        return real()
+
+    env.switcher.config_hash = hash_then_other_app
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b"}]})
+    assert job["status"] == "yielded" and ("load", "fable-27b") not in env.switcher.calls
+    assert job["restore"] == "Nothing was loaded before the test."
+
+
+def test_put_back_does_not_load_over_a_model_started_during_its_hash_wait(tmp_path, monkeypatch):
+    env = make(tmp_path, monkeypatch, loaded={"quasar-27b": "ready"})
+    real = env.switcher.config_hash
+
+    def hash_then_other_app():
+        if env.runner.job and env.runner.job["status"] == "restoring":
+            env.switcher.states.setdefault("twin-27b", "starting")
+        return real()
+
+    env.switcher.config_hash = hash_then_other_app
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b"}]})
+    assert job["status"] == "done"
+    assert job["restore"] == f"{QUASAR} was not loaded again, because an app is using {TWIN}."
+    assert env.switcher.calls[-1] == ("unload", "fable-27b")  # no put-back load
+
+
+def test_a_request_between_the_inflight_read_and_the_unload_is_not_killed(tmp_path, monkeypatch):
+    """Item 3: the unload is P7's if-idle unload; llama-swap refusing it as busy yields."""
+    env = make(tmp_path, monkeypatch, loaded={"quasar-27b": "ready"})
+    env.probe.busy = {"quasar-27b"}  # the in-flight read showed nothing; llama-swap holds a request
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b"}]})
+    assert job["status"] == "yielded"
+    assert job["message"] == (f"{QUASAR} started answering something for another app, "
+                              "so the test stopped to leave it alone.")
+    assert env.switcher.calls == [("busy", "quasar-27b")] and env.switcher.states == {"quasar-27b": "ready"}
+    assert job["restore"] == f"{QUASAR} is loaded on its saved settings, as before."
+
+
+def test_put_back_keeps_a_test_model_llama_swap_says_is_busy(tmp_path, monkeypatch):
+    env = make(tmp_path, monkeypatch, loaded={"quasar-27b": "ready"})
+
+    def someone_starts(body):
+        if body["messages"] != WARMUP_MESSAGES:
+            env.probe.busy = {"quasar-27b"}
+
+    env.chat.on_stream = someone_starts
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "quasar-27b", "preset": "Fast"}]})
+    assert env.switcher.calls[-1] == ("busy", "quasar-27b")
+    assert job["restore"].startswith(f"{QUASAR} is still on test settings because an app is using it.")
+    assert env.service.test_leftover == {"model": "quasar-27b", "preset": "Fast"}
+
+
+def test_a_stop_between_steps_never_starts_the_answer(tmp_path, monkeypatch):
+    """Item 4: Stop lands after the step check (here while /running is read for the answer)."""
+    env = make(tmp_path, monkeypatch)
+    real = env.switcher.running
+
+    def running():
+        if env.chat.bodies and env.runner.job["status"] == "running":
+            env.runner.stop()
+        return real()
+
+    env.switcher.running = running
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b"}]})
+    assert job["status"] == "stopped" and env.chat.answers() == []
+
+
+def test_a_new_test_clears_the_last_stop(tmp_path, monkeypatch):
+    env = make(tmp_path, monkeypatch)
+    env.chat.aborted = True  # left by the last test's Stop
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b"}]})
+    assert job["status"] == "done" and job["sides"][0]["answer"] == "Hello there friend"
+
+
+def test_a_stop_before_the_load_registers_puts_the_model_away_again(tmp_path, monkeypatch):
+    """Item 5: Stop's unload reached llama-swap before P6 registered the load, so the load
+    finished; the model is put away again even when put-back would leave it."""
+    env = make(tmp_path, monkeypatch)
+
+    def stop_too_early(model_id):
+        env.switcher.loading = None  # the swap is not registered yet: the unload cancels nothing
+        env.runner.stop()
+
+    env.switcher.on_load = stop_too_early
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b"}], "putBack": False})
+    assert job["status"] == "stopped" and env.switcher.states == {}
+    assert env.switcher.calls == [("load", "fable-27b"), ("unload", "fable-27b"), ("unload", "fable-27b")]
+
+
+def test_stop_during_the_hash_wait_is_stopped_not_failed(tmp_path, monkeypatch):
+    env = make(tmp_path, monkeypatch)
+    env.switcher.stale = True
+    real = env.switcher.config_hash
+
+    def hash_and_stop():
+        if env.runner.job["status"] == "running":
+            env.runner.stop()
+        return real()
+
+    env.switcher.config_hash = hash_and_stop
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b", "preset": "Three"}]})
+    assert job["status"] == "stopped" and job["message"] == "Stopped."
+    settings = next(step for step in job["steps"] if step["kind"] == "settings")
+    assert settings["ms"] < 30_000  # did not sit out the whole 30 s wait
+
+
+def test_put_back_that_cannot_tell_notes_the_leftover_and_waits(tmp_path, monkeypatch):
+    """Item 6."""
+    env = make(tmp_path, monkeypatch, loaded={"quasar-27b": "ready"})
+    waits = []
+    real_wait = env.service.wait_for_switcher
+    env.service.wait_for_switcher = lambda text, stop=None: waits.append(text) or real_wait(text, stop=stop)
+
+    def blind(body):
+        if body["messages"] != WARMUP_MESSAGES:
+            env.switcher.up = False  # /running times out from here on
+
+    env.chat.on_stream = blind
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "quasar-27b", "preset": "Fast"}]})
+    assert job["steps"][-1]["state"] == "failed"
+    assert job["restore"].startswith("Can't tell what's loaded right now")
+    assert env.service.test_leftover == {"model": "quasar-27b", "preset": "Fast"}
+    assert len(waits) == 2  # the test settings, then the saved file at put-back
+    assert env.service.test_settings is None
+
+
+def test_put_back_exception_clears_the_overlay(tmp_path, monkeypatch):
+    """Item 13: an error inside put-back still clears the test settings."""
+    env = make(tmp_path, monkeypatch, loaded={"quasar-27b": "ready"})
+    env.switcher.after_load = lambda m: setattr(env.switcher, "load_error", RuntimeError("socket closed"))
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "quasar-27b", "preset": "Fast"}]})
+    assert job["steps"][-1]["state"] == "failed"
+    assert job["restore"] == "Putting things back didn't finish (socket closed). Check the Models tab."
+    assert env.service.test_settings is None and env.service.read_test_marker() is None
+
+
+def test_put_back_exception_with_a_failed_clear_notes_the_leftover(tmp_path, monkeypatch):
+    """Item 7."""
+    env = make(tmp_path, monkeypatch, loaded={"quasar-27b": "ready"})
+    real = env.service.set_test_settings
+
+    def set_or_fail(model_id, preset):
+        if model_id is None:
+            raise OSError("disk full")
+        return real(model_id, preset)
+
+    env.service.set_test_settings = set_or_fail
+    env.probe.busy = set()
+    env.chat.on_stream = lambda body: env.probe.busy.add("quasar-27b") if body["messages"] != WARMUP_MESSAGES else None
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "quasar-27b", "preset": "Fast"}]})
+    assert job["steps"][-1]["state"] == "failed"
+    assert "The test settings could not be taken out of the switcher file." in job["restore"]
+    assert env.service.test_leftover == {"model": "quasar-27b", "preset": "Fast"}
+    assert env.service.read_test_marker()["model"] == "quasar-27b"  # recover() finds it later
+    assert env.service.test_running is False
+
+
+def test_an_answer_without_a_finish_signal_fails_the_test(tmp_path, monkeypatch):
+    """Item 8."""
+    from tests.settings.playground_fakes import sse
+    env = make(tmp_path, monkeypatch)
+    env.chat.scripts["fable-27b"] = [(0.2, sse({"choices": [{"index": 0, "delta": {"content": "Hel"}}]}))]
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b"}]})
+    assert job["status"] == "failed"
+    assert job["message"] == f"{FABLE} could not answer: the answer was cut off before it finished."
+    assert job["sides"][0]["answer"] == "Hel" and job["sides"][0]["error"] == "The answer ended without a finish signal."
+    assert job["steps"][-1]["state"] == "done"
+
+
+def test_start_plans_outside_the_lock_and_checks_again(tmp_path, monkeypatch):
+    """Item 9."""
+    import threading
+    env = make(tmp_path, monkeypatch, loaded={"quasar-27b": "ready"})
+    free = []
+
+    def read_from_another_thread():
+        reader = threading.Thread(target=env.runner.snapshot)
+        reader.start()
+        reader.join(timeout=2.0)
+        free.append(not reader.is_alive())
+
+    env.probe.on_inflight = read_from_another_thread
+    start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b"}]})
+    assert free and all(free)
+
+    env.probe.on_inflight = lambda: setattr(env.runner, "job", {"status": "running", "steps": []})
+    with pytest.raises(PlaygroundError) as refused:
+        env.runner.start({"prompt": "Hi", "sides": [{"model": "fable-27b"}], "confirm": True})
+    assert refused.value.payload["code"] == "test_running" and env.service.test_running is False
+
+
+def test_put_back_load_superseded_says_another_app_took_the_card(tmp_path, monkeypatch):
+    """Item 11."""
+    env = make(tmp_path, monkeypatch, loaded={"quasar-27b": "ready"})
+
+    def superseded(model_id):
+        if model_id == "quasar-27b":
+            env.switcher.states = {"twin-27b": "starting"}
+            raise SwitcherError(409, "model_superseded", "superseded by twin-27b")
+
+    env.switcher.on_load = superseded
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b"}]})
+    assert job["status"] == "done" and job["steps"][-1]["state"] == "done"
+    assert job["restore"] == f"{QUASAR} was not loaded again, because another app took the graphics card."
+
+
+def test_start_refused_while_a_panel_restart_is_pending(tmp_path, monkeypatch):
+    env = make(tmp_path, monkeypatch)
+    env.service._restarts_pending = 1
+    with pytest.raises(PlaygroundError) as refused:
+        env.runner.start({"prompt": "Hi", "sides": [{"model": "fable-27b"}], "confirm": True})
+    assert (refused.value.status, refused.value.payload["code"]) == (409, "busy")
+    assert env.runner.snapshot() == {"status": "idle"}
+
+
+def test_helper_restart_leaves_a_starting_test_model_llama_swap_holds(tmp_path, monkeypatch):
+    """Item 13: recover() with the model starting (a request waits on it)."""
+    env = make(tmp_path, monkeypatch)
+    env.service.set_test_settings("quasar-27b", "Fast")
+    env.switcher.states = {"quasar-27b": "starting"}
+    env.probe.busy = {"quasar-27b"}
+    service, runner = env.build()
+    assert runner.recover() == "left"
+    assert env.switcher.states == {"quasar-27b": "starting"} and service.read_test_marker() is None
+    assert service.test_leftover == {"model": "quasar-27b", "preset": "Fast"}
+
+
+def test_helper_restart_with_the_state_unknown_notes_the_leftover(tmp_path, monkeypatch):
+    env = make(tmp_path, monkeypatch)
+    env.service.set_test_settings("quasar-27b", "Fast")
+    env.switcher.up = False
+    service, runner = env.build()
+    assert runner.recover() == "unknown" and env.switcher.calls == []
+    assert service.test_leftover == {"model": "quasar-27b", "preset": "Fast"} and service.read_test_marker() is None

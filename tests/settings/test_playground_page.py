@@ -57,6 +57,12 @@ assert.equal(p.betterSide(a, b, 'totalMs'), 'A');
 assert.equal(p.betterSide(a, b, 'firstWordMs'), null);   // 2.4% apart: no tag
 assert.equal(p.betterSide(a, b, 'guessPct'), null);      // B did not report
 assert.equal(p.betterSide(a, b, 'loadMs'), null);        // loading is never judged
+const measured = {...b, stats: {...b.stats, writeSource: 'measured'}};
+assert.equal(p.betterSide(a, measured, 'writeTps'), null);  // engine vs measured: not comparable
+assert.equal(p.betterSide(a, measured, 'totalMs'), 'A');
+const stopped = {...b, stats: {...b.stats, finishReason: 'cancelled'}};
+assert.equal(p.betterSide(a, stopped, 'totalMs'), null);    // a stopped answer is never judged
+assert.equal(p.betterSide(stopped, a, 'writeTps'), null);
 const rowsB = p.speedRows(b, a);
 assert.equal(rowsB.find((r) => r.key === 'loadMs').text, 'already loaded');
 assert.equal(rowsB.find((r) => r.key === 'writeTps').better, false);

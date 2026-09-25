@@ -26,6 +26,12 @@ type unloadReq struct {
 	targets []string
 	timeout time.Duration
 	respond chan struct{}
+	// FreeToken patch P7: ifIdle refuses the unload (*busy set true, nothing
+	// stopped) when the scheduler still holds a request for a target. busy is
+	// a pointer because the request travels by value; it is written before
+	// respond is closed.
+	ifIdle bool
+	busy   *bool
 }
 
 // baseRouter owns the channels, run-loop, and process machinery shared by every
@@ -167,7 +173,13 @@ func (b *baseRouter) run() {
 			b.notifyProcessed()
 
 		case req := <-b.unloadCh:
-			b.schedule.OnUnload(req.targets, req.timeout)
+			// FreeToken patch P7: the idle check runs here, on the run loop,
+			// in the same step as the stop, so no request can be admitted in between.
+			if req.ifIdle && b.anyBusy(req.targets) {
+				*req.busy = true
+			} else {
+				b.schedule.OnUnload(req.targets, req.timeout)
+			}
 			close(req.respond)
 			b.notifyProcessed()
 

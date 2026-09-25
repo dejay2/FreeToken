@@ -116,7 +116,6 @@ class FakeChat:
     def stream(self, body, session):
         self.bodies.append(body)
         self.sessions.append(session)
-        self.aborted = False
         warmup = body["messages"] == WARMUP_MESSAGES
         if self.on_stream is not None:
             self.on_stream(body)
@@ -131,16 +130,32 @@ class FakeChat:
     def abort(self):
         self.aborted = True
 
+    def reset(self):
+        """Like SwitcherChat.reset: an abort holds until the next test starts."""
+        self.aborted = False
+
     def answers(self):
         return [body for body in self.bodies if body["messages"] != WARMUP_MESSAGES]
 
 
 class FakeProbe:
-    def __init__(self) -> None:
+    """busy: models llama-swap's P7 if-idle unload refuses (a request it holds that the
+    in-flight read did not show). on_inflight runs on every in-flight read."""
+
+    def __init__(self, switcher=None) -> None:
         self.rows, self.used, self.unknown = [], {}, False
+        self.switcher, self.busy, self.on_inflight = switcher, set(), None
 
     def inflight(self):
+        if self.on_inflight is not None:
+            self.on_inflight()
         return None if self.unknown else list(self.rows)
+
+    def unload_if_idle(self, model_id):
+        if model_id in self.busy:
+            self.switcher.calls.append(("busy", model_id))
+            return "busy"
+        return "unloaded" if self.switcher.unload(model_id) else "failed"
 
     def last_used(self, model_id):
         return self.used.get(model_id)
@@ -164,7 +179,7 @@ def make(tmp_path, monkeypatch, loaded=None, doc=None, with_routes=False, static
     store.save(doc or presets_doc(), expected_revision=None)
     writer.write(render_config(store.load()[0], {}))
     switcher.states = dict(loaded or {})
-    chat, probe = FakeChat(clock), FakeProbe()
+    chat, probe = FakeChat(clock), FakeProbe(switcher)
 
     def build():
         """A fresh PanelService and runner over the same files: what a helper restart gives."""
