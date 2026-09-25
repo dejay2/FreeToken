@@ -96,6 +96,19 @@ class CacheStepReply(BaseFrontendMsg):
 
 
 @dataclass
+class CacheSleepReply(BaseFrontendMsg):
+    # detokenizer worker -> api server: result of a sleep or wake (see CacheSleepResultMsg).
+    request_id: str
+    action: str
+    status: str
+    asleep: bool = False
+    released_bytes: int = 0
+    vram_free_bytes: int = 0
+    elapsed_s: float = 0.0
+    error: str | None = None
+
+
+@dataclass
 class PrefillProgressReply(BaseFrontendMsg):
     processed_tokens: int
     batch_size: int

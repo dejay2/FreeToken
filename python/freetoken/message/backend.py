@@ -117,6 +117,14 @@ class CacheStepBackendMsg(BaseBackendMsg):
 
 
 @dataclass
+class CacheSleepBackendMsg(BaseBackendMsg):
+    """tokenizer worker -> scheduler: put the engine to sleep (give the card back, keep the
+    host banks) or wake it. See docs/superpowers/specs/2026-09-25-freetoken-sleep-design.md."""
+    request_id: str
+    action: str  # "sleep" | "wake"
+
+
+@dataclass
 class CacheResidencyBackendMsg(BaseBackendMsg):
     """API server -> scheduler: query layer residency report."""
     request_id: str
