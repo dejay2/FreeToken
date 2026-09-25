@@ -24,6 +24,12 @@ an already-held model on every later save. Existing holds carry over untouched. 
 entry holds only the folder and the --profile id, so a FreeToken model also counts as affected
 when freetoken_profile_settings changes (freetoken.sh pushes the profile at every load, so
 "restart" is unload plus load and "next time" needs no hold).
+
+Stage B adds models (a file or folder on the PC, or a Hugging Face download checked against
+the repo's published checksums) and removes them (unload first, then save, then the model's
+profile, then its files when asked, then Pi). Detection runs again on the server at Save.
+Removing needs a known switcher state: P5 stops a removed model that is still loaded, so an
+unknown state could otherwise pull a model out from under a chat.
 """
 
 from __future__ import annotations
@@ -33,6 +39,7 @@ import datetime as _dt
 import json
 import math
 import os
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -45,15 +52,19 @@ from starlette.concurrency import run_in_threadpool
 
 from . import ninfer_dials, ninfer_fit
 from .boot_parser import BootFile, BootParseError
-from .dials import DIAL_BY_NAME, DIALS, GROUP_INFO, Dial, dial_value_for_display, validate_settings
+from .dials import (DIAL_BY_NAME, DIALS, GROUP_INFO, MODEL_AWARE_DIALS, Dial, adapt_dial, dial_value_for_display,
+                    validate_settings)
+from .download import AddUnsupported, DownloadConflict, InvalidRepository
 from .memory_fit import EstimateUnavailable, SettingsValidationError
+from .model_detect import PART_RE, detect, model_files
 from .model_info import read_model
+from .pi_sync import PiSync
 from .profiles_manager import ProfileError, ProfileValidationError
 from .registry import (
-    ACTIVE, ENGINE_LABELS, ENGINES, RegistryCorrupt, RegistryError, RegistryMissing, RegistryValidationError,
-    StaleRevision, base_settings, canonical_engine_settings, canonicalize, differences, effective_settings,
-    engine_defaults, expand, find_model, freetoken_profile_settings, idle_minutes, preset_values, same,
-    validate_registry,
+    ACTIVE, ENGINE_LABELS, ENGINES, ID_RULE, MODEL_ID_RE, NAME_MAX, RegistryCorrupt, RegistryError, RegistryMissing,
+    RegistryValidationError, StaleRevision, base_settings, canonical_engine_settings, canonicalize, differences,
+    effective_settings, engine_defaults, expand, find_model, freetoken_profile_settings, idle_minutes, preset_values,
+    same, validate_registry,
 )
 from .registry_import import ImportRefused, import_live
 from .swap_config import HEADER, SwitcherRefused, config_sha256, extract_model_blocks, profile_id, render_config
@@ -189,11 +200,54 @@ def _default_spawn(fn: Callable[..., Any], *args: Any) -> None:
     threading.Thread(target=fn, args=args, name="panel-restart", daemon=True).start()
 
 
+def default_add_roots() -> dict[str, Path]:
+    """Spec section 7: ~/models/<name> for FreeToken folders, ~/ninfer-work/models/ for NInfer."""
+    home = Path.home()
+    return {"folder": Path(os.environ.get("FREETOKEN_MODELS_DIR") or home / "models"),
+            "ninfer": Path(os.environ.get("FREETOKEN_NINFER_MODELS_DIR") or home / "ninfer-work" / "models")}
+
+
+def _home_path(path: str) -> str:
+    home = str(Path.home()).rstrip("/")
+    return "~/" + path[len(home) + 1:] if path.startswith(home + "/") else path
+
+
+def _fit_to_model(doc: Mapping[str, Any], entry: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """FreeToken defaults a new model cannot use become its own values at its limit.
+
+    Without this the add fails, and a registry holding such a model would refuse every later
+    save (_save checks every FreeToken model's limits). Checked 2026-09-25 against five() +
+    a Llama config with max_position_embeddings 8192: only ContextTokens (262,144 by default)
+    is over, and 8192 clears validate_settings; a 64-expert, 24-layer Qwen3-MoE also needs
+    MoECacheSize 5332 -> 1536. Dials stored in another form (GpuOwnedLayers "auto:{n}") are
+    left for Jay: the save then names them."""
+    info = read_model(expand(entry["artifact"]))
+    effective = effective_settings(doc, entry)
+    effective.pop("ModelPath", None)
+    overrides: dict[str, Any] = {}
+    notes: list[str] = []
+    for error in validate_settings(effective, info):
+        dial = DIAL_BY_NAME.get(error["field"])
+        if dial is None or dial.stored_as or dial.name not in MODEL_AWARE_DIALS or dial.name in overrides:
+            continue
+        value, bounds = effective.get(dial.name), adapt_dial(dial, info)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if bounds.get("max") is not None and value > bounds["max"]:
+            overrides[dial.name], word = bounds["max"], "most"
+        elif bounds.get("min") is not None and value < bounds["min"]:
+            overrides[dial.name], word = bounds["min"], "least"
+        else:
+            continue
+        notes.append(f"{dial.plain or dial.name} set to {overrides[dial.name]:,}, the {word} this model allows.")
+    return overrides, notes
+
+
 class PanelService:
     def __init__(self, *, store, writer, switcher, profiles, boot_file: Callable[[], BootFile],
                  default_boot: Callable[[], Path], estimate_service, card_probe=None, windows_free_probe=None,
                  holds_path=None, artifact_size=None, spawn=None, clock=time.monotonic, sleep=time.sleep,
-                 restart_wait_s: float = 30.0) -> None:
+                 restart_wait_s: float = 30.0, downloads=None, pi=None, add_roots=None, profile_deleted=None) -> None:
         self.store, self.writer, self.switcher, self.profiles = store, writer, switcher, profiles
         self._boot_file, self._default_boot, self.estimate_service = boot_file, default_boot, estimate_service
         self._card_probe = card_probe or _default_card_probe
@@ -202,6 +256,12 @@ class PanelService:
         self._artifact_size = artifact_size or os.path.getsize
         self._spawn = spawn or _default_spawn
         self._clock, self._sleep, self.restart_wait_s = clock, sleep, restart_wait_s
+        self.downloads = downloads
+        self.pi = pi if pi is not None else PiSync(enabled=False)
+        self.add_roots = {k: Path(v) for k, v in (add_roots or default_add_roots()).items()}
+        # Called with profiles.delete()'s result so the app can move the helper back to its
+        # default boot file when the removed model's profile was the active one.
+        self.profile_deleted = profile_deleted
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._watcher: threading.Thread | None = None
@@ -304,8 +364,12 @@ class PanelService:
             holds = self._live_holds(known, down)
             before = extract_model_blocks(render_config(current, {}))
             after = extract_model_blocks(render_config(proposed, {}))
+            # A removed model's hold goes with it (Stage B): its entry is no longer in the list.
+            holds = {model_id: block for model_id, block in holds.items() if model_id in after}
             if known is None:
-                moved = [m for m in after if m not in holds and before.get(m) != after[m]]
+                # A model new to the list has no entry in the switcher yet, so it cannot be
+                # loaded: adding one while the state is unknown is safe (Stage B).
+                moved = [m for m in after if m in before and m not in holds and before[m] != after[m]]
                 if moved:
                     raise PanelError(503, "switcher_unknown", _unknown_save_message(
                         [row["name"] for row in self._named(proposed, moved)]))
@@ -571,6 +635,7 @@ class PanelService:
             "kind": "model", "id": model_id, "name": model["name"], "title": model["name"], "revision": revision,
             "engine": engine, "engineLabel": ENGINE_LABELS[engine], "runtime": model.get("runtime"),
             "runtimeLabel": ninfer_dials.RUNTIME_LABELS.get(model.get("runtime"), ""),
+            "artifact": model["artifact"],
             "state": running.get(model_id, "stopped") if up else "unknown",
             "presets": sorted(presets), "activePreset": chosen, "savedPreset": model.get("activePreset"),
             "dials": [dial.as_dict(identity[dial.name]) for dial in IDENTITY_DIALS] + dials,
@@ -790,6 +855,7 @@ class PanelService:
                 "engineLabel": ENGINE_LABELS[model["engine"]], "runtime": model.get("runtime"),
                 "runtimeLabel": ninfer_dials.RUNTIME_LABELS.get(model.get("runtime"), ""),
                 "activePreset": model.get("activePreset"), "presets": sorted(model.get("presets") or {}),
+                "aliases": list(model.get("aliases") or []),
                 "ramNeedGB": model["ramNeedGB"], "idleMinutes": idle_minutes(doc, model),
                 "idleFromSystem": model.get("idleMinutes") is None,
                 "state": running.get(model["id"], "stopped") if up else "unknown",
@@ -823,6 +889,200 @@ class PanelService:
         if model["engine"] != "freetoken":
             raise PanelError(409, "not_freetoken", f"{model_id} is not a FreeToken model.")
         return {"id": model_id, "name": model["name"], "settings": freetoken_profile_settings(doc, model)}
+
+    # ---- add and remove (Stage B) ----
+    @staticmethod
+    def _taken(doc: Mapping[str, Any]) -> list[str]:
+        return [m["id"] for m in doc["models"]] + [a for m in doc["models"] for a in m.get("aliases") or []]
+
+    @staticmethod
+    def _owner(doc: Mapping[str, Any], name: str) -> str | None:
+        wanted = name.lower()
+        for model in doc["models"]:
+            if model["id"].lower() == wanted or any(str(a).lower() == wanted for a in model.get("aliases") or []):
+                return model["name"]
+        return None
+
+    @staticmethod
+    def _already(doc: Mapping[str, Any], path: str) -> str | None:
+        real = os.path.realpath(path)
+        for model in doc["models"]:
+            if os.path.realpath(expand(model["artifact"])) == real:
+                return model["name"]
+        return None
+
+    def add_info(self) -> dict[str, Any]:
+        return {"roots": {name: str(path) for name, path in self.add_roots.items()},
+                "download": self.downloads.latest_add() if self.downloads is not None else None}
+
+    def detect_path(self, path: str) -> dict[str, Any]:
+        doc, _ = self.store.load()
+        found = detect(path, taken=self._taken(doc))
+        found["already"] = self._already(doc, found["path"]) if found["kind"] != "unsupported" else None
+        return found
+
+    def _hub(self, method: str, *args: Any) -> Any:
+        if self.downloads is None:
+            raise PanelError(503, "downloads_off", "Downloads are not available on this helper.")
+        try:
+            return getattr(self.downloads, method)(*args, folder_root=self.add_roots["folder"],
+                                                   ninfer_root=self.add_roots["ninfer"])
+        except AddUnsupported as exc:
+            raise PanelError(422, "not_supported", str(exc)) from exc
+        except InvalidRepository as exc:
+            raise PanelError(422, "bad_link", str(exc)) from exc
+        except DownloadConflict as exc:
+            raise PanelError(409, "download_conflict", str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - the Hub's own errors (no such repo, no network), in plain words
+            raise PanelError(502, "hub_error", f"Couldn't read that repo from Hugging Face: {exc}") from exc
+
+    def plan_download(self, link: str, entry: str | None = None) -> dict[str, Any]:
+        return self._hub("plan_add", link, entry)
+
+    def start_download(self, link: str, entry: str | None = None) -> dict[str, Any]:
+        return self._hub("start_add", link, entry).as_dict()
+
+    @staticmethod
+    def _add_job(job: Any, job_id: str) -> dict[str, Any]:
+        if job is None or job.kind != "add":
+            raise KeyError(job_id)
+        return job.as_dict()
+
+    def download_status(self, job_id: str) -> dict[str, Any]:
+        return self._add_job(self.downloads.get(job_id) if self.downloads is not None else None, job_id)
+
+    def cancel_download(self, job_id: str) -> dict[str, Any]:
+        return self._add_job(self.downloads.cancel(job_id) if self.downloads is not None else None, job_id)
+
+    def add_model(self, path: str, model_id: Any, name: Any, ram_need: Any, revision: str | None) -> dict[str, Any]:
+        with self._lock:
+            doc, current_revision = self.store.load()
+            if revision != current_revision:
+                raise StaleRevision("The model list was changed somewhere else.")
+            found = detect(path, taken=self._taken(doc))
+            if found["kind"] == "unsupported":
+                raise PanelError(422, "not_supported", found["reason"])
+            already = self._already(doc, found["path"])
+            if already:
+                raise PanelError(409, "already_added", f"This is already in the list as {already}.")
+            model_id, name = str(model_id or "").strip(), str(name or "").strip()
+            errors: list[dict[str, str]] = []
+            if not MODEL_ID_RE.fullmatch(model_id):
+                errors.append({"field": "add.id", "message": f"The id: {ID_RULE}"})
+            elif (owner := self._owner(doc, model_id)) is not None:
+                errors.append({"field": "add.id", "message": f"The id {model_id} is already used by {owner}."})
+            if not name or len(name) > NAME_MAX or any(ord(c) < 32 or ord(c) == 127 for c in name):
+                errors.append({"field": "add.name", "message": f"The name must be 1 to {NAME_MAX} characters on one line."})
+            ram: int | float | None = None
+            try:
+                ram = _number(ram_need)
+                if not 0 <= ram <= 512:
+                    raise ValueError("out of range")
+            except (TypeError, ValueError):
+                errors.append({"field": "add.ramNeedGB", "message": "The PC memory it needs must be a number from 0 to 512 GB."})
+            if errors:
+                raise RegistryValidationError(errors)
+            entry = {"id": model_id, "name": name, "engine": found["engine"], "runtime": found["runtime"],
+                     "artifact": _home_path(found["path"]), "ramNeedGB": ram, "idleMinutes": None,
+                     "aliases": [], "overrides": {}, "presets": {}, "activePreset": None}
+            adjusted: list[str] = []
+            if entry["engine"] == "freetoken":
+                entry["overrides"], adjusted = _fit_to_model(doc, entry)
+
+            def mutate(proposed: dict) -> dict:
+                proposed["models"].append(copy.deepcopy(entry))
+                return proposed
+
+            result = self._save(mutate, current_revision, None)
+            engines = {m["id"]: m["engine"] for m in doc["models"]}
+            result.update(status="added", id=model_id, name=name, adjusted=adjusted,
+                          pi=self.pi.add(model_id, name, entry["engine"], engines))
+            return result
+
+    def _check_deletable(self, doc: Mapping[str, Any], model: Mapping[str, Any], files: list[str]) -> None:
+        """Runs before anything changes. Only the model's own files: a NInfer entry or part, or
+        a folder holding config.json; never HOME or above; never a path another model's files
+        are, contain or sit inside (a v3 entry can read another model's parts)."""
+        name = model["name"]
+        if not files:
+            raise PanelError(409, "files_missing", f"{name}'s files were not found, so there is nothing to delete. "
+                                                   "Remove it without deleting files.")
+        home = Path(os.path.realpath(Path.home()))
+        targets = [Path(os.path.realpath(item)) for item in files]
+        for original, real in zip(files, targets):
+            if real == home or real in home.parents or real == Path("/"):
+                raise PanelError(409, "files_unsafe", f"{original} is your home folder or above it, so nothing was deleted.")
+            if model["engine"] == "freetoken":
+                if not (Path(original) / "config.json").is_file():
+                    raise PanelError(409, "files_unsafe", f"{original} does not look like a model folder, so nothing was deleted.")
+            elif not (real.name.endswith(".ninfer") or PART_RE.match(real.name)):
+                raise PanelError(409, "files_unsafe", f"{original} is not a NInfer file, so nothing was deleted.")
+        used: list[tuple[Path, str]] = []
+        for other in doc["models"]:
+            if other["id"] == model["id"]:
+                continue
+            paths = model_files(other["engine"], other["artifact"]) or [expand(other["artifact"])]
+            used += [(Path(os.path.realpath(path)), other["name"]) for path in paths]
+        for real in targets:
+            for other_path, other_name in used:
+                if other_path == real or real in other_path.parents or other_path in real.parents:
+                    raise PanelError(409, "files_shared", f"{other_name} uses the same files, so nothing was removed. "
+                                                          f"Remove it without deleting files, or remove {other_name} first.")
+
+    @staticmethod
+    def _delete_files(files: list[str]) -> dict[str, Any]:
+        gone, failed = [], []
+        for item in files:
+            path = Path(item)
+            try:
+                if path.is_symlink() or path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    shutil.rmtree(path)
+                gone.append(str(path))
+            except OSError as exc:
+                failed.append(f"{path} ({exc.strerror or exc})")
+        if failed:
+            return {"deleted": False, "paths": gone,
+                    "message": "The model was removed, but some of its files could not be deleted: " + "; ".join(failed) + "."}
+        return {"deleted": True, "paths": gone, "message": "Its files were deleted."}
+
+    def _drop_profile(self, model: Mapping[str, Any]) -> dict[str, Any] | None:
+        if model["engine"] != "freetoken":
+            return None
+        try:
+            result = self.profiles.delete(profile_id(model["id"]))
+        except ProfileError as exc:
+            return {"deleted": False, "message": f"Its FreeToken settings profile could not be deleted: {exc}"}
+        if result.get("deleted") and result.get("activeProfileId") and result.get("bootFilePath") and self.profile_deleted:
+            self.profile_deleted(result)
+        return {"deleted": bool(result.get("deleted"))}
+
+    def remove_model(self, model_id: str, delete_files: bool, revision: str | None) -> dict[str, Any]:
+        with self._lock:
+            doc, current_revision = self.store.load()
+            if revision != current_revision:
+                raise StaleRevision("The model list was changed somewhere else.")
+            model = find_model(doc, model_id)
+            files = model_files(model["engine"], model["artifact"]) if delete_files else []
+            if delete_files:
+                self._check_deletable(doc, model, files)
+            known, _down = self._ask()
+            if known is None:
+                raise PanelError(503, "switcher_unknown", f"Can't tell whether {model['name']} is loaded right now, "
+                                                          "so it was not removed. Try again in a moment.")
+            if model_id in known and not self.switcher.unload(model_id):
+                raise PanelError(503, "unload_failed", f"Couldn't put {model['name']} away, so nothing was removed. "
+                                                       "Try again in a moment.")
+
+            def mutate(proposed: dict) -> dict:
+                proposed["models"] = [m for m in proposed["models"] if m["id"] != model_id]
+                return proposed
+
+            result = self._save(mutate, current_revision, None)
+            result.update(status="removed", id=model_id, name=model["name"], profile=self._drop_profile(model),
+                          files=self._delete_files(files) if delete_files else None, pi=self.pi.remove(model_id))
+            return result
 
     # ---- holds and start-up ----
     def release_finished_holds(self) -> list[str]:
@@ -906,6 +1166,27 @@ class ImportBody(BaseModel):
 
 class RestoreBody(BaseModel):
     backup: str
+
+
+class DetectBody(BaseModel):
+    path: str = ""
+
+
+class LinkBody(BaseModel):
+    link: str = ""
+    entry: str | None = None
+
+
+class AddBody(_SaveBody):
+    path: str = ""
+    id: str = ""
+    name: str = ""
+    ramNeedGB: Any = None
+
+
+class RemoveBody(BaseModel):
+    revision: str | None = None
+    deleteFiles: bool = False
 
 
 def create_panel_router(service: PanelService) -> APIRouter:
@@ -1002,7 +1283,40 @@ def create_panel_router(service: PanelService) -> APIRouter:
     async def effective(model_id: str):
         return await call(service.effective, model_id)
 
+    @router.get("/add/info")
+    async def add_info():
+        return await call(service.add_info)
+
+    @router.post("/add/detect")
+    async def add_detect(body: DetectBody):
+        return await call(service.detect_path, body.path)
+
+    @router.post("/add/plan")
+    async def add_plan(body: LinkBody):
+        return await call(service.plan_download, body.link, body.entry)
+
+    @router.post("/add/downloads")
+    async def add_download(body: LinkBody):
+        return await call(service.start_download, body.link, body.entry)
+
+    @router.get("/add/downloads/{job_id}")
+    async def add_download_status(job_id: str):
+        return await call(service.download_status, job_id)
+
+    @router.post("/add/downloads/{job_id}/cancel")
+    async def add_download_cancel(job_id: str):
+        return await call(service.cancel_download, job_id)
+
+    @router.post("/models")
+    async def add_model(body: AddBody):
+        return await call(service.add_model, body.path, body.id, body.name, body.ramNeedGB, body.revision)
+
+    @router.post("/models/{model_id}/remove")
+    async def remove_model(model_id: str, body: RemoveBody):
+        return await call(service.remove_model, model_id, body.deleteFiles, body.revision)
+
     return router
 
 
-__all__ = ["ChooseRestart", "IDENTITY_DIALS", "PanelError", "PanelService", "SYSTEM_DIALS", "create_panel_router"]
+__all__ = ["ChooseRestart", "IDENTITY_DIALS", "PanelError", "PanelService", "SYSTEM_DIALS", "create_panel_router",
+           "default_add_roots"]
