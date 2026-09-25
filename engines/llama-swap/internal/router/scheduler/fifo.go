@@ -126,6 +126,11 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 	if s.cfg.LatestWinsEnabled() && s.supersede(req.Model, evict) {
 		running = s.runningSet(req.Model)
 		evict = s.planner.EvictionFor(req.Model, running)
+		// The cancelled swaps never send SwapDone, so nothing else would
+		// drain the queue: a request queued only behind a victim (a shared
+		// eviction target) sat there until some unrelated event. Drain once
+		// this request is placed, so the newest pick still decides first.
+		defer s.drainQueue()
 	}
 
 	// (4) Collision with an in-flight swap — queue.

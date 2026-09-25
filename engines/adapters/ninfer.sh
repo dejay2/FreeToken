@@ -49,7 +49,8 @@ fi
 if pgrep -x "$PROC" >/dev/null; then
   log "stopping a $PROC started outside llama-swap"
   pkill -TERM -x "$PROC"
-  for _ in $(seq 1 30); do pgrep -x "$PROC" >/dev/null || break; sleep 1; done
+  # NINFER_TERM_WAIT (seconds, default 30) exists so tests can reach the KILL step quickly.
+  for _ in $(seq 1 "${NINFER_TERM_WAIT:-30}"); do pgrep -x "$PROC" >/dev/null || break; sleep 1; done
   pkill -KILL -x "$PROC" 2>/dev/null
   sleep 2
   pgrep -x "$PROC" >/dev/null && { log "$PROC would not stop; refusing"; exit 1; }

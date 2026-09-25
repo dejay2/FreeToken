@@ -195,6 +195,12 @@ func (c *PeerConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return fmt.Errorf("peer models can not be empty")
 	}
 
+	// FreeToken patch P4: peers get the same clampParams load check as models, so a
+	// malformed peer range fails loading instead of being dropped by the filter.
+	if err := defaults.Filters.ValidateClampParams(); err != nil {
+		return fmt.Errorf("peer filters: %w", err)
+	}
+
 	*c = PeerConfig(defaults)
 	return nil
 }

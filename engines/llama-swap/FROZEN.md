@@ -37,9 +37,9 @@ Every changed spot carries a `// FreeToken patch Pn:` comment.
 
 | Patch | What | Files |
 |---|---|---|
-| P4 | clampParams filter: clamp numeric params into [min,max] | internal/config/filters.go, internal/server/filters.go, config-schema.json |
+| P4 | clampParams filter: clamp numeric params into [min,max]; config load refuses entries it would drop | internal/config/{filters.go,load.go,peer.go}, internal/server/filters.go, config-schema.json |
 | P1 | latest wins: a new pick cancels a colliding not-ready swap (409 model_superseded) | internal/config/config.go, internal/router/scheduler/{scheduler.go,fifo.go}, internal/router/base.go, internal/process/process_command.go, internal/swaputil/superseded.go, config-schema.json |
-| P2 | memory gate: wait for Windows free RAM - ramNeedGB >= floorGB before loading (503 not_enough_memory); optional `memoryGate.helperURL` bypass when the settings helper runs a FreeToken llama-swap did not start; probe cmd has WaitDelay; probe failure logs Warn, a cancelled probe returns ctx.Err() | internal/memgate/*, internal/config/{config.go,model_config.go}, internal/router/base.go, config-schema.json |
+| P2 | memory gate: wait for Windows free RAM - ramNeedGB >= floorGB before loading (503 not_enough_memory); optional `memoryGate.helperURL` bypass when the settings helper runs a FreeToken llama-swap did not start; probe cmd has WaitDelay; probe failure logs Warn, a cancelled probe returns ctx.Err() | internal/memgate/*, internal/config/{config.go,model_config.go,load.go}, internal/router/{base.go,reconfigure.go}, config-schema.json |
 | P5 | selective reload, part 1: the group router reconfigures in place (`PrepareReconfigure` -> `ReconfigPlan.Commit/Abort`); unchanged loaded models keep their process and in-flight requests, changed and removed models are stopped through `OnUnload`; each process gets its own child context of procCtx; swaps work from the table captured at `StartSwap`; matrix router has no planner factory and keeps upstream's full rebuild | internal/router/{reconfigure.go,base.go,group.go}, internal/router/scheduler/{scheduler.go,fifo.go} |
 | P5 | selective reload, part 2: a config reload reconfigures the local router in place (unchanged entries keep their process and requests; changed/removed ones are stopped via OnUnload; matrix or router-kind changes rebuild as upstream) through `server.Rebuild`; the retired Server shuts down everything but the kept router (`ShutdownExceptLocal`); a stale plan is refused (`ErrStaleReconfigure`); reloads coalesce instead of being dropped; `--check-config` (= `-validate`); `GET /api/config/hash` | llama-swap.go, freetoken_reload.go, internal/router/{base.go,reconfigure.go}, internal/server/{server.go,freetoken_api.go} |
 | P6 | `POST /api/models/load/{model}`: load through the scheduler (P1/P2 apply), answer when ready or failed (200 `{"model","state":"ready"}`, 409 model_superseded, 503 not_enough_memory, 404 unknown or not local) | internal/router/load.go, internal/server/{server.go,freetoken_api.go} |
@@ -96,3 +96,60 @@ Notes (P5 part 2 and P6, 2026-09-24):
   (TestReloadCoalescer_StopWaitsDropsAndRefuses, TestServer_ShutdownWithLocal).
 - P6 (fix round 1): `Load` has no "already ready" shortcut; a ready model goes through the
   scheduler's own fast path like a chat request, so P1 supersede applies identically.
+
+Notes (tidy of deferred review minors, 2026-09-25):
+
+- P4: `clampParams` entries with an empty or protected key, not exactly two numbers, a NaN
+  bound (YAML `.nan`: every comparison with NaN is false, so it clamped nothing) or min > max
+  are now a config load error (`Filters.ValidateClampParams`, called from load.go), so
+  `--check-config` and the control panel see them instead of the filter dropping them silently.
+  `.inf`/`-.inf` bounds are allowed and mean no limit on that side. Keys are not checked
+  against a list of known request parameters: like setParams/stripParams a key is any gjson
+  path, and ours are generated from the panel's NInfer dial table. A JSON value cannot be
+  NaN; an out-of-range literal (`1e999`) parses to +-Inf and is clamped to the finite bound;
+  the int conversion skips infinite bounds. `SanitizedClampParams` drops NaN bounds too.
+  Tests: TestLoadConfig_ClampParamsValidation, TestFilters_SanitizedClampParams,
+  TestApplyFilters_ClampParamsInfAndNaN.
+- P2: `memoryGate.floorGB` is now `*float64`: unset = 6 (`config.DefaultFloorGB`), an explicit
+  0 = no cushion (it used to become 6 silently), negative or NaN is a load error
+  (TestLoadConfig_MemoryGateFloorGB).
+- P2: TestBase_MemGate_ReservationReleased (internal/router/memgate_test.go) covers the FIFO
+  concurrency reservation being handed back after a gate 503, a start failure after the gate,
+  and a client giving up while parked in the gate (concurrencyLimit 1, so a leak shows up
+  as a 429 on the next request; checked by removing the releases, all three fail).
+- P1: after latest-wins cancels a swap, `OnRequest` now drains the queue once the new request
+  is placed. Cancelled swaps send no SwapDone, so a request queued only behind the victim (a
+  shared eviction target) waited for some unrelated later event
+  (TestFIFO_LatestWins_SupersedeDrainsQueuePromptly; fails without the drain).
+- P1, left as is: `supersede` stops its victims synchronously on the run loop, so a slow stop
+  holds up other scheduling for up to the victim's unloadTimeout (NInfer 30 s, FreeToken
+  180 s; the FreeToken adapter's stop goes through the helper). Not made asynchronous
+  because the synchronous stop is what orders it before any later decision: with a
+  background stop, a quick re-pick of the victim (A -> B -> A) starts a fresh swap for A
+  whose EnsureReady can then be killed by the stale stop, and the next pick's memory gate
+  would probe while the victim still holds its RAM. Victims are loads that have not become
+  ready, and several are stopped in parallel (`StopProcesses`), so the cost is one stop.
+  Making it asynchronous needs a per-process stop generation; not worth it for this box.
+- P5: a reload whose config differs only in comments keeps every model: kept/changed is
+  `reflect.DeepEqual` on the parsed `ModelConfig`, which carries nothing from comments, and the
+  hash served by `/api/config/hash` only tells the panel which file is live. Could not
+  reproduce the reported "header-only change stopped all models" with the generated config
+  (TestReconfigure_HeaderOnlyChangeKeepsEveryModel, loaded from YAML through NewGroup and
+  PrepareReconfigure). The stale example-config comment saying a save stops the loaded model
+  (pre-P5 behaviour) is corrected.
+- P5: `${PORT}` is allocated from startPort in sorted model-ID order at every load, so an
+  unchanged model set gives every model the same port and a `${PORT}` model is kept. Adding
+  or removing a model that sorts before it moves its port; that entry then really differs
+  (cmd and proxy name another port, and its old port goes to another model), so it is
+  restarted. Our generated config uses fixed ports (2020, 8090) and no `${PORT}`
+  (TestReconfigure_PortMacroUnchangedModelIsKept).
+- P5, left as is: a SIGTERM while a reload is blocked for longer than the backstop
+  (shutdownTimeout + 5 s = 35 s) ends in `os.Exit(1)` before the router stops its processes.
+  On the box the unit (scripts/engines/install-service.sh) has `KillMode=mixed`, so when the
+  main process exits systemd SIGKILLs everything left in the unit's cgroup: NInfer
+  (`ninfer-serve` is exec'd by the adapter) goes with it. FreeToken's server runs in the
+  `freetoken-settings` unit, not here, so it can outlive a killed `freetoken.sh`; the next
+  FreeToken load adopts it (same model and profile) or stops it through the helper, and the
+  next NInfer load stops it through the helper and kills a stray `ninfer-serve` by name.
+  Outside systemd the same adapters converge on the next load. Not fixed in Go: the forced
+  exit would have to find and kill each process group itself.

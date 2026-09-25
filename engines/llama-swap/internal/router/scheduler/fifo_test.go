@@ -1178,3 +1178,38 @@ func TestFIFO_LatestWins_RepickAfterSupersedeStartsFreshSwap(t *testing.T) {
 		t.Errorf("superseded a=%d b=%d want 1 each", supersededFor(eff, "a"), supersededFor(eff, "b"))
 	}
 }
+
+// FreeToken patch P1: a request queued only because it shared an eviction
+// target with a swap that latest-wins then cancelled must start right away.
+// Cancelled swaps send no SwapDone, so before the fix it waited for some
+// unrelated later event to drain the queue.
+func TestFIFO_LatestWins_SupersedeDrainsQueuePromptly(t *testing.T) {
+	eff := newFakeEffects()
+	for _, m := range []string{"a", "b", "c"} {
+		eff.states[m] = process.StateStopped
+	}
+	eff.states["x"] = process.StateReady
+	s := newFIFO(&stubPlanner{evict: map[string][]string{"a": {"x"}, "b": {"x"}, "c": {"a"}}}, eff)
+
+	s.OnRequest(req("a"))
+	eff.states["a"] = process.StateStarting
+	s.OnRequest(req("b")) // shares x with a: queued, a is not cancelled
+	if eff.startsFor("b") != 0 || len(s.queued) != 1 {
+		t.Fatalf("setup: StartSwap(b)=%d queued=%d", eff.startsFor("b"), len(s.queued))
+	}
+	s.OnRequest(req("c")) // c evicts a: a is superseded
+
+	if !slices.Equal(eff.cancelled, []string{"a"}) {
+		t.Fatalf("cancelled=%v want [a]", eff.cancelled)
+	}
+	if eff.startsFor("c") != 1 {
+		t.Fatalf("StartSwap(c)=%d want 1", eff.startsFor("c"))
+	}
+	if eff.startsFor("b") != 1 || len(s.queued) != 0 {
+		t.Fatalf("b must start as soon as a is cancelled: StartSwap(b)=%d queued=%d", eff.startsFor("b"), len(s.queued))
+	}
+	// c was decided before the drain: its swap started first.
+	if eff.starts[len(eff.starts)-2].model != "c" {
+		t.Errorf("start order=%v want c before b", eff.starts)
+	}
+}

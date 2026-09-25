@@ -91,6 +91,11 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		return Config{}, fmt.Errorf("globalConcurrencyLimit must be >= 0")
 	}
 
+	// FreeToken patch P2: explicit 0 means no cushion; below 0 (or NaN) is a typo.
+	if f := config.MemoryGate.FloorGB; f != nil && !(*f >= 0) {
+		return Config{}, fmt.Errorf("memoryGate.floorGB must be >= 0")
+	}
+
 	config.UI.Activity.SessionID = normalizeHeaderNames(config.UI.Activity.SessionID)
 
 	if config.Store != nil {
@@ -162,6 +167,11 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 
 		if err := modelConfig.Capabilities.Validate(); err != nil {
 			return Config{}, fmt.Errorf("model %s: %w", modelId, err)
+		}
+
+		// FreeToken patch P4: refuse clampParams entries the filter would drop.
+		if err := modelConfig.Filters.ValidateClampParams(); err != nil {
+			return Config{}, fmt.Errorf("model %s filters: %w", modelId, err)
 		}
 
 		// Auto-register setParamsByID keys as aliases (skip the model's own ID)

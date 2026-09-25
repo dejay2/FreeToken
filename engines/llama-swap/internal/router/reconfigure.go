@@ -123,10 +123,8 @@ func newMemGate(conf config.Config, logger *logmon.Monitor) *memgate.Gate {
 	if mg.Probe != "windows" {
 		return nil
 	}
-	floor, wait := mg.FloorGB, mg.WaitSeconds
-	if floor <= 0 {
-		floor = 6
-	}
+	// FreeToken patch P2: unset floorGB is 6, an explicit 0 is no cushion.
+	floor, wait := mg.EffectiveFloorGB(), mg.WaitSeconds
 	if wait <= 0 {
 		wait = 300
 	}

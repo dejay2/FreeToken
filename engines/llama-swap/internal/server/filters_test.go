@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"io"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -200,6 +201,35 @@ func TestApplyFilters_ClampParams(t *testing.T) {
 		{"in range untouched", `{"model":"m","top_p":0.95}`, `{"model":"m","top_p":0.95}`},
 		{"absent untouched", `{"model":"m"}`, `{"model":"m"}`},
 		{"string untouched", `{"model":"m","top_k":"40"}`, `{"model":"m","top_k":"40"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := applyFilters([]byte(tc.in), "m", "", f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("got %s want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// FreeToken patch P4: an out-of-range JSON literal parses to +-Inf and is
+// clamped to the finite bound; an infinite bound means "no limit" and never
+// gets written into the body; a NaN bound is dropped, not applied.
+func TestApplyFilters_ClampParamsInfAndNaN(t *testing.T) {
+	f := config.Filters{ClampParams: map[string][]float64{
+		"top_k":      {0, 20},
+		"max_tokens": {1, math.Inf(1)},
+		"min_p":      {math.NaN(), 1},
+	}}
+	cases := []struct{ name, in, want string }{
+		{"+Inf value clamped to max", `{"model":"m","top_k":1e999}`, `{"model":"m","top_k":20}`},
+		{"-Inf value clamped to min", `{"model":"m","top_k":-1e999}`, `{"model":"m","top_k":0}`},
+		{"open upper bound leaves big values", `{"model":"m","max_tokens":1e999}`, `{"model":"m","max_tokens":1e999}`},
+		{"open upper bound still clamps below min", `{"model":"m","max_tokens":0}`, `{"model":"m","max_tokens":1}`},
+		{"NaN bound entry is ignored", `{"model":"m","min_p":5}`, `{"model":"m","min_p":5}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

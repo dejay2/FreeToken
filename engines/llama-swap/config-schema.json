@@ -187,7 +187,9 @@
                 },
                 "floorGB": {
                     "type": "number",
-                    "default": 6
+                    "minimum": 0,
+                    "default": 6,
+                    "description": "FreeToken patch P2: GB kept free after the load. Unset = 6; an explicit 0 = no cushion."
                 },
                 "waitSeconds": {
                     "type": "integer",
@@ -541,7 +543,7 @@
                             },
                             "clampParams": {
                                 "type": "object",
-                                "description": "FreeToken patch P4: inclusive [min, max] per numeric request parameter; out-of-range values are clamped.",
+                                "description": "FreeToken patch P4: inclusive [min, max] per numeric request parameter; out-of-range values are clamped. Config load refuses a protected or empty key, NaN bounds and min > max; .inf/-.inf mean no limit on that side.",
                                 "additionalProperties": {
                                     "type": "array",
                                     "items": {"type": "number"},
@@ -797,7 +799,7 @@
                             },
                             "clampParams": {
                                 "type": "object",
-                                "description": "FreeToken patch P4: inclusive [min, max] per numeric request parameter; out-of-range values are clamped.",
+                                "description": "FreeToken patch P4: inclusive [min, max] per numeric request parameter; out-of-range values are clamped. Config load refuses a protected or empty key, NaN bounds and min > max; .inf/-.inf mean no limit on that side.",
                                 "additionalProperties": {
                                     "type": "array",
                                     "items": {"type": "number"},
