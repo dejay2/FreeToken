@@ -598,3 +598,109 @@ def test_a_wake_oom_inside_a_real_pool_rebuild_recovers_to_sleep(tmp_path, monke
     assert eng.kv_cache._kv_buffer.shape[2] == 2
     assert eng.wake()["asleep"] is False
     assert eng.linear_state_pool.conv_states.shape[1] == 9 and eng.kv_cache._kv_buffer.shape[2] == 101
+
+
+def test_nothing_keeps_the_draft_head_alive_through_the_sleep_flush(tmp_path, monkeypatch):
+    # PR #19 review: a local `draft` in sleep_engine / release_to_sleep kept the head (and its
+    # weights + private KV) alive through gc.collect and the final _sync_get_memory, so the
+    # allocator flush could not free it and released_bytes undercounted.
+    import weakref
+
+    import freetoken.engine.sleep as sleep_mod
+
+    class Draft:
+        num_pages, seed = 7, 1
+
+        def close(self):
+            pass
+
+    eng = SleepEngine(tmp_path)
+    eng.spec_draft = Draft()
+    ref = weakref.ref(eng.spec_draft)
+    seen = []
+    real_sync, real_collect = eng._sync_get_memory, sleep_mod.gc.collect
+    eng._sync_get_memory = lambda: (seen.append(("sync", ref() is None)), real_sync())[1]
+    monkeypatch.setattr(sleep_mod.gc, "collect", lambda *a: (seen.append(("gc", ref() is None)), real_collect(*a))[1])
+    eng.sleep()
+    assert seen[0] == ("sync", False)  # free_before, head still loaded
+    assert seen[1:] and all(dead for _, dead in seen[1:]), seen
+
+
+def test_draft_head_close_drops_its_device_state():
+    from freetoken.engine.spec_draft import SpecDraftHead
+
+    head = SpecDraftHead.__new__(SpecDraftHead)
+    head.engine, head.num_pages, head.seed = object(), 33, 5
+    head.kv_cache, head.model = SimpleNamespace(), torch.nn.Linear(2, 2)
+    head.page_table, head._graph_in_sample = torch.zeros(2), torch.zeros(3)
+    head.expert_runner = SimpleNamespace(close=lambda: None)
+    head._graph_runner = SimpleNamespace(destroy=lambda: None)
+    head.close()
+    assert head.kv_cache is None and head.model is None and head.expert_runner is None
+    assert head.page_table is None and head._graph_in_sample is None
+    assert head.engine is not None and (head.num_pages, head.seed) == (33, 5)
+    head.close()  # idempotent (shutdown after a sleep)
+
+
+def test_a_failed_wake_frees_what_the_failing_constructor_held(tmp_path, monkeypatch):
+    # PR #19 review: an OOM inside the draft head's constructor leaves its half-built tensors
+    # reachable from exc.__traceback__ frames; the rollback flush must not see them alive.
+    import weakref
+
+    import freetoken.engine.sleep as sleep_mod
+
+    held = []
+
+    class Buffer:
+        pass
+
+    class Head:
+        def __init__(self, engine, spec, **kwargs):
+            scratch = Buffer()  # stands in for a tensor the constructor allocated
+            held.append(weakref.ref(scratch))
+            oom()
+
+    monkeypatch.setattr("freetoken.engine.spec_draft.SpecDraftHead", Head)
+    eng = SleepEngine(tmp_path)
+    eng.spec_draft = SimpleNamespace(close=lambda: None)
+    eng.sleep()
+    real_release = sleep_mod.release_to_sleep
+    alive_at_flush = []
+
+    def release(engine, snap, **kw):
+        alive_at_flush.append(held[0]() is not None)
+        return real_release(engine, snap, **kw)
+
+    monkeypatch.setattr(sleep_mod, "release_to_sleep", release)
+    with pytest.raises(SleepRefused, match="went back to sleep"):
+        eng.wake()
+    assert alive_at_flush == [False]
+
+
+def test_the_wake_refusal_shows_the_card_wide_free_memory_not_cudas_view(tmp_path, monkeypatch):
+    # Live 2026-09-25 (WSL): cudaMemGetInfo said 17.7 GB free while another process's 25 GB
+    # held the card (nvidia-smi: 30714 of 32607 MiB used, about 1.9 GB free).
+    from freetoken.engine import sleep as sleep_mod
+
+    GB = 1 << 30
+    msg = sleep_mod._wake_refusal(int(17.7 * GB), 24 * GB, int(1.9 * GB))
+    assert "has 1.9 GB free and waking needs 24.0 GB" in msg and "17.7" not in msg
+    # NVML unreadable: no number rather than a wrong one.
+    msg = sleep_mod._wake_refusal(int(17.7 * GB), 24 * GB, None)
+    assert "GB free" not in msg and "17.7" not in msg and "needs 24.0 GB" in msg
+    # The gate uses the card-wide figure too: cuda's view alone would wave this wake through.
+    eng = SleepEngine(tmp_path)
+    eng.sleep()
+    monkeypatch.setattr(sleep_mod, "_card_free_bytes", lambda engine: 0)
+    with pytest.raises(SleepRefused, match="has 0.0 GB free"):
+        eng.wake()
+    assert eng.sleep_snapshot is not None and eng.recaptures == []
+    monkeypatch.setattr(sleep_mod, "_card_free_bytes", lambda engine: None)
+    assert eng.wake()["asleep"] is False
+
+
+def test_card_free_bytes_is_none_off_cuda(tmp_path):
+    from freetoken.engine import sleep as sleep_mod
+
+    assert sleep_mod._card_free_bytes(SleepEngine(tmp_path)) is None
+    assert sleep_mod._nvml_free_bytes("GPU-00000000-0000-0000-0000-000000000000") is None

@@ -509,6 +509,8 @@ class FrontendManager:
             return f"server unavailable: waking up took longer than {int(timeout)} s"
         if result.get("status") == "ok" and not self.asleep:
             return None
+        if result.get("status") in ("loading", "failed", "stopping"):
+            return f"server unavailable: engine is {result['status']}"
         return f"server is asleep and could not wake: {result.get('error') or result.get('status')}"
 
     async def _wake_and_allocate(self, timeout: float) -> int:
@@ -1311,6 +1313,16 @@ async def cache_step(req: CacheStepRequest):
 async def dispatch_sleep(state: FrontendManager, *, action: str, timeout: float = WAKE_WAIT_S) -> Dict[str, Any]:
     """Send a sleep or wake to the scheduler under the maintenance gate and await the reply
     (the same shape as dispatch_step: requests wait while it runs)."""
+    # Revalidate the lifecycle gate HERE, with no await between the check and
+    # _open_maintenance: a chat's wake runs as a task (ensure_awake), and /v1/admin/prepare-stop
+    # can set "stopping" and seal accounting before that task first runs. Opening the gate then
+    # would overwrite "stopping", and the wake's success would reopen admission as "serving"
+    # on an engine the daemon is about to kill (PR #19 review).
+    blocked = state.maintenance_state if state.maintenance_state in ("loading", "failed", "stopping") else None
+    if blocked is None and getattr(state, "_sealed_accounting", None) is not None:
+        blocked = "stopping"
+    if blocked is not None:
+        return {"status": blocked, "error": f"engine is {blocked}"}
     request_id = str(uuid.uuid4())
     fut = asyncio.get_running_loop().create_future()
     state.rebuild_futures[request_id] = fut

@@ -270,3 +270,18 @@ def test_a_pool_rebuild_drops_every_recorded_replay():
     ladder.rebind()
 
     assert ladder._graphs == {} and ladder._graph_outputs == {}
+
+
+def test_the_ladder_slot_survives_the_cache_managers_allocator_reset():
+    """PR #19 review: sleep/wake rebuild the GDN pool and rebind the ladder, then the scheduler's
+    CacheManager.rebuild reclaims every slot. The ladder's snapshot slot must stay out of the
+    free list, or the next request gets it and verification overwrites the rollback snapshot."""
+    pool = _pool()
+    ladder = SpecStateLadder(pool, WIDTH)
+    for _ in range(2):  # boot reservation, then rebuild + rebind (the sleep/wake order)
+        pool.reclaim_all_slots()  # CacheManager.rebuild -> reclaim_all_slots
+        handed_out = pool.alloc(pool.num_free_slots)
+        assert ladder.slot not in handed_out
+        assert sorted(handed_out + [ladder.slot]) == list(range(1, NUM_SLOTS))
+        pool.rebuild(NUM_SLOTS)
+        ladder.rebind()

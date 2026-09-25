@@ -1430,6 +1430,25 @@ class SpecDraftHead:
         runner = getattr(self, "expert_runner", None)
         if runner is not None:
             runner.close()
+        # Drop every device-holding member too. Sleep closes the head and then flushes the
+        # caching allocator; any stray reference to this object (a traceback frame, a local)
+        # would otherwise keep the weights, the private KV pool and the graph buffers alive
+        # through that flush (PR #19 review). Scalars (num_pages, seed) stay readable.
+        for name, value in list(vars(self).items()):
+            if name in _CLOSE_KEEP:
+                continue
+            if name in _CLOSE_DROP or isinstance(value, (torch.Tensor, torch.nn.Module)):
+                setattr(self, name, None)
+        self._buffered = []
+
+
+# close(): members that reference the target engine (not owned by the head) stay; the ones
+# below hold the head's own device state without being a bare Tensor / Module.
+_CLOSE_KEEP = frozenset({"engine", "target_ctx", "target_model", "device"})
+_CLOSE_DROP = frozenset({
+    "model", "staged_model", "draft_lm_head", "expert_runner", "kv_cache", "page_table",
+    "attn_backend", "_sampler", "_saved_blocks", "_graph_runner",
+})
 
 
 def _row_top1(logits: torch.Tensor) -> float:

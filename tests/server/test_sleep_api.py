@@ -228,3 +228,25 @@ def test_wake_reports_the_real_state_and_a_timeout(monkeypatch):
     r = client.post("/v1/wake?timeout=0.01")
     assert r.status_code == 503 and r.json()["status"] == "timeout", r.json()
     assert "took longer" in r.json()["error"]
+
+
+@pytest.mark.anyio
+async def test_a_stop_sealed_before_the_chats_wake_task_runs_refuses_the_wake():
+    """PR #19 review: the chat schedules its wake as a task; prepare-stop runs first, sets
+    "stopping" and seals accounting. The wake must not reopen the gate or wake the engine."""
+    from freetoken.server.accounting import prepare_stop_accounting
+
+    m = manager(asleep=True)
+    m.instance_id = "t"
+    sent = wire_scheduler(m)
+    chat = asyncio.ensure_future(m.wait_until_serving())
+    stop = asyncio.ensure_future(prepare_stop_accounting(m, drain_timeout_s=0.1))
+    # Run the stop to completion before the chat's wake task gets its first turn: ensure_future
+    # below is scheduled after the stop task, so the stop's gate closes first.
+    reason, sealed = await asyncio.gather(chat, stop)
+    assert sealed["drain_complete"] is True
+    assert sent == []  # no wake reached the scheduler
+    assert m.maintenance_state == "stopping" and m.asleep is True and not m.maintenance_ops
+    assert reason == "server unavailable: engine is stopping"
+    with pytest.raises(AdmissionClosedError, match="stopping"):
+        await m.new_user_async()

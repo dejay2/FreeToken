@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import gc
 import time
+import traceback
 from dataclasses import dataclass, field
 
 import torch
@@ -107,6 +108,69 @@ def _gb(n: int) -> str:
     return f"{n / (1 << 30):.1f} GB"
 
 
+def _wake_refusal(free_now: int, need: int, card_free: int | None) -> str:
+    """The wake preflight's refusal. cudaMemGetInfo (free_now) under WSL/WDDM does not see
+    other processes' allocations: live 2026-09-25 it read 17.7 GB free while a 25 GB game
+    allocation held the card and nvidia-smi showed 30714 of 32607 MiB used (about 1.9 GB
+    free). The number shown is the smaller of it and NVML's card-wide free (what nvidia-smi
+    reports); when NVML cannot be read, no number is shown rather than a wrong one."""
+    tail = "; close the game or program using it, then try again"
+    if card_free is None:
+        return f"the graphics card does not have enough free memory to wake (waking needs {_gb(need)})" + tail
+    return f"the graphics card has {_gb(min(free_now, card_free))} free and waking needs {_gb(need)}" + tail
+
+
+def _card_free_bytes(engine) -> int | None:
+    """Card-wide free bytes from NVML for the engine's device (every process counted), or
+    None when it cannot be read (no CUDA device, no NVML library, a lookup error)."""
+    device = getattr(engine, "device", None)
+    if device is None or getattr(device, "type", None) != "cuda" or not torch.cuda.is_available():
+        return None
+    try:
+        uuid = str(torch.cuda.get_device_properties(device).uuid)
+    except Exception:  # noqa: BLE001
+        return None
+    return _nvml_free_bytes(uuid if uuid.startswith("GPU-") else f"GPU-{uuid}")
+
+
+def _nvml_free_bytes(uuid: str) -> int | None:
+    import ctypes
+    import os
+
+    names = ["nvml.dll"] if os.name == "nt" else ["libnvidia-ml.so.1", "/usr/lib/wsl/lib/libnvidia-ml.so.1"]
+    lib = None
+    for name in names:
+        try:
+            lib = ctypes.CDLL(name)
+            break
+        except OSError:
+            continue
+    if lib is None:
+        return None
+
+    class _Memory(ctypes.Structure):
+        _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong),
+                    ("used", ctypes.c_ulonglong)]
+
+    try:
+        if lib.nvmlInit_v2() != 0:
+            return None
+        try:
+            handle = ctypes.c_void_p()
+            if lib.nvmlDeviceGetHandleByUUID(uuid.encode("ascii"), ctypes.byref(handle)) != 0:
+                return None
+            mem = _Memory()
+            if lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem)) != 0:
+                return None
+            if not (0 < mem.total and mem.free <= mem.total):
+                return None
+            return int(mem.free)
+        finally:
+            lib.nvmlShutdown()
+    except (OSError, AttributeError):
+        return None
+
+
 def _report(snap: SleepSnapshot | None, *, asleep: bool, elapsed: float, free: int, note=None) -> dict:
     return {
         "asleep": asleep,
@@ -164,6 +228,10 @@ def sleep_engine(engine) -> dict:
     if draft is not None:
         snap.draft_num_pages = getattr(draft, "num_pages", None)
         snap.draft_seed = getattr(draft, "seed", None)
+    # No local reference may outlive release_to_sleep: the head's weights and private KV
+    # (2.17-2.56 GiB) are freed by refcount, and a live `draft` here would keep them through
+    # the flush below, so released_bytes would undercount (PR #19 review).
+    del draft
     # Point of no return for the scheduler's verdict: a failure from here is "after teardown".
     engine.rebuild_teardown_started = True
     release_to_sleep(engine, snap)
@@ -208,6 +276,7 @@ def release_to_sleep(engine, snap: SleepSnapshot, *, force_pools: bool = False) 
         draft.close()
         engine.spec_draft = None
         progress("sleep:draft")
+    del draft  # the last reference: gc.collect / empty_cache below must be able to free it
     # 3. Owned (and RAM-parked) layers go to the SSD copy, never to pinned RAM: 1.32 GiB of
     #    Windows RAM per layer is not there to spend (control-panel acceptance 2026-09-25:
     #    Windows free fell to 2.7 GB during a boot). _move_layer suspends prefill overlap on
@@ -271,11 +340,12 @@ def wake_engine(engine) -> dict:
     # refusal and the model stays exactly as it slept.
     free_now = int(engine._sync_get_memory()[0])
     need = snap.released_bytes + _wake_margin(snap)
-    if free_now < need:
-        raise SleepRefused(
-            f"the graphics card has {_gb(free_now)} free and waking needs {_gb(need)}; "
-            "close the game or program using it, then try again"
-        )
+    # The gate takes NVML's card-wide figure too when it can read it: cudaMemGetInfo under
+    # WSL misses other processes (see _wake_refusal), and a wake it waved through would OOM,
+    # go back to sleep and count toward MAX_FAILED_WAKES, so a game could force a restart.
+    card_free = _card_free_bytes(engine)
+    if min(free_now, card_free if card_free is not None else free_now) < need:
+        raise SleepRefused(_wake_refusal(free_now, need, card_free))
     engine.rebuild_teardown_started = True
     try:
         _restore(engine, snap)
@@ -286,6 +356,10 @@ def wake_engine(engine) -> dict:
             # latches failed and the helper's watchdog restarts the server.
             raise WakeFailed(f"wake failed ({exc!r}); not an out-of-memory, restart needed") from exc
         logger.error(f"wake failed ({exc!r}); putting the model back to sleep")
+        # The traceback's frames (SpecDraftHead / GraphRunner constructors, a layer move) still
+        # hold whatever they allocated before the OOM; clear them or the flush below cannot
+        # hand those bytes back (PR #19 review).
+        _drop_frames(exc)
         try:
             release_to_sleep(engine, snap, force_pools=True)
             engine._sync_get_memory()  # empty_cache: hand the partial allocations back
@@ -306,6 +380,20 @@ def wake_engine(engine) -> dict:
     elapsed = time.monotonic() - t0
     logger.info_rank0(f"Awake in {elapsed:.1f} s, {mem_GB(free_after)} free on the card")
     return _report(None, asleep=False, elapsed=elapsed, free=free_after)
+
+
+def _drop_frames(exc: BaseException) -> None:
+    """Clear the locals of every finished frame in ``exc``'s traceback (and its chained
+    causes) and detach the tracebacks, so tensors a failing constructor held become garbage.
+    The message and type survive for the SleepRefused / WakeFailed chain."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        tb = exc.__traceback__
+        if tb is not None:
+            traceback.clear_frames(tb)  # skips the still-executing frame (wake_engine)
+            exc.__traceback__ = None
+        exc = exc.__cause__ or exc.__context__
 
 
 def _is_oom(exc: BaseException) -> bool:

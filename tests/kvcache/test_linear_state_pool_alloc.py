@@ -189,3 +189,13 @@ def test_slot_state_bytes_for_the_real_geometry():
     delta = linear_state_bytes_per_req(group, 1, torch.bfloat16, (spec,)) - \
         linear_state_bytes_per_req(group, 1, torch.bfloat16)
     assert delta == 4 * 2560 * 9 * 2 == 180 * 1024
+
+
+def test_reserved_slots_survive_reclaim_until_rebuild():
+    pool = _pool(num_slots=6)
+    (kept,) = pool.alloc_reserved(1)
+    pool.alloc(2)
+    pool.reclaim_all_slots()
+    assert kept not in pool._free_slots and pool.num_free_slots == 4
+    pool.rebuild(6)  # new tensors: the owner re-reserves (SpecStateLadder.rebind)
+    assert pool.num_free_slots == 5

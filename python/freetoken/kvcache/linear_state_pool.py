@@ -100,6 +100,12 @@ class LinearStatePool:
         # flows between them by demand. Unused by the op harness (which assigns slots by hand).
         self.padding_slot = 0
         self._free_slots: list[int] = list(range(1, num_slots))
+        # Slots held for the engine's lifetime by a non-request owner (the MTP state ladder's
+        # rollback snapshot). reclaim_all_slots must not hand them out again: a CacheManager
+        # rebuild after the ladder's rebind would otherwise give the ladder's slot to the next
+        # request, and speculative verification would overwrite its snapshot (PR #19 review).
+        # rebuild() drops them, since it replaces the tensors; the owner re-reserves.
+        self._reserved_slots: list[int] = []
 
     def _alloc_slot_states(self, num_slots: int) -> dict[str, torch.Tensor]:
         return {
@@ -141,11 +147,20 @@ class LinearStatePool:
             )
         return [self._free_slots.pop() for _ in range(n)]
 
+    def alloc_reserved(self, n: int = 1) -> list[int]:
+        """``alloc`` for a long-lived owner outside the request path: the slots survive
+        ``reclaim_all_slots`` (they stay out of the free list) until the next ``rebuild``."""
+        slots = self.alloc(n)
+        self._reserved_slots.extend(slots)
+        return slots
+
     def reclaim_all_slots(self) -> None:
-        """Restore the free-list to all non-padding slots. Idle-only: the caller (e.g. a
-        CacheManager rebuild that discards the tree owning donated snapshots) must guarantee no
-        running request holds a slot, otherwise live state would be handed out twice."""
-        self._free_slots = list(range(1, self._num_slots))
+        """Restore the free-list to all non-padding, non-reserved slots. Idle-only: the caller
+        (e.g. a CacheManager rebuild that discards the tree owning donated snapshots) must
+        guarantee no running request holds a slot, otherwise live state would be handed out
+        twice."""
+        reserved = set(self._reserved_slots)
+        self._free_slots = [s for s in range(1, self._num_slots) if s not in reserved]
 
     def rebuild(self, num_slots: int) -> None:
         """Reallocate the conv + recurrent state tensors for ``num_slots`` slots IN PLACE.
@@ -177,6 +192,7 @@ class LinearStatePool:
         self.slot_states = self._alloc_slot_states(num_slots)
         self._num_slots = num_slots
         self._free_slots = list(range(1, num_slots))
+        self._reserved_slots = []
 
     def free(self, slots) -> None:
         """Return slot ids to the free-list. Accepts an int, list, or 1-D tensor."""
