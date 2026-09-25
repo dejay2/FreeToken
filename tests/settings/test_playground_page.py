@@ -130,3 +130,37 @@ assert.match(md, /### B · Fable · Saved settings\n\n\(no answer\)\n/);
 assert.match(md, /_QUASAR is loaded again on its saved settings \(21\.0 s\)\._\n$/);
 assert.doesNotMatch(md, /\n\n\n/);
 """)
+
+
+def test_page_has_the_test_tab_and_every_id_the_script_uses():
+    page = PAGE.read_text(encoding="utf-8")
+    for needle in ('data-main="test"', 'id="test-view"', '<script src="/playground.js"></script>',
+                   'id="pg-prompt"', 'id="pg-system"', 'id="pg-a-model"', 'id="pg-a-preset"', 'id="pg-b-on"',
+                   'id="pg-b-fields"', 'id="pg-warmup"', 'id="pg-putback"', 'id="pg-run"', 'id="pg-start"',
+                   'id="pg-plan-cancel"', 'id="pg-stop"', 'id="pg-steps"', 'id="pg-results"', 'id="pg-restore"',
+                   'id="pg-history"', 'id="pg-export"', 'id="pg-clear"'):
+        assert needle in page, needle
+    assert page.index('<script src="/panel.js">') < page.index('<script src="/playground.js">')
+    script = PG_JS.read_text(encoding="utf-8")
+    for element in set(re.findall(r"\$\('(pg-[\w-]+)'\)", script)):
+        assert f'id="{element}"' in page, element
+    for side in ("a", "b"):
+        for field in ("model", "preset", "temperature", "top_p", "top_k", "maxTokens"):
+            assert f'id="pg-{side}-{field}"' in page, (side, field)
+
+
+def test_show_main_knows_the_test_tab():
+    text = PANEL_JS.read_text(encoding="utf-8")
+    assert "'freetoken', 'test']" in text and "pgOpen()" in text
+
+
+def test_right_now_strip_shows_a_running_test_and_a_leftover():
+    _node(r"""
+const base = {switcher: {up: true, running: [{id: 'quasar-27b', name: 'QUASAR', state: 'ready'}]}, card: null, held: []};
+const running = p.nowStripHtml({...base, test: {running: true, model: 'fable-27b', name: 'Fable', preset: 'Three'}});
+assert.match(running, /Test running: Fable on preset “Three”/);
+assert.match(p.nowStripHtml({...base, test: {running: true, model: null}}), /A test is running on the Test tab\./);
+const left = p.nowStripHtml({...base, testLeftover: {model: 'quasar-27b', name: 'QUASAR', preset: 'Fast'}});
+assert.match(left, /QUASAR is still on test settings \(preset “Fast”\) because an app was using it\. It goes back to its saved settings at its next load\./);
+assert.doesNotMatch(p.nowStripHtml(base), /test/i);
+""", module=PANEL_JS)

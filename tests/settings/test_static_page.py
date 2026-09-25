@@ -69,7 +69,7 @@ def _source() -> str:
     parser = _PageParser()
     parser.feed(_page())
     assert parser.title.strip(), "the page needs a browser title"
-    assert parser.external_assets == ["/panel.js"], "the page loads only its own panel.js"
+    assert parser.external_assets == ["/panel.js", "/playground.js"], "the page loads only its own panel.js and playground.js"
     return "\n".join(parser.scripts)
 
 
@@ -129,7 +129,7 @@ def test_page_has_tabs_info_buttons_sliders_and_browse() -> None:
     source = _source()
 
     assert 'role="tablist"' in page
-    assert [m.group(1) for m in re.finditer(r'<button[^>]+data-main="([^"]+)"', page)] == ["models", "system", "ninfer", "freetoken"]
+    assert [m.group(1) for m in re.finditer(r'<button[^>]+data-main="([^"]+)"', page)] == ["models", "system", "ninfer", "freetoken", "test"]
     assert "renderTabs(groups)" in source
     # Plain-language help, effect chips, sliders and folder browsing are all driven by the
     # metadata the settings route sends; the page only needs the generic hooks.
