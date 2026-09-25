@@ -476,3 +476,285 @@ class PlaygroundRunner:
             if step["state"] == "running" and started is not None:
                 step["elapsedMs"] = max(0, round((now - started) * 1000))
         return out
+
+    # ---- start and stop ----
+    def start(self, body: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            plan = self.plan(body)
+            if "expectBefore" in body and body.get("expectBefore") != plan["before"]:
+                raise PlaygroundError(409, "changed", "Something changed since the plan was shown. "
+                                      "Check the new plan and press Start again.", {"plan": plan})
+            if plan["warnings"] and not body.get("confirm"):
+                raise PlaygroundError(409, "confirm", "Check the plan and press Start.", {"plan": plan})
+            try:
+                self.panel.begin_test()
+            except PanelError as exc:  # another test holds the panel's guard
+                raise PlaygroundError(exc.status, exc.payload["code"], exc.payload["message"]) from None
+            self._stop.clear()
+            self._session = SESSION_PREFIX + uuid.uuid4().hex[:10]
+            self._ours = None
+            job = {**plan, "id": self._session[len(SESSION_PREFIX):], "status": "running",
+                   "startedAt": _now_iso(), "finishedAt": None, "message": "", "restore": ""}
+            self.job = job
+        try:
+            self._spawn(self._run, job)
+        except BaseException:
+            # Nothing ran yet, so there is nothing to put back; only the guard needs lifting.
+            with self._lock:
+                job["status"], job["message"] = "failed", "The test could not start."
+                job["finishedAt"] = _now_iso()
+            self.panel.end_test()
+            raise
+        return self.snapshot()
+
+    def stop(self) -> dict[str, Any]:
+        """Ends the current step: closes the answer stream, or unloads the model being loaded
+        (P1 cancels a half-finished swap on unload), so a 2.5 min FreeToken load never makes
+        Stop wait. Put-back still runs."""
+        with self._lock:
+            if self.job is None or self.job["status"] != "running":
+                return self.snapshot()
+            self._stop.set()
+            self.job["status"] = "stopping"
+            loading = self._loading
+        self.chat.abort()
+        if loading is not None:
+            self._spawn(self.switcher.unload, loading)
+        return self.snapshot()
+
+    # ---- the walk ----
+    def _mark(self, step: dict[str, Any], state: str, detail: str | None = None) -> None:
+        with self._lock:
+            now = self._clock()
+            if state == "running":
+                step["_t0"] = now
+            elif step.get("_t0") is not None:
+                step["ms"] = max(0, round((now - step["_t0"]) * 1000))
+            step["state"] = state
+            if detail is not None:
+                step["detail"] = detail
+
+    def _run(self, job: dict[str, Any]) -> None:
+        halt: _Halt | None = None
+        work = [step for step in job["steps"] if step["kind"] != "restore"]
+        try:
+            try:
+                for step in work:
+                    if self._stop.is_set():
+                        raise _Halt("stopped", STOPPED)
+                    self._mark(step, "running")
+                    try:
+                        self._do(job, step)
+                    except _Halt as exc:
+                        self._mark(step, "failed", exc.message)
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - put-back must still run
+                        self._mark(step, "failed", str(exc))
+                        raise _Halt("failed", f"Something went wrong: {exc}") from exc
+                    self._mark(step, "done")
+            except _Halt as exc:
+                halt = exc
+            for step in work:
+                if step["state"] == "waiting":
+                    self._mark(step, "skipped")
+            restore = job["steps"][-1]
+            with self._lock:
+                job["status"] = "restoring"
+            self._mark(restore, "running")
+            ok, words = self._restore(job)
+            self._mark(restore, "done" if ok else "failed", words)
+            with self._lock:
+                job["restore"] = words
+                job["status"] = "done" if halt is None else halt.kind
+                job["message"] = "" if halt is None else halt.message
+        finally:
+            with self._lock:
+                if job["status"] in ACTIVE:
+                    job["status"], job["message"] = "failed", job["message"] or "The test ended unexpectedly."
+                job["finishedAt"] = _now_iso()
+            self.panel.end_test()
+
+    def _do(self, job: dict[str, Any], step: dict[str, Any]) -> None:
+        kind, model = step["kind"], step["model"]
+        side = next(s for s in job["sides"] if s["key"] == step["side"])
+        if kind == "unload":
+            busy = self._others_using(model)
+            if busy is None:
+                raise _Halt("failed", f"Couldn't check whether {self._name(model)} is busy, so the test stopped.")
+            if busy:
+                raise _Halt("yielded", f"{self._name(model)} started answering something for another app, "
+                                       "so the test stopped to leave it alone.")
+            if not self.switcher.unload(model):
+                raise _Halt("failed", f"Couldn't put {self._name(model)} away.")
+            if self._ours == model:
+                self._ours = None
+        elif kind == "settings":
+            try:
+                text = self.panel.set_test_settings(model if step["preset"] else None, step["preset"])
+            except (PanelError, SwitcherRefused, RegistryError, KeyError, OSError) as exc:
+                raise _Halt("failed", f"Couldn't write the test settings: {exc}") from None
+            if not self.panel.wait_for_switcher(text):
+                raise _Halt("failed", "The switcher didn't pick up the test settings, so nothing was loaded.")
+        elif kind == "load":
+            self._load(side, model)
+        else:
+            self._answer(job, side, warmup=kind == "warmup")
+
+    def _load(self, side: dict[str, Any], model: str) -> None:
+        with self._lock:
+            self._loading = model
+        started = self._clock()
+        try:
+            self.switcher.load(model)
+        except SwitcherError as exc:
+            if self._stop.is_set():
+                raise _Halt("stopped", STOPPED) from None
+            if exc.code == "model_superseded":
+                raise _Halt("yielded", YIELDED) from None
+            raise _Halt("failed", f"Loading {side['name']} failed: {exc.message or exc.code}") from None
+        except OSError:
+            raise _Halt("failed", "The model switcher is not running.") from None
+        finally:
+            with self._lock:
+                self._loading = None
+        self._ours = model
+        with self._lock:
+            side["loadMs"] = (side["loadMs"] or 0) + max(0, round((self._clock() - started) * 1000))
+        if self._stop.is_set():
+            raise _Halt("stopped", STOPPED)
+
+    def _answer(self, job: dict[str, Any], side: dict[str, Any], *, warmup: bool) -> None:
+        running = self.switcher.running() or {}
+        if running.get(side["model"]) != "ready":
+            raise _Halt("yielded", f"{side['name']} is no longer loaded; another app may have asked for a "
+                                   "different model. The test stopped.")
+        if warmup:
+            body: dict[str, Any] = {"model": side["model"], "messages": WARMUP_MESSAGES, "max_tokens": WARMUP_TOKENS}
+        else:
+            messages = [{"role": "system", "content": job["system"]}] if job["system"] else []
+            messages.append({"role": "user", "content": job["prompt"]})
+            body = {"model": side["model"], "messages": messages, **side["sampling"]}
+        body.update({"stream": True, "stream_options": {"include_usage": True}})
+        tracker = AnswerTracker(started=self._clock())
+        try:
+            for line in self.chat.stream(body, self._session):
+                tracker.feed_line(line, self._clock())
+                if not warmup:
+                    self._publish(side, tracker)
+                if self._stop.is_set():
+                    break
+        except ChatFailed as exc:
+            if self._stop.is_set():
+                raise _Halt("stopped", STOPPED) from None
+            if exc.code == "model_superseded":
+                raise _Halt("yielded", YIELDED) from None
+            raise _Halt("failed", f"{side['name']} could not answer: {exc.message}") from None
+        finally:
+            tracker.ended = self._clock()
+            self._own_last[side["model"]] = self._wall()
+        stopped = self._stop.is_set()
+        if not warmup:
+            self._publish(side, tracker, final=True, cancelled=stopped)
+            with self._lock:
+                names = self._aliases.get(side["model"], {side["model"]})
+                if tracker.served_model and tracker.served_model not in names:
+                    side["error"] = f"The answer came from {tracker.served_model}, not {side['name']}."
+                elif not stopped and not tracker.done and tracker.finish_reason is None:
+                    side["error"] = "The answer ended without a finish signal."
+        if stopped:
+            raise _Halt("stopped", STOPPED)
+
+    def _publish(self, side: dict[str, Any], tracker: AnswerTracker, *, final: bool = False,
+                 cancelled: bool = False) -> None:
+        stats = answer_stats(tracker, cancelled=cancelled and final)
+        with self._lock:
+            side["answer"] = tracker.answer_text[:MAX_TEXT_CHARS]
+            side["reasoning"] = tracker.reasoning_text[:MAX_TEXT_CHARS]
+            side["stats"] = stats
+
+    # ---- put back ----
+    def _restore(self, job: dict[str, Any]) -> tuple[bool, str]:
+        """Always runs last. Puts an idle test model away, clears the overlay, and loads the
+        model from before on its saved settings, unless another app's model is on the card,
+        Jay said not to, or the switcher has not picked up the saved file."""
+        before, put_back = job["before"], job["putBack"]
+        words: list[str] = []
+        try:
+            test = self.panel.test_settings
+            running = self.switcher.running()
+            if running is None or is_down(running):
+                self.panel.set_test_settings(None, None)
+                return False, "Can't tell what's loaded right now, so nothing was loaded again. Check the Models tab."
+            loaded = sorted(model for model, state in running.items() if state in LOADED_STATES)
+            left = None
+            for model in list(loaded):
+                on_test = bool(test) and model == test["model"]
+                if not (on_test or model == self._ours):
+                    continue  # another app's model
+                if not on_test and (model == before or not put_back):
+                    continue  # our setup on saved settings, and it may stay
+                if self._others_using(model) is False and self.switcher.unload(model):
+                    loaded.remove(model)
+                    self._ours = None if self._ours == model else self._ours
+                elif on_test:
+                    left = model
+                    self.panel.note_test_leftover(model, test["preset"])
+                    words.append(f"{self._name(model)} is still on test settings because an app is using it. "
+                                 "It goes back to its saved settings at its next load.")
+            text = self.panel.set_test_settings(None, None)
+            if not self.panel.wait_for_switcher(text):
+                words.append("The switcher hasn't picked up the saved settings yet, so nothing was loaded again. "
+                             "Check the Models tab.")
+                return False, " ".join(words)
+            if before is None:
+                words.append("Nothing was loaded before the test.")
+            elif before == left:
+                pass
+            elif before in loaded:
+                words.append(f"{self._name(before)} is loaded on its saved settings, as before.")
+            elif not put_back:
+                words.append(f"{self._name(before)} was not loaded again, as asked.")
+            elif loaded:
+                words.append(f"{self._name(before)} was not loaded again, because an app is using {self._name(loaded[0])}.")
+            else:
+                started = self._clock()
+                self.switcher.load(before)
+                took = max(0, round((self._clock() - started) * 1000))
+                words.append(f"{self._name(before)} is loaded again on its saved settings ({_seconds(took)}).")
+            return True, " ".join(words)
+        except Exception as exc:  # noqa: BLE001 - never leave the overlay set
+            try:
+                self.panel.set_test_settings(None, None)
+            except Exception:  # noqa: BLE001
+                pass
+            words.append(f"Putting things back didn't finish ({exc}). Check the Models tab.")
+            return False, " ".join(words)
+
+    # ---- helper start ----
+    def recover(self) -> str:
+        """At helper start: a test running when the helper stopped may have left its model on
+        test settings. Put it away when nobody uses it; otherwise leave it and say so on the
+        Right-now strip. Nothing on disk needs restoring: the registry was never written, and
+        sync_config() rewrites the switcher file right after this (holding a busy NInfer
+        model's running entry, as for any loaded model)."""
+        marker = self.panel.read_test_marker()
+        if marker is None:
+            return "none"
+        try:
+            self._doc()
+        except PlaygroundError:
+            pass
+        model, preset = str(marker.get("model") or ""), marker.get("preset")
+        running = self.switcher.running()
+        result = "gone"
+        if running is None:
+            self.panel.note_test_leftover(model, preset)
+            result = "unknown"
+        elif not is_down(running) and running.get(model) in LOADED_STATES:
+            if self._others_using(model) is False and self.switcher.unload(model):
+                result = "unloaded"
+            else:
+                self.panel.note_test_leftover(model, preset)
+                result = "left"
+        self.panel.clear_test_marker()
+        return result
