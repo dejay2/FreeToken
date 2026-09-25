@@ -20,6 +20,7 @@ import datetime as _dt
 import hashlib
 import json
 import os
+import stat
 import re
 import shlex
 import shutil
@@ -325,7 +326,13 @@ class SwapConfigWriter:
             return None
         stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         target = self.path.with_name(f"{self.path.name}.hand-{stamp}")
-        write_atomic(target, text.encode("utf-8"), 0o644)
+        # Keep the source's permissions, never wider than 0600-by-default: a hand-written
+        # config may carry llama-swap apiKeys (PR #20 review round 2).
+        try:
+            mode = stat.S_IMODE(self.path.stat().st_mode) & 0o600
+        except OSError:
+            mode = 0o600
+        write_atomic(target, text.encode("utf-8"), mode or 0o600)
         return target
 
     def discard(self, staged: Path) -> None:

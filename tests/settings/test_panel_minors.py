@@ -250,6 +250,18 @@ def test_restore_over_a_hand_written_config_keeps_a_copy(env):
     assert len([p for p in env.cfg.parent.iterdir() if p.name.startswith("config.yaml.hand-")]) == 1
 
 
+def test_a_hand_written_copy_is_never_readable_by_other_users(env):
+    """PR #20 review round 2: a 0600 hand-written config (llama-swap apiKeys) was copied 0644."""
+    first = seed(env)
+    env.client.put("/api/panel/system", json={"revision": first, "system": {"floorGB": 7}})
+    env.cfg.write_text("# my own file\nmodels: {}\n")
+    env.cfg.chmod(0o600)
+    backup = env.store.backups()[0]
+    assert env.client.post("/api/panel/registry/restore", json={"backup": backup}).status_code == 200
+    copies = [p for p in env.cfg.parent.iterdir() if p.name.startswith("config.yaml.hand-")]
+    assert len(copies) == 1 and (copies[0].stat().st_mode & 0o077) == 0
+
+
 # ---- 25: the Right-now strip reads one consistent restart note and never waits on a save ----
 def test_now_answers_while_a_save_holds_the_panel_lock(env):
     seed(env)
