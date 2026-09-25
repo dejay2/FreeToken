@@ -144,6 +144,19 @@ def test_backups_are_pruned_to_twenty(tmp_path):
     assert len(backups(folder, "models.json")) == 20 and len(backups(folder, "settings.json")) == 20
 
 
+def test_pruning_never_touches_hand_made_backups(tmp_path):
+    folder = write_pi(tmp_path / "agent")
+    # More hand-made copies than BACKUPS_KEPT: the old prefix match counted and deleted them.
+    hand = [folder / f"{name}.bak-before-{i:02d}" for name in ("models.json", "settings.json") for i in range(25)]
+    for path in hand:
+        path.write_text("{}")
+    pi = PiSync(folder, now=Clock())
+    for _ in range(12):
+        pi.add("small-9b", "Small", "ninfer", ENGINES)
+        pi.remove("small-9b")
+    assert all(path.exists() for path in hand)
+
+
 def test_crlf_and_bom_are_kept(tmp_path):
     folder = write_pi(tmp_path / "agent")
     for name in ("models.json", "settings.json"):

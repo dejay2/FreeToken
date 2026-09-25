@@ -27,6 +27,7 @@ import datetime as _dt
 import getpass
 import json
 import os
+import re
 import threading
 import uuid
 from pathlib import Path
@@ -249,8 +250,10 @@ class PiSync:
 
     def _prune(self) -> None:
         for path in (self.models_path, self.settings_path):
-            prefix = path.name + ".bak-"
-            names = sorted((p.name for p in self.agent_dir.iterdir() if p.name.startswith(prefix)), reverse=True)
+            # Only our own timestamped copies: Jay keeps hand-made ones such as
+            # settings.json.bak-before-quasar in the same folder (seen on the box 2026-09-25).
+            ours = re.compile(re.escape(path.name) + r"\.bak-\d{8}-\d{6}-\d{6}$")
+            names = sorted((p.name for p in self.agent_dir.iterdir() if ours.match(p.name)), reverse=True)
             for name in names[BACKUPS_KEPT:]:
                 (self.agent_dir / name).unlink(missing_ok=True)
 
