@@ -170,3 +170,62 @@ def test_a_bigger_prefill_chunk_raises_the_reservation():
     at_1024 = estimate(quasar(), QUASAR_BYTES)["runtimeReservationBytes"]
     assert estimate(small, QUASAR_BYTES)["runtimeReservationBytes"] == at_1024
     assert estimate(big, QUASAR_BYTES)["runtimeReservationBytes"] > at_1024
+
+
+# ---- upstream runtime (Fable, Twin), measured live 2026-09-25, RTX 5090, WSL ----
+# engines/ninfer-upstream ninfer-serve run by hand with the config.yaml command line (kv-capacity
+# 200000, fp8, mtp draft-tokens 4, lm-head-draft, vision, max-context 150000) plus
+# --request-log-jsonl; exact bytes from its startup "memory" record and the refusal line.
+from freetoken.daemon.settings.ninfer_fit import runtime_reservation  # noqa: E402
+from freetoken.daemon.settings import ninfer_dials  # noqa: E402
+
+FABLE_BYTES = 21_500_080_900
+TWIN_BYTES = 21_492_920_836
+UPSTREAM_AVAILABLE = 10_948_182_016  # available_after_weights_bytes, both models, every run
+UPSTREAM_RESERVATION = {4: 9_523_597_057, 6: 10_337_772_033, 8: 11_151_947_009}  # mc8 = refusal
+
+
+def upstream(model_id, concurrency):
+    doc = five()
+    model = find_model(doc, model_id)
+    settings = effective_settings(doc, model)
+    settings["max-concurrency"] = concurrency
+    return settings, model["runtime"]
+
+
+def test_upstream_reservation_matches_the_measured_bytes():
+    for model_id in ("fable-27b", "twin-27b"):
+        for concurrency, measured in UPSTREAM_RESERVATION.items():
+            settings, runtime = upstream(model_id, concurrency)
+            assert runtime == "ninfer-upstream"
+            parts = runtime_reservation(ninfer_dials.normalized(settings), 3125, runtime)
+            assert parts["total"] == measured
+    # kv_payload_bytes at mc4 and the MTP graph allowance (82 MiB x 4), to the byte.
+    parts = runtime_reservation(ninfer_dials.normalized(upstream("fable-27b", 4)[0]), 3125, "ninfer-upstream")
+    assert parts["kv"] == 7_018_128_384 and parts["graphs"] == 343_932_928
+
+
+def test_upstream_room_is_within_8_mb_and_never_above_fable():
+    fable = startup_room(FABLE_BYTES, CARD_5090, runtime="ninfer-upstream")
+    twin = startup_room(TWIN_BYTES, CARD_5090, runtime="ninfer-upstream")
+    assert twin == UPSTREAM_AVAILABLE
+    assert 0 <= UPSTREAM_AVAILABLE - fable < 8 * 1024 ** 2
+
+
+def test_upstream_mc4_mc6_start_and_mc8_refuses():
+    for model_id, size in (("fable-27b", FABLE_BYTES), ("twin-27b", TWIN_BYTES)):
+        verdicts = {}
+        for concurrency in (4, 6, 8):
+            settings, runtime = upstream(model_id, concurrency)
+            verdicts[concurrency] = estimate(settings, size, card_total_bytes=CARD_5090,
+                                             runtime=runtime)["startupVerdict"]
+        # Logged planned slack: mc4 1,424,584,959 B and mc6 610,409,983 B (both started), mc8
+        # refused. The upstream margin is 1.0 GiB (STARTUP_TIGHT_MARGIN): the shipped mc4 fits, mc6
+        # (582 MiB slack) is tight.
+        assert verdicts == {4: "fits", 6: "tight", 8: "wont_fit"}
+
+
+def test_quasar_runtime_default_is_unchanged():
+    assert quasar_at(6)["runtimeReservationBytes"] == REFUSED_NEEDS
+    assert estimate(quasar(), QUASAR_BYTES, card_total_bytes=CARD_5090, runtime="ninfer") == \
+        estimate(quasar(), QUASAR_BYTES, card_total_bytes=CARD_5090)

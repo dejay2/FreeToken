@@ -709,7 +709,8 @@ class PanelService:
                     loaded, down = self._ask()
                     if loaded is not None and not down and not loaded:
                         desktop = card.get("usedBytes")
-                estimate = ninfer_fit.estimate(draft, size, card_total_bytes=total, desktop_bytes=desktop)
+                estimate = ninfer_fit.estimate(draft, size, card_total_bytes=total, desktop_bytes=desktop,
+                                             runtime=model.get("runtime"))
                 out.update(needBytes=estimate["needBytes"], components=estimate["components"], notes=estimate["notes"])
                 # Two checks: the card memory in use once up (needBytes) and NInfer's own startup
                 # refusal on its up-front runtime reservation (fit round 2, 2026-09-25).

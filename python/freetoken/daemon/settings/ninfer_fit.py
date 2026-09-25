@@ -95,6 +95,37 @@ Where the numbers come from in the frozen runtime (engines/ninfer):
 Calibration (predicted vs logged): runtime mc4 int8 10.58 GiB (10.6), mc5 11.42 (11.4), mc6
 13,177,821,184 B exactly, mc4 fp8 10.43 (10.4); room 13,111,561,216 B at 2.6 GiB desktop on the
 34,190,917,632 B card -> mc4 fits with 1.7 GiB spare, mc5 is tight (0.8 GiB), mc6 refuses.
+
+Upstream runtime (Fable, Twin) calibration (track 5, 2026-09-25)
+----------------------------------------------------------------
+Fable and Twin run engines/ninfer-upstream (Qwen3_5ForCausalLM artifacts, v3). Its planner
+(src/models/qwen3_5/program/planning/startup.cpp:101-264 persistent layout, :827-870 graph
+allowance and reservation = persistent + workspace + graphs; runtime/engine/kv_capacity.cpp:
+76-141 the same refusal) has the same shape as the frozen runtime, so the KV, StateImage, replay
+and graph terms above carry over unchanged. Measured live on the RTX 5090 (WSL), ninfer-serve run
+by hand with the config.yaml command line (kv-capacity 200000, fp8, mtp draft-tokens 4,
+lm-head-draft, vision, max-context 150000, prefill-chunk default) plus --request-log-jsonl, whose
+startup record carries every byte (src/serve/request_log.cpp:500-517):
+
+    fable mc4  reservation 9,523,597,057 = sequence 8,313,016,064 + workspace 866,648,065
+               + graphs 343,932,928; kv payload 7,018,128,384; available 10,948,182,016
+    fable mc6  reservation 10,337,772,033 (sequence 8,955,224,576, graphs 515,899,392), started
+    fable mc8  refused: requires 11,151,947,009 bytes, only 10,948,182,016 available
+    twin       byte-identical to fable at mc4 and mc8 (same geometry; weights 21,479,648,768 B)
+    mc1        refused earlier: kv-capacity 200000 > mc x ceil(150000/64) pages (not a memory limit)
+
+The KV payload matches the formula to the byte and the graph allowance is the MTP 82 MiB x mc.
+Against the frozen-runtime constants the reservation was 51-64 MB high (+0.6%) and the room
+445 MB high (Fable: 11,393,612,540 predicted vs 10,948,182,016), so mc8 read "tight" instead of
+a refusal. Upstream therefore gets its own two constants plus a per-lane remainder:
+* workspace: the workspace arena is the Vision encode peak (866,648,065 B, the same at mc4 and
+  mc6); the fitted fixed remainder is 877,647,105 B, plus 3,131,724 B per lane (round state /
+  sampling tensors the model above leaves out; the mc4/mc6/mc8 points are exactly linear).
+* weights delta: -1,041,913,962 B, fitted on Twin's artifact (21,492,920,836 B) so that the
+  heavier Fable artifact (21,500,080,900 B, same 21,479,648,768 B on the card) comes out 7 MB
+  under the logged room -- the safe side. cudaMemGetInfo reported the same available bytes to
+  the byte with the idle card at 1.5 GiB and at 2.1 GiB, so the 2.6 GiB startup desktop stays.
+After: mc4/mc6/mc8 reservations exact, room within 7.2 MB (both models), mc8 refuses.
 """
 
 from __future__ import annotations
@@ -153,6 +184,24 @@ RUNTIME_WORKSPACE_BYTES = 954_523_336
 WEIGHTS_SEEN_DELTA_BYTES = -1_494_504_550
 STARTUP_DESKTOP_BYTES = int(2.6 * GIB)  # idle card 2614-2688 MiB on 2026-09-25
 MASKED_DRAFT = ("dflash", "dflash2")
+# Per-runtime calibrated terms (module docstring). "ninfer" is the frozen QUASAR runtime (mc6
+# dflash2 refusal, 2026-09-25); "ninfer-upstream" is Fable/Twin (mtp draft 4, fp8, vision,
+# kv 200000: mc4/mc6 started, mc8 refused at 11,151,947,009 vs 10,948,182,016, 2026-09-25).
+RUNTIME_CALIBRATION = {
+    "ninfer": {"workspace": RUNTIME_WORKSPACE_BYTES, "per_lane": 0,
+               "weights_delta": WEIGHTS_SEEN_DELTA_BYTES},
+    "ninfer-upstream": {"workspace": 877_647_105, "per_lane": 3_131_724,
+                        "weights_delta": -1_041_913_962},
+}
+# Startup "tight" margin per runtime. The upstream prediction is byte-exact (room within 7.2 MB,
+# safe side), and the shipped Fable/Twin mc4 setting starts with 1.33 GiB of slack and has
+# served since 2026-09-24, so 1.0 GiB warns only below what has been measured to work.
+STARTUP_TIGHT_MARGIN = {"ninfer-upstream": int(1.0 * GIB)}
+DEFAULT_RUNTIME = "ninfer"
+
+
+def _calibration(runtime: str | None) -> Mapping[str, int]:
+    return RUNTIME_CALIBRATION.get(runtime or DEFAULT_RUNTIME, RUNTIME_CALIBRATION[DEFAULT_RUNTIME])
 
 
 def _graph_profiles_through(max_frontier: int, preferred_ends: list[int]) -> list[tuple[int, int]]:
@@ -193,8 +242,9 @@ def graph_allowance_bytes(spec: str, concurrency: int, capacity: int, draft: int
     return per_batch * concurrency
 
 
-def runtime_reservation(full: Mapping[str, Any], pages: int) -> dict[str, int]:
+def runtime_reservation(full: Mapping[str, Any], pages: int, runtime: str | None = None) -> dict[str, int]:
     """NInfer's up-front runtime reservation for `pages` Main KV page groups, split by part."""
+    cal = _calibration(runtime)
     concurrency = int(full["max-concurrency"])
     capacity = int(full["max-context"])
     spec = full["spec"]
@@ -219,7 +269,8 @@ def runtime_reservation(full: Mapping[str, Any], pages: int) -> dict[str, int]:
         lanes += DFLASH_FEATURE_ROWS * (draft + 1) * concurrency * 2
     graphs = 0 if full["no-cuda-graph"] else graph_allowance_bytes(spec, concurrency, capacity, draft)
     parts = {"kv": kv, "stateImages": slots * slot_bytes, "lanes": lanes, "graphs": graphs,
-             "workspace": int(RUNTIME_WORKSPACE_BYTES * max(1.0, int(full["prefill-chunk"]) / 1024))}
+             "workspace": int(cal["workspace"] * max(1.0, int(full["prefill-chunk"]) / 1024))
+             + cal["per_lane"] * concurrency}
     parts["total"] = sum(parts.values())
     return parts
 
@@ -231,33 +282,34 @@ def _page_bounds(full: Mapping[str, Any]) -> tuple[int, int]:
     return max(logical, concurrency), concurrency * logical
 
 
-def startup_room(artifact_bytes: int, card_total_bytes: int, desktop_bytes: int | None = None) -> int:
+def startup_room(artifact_bytes: int, card_total_bytes: int, desktop_bytes: int | None = None,
+                 runtime: str | None = None) -> int:
     """What cudaMemGetInfo will call free after the weights (registry.cpp:67-78, :121).
 
     desktop_bytes is a live card reading taken with nothing loaded; the larger of it and
     STARTUP_DESKTOP_BYTES is used."""
     desktop = max(STARTUP_DESKTOP_BYTES, int(desktop_bytes or 0))
-    return card_total_bytes - desktop - (int(artifact_bytes) + WEIGHTS_SEEN_DELTA_BYTES)
+    return card_total_bytes - desktop - (int(artifact_bytes) + _calibration(runtime)["weights_delta"])
 
 
 def startup_check(full: Mapping[str, Any], artifact_bytes: int, card_total_bytes: int | None,
-                  desktop_bytes: int | None = None) -> dict[str, Any]:
+                  desktop_bytes: int | None = None, runtime: str | None = None) -> dict[str, Any]:
     """Predict kv_capacity.cpp:76-127 for these settings: reservation, room and a verdict."""
     minimum, maximum = _page_bounds(full)
     capacity = full["kv-capacity"]
-    room = startup_room(artifact_bytes, card_total_bytes, desktop_bytes) if card_total_bytes else None
+    room = startup_room(artifact_bytes, card_total_bytes, desktop_bytes, runtime) if card_total_bytes else None
     if capacity == 0:
         if room is None:
             pages = minimum
         else:
-            base = runtime_reservation(full, minimum)["total"]
-            stride = runtime_reservation(full, minimum + 1)["total"] - base if minimum < maximum else 0
+            base = runtime_reservation(full, minimum, runtime)["total"]
+            stride = runtime_reservation(full, minimum + 1, runtime)["total"] - base if minimum < maximum else 0
             spare = room - AUTO_HEADROOM_BYTES - base
             pages = minimum if spare < 0 or not stride else min(maximum, minimum + spare // stride)
     else:
         tokens = capacity if capacity != "" else full["max-context"]
         pages = max(-(-int(tokens) // PAGE_TOKENS), minimum)
-    reservation = runtime_reservation(full, pages)["total"]
+    reservation = runtime_reservation(full, pages, runtime)["total"]
     budget = None if room is None else room - (AUTO_HEADROOM_BYTES if capacity == 0 else 0)
     out = {"reservationBytes": int(reservation), "roomBytes": None if room is None else int(room),
            "verdict": "unknown", "message": ""}
@@ -269,7 +321,8 @@ def startup_check(full: Mapping[str, Any], artifact_bytes: int, card_total_bytes
         out["message"] = (f"NInfer would refuse to start. It needs to set aside {need_gb:.1f} GB for chats "
                           f"but only {free_gb:.1f} GB would be free. Try fewer chats at the same time "
                           "or a smaller chat memory.")
-    elif capacity != 0 and budget - reservation < TIGHT_MARGIN_BYTES:
+    elif capacity != 0 and budget - reservation < STARTUP_TIGHT_MARGIN.get(runtime or DEFAULT_RUNTIME,
+                                                                           TIGHT_MARGIN_BYTES):
         # 'Fill the card' grows the chat memory into whatever is free by design, so only its
         # minimum can fail; tight applies to an explicit size.
         out["verdict"] = "tight"
@@ -297,7 +350,8 @@ def kv_bytes_per_token(dtype: str) -> int:
 
 
 def estimate(settings: Mapping[str, Any], artifact_bytes: int, *, card_total_bytes: int | None = None,
-             desktop_bytes: int | None = None) -> dict[str, Any]:
+             desktop_bytes: int | None = None, runtime: str | None = None) -> dict[str, Any]:
+    """runtime is the registry's NInfer runtime ("ninfer" or "ninfer-upstream"); None = "ninfer"."""
     full = ninfer_dials.normalized(settings)
     dtype = full["kv-dtype"]
     concurrency = full["max-concurrency"]
@@ -333,7 +387,7 @@ def estimate(settings: Mapping[str, Any], artifact_bytes: int, *, card_total_byt
         kv = tokens * kv_bytes_per_token(dtype)
     components = [{"label": label, "bytes": int(size)} for label, size in fixed]
     components.append({"label": f"Chat memory ({tokens:,} tokens, {dtype})", "bytes": int(kv)})
-    startup = startup_check(full, artifact_bytes, card_total_bytes, desktop_bytes)
+    startup = startup_check(full, artifact_bytes, card_total_bytes, desktop_bytes, runtime)
     return {"needBytes": sum(item["bytes"] for item in components), "components": components,
             "notes": notes, "kvTokens": int(tokens),
             "runtimeReservationBytes": startup["reservationBytes"], "runtimeRoomBytes": startup["roomBytes"],
