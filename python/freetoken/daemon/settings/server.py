@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
+import socket
+import threading
+import time
 from pathlib import Path
+from typing import Any, Callable
 
 from .app import HELPER_VERSION, create_app, default_paths
 from .process_manager import ProcessManager
 from .profiles_manager import ProfilesManager
+
+logger = logging.getLogger("freetoken.daemon.settings.server")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -23,6 +30,87 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-lock", default=str(paths["lock"]), help="GPU ownership file")
     parser.add_argument("--job-id", default=os.environ.get("FREETOKEN_SETTINGS_JOB_ID"))
     return parser
+
+
+def start_panel(app) -> None:
+    """Control panel start-up. First put away a model an interrupted Test-tab test left on test
+    settings (playground.recover), then make the switcher file match the registry, then keep
+    releasing "next time" holds once their model unloads (panel.py). recover() runs before
+    sync_config() because sync rewrites the switcher file from the registry, and the marker
+    tells recover which model was on test settings. A failing recover must never stop the
+    helper: the Right-now strip still shows what is loaded, and the marker's model is noted
+    as a leftover so the strip says it may still sit on test settings (the marker stays, so
+    the next helper start tries again)."""
+    panel = app.state.panel
+    _recovering(panel, True)
+    try:
+        _start_panel(app, panel)
+    finally:
+        _recovering(panel, False)
+
+
+def _recovering(panel: Any, on: bool) -> None:
+    """Hold (or lift) the panel's test guard for start-up recovery: a Test-tab test or a
+    panel load/unload that started mid-recovery would race its put-away and its switcher-file
+    rewrite (PR #18 review round 2); they get 409 busy meanwhile. The adapter's lifecycle
+    routes (/api/server/stop and the rest, app.py) never take this guard, so freetoken.sh's
+    unload still reaches them while recovery puts a FreeToken model away."""
+    method = getattr(panel, "begin_recovery" if on else "end_recovery", None)
+    if method is not None:
+        method()
+
+
+def _start_panel(app: Any, panel: Any) -> None:
+    try:
+        app.state.playground.recover()
+    except Exception:  # noqa: BLE001
+        logger.exception("Test-tab recovery failed at helper start; the marker is kept for the next start")
+        try:
+            marker = panel.read_test_marker()
+            if marker:
+                panel.note_test_leftover(str(marker.get("model") or ""), marker.get("preset"))
+        except Exception:  # noqa: BLE001
+            logger.exception("The test marker could not be read after the failed recovery")
+    app.state.panel.sync_config()
+    app.state.panel.start_hold_watcher()
+
+
+def _accepts(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def start_panel_when_listening(app: Any, port: int, *, accepts: Callable[[int], bool] = _accepts,
+                               sleep: Callable[[float], None] = time.sleep,
+                               stop: threading.Event | None = None) -> threading.Thread:
+    """Run start_panel once this helper accepts connections on port, in a thread.
+
+    Recovery may put away a FreeToken model, and freetoken.sh's unload calls this helper's
+    /api/server/stop to stop the model server. Run before uvicorn listened, that call failed,
+    the adapter exited without stopping FreeToken, and recovery still reported success (PR
+    #18 review). uvicorn's lifespan startup also runs before it binds, so the wait is on the
+    port itself. stop ends the wait when the helper exits without ever listening."""
+    stop = stop or threading.Event()
+    # The guard goes up now, before uvicorn listens: a test started in the gap between the
+    # port opening and this thread noticing it would otherwise slip in ahead of recovery.
+    _recovering(app.state.panel, True)
+
+    def run() -> None:
+        try:
+            while not accepts(port):
+                if stop.is_set():
+                    return
+                sleep(0.2)
+            start_panel(app)
+        finally:
+            _recovering(app.state.panel, False)
+
+    thread = threading.Thread(target=run, name="panel-start", daemon=True)
+    thread.start()
+    return thread
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,11 +132,10 @@ def main(argv: list[str] | None = None) -> int:
         log_path=args.log_file,
         version=HELPER_VERSION,
     )
-    # Control panel (Stage A): make the switcher file match the registry, then keep releasing
-    # "next time" holds once their model unloads (panel.py).
     panel = app.state.panel
-    panel.sync_config()
-    panel.start_hold_watcher()
+    # Recovery and the first sync wait until the page answers (start_panel_when_listening).
+    exiting = threading.Event()
+    start_panel_when_listening(app, args.port, stop=exiting)
     # Start the memory governor with the helper, not only from a page-driven Start: a helper
     # restart adopts a model server that is already serving (helper 1.3.0), and without this
     # the adopted server ran with no governor at all (seen live 2026-09-07 18:06: status stuck
@@ -65,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
 
         uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info")
     finally:
+        exiting.set()
         panel.stop_hold_watcher()
         process_manager.stop_watchdog()
         process_manager.stop_governor()
@@ -72,4 +160,4 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-__all__ = ["main"]
+__all__ = ["main", "start_panel", "start_panel_when_listening"]

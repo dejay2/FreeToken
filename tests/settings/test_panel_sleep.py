@@ -50,6 +50,20 @@ def test_sleep_and_wake_go_to_the_helper_not_the_switcher(env):
     assert calls == ["sleep", "wake"] and env.switcher.calls == []
 
 
+def test_sleep_is_refused_while_a_test_tab_run_holds_the_card(env):
+    seed(env)
+    env.switcher.states = {"qwen3.8-flash": "ready"}
+    calls = _wire(env)
+    env.service.begin_test()
+    try:
+        reply = env.client.post("/api/panel/models/qwen3.8-flash/sleep")
+        assert reply.status_code == 409 and reply.json()["code"] == "test_running"
+        assert calls == []
+    finally:
+        env.service.end_test()
+    assert env.client.post("/api/panel/models/qwen3.8-flash/sleep").status_code == 200
+
+
 def test_sleep_refusals_speak_plainly(env):
     seed(env)
     env.switcher.states = {"quasar-27b": "ready"}

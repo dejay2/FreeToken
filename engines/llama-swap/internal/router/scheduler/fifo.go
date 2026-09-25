@@ -100,6 +100,16 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 		return
 	}
 
+	// FreeToken patch P8: an if-free request never preempts. The check runs
+	// here, on the run loop, before admission, so nothing can start between it
+	// and the decision below.
+	if req.IfFree {
+		if other := s.otherActivity(req.Model); other != "" {
+			s.rejectAdmission(req, NotFreeError{Model: req.Model, Other: other})
+			return
+		}
+	}
+
 	if !s.admit(req) {
 		return
 	}
@@ -213,7 +223,8 @@ func (s *FIFO) supersede(target string, evict []string) bool {
 
 // OnCancel removes a request whose client has disconnected from the queue and
 // from every in-flight swap's waiters. If the request was the sole waiter of an
-// active swap, the swap goroutine is left to complete on its own — OnSwapDone
+// active swap, the swap goroutine is left to complete on its own (FreeToken
+// patch P8 round 2: unless the request was a load, see below) — OnSwapDone
 // will find no waiters and simply clean up. This prevents drainQueue from ever
 // starting a model load for a caller that is no longer there.
 func (s *FIFO) OnCancel(req HandlerReq) {
@@ -234,17 +245,42 @@ func (s *FIFO) OnCancel(req HandlerReq) {
 	}
 
 	// Prune from any active swap's waiters.
-	for _, sw := range s.active {
+	var abandoned []string
+	for id, sw := range s.active {
 		filtered := sw.waiters[:0]
+		pruned := false
 		for _, w := range sw.waiters {
 			if w.Respond == req.Respond {
-				removed = true
+				removed, pruned = true, true
 				s.release(w.Model)
 				continue
 			}
 			filtered = append(filtered, w)
 		}
 		sw.waiters = filtered
+		// FreeToken patch P8 (round 2): a load (P6) whose caller cancelled
+		// and that nobody else joined is aborted, not left to complete. A
+		// swap parked in the memory gate has no process state, so nothing
+		// (not /running, not an if-idle unload by a caller that only reads
+		// /running) would ever find it, and it booted its model whenever room
+		// appeared, beside whatever had been loaded meanwhile.
+		if pruned && req.AbortSwapIfLast && len(filtered) == 0 {
+			abandoned = append(abandoned, id)
+		}
+	}
+	if len(abandoned) > 0 {
+		sort.Strings(abandoned)
+		for _, id := range abandoned {
+			delete(s.active, id)
+			s.effects.CancelSwap(id)
+			s.logger.Infof("%s: load of %s cancelled by its only caller; swap aborted", s.name, id)
+		}
+		// A process the swap had already started is stopped (blocking, as
+		// supersede does), so nothing half-loaded is left behind.
+		for _, id := range abandoned {
+			s.effects.StopProcesses(s.effects.UnloadTimeout(id), []string{id})
+		}
+		defer s.drainQueue()
 	}
 
 	if removed {
@@ -340,6 +376,56 @@ func (s *FIFO) OnUnload(targets []string, timeout time.Duration) {
 	// Removing entries from active above may have unblocked queued requests
 	// that previously collided with the now-cancelled swaps.
 	s.drainQueue()
+}
+
+// FreeToken patch P7: Busy reports whether the scheduler still holds any
+// request for modelID: one being served (inFlight), or one admitted and
+// waiting in the queue or on a swap (reserved), or a swap to it in progress
+// (active). Runs on the run loop like every other FIFO method.
+//
+// FreeToken patch P8: a swap whose waiters have all gone (a P6 load whose
+// caller cancelled it) holds nobody, so it no longer counts: an if-idle unload
+// may stop it. Every live waiter is also counted in reserved.
+func (s *FIFO) Busy(modelID string) bool {
+	if s.inFlight[modelID] > 0 || s.reserved[modelID] > 0 {
+		return true
+	}
+	sw := s.active[modelID]
+	return sw != nil && len(sw.waiters) > 0
+}
+
+// FreeToken patch P8: otherActivity names a model other than target that is
+// running (starting, ready or stopping), being swapped in (including a swap
+// parked in the memory gate, which has no process state yet), queued, or
+// holding requests; "" when there is none. Sorted, so the answer is stable.
+func (s *FIFO) otherActivity(target string) string {
+	var others []string
+	for id := range s.effects.RunningModels() {
+		others = append(others, id)
+	}
+	for id := range s.active {
+		others = append(others, id)
+	}
+	for id, n := range s.reserved {
+		if n > 0 {
+			others = append(others, id)
+		}
+	}
+	for id, n := range s.inFlight {
+		if n > 0 {
+			others = append(others, id)
+		}
+	}
+	for _, q := range s.queued {
+		others = append(others, q.Model)
+	}
+	sort.Strings(others)
+	for _, id := range others {
+		if id != target {
+			return id
+		}
+	}
+	return ""
 }
 
 // OnShutdown grants err to every waiter still held by the scheduler.

@@ -124,6 +124,16 @@ type HandlerReq struct {
 	Admit      chan error
 	Respond    chan HandlerResp
 	PositionCh chan int
+	// FreeToken patch P8: IfFree refuses the request at admission (NotFreeError,
+	// nothing admitted, nothing cancelled) unless no other model is running,
+	// loading, waiting in the memory gate, queued or holding requests.
+	IfFree bool
+	// FreeToken patch P8 (round 2): AbortSwapIfLast makes a cancel of this
+	// request abort the swap it waits on when no other waiter is left: the
+	// swap goroutine is cancelled (a wait in the memory gate included) and its
+	// process stopped. Set by Load (P6); a chat request keeps upstream's
+	// behaviour (the swap completes on its own).
+	AbortSwapIfLast bool
 }
 
 // HandlerResp is the routing decision returned to a HandlerReq's caller: either

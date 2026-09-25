@@ -13,6 +13,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/perf"
+	"github.com/mostlygeek/llama-swap/internal/router" // FreeToken patch P7
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
@@ -156,6 +157,23 @@ func (s *Server) handleAPIUnloadModel(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.local.Handles(realName) {
 		swaputil.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
+		return
+	}
+	// FreeToken patch P7: ?ifIdle=1 stops the model only when no request is
+	// using it (409 code "busy" otherwise); see router/unload_idle.go for what
+	// is and isn't atomic.
+	if r.URL.Query().Get("ifIdle") == "1" {
+		idle, ok := s.local.(router.IdleUnloader)
+		if !ok {
+			swaputil.SendResponse(w, r, http.StatusNotImplemented, "this router cannot unload only if idle")
+			return
+		}
+		if err := idle.UnloadIfIdle(realName); err != nil {
+			swaputil.SendError(w, r, err)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
 		return
 	}
 	s.local.Unload(0, realName)

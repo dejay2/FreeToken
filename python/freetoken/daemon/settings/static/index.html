@@ -263,6 +263,35 @@
     .dot.ready { background: var(--good); } .dot.asleep { background: var(--accent); } .dot.starting, .dot.stopping { background: var(--warn); animation: pulse 1.2s infinite; } .dot.unknown { background: var(--bad); }
     @media (max-width: 640px) { #now.status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .models-table td.row-actions .actions { justify-content: flex-start; } .models-table thead { display: none; } .models-table td { display: block; border: 0; padding: 4px 0; } .models-table tr { display: block; border-bottom: 1px solid var(--line); padding: 8px 0; } .models-table td[data-label]::before { content: attr(data-label) ": "; color: var(--muted); font-size: .84rem; } }
 
+    /* Test tab (part 3) */
+    #test-view textarea { width: 100%; }
+    .pg-label { display: block; font-weight: 600; margin: 4px 0 6px; }
+    .pg-box { margin: 10px 0; }
+    .pg-box > summary { cursor: pointer; color: var(--muted); font-weight: 600; }
+    .pg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 14px; margin: 14px 0; }
+    .pg-setup { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; background: var(--panel-2); min-width: 0; }
+    .pg-setup label { display: block; margin: 8px 0; font-size: .9rem; }
+    .pg-setup fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+    .pg-setup fieldset:disabled { opacity: .55; }
+    .pg-options { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 6px 0 12px; font-size: .9rem; }
+    .pg-plan { border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 12px; padding: 12px 16px; margin: 12px 0; background: var(--panel-2); }
+    .pg-steps { list-style: none; padding: 0; margin: 8px 0; font-size: .9rem; font-variant-numeric: tabular-nums; }
+    .pg-steps li { padding: 3px 0; overflow-wrap: anywhere; }
+    .pg-steps li.running { font-weight: 600; }
+    .pg-steps li.failed { color: var(--bad); }
+    .pg-steps li.skipped { color: var(--muted); }
+    .pg-result { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; background: var(--panel); min-width: 0; }
+    .pg-result h3 { font-size: 1rem; margin: 0 0 8px; overflow-wrap: anywhere; }
+    .pg-speed { width: 100%; border-collapse: collapse; font-size: .88rem; font-variant-numeric: tabular-nums; margin-bottom: 10px; }
+    .pg-speed th { text-align: left; font-weight: 500; color: var(--muted); padding: 3px 8px 3px 0; white-space: nowrap; }
+    .pg-speed td { padding: 3px 0; overflow-wrap: anywhere; }
+    .pg-better { font-size: .72rem; background: var(--good-soft); color: var(--good); border-radius: 999px; padding: 1px 7px; margin-left: 4px; }
+    .pg-answer { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 480px; overflow: auto; border-top: 1px solid var(--line); padding-top: 8px; font-size: .92rem; }
+    .pg-thinking > summary { cursor: pointer; color: var(--muted); font-size: .85rem; }
+    .pg-history { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
+    .pg-history-row { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 8px 0; border-bottom: 1px solid var(--line); }
+    .pg-history-row > div:first-child { min-width: 0; flex: 1 1 240px; overflow-wrap: anywhere; }
+
     @media (max-width: 900px) { .top-right { align-items: flex-start; } }
     @media (max-width: 600px) { .dial { grid-template-columns: 1fr; } .amount { grid-template-columns: 1fr; } .amount .number-wrap { justify-content: flex-end; } }
   </style>
@@ -292,12 +321,68 @@
       <button class="tab-btn" role="tab" type="button" data-main="system" aria-selected="false">System</button>
       <button class="tab-btn" role="tab" type="button" data-main="ninfer" aria-selected="false">NInfer defaults</button>
       <button class="tab-btn" role="tab" type="button" data-main="freetoken" aria-selected="false">FreeToken defaults</button>
+      <button class="tab-btn" role="tab" type="button" data-main="test" aria-selected="false">Test</button>
     </nav>
 
     <section class="panel" id="models-view">
       <div id="registry-problem" hidden></div>
       <div class="panel-head" id="models-head"><div><h2>Models</h2><p class="small">Load or unload a model, or open its settings. Apps keep using the same address whichever model is loaded.</p></div><button class="button primary" id="add-model" type="button">Add a model</button></div>
       <div id="models-list"><p class="empty">Loading models…</p></div>
+    </section>
+
+    <section class="panel" id="test-view" hidden>
+      <div class="panel-head"><div><h2>Test</h2><p class="small">Ask one or two setups the same thing and compare speed and answers. Loading a model is timed on its own and never counted in the answer. Afterwards the model that was loaded goes back on its saved settings, and a model another app is using is never put away.</p></div></div>
+      <p class="error" id="pg-error" hidden></p>
+      <label class="pg-label" for="pg-prompt">What should the model answer?</label>
+      <textarea id="pg-prompt" rows="5" maxlength="20000" placeholder="For example: explain how a heat pump works in three short paragraphs."></textarea>
+      <details class="pg-box"><summary>System message (optional)</summary><textarea id="pg-system" rows="3" maxlength="8000"></textarea></details>
+      <div class="pg-grid">
+        <div class="pg-setup">
+          <h3>Setup A</h3>
+          <label>Model <select id="pg-a-model"></select></label>
+          <label>Settings <select id="pg-a-preset"></select></label>
+          <details class="pg-box"><summary>Answer settings</summary>
+            <label>Creativity (temperature) <input id="pg-a-temperature" type="number" min="0" max="2" step="0.1" placeholder="the model's own"></label>
+            <label>Top-p <input id="pg-a-top_p" type="number" min="0" max="1" step="0.05" placeholder="the model's own"></label>
+            <label>Top-k <input id="pg-a-top_k" type="number" min="0" max="200" step="1" placeholder="the model's own"></label>
+            <label>Longest answer (tokens) <input id="pg-a-maxTokens" type="number" min="1" max="4096" step="1" value="512"></label>
+          </details>
+        </div>
+        <div class="pg-setup">
+          <h3>Setup B</h3>
+          <label class="pg-toggle"><input type="checkbox" id="pg-b-on"> Compare with a second setup</label>
+          <fieldset id="pg-b-fields" disabled>
+            <label>Model <select id="pg-b-model"></select></label>
+            <label>Settings <select id="pg-b-preset"></select></label>
+            <details class="pg-box"><summary>Answer settings</summary>
+              <label>Creativity (temperature) <input id="pg-b-temperature" type="number" min="0" max="2" step="0.1" placeholder="the model's own"></label>
+              <label>Top-p <input id="pg-b-top_p" type="number" min="0" max="1" step="0.05" placeholder="the model's own"></label>
+              <label>Top-k <input id="pg-b-top_k" type="number" min="0" max="200" step="1" placeholder="the model's own"></label>
+              <label>Longest answer (tokens) <input id="pg-b-maxTokens" type="number" min="1" max="4096" step="1" value="512"></label>
+            </details>
+          </fieldset>
+        </div>
+      </div>
+      <div class="pg-options">
+        <label><input type="checkbox" id="pg-warmup" checked> Warm up after loading (not counted)</label>
+        <label><input type="checkbox" id="pg-putback" checked> Load what's loaded now again afterwards</label>
+      </div>
+      <div class="actions"><button class="button primary" id="pg-run" type="button">Run</button><button class="button danger" id="pg-stop" type="button" hidden>Stop</button></div>
+      <div class="pg-plan" id="pg-plan" hidden>
+        <h3>The plan</h3>
+        <ol id="pg-plan-steps"></ol>
+        <p class="small" id="pg-plan-total"></p>
+        <div id="pg-plan-warnings"></div>
+        <div class="actions"><button class="button primary" id="pg-start" type="button">Start</button><button class="button" id="pg-plan-cancel" type="button">Cancel</button></div>
+      </div>
+      <p class="small" id="pg-status" aria-live="polite"></p>
+      <ul class="pg-steps" id="pg-steps"></ul>
+      <div class="pg-grid" id="pg-results"></div>
+      <p class="small" id="pg-restore"></p>
+      <div class="pg-history">
+        <div class="panel-head"><h3>Earlier tests (this browser)</h3><div class="actions"><button class="button small" id="pg-export" type="button">Export all</button><button class="button small ghost" id="pg-clear" type="button">Clear history</button></div></div>
+        <div id="pg-history"></div>
+      </div>
     </section>
 
     <section id="editor" hidden>
@@ -610,6 +695,7 @@
   </div>
 
   <script src="/panel.js"></script>
+  <script src="/playground.js"></script>
   <script>
     'use strict';
     const state = { settings: {}, saved: {}, dials: [], groups: [], model: null, modelTimer: null, modelPath: null, busy: false, logTimer: null, tab: '', query: '', browser: null, lastNonAuto: {}, view: null };
