@@ -176,7 +176,7 @@
     .tab-utility { margin-bottom: 14px; }
     .status-strip { margin-bottom: 14px; }
     .status-strip .panel-head { margin-bottom: 10px; }
-    .model-card[hidden], #models-tools[hidden] { display: none; }
+    .model-card[hidden] { display: none; }
 
     /* Server tab */
     .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
@@ -477,148 +477,8 @@
 
     <div class="model-card" id="model-card" aria-live="polite"><p class="empty">Reading the model folder…</p></div>
 
-    <!-- models-tab -->
-    <details class="panel tab-utility" id="models-tools">
-      <summary>Model downloads and folders</summary>
-      <div class="panel-head"><div><h2>Download a model</h2><p class="small">Paste a Hugging Face link or name. Preview checks the files, memory and drive space before anything is copied.</p></div></div>
-      <div class="inline-form"><input id="model-repo" type="text" placeholder="Paste a Hugging Face link or name" aria-label="Hugging Face model link or name"><button class="button primary" id="model-preview" type="button">Preview</button></div>
-      <div id="model-preview-card" class="model-card" hidden aria-live="polite"></div>
-      <div id="model-download-actions" class="actions" hidden><button class="button primary" id="model-download" type="button">Download model</button></div>
-      <div id="model-download-progress" class="job" hidden aria-live="polite"><div style="flex:1;min-width:220px"><strong id="model-download-stage">Waiting</strong><div class="bar"><span id="model-download-bar" style="width:0%"></span></div><span class="small" id="model-download-detail"></span></div><button class="button small" id="model-download-cancel" type="button">Cancel</button></div>
-      <div class="panel-head"><div><h2>Model folders on this drive</h2><p class="small">Use one of these folders as the model folder on the Model &amp; chats tab.</p></div><button class="button small" id="model-folders-refresh" type="button">Refresh</button></div>
-      <div id="model-folders"><p class="empty">Looking for model folders…</p></div>
-    </details>
     <div id="settings" aria-live="polite"><p class="empty">Loading settings…</p></div>
-    <!-- /models-tab -->
     </section><!-- /editor -->
-    <script>
-      window.addEventListener('DOMContentLoaded', () => {
-        const modelDownload = { preview: null, jobId: null, timer: null };
-        const terminalDownloadStages = new Set(['done', 'failed', 'cancelled']);
-        const modelSize = (bytes) => bytes ? `${(Number(bytes) / 1024 ** 3).toFixed(Number(bytes) >= 10 * 1024 ** 3 ? 1 : 2)} GB` : '—';
-        function renderDownloadPreview(body) {
-          modelDownload.preview = body;
-          const fit = body.fit || {};
-          const tone = !fit.fits ? 'bad' : (fit.tight ? 'warn' : '');
-          const card = $('model-preview-card');
-          card.hidden = false;
-          card.className = `model-card ${tone}`;
-          const status = fit.fits ? (fit.tight ? 'Fits, but close' : 'Fits this PC') : 'Will not fit this PC';
-          const extra = !fit.fits ? ' It will not start on this PC.' : '';
-          const facts = [
-            `<span>Needs <b>${escapeHtml(modelSize(fit.needsBytes))}</b></span>`,
-            `<span>Estimated memory budget <b>${escapeHtml(modelSize(fit.budgetBytes))}</b></span>`,
-            `<span>Drive space needed <b>${escapeHtml(modelSize(body.downloadBytes))}</b></span>`,
-            `<span>Drive space free <b>${escapeHtml(modelSize(body.diskFreeBytes))}</b></span>`,
-          ];
-          if (fit.expertBytes) facts.push(`<span>Expert pieces <b>${escapeHtml(modelSize(fit.expertBytes))}</b></span>`);
-          card.innerHTML = `<div class="model-head"><h2>${escapeHtml(body.name || 'Model')}</h2><span class="small">${escapeHtml(body.architecture || body.modelType || '')}</span></div><div class="badge-line"><span class="chip ${fit.fits ? (fit.tight ? 'cost' : 'good') : 'bad'}">${escapeHtml(status)}</span>${body.exists ? '<span class="chip">Already on this drive</span>' : ''}${body.diskFits === false ? '<span class="chip bad">Not enough drive space</span>' : ''}</div><div class="facts">${facts.join('')}</div><p class="hint ${fit.fits ? (fit.tight ? 'warn' : '') : 'warn'}">${escapeHtml((fit.verdict || 'Memory fit was not returned.') + extra)}</p>`;
-          $('model-download-actions').hidden = false;
-          $('model-download').disabled = !!body.exists || body.diskFits !== true;
-        }
-        async function previewModelDownload() {
-          const repo = $('model-repo').value.trim();
-          if (!repo) { setNotice('Paste a Hugging Face link or name first.', 'warn'); $('model-repo').focus(); return; }
-          $('model-preview').disabled = true;
-          $('model-preview-card').hidden = false;
-          $('model-preview-card').className = 'model-card';
-          $('model-preview-card').innerHTML = '<p class="empty">Checking the model files…</p>';
-          try {
-            const { response, body } = await json(`/api/downloads/preview?repo=${encodeURIComponent(repo)}`);
-            if (!response.ok) throw new Error(body.detail || 'Could not preview that model.');
-            renderDownloadPreview(body);
-          } catch (error) {
-            $('model-preview-card').className = 'model-card bad';
-            $('model-preview-card').innerHTML = `<p class="hint warn">${escapeHtml(error.message || 'Could not preview that model.')}</p>`;
-            $('model-download-actions').hidden = true;
-          } finally { $('model-preview').disabled = false; }
-        }
-        function renderDownloadProgress(body) {
-          const stage = body.stage || 'queued';
-          const percent = Math.max(0, Math.min(100, Number(body.percent) || 0));
-          $('model-download-progress').hidden = false;
-          $('model-download-stage').textContent = stage.replace(/_/g, ' ');
-          $('model-download-detail').textContent = `${percent.toFixed(1)}% · ${modelSize(body.receivedBytes)} of ${modelSize(body.totalBytes)}${body.error ? ` · ${body.error}` : ''}`;
-          $('model-download-bar').style.width = `${percent}%`;
-          $('model-download-cancel').disabled = terminalDownloadStages.has(stage);
-          if (stage === 'done') {
-            if (modelDownload.preview) { modelDownload.preview.exists = true; renderDownloadPreview(modelDownload.preview); }
-            setNotice('Model download finished. It is ready to choose on the Settings tab.', 'good');
-            loadModelFolders();
-          } else if (stage === 'failed') {
-            if (modelDownload.preview) renderDownloadPreview(modelDownload.preview);
-            setNotice(body.error || 'The model download failed.', 'bad');
-          } else if (stage === 'cancelled') {
-            if (modelDownload.preview) renderDownloadPreview(modelDownload.preview);
-            setNotice('Download cancelled. The partial files were kept so a retry can continue.', 'warn');
-          }
-        }
-        async function pollModelDownload() {
-          if (!modelDownload.jobId) return;
-          try {
-            const { response, body } = await json(`/api/downloads/${encodeURIComponent(modelDownload.jobId)}`);
-            if (!response.ok) throw new Error(body.detail || 'Could not read download progress.');
-            renderDownloadProgress(body);
-            if (terminalDownloadStages.has(body.stage)) { modelDownload.jobId = null; clearTimeout(modelDownload.timer); return; }
-            modelDownload.timer = setTimeout(pollModelDownload, 2000);
-          } catch (error) {
-            modelDownload.jobId = null;
-            clearTimeout(modelDownload.timer);
-            setNotice(error.message || 'Could not read download progress.', 'bad');
-          }
-        }
-        async function startModelDownload() {
-          const preview = modelDownload.preview;
-          if (!preview || preview.exists || preview.diskFits !== true) return;
-          $('model-download').disabled = true;
-          try {
-            const { response, body } = await json('/api/downloads', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repo: $('model-repo').value.trim() }) });
-            if (!response.ok) throw new Error(body.detail || 'Could not start the download.');
-            modelDownload.jobId = body.id;
-            renderDownloadProgress({ stage: 'queued', receivedBytes: 0, totalBytes: preview.downloadBytes, percent: 0, files: [] });
-            pollModelDownload();
-          } catch (error) {
-            $('model-download').disabled = false;
-            setNotice(error.message || 'Could not start the download.', 'bad');
-          }
-        }
-        async function cancelModelDownload() {
-          if (!modelDownload.jobId) return;
-          const { response, body } = await json(`/api/downloads/${encodeURIComponent(modelDownload.jobId)}/cancel`, { method: 'POST' });
-          if (!response.ok) { setNotice(body.detail || 'Could not cancel the download.', 'bad'); return; }
-          renderDownloadProgress(body);
-          setNotice('Cancel requested. The current file will finish first.', 'warn');
-        }
-        function renderModelFolders(items) {
-          $('model-folders').innerHTML = items.length ? items.map((model) => `<article class="profile"><div class="profile-head"><div><h3>${escapeHtml(model.name || 'Model')}</h3><p class="small">${escapeHtml(model.architecture || model.error || model.path || '')}</p></div><button class="button small" type="button" data-use-model="${escapeHtml(model.path || '')}">Use as model folder</button></div><div class="values"><span>${model.found ? 'Model files found' : 'Folder not fully read'}</span>${model.fit?.verdict ? `<span>${escapeHtml(model.fit.verdict)}</span>` : ''}</div></article>`).join('') : '<p class="empty">No model folders found yet.</p>';
-          document.querySelectorAll('[data-use-model]').forEach((button) => button.addEventListener('click', () => useModelFolder(button.dataset.useModel)));
-        }
-        async function loadModelFolders() {
-          const { response, body } = await json('/api/models');
-          if (response.ok) renderModelFolders(Array.isArray(body.models) ? body.models : []);
-        }
-        function useModelFolder(path) {
-          const dial = state.dials.find((dial) => dial.browse === 'model');
-          if (!dial) { setNotice('The model folder setting is not available yet.', 'bad'); return; }
-          const input = document.querySelector(`[data-dial="${CSS.escape(dial.name)}"]`);
-          if (!input) { setNotice('The model folder setting is not available yet.', 'bad'); return; }
-          input.value = path;
-          state.settings[dial.name] = path;
-          markChanged(dial.name);
-          showTab('model-chats');
-          refreshModel(path);
-          setNotice('Model folder selected. Save the settings to keep it.', 'good');
-        }
-        $('model-preview').addEventListener('click', previewModelDownload);
-        $('model-repo').addEventListener('keydown', (event) => { if (event.key === 'Enter') previewModelDownload(); });
-        $('model-download').addEventListener('click', startModelDownload);
-        $('model-download-cancel').addEventListener('click', cancelModelDownload);
-        $('model-folders-refresh').addEventListener('click', loadModelFolders);
-        loadModelFolders();
-        let tab = ''; try { tab = localStorage.getItem('ft-tab') || ''; } catch (_) {}
-        if (tab === 'model-chats') showTab('model-chats');
-      });
-    </script>
   </main>
 
   <p id="notice" class="notice hidden" aria-live="polite"></p>
@@ -728,8 +588,6 @@
       const view = state.view || {};
       const modelCard = $('model-card');
       if (modelCard) modelCard.hidden = !(view.kind === 'model' && state.model && state.tab === 'this-model');
-      const modelTools = $('models-tools');
-      if (modelTools) modelTools.hidden = true; // replaced by the Add a model wizard on the Models tab (Stage B)
       const status = $('status-strip');
       const showStatus = view.kind === 'engine' && view.engine === 'freetoken' && state.tab === 'server-advanced';
       if (status && showStatus && status.hidden) loadStatus(); // fill it now, not on the next 3 s tick
@@ -893,7 +751,6 @@
       state.settings[control.dataset.dial] = value;
       if (control.type === 'checkbox') control.nextElementSibling.textContent = control.checked ? 'On' : 'Off';
       if (control.type === 'number' && dial && dial.slider) { const slider = document.querySelector(`[data-slider="${CSS.escape(dial.name)}"]`); if (slider) slider.value = control.value; }
-      if (dial && dial.browse === 'model') scheduleModelRefresh(value);
       markChanged(control.dataset.dial);
     }
 
@@ -938,7 +795,7 @@
       $('save-badge').hidden = changed.length === 0;
       $('save-badge').textContent = String(changed.length);
     }
-    window.addEventListener('beforeunload', (event) => { if (changedNames().length) { event.preventDefault(); event.returnValue = ''; } });
+    window.addEventListener('beforeunload', (event) => { if (changedNames().length || (typeof panelExtraDirty === 'function' && panelExtraDirty())) { event.preventDefault(); event.returnValue = ''; } });
 
     function showFieldErrors(errors) {
       const fields = Array.from(document.querySelectorAll('[data-error]'));
@@ -978,40 +835,9 @@
       card.innerHTML = `<div class="model-head"><h2>${escapeHtml(model.name || 'Model')}</h2><span class="small">${escapeHtml(model.architecture || model.modelType || '')}</span></div><div class="badge-line">${badges}</div><div class="facts">${facts.join('')}</div><p class="small">The limits, slider tops and memory numbers on this page are sized for this model. Change the model folder and they follow it.</p>`;
     }
 
-    // The page re-shapes itself for the folder typed or browsed into the model dial before it is
-    // saved, so the limits and explanations already match the model that will be started.
-    async function refreshModel(path) {
-      const target = String(path ?? '');
-      if (target === state.modelPath) return;
-      state.modelPath = target;
-      const { response, body } = await json(`/api/settings?model=${encodeURIComponent(target)}`);
-      if (!response.ok || state.modelPath !== target) return;
-      state.model = body.model || null;
-      state.dials = Array.isArray(body.dials) ? body.dials : state.dials;
-      state.groups = Array.isArray(body.groups) ? body.groups : state.groups;
-      // Launcher text uses a model-specific spelling for layer counts: Qwen's "auto:3" means
-      // three busiest layers, while another model's "3" means three evenly spread layers.
-      const respelled = [];
-      state.dials.forEach((dial) => {
-        if (!dial.storedAs || !(dial.name in state.settings)) return;
-        const count = storedCount(state.settings[dial.name]);
-        const next = toStored(dial, count);
-        if (next !== state.settings[dial.name]) {
-          state.settings[dial.name] = next;
-          respelled.push(dial.name);
-        }
-      });
-      renderModelCard();
-      renderSettings();
-      respelled.forEach((name) => markChanged(name));
-      // Values the new model cannot take are flagged straight away, before Save.
-      const errors = [];
-      state.dials.forEach((dial) => { if (dial.max == null) return; const shown = toShown(dial, state.settings[dial.name]); if (shown !== '' && !isAuto(dial, state.settings[dial.name]) && Number(shown) * (dial.displayFactor || 1) > Number(dial.max)) errors.push({ field: dial.name, message: `Above what this model allows (${fmt(toShown(dial, dial.max))}${dial.displayUnit || dial.unit ? ` ${dial.displayUnit || dial.unit}` : ''}).` }); });
-      showFieldErrors(errors);
-    }
-    function scheduleModelRefresh(path) { clearTimeout(state.modelTimer); state.modelTimer = setTimeout(() => refreshModel(path), 500); }
 
-    function setBusy(value) { state.busy = value; document.querySelectorAll('#editor .button, #models-view .button').forEach((button) => { button.disabled = value; }); refreshDirty(); }
+    // Rename/Delete preset stay off without a preset (panel.js presetButtons), busy or not.
+    function setBusy(value) { state.busy = value; document.querySelectorAll('#editor .button, #models-view .button').forEach((button) => { button.disabled = value; }); if (typeof presetButtons === 'function') presetButtons(); refreshDirty(); }
 
     /* ---------- status + logs ---------- */
     const fmtMb = (mb) => mb == null ? '—' : `${(Number(mb) / 1024).toFixed(1)} GB`;
@@ -1086,7 +912,6 @@
       if (onPick) { closeBrowser(); onPick(path); return; }
       const input = document.querySelector(`[data-dial="${CSS.escape(name)}"]`);
       input.value = path; state.settings[name] = path; markChanged(name);
-      const dial = dialByName(name); if (dial && dial.browse === 'model') refreshModel(path);
       closeBrowser();
     }
     $('browser-close').addEventListener('click', closeBrowser);

@@ -14,6 +14,7 @@ import copy
 import datetime as _dt
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
@@ -27,6 +28,9 @@ from .dials import canonical_value, validate_settings
 
 REGISTRY_VERSION = 1
 BACKUPS_KEPT = 20
+# A damaged file set aside by a restore (registry.json.corrupt-<time>). Kept outside the backup
+# list, and before this nothing ever removed them (stage A deferred minor): the newest 5 stay.
+CORRUPT_KEPT = 5
 ENGINES = ("ninfer", "freetoken")
 ENGINE_LABELS = {"ninfer": "NInfer", "freetoken": "FreeToken"}
 RUNTIMES = {"ninfer": ninfer_dials.RUNTIMES, "freetoken": ("freetoken",)}
@@ -39,6 +43,7 @@ SCHEMA_PATH = Path(__file__).with_name("registry.schema.json")
 SYSTEM_DEFAULTS = {"floorGB": 6, "waitSeconds": 300, "latestWins": True, "defaultIdleMinutes": 0,
                    "helperURL": "http://127.0.0.1:2031"}
 ACTIVE = object()  # "the model's active preset"
+logger = logging.getLogger("freetoken.daemon.settings.registry")
 
 
 class RegistryError(RuntimeError):
@@ -149,9 +154,18 @@ def canonical_engine_settings(engine: str, settings: Mapping[str, Any]) -> dict[
     errors = validate_engine_settings(engine, settings, cross=False)
     if errors:
         raise RegistryValidationError(errors)
-    if engine == "ninfer":
-        return ninfer_dials.canonical_settings(settings)
-    return {name: canonical_value(FREETOKEN_DIALS[name], value) for name, value in settings.items()}
+    try:
+        if engine == "ninfer":
+            return ninfer_dials.canonical_settings(settings)
+        return {name: canonical_value(FREETOKEN_DIALS[name], value) for name, value in settings.items()}
+    except (TypeError, ValueError, OverflowError) as exc:
+        # Validation passed, so this is a value the checks let through by mistake. Python's own
+        # words ("invalid literal for int()...") used to reach the page; they go to the log and
+        # the page gets a plain line (stage A deferred minor).
+        logger.warning("a %s setting passed the checks but could not be stored: %s: %s",
+                       engine, type(exc).__name__, exc)
+        raise RegistryValidationError([{"field": "settings", "message":
+                                        "One of these values could not be stored. Check the numbers and try again."}]) from None
 
 
 def validate_engine_settings(engine: str, settings: Any, runtime: str | None = None, cross: bool = True) -> list[dict[str, str]]:
@@ -350,7 +364,10 @@ class RegistryStore:
         try:
             doc = json.loads(data.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
-            raise RegistryCorrupt(f"The model list is not valid JSON ({exc}).", self.backups()) from exc
+            # The parser's own text (line, column, character) goes to the log, not the page.
+            logger.warning("%s is not valid JSON: %s", self.path, exc)
+            raise RegistryCorrupt("The model list is not valid JSON: the file is damaged or was cut short.",
+                                  self.backups()) from exc
         errors = validate_registry(doc)
         if errors:
             raise RegistryCorrupt(f"The model list has problems: {summarize_errors(errors)}", self.backups())
@@ -409,24 +426,49 @@ class RegistryStore:
 
     def _backup(self, data: bytes, kind: str = "bak") -> None:
         stamp = self._now().strftime("%Y%m%d-%H%M%S-%f")
-        target = self.path.with_name(f"{self.path.name}.{kind}-{stamp}")
-        target.write_bytes(data)
-        os.chmod(target, 0o600)
+        # Written whole or not at all: a half-written backup would be offered by the page.
+        write_atomic(self.path.with_name(f"{self.path.name}.{kind}-{stamp}"), data)
 
     def _atomic_write(self, data: bytes) -> None:
-        temporary = self.path.with_name(self.path.name + ".tmp")
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        write_atomic(self.path, data)
+
+    def corrupt_copies(self) -> list[str]:
+        prefix = self.path.name + ".corrupt-"
         try:
-            os.write(fd, data)
+            names = [entry.name for entry in self.path.parent.iterdir() if entry.name.startswith(prefix)]
+        except FileNotFoundError:
+            return []
+        return sorted(names, reverse=True)
+
+    def _prune(self) -> None:
+        for name in self.backups()[BACKUPS_KEPT:] + self.corrupt_copies()[CORRUPT_KEPT:]:
+            (self.path.parent / name).unlink(missing_ok=True)
+
+
+def write_atomic(path: Path, data: bytes, mode: int = 0o600) -> None:
+    """Write data to path through a temporary file beside it: every byte written (os.write may
+    write less than asked), fsync, then one os.replace. A failure part-way removes the
+    temporary file and leaves path as it was (stage A deferred minor: a full disk used to leave
+    a partial .tmp behind)."""
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
             os.fsync(fd)
         finally:
             os.close(fd)
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, self.path)
-
-    def _prune(self) -> None:
-        for name in self.backups()[BACKUPS_KEPT:]:
-            (self.path.parent / name).unlink(missing_ok=True)
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
 
 
 __all__ = [name for name in dir() if not name.startswith("_")]

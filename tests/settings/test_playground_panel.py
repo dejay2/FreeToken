@@ -80,6 +80,8 @@ def test_wait_for_switcher(env):
     seed(env, with_presets())
     assert env.service.wait_for_switcher(env.cfg.read_text()) is True
     env.service.restart_wait_s = 0
+    # The switcher still on an older file than both the text and the file on disk: give up.
+    env.switcher.config_hash = lambda: "an older file"
     assert env.service.wait_for_switcher("something else") is False
 
 
@@ -167,6 +169,7 @@ def test_wait_for_switcher_gives_up_on_stop(env):
     stop.set()
     import time
     env.service.restart_wait_s = 2.0
+    env.switcher.config_hash = lambda: "an older file"
     started = time.monotonic()
     assert env.service.wait_for_switcher("something else", stop=stop) is False
     assert time.monotonic() - started < 1.0  # not the full wait

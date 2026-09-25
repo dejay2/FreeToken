@@ -91,7 +91,7 @@ def env(tmp_path, monkeypatch):
     estimates = FakeEstimates()
     service = PanelService(
         store=store, writer=writer, switcher=switcher, profiles=profiles,
-        boot_file=lambda: BootFile(boot), default_boot=lambda: boot, estimate_service=estimates,
+        boot_file=lambda: BootFile(boot), estimate_service=estimates,
         card_probe=lambda: {"totalBytes": 32 * GIB, "usedBytes": 2 * GIB},
         windows_free_probe=lambda: 40 * GIB, artifact_size=lambda path: 19_782_132_224,
         spawn=lambda fn, *args: spawned.append((fn, args)), sleep=lambda _: None,

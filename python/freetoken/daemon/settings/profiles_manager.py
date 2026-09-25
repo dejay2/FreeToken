@@ -249,18 +249,25 @@ class ProfilesManager:
         existing = next((item for item in profiles if item["id"] == profile_id), None)
         if existing is not None and create_only:
             return {**self._profile_payload(existing), "changed": False}
+        # The description was lost two ways (stage A deferred minor): a push with the same
+        # settings and name but a new description never reached the file, and a push with no
+        # description (the route's default "") blanked the one kept. An empty one keeps the old.
+        kept = (existing or {}).get("description") or ""
         item = {
             "id": profile_id,
             "name": name.strip(),
-            "description": description,
+            "description": description if isinstance(description, str) and description.strip() else kept,
             "isPreset": False,
             "label": "profile",
             "kind": "profile",
             "settings": dict(settings),
             "bootFile": self._relative_profile_file(profile_id),
         }
+        # "changed" tells the adapter whether a running server still matches, so the
+        # description (words only) writes the file without counting as a change.
         changed = existing is None or existing["settings"] != item["settings"] or existing["name"] != item["name"]
-        if changed or not self.profile_path(profile_id).is_file():
+        described = existing is not None and (existing.get("description") or "") != item["description"]
+        if changed or described or not self.profile_path(profile_id).is_file():
             profiles = [entry for entry in profiles if entry["id"] != profile_id] + [item]
             self._write_profile_file(item)
             self._write_custom(profiles)

@@ -84,6 +84,10 @@ STAGING_PREFIX = ".incoming-"
 STAGING_MESSAGE = ("That is inside a download's staging folder, so it may be half-written. Wait for the "
                    "download to finish, then add the finished file or folder.")
 NOT_FOUND_MESSAGE = "That model is no longer in the list. Reload the page."
+# A 404 from any panel route (a model id, a preset, a settings page or a download that is gone)
+# says so in plain words; it used to be {"detail": "not found: <key>"} (stage A deferred minor).
+MISSING_MESSAGE = "That model or preset is no longer in the list. Reload the page."
+MISSING_DOWNLOAD_MESSAGE = "The settings page no longer knows that download. It may have restarted; start it again."
 IMPORT_UNKNOWN_MESSAGE = ("Can't tell whether a model is loaded right now, so the import would risk "
                           "restarting it. Try again in a moment.")
 REWRITE_UNKNOWN_MESSAGE = ("Can't tell whether a model is loaded right now, so this could restart it. "
@@ -94,6 +98,13 @@ STALE_GRACE_S = 10.0
 # A failed restart stays on the Right-now strip this long, or until the next save/load/unload.
 RESTART_SHOWN_S = 600.0
 RESTART_STALE_MESSAGE = "The switcher didn't pick up the new settings; the old ones are still in use. Check the switcher log."
+# The switcher file was replaced by something other than the panel (an old copy put back, a hand
+# edit) after the restart's write: the switcher is on that file, not the new settings (PR #20 review).
+RESTART_SUPERSEDED_MESSAGE = ("The switcher file was changed outside the control panel before the restart finished, "
+                              "so the new settings are not in use and the model was not loaded again. "
+                              "Open its settings and save again.")
+ARTIFACT_CHANGED_MESSAGE = ("That model's files changed since its settings were opened (it may have been removed and "
+                            "added again), so nothing was removed. Reload the page and try again.")
 TEST_RUNNING_MESSAGE = "A test is running on the Test tab. Wait for it to finish, or stop it there."
 RESTART_PENDING_MESSAGE = ("The control panel is restarting a model with its new settings. "
                            "Try again when it has finished.")
@@ -187,6 +198,10 @@ def _engine_dials(engine: str, values: Mapping[str, Any], runtime: str | None, m
     dials = [dial.as_dict(values.get(dial.name, dial.default), model_info) for dial in DIALS if dial.name != "ModelPath"]
     groups = [{"name": name, "plain": info.get("plain", name), "info": info.get("info", "")} for name, info in GROUP_INFO.items()]
     return dials, groups
+
+
+def _and_list(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
 
 
 def _unknown_save_message(names: list[str]) -> str:
@@ -320,13 +335,13 @@ def _fit_to_model(doc: Mapping[str, Any], entry: Mapping[str, Any]) -> tuple[dic
 
 class PanelService:
     def __init__(self, *, store, writer, switcher, profiles, boot_file: Callable[[], BootFile],
-                 default_boot: Callable[[], Path], estimate_service, card_probe=None, windows_free_probe=None,
+                 estimate_service, card_probe=None, windows_free_probe=None,
                  holds_path=None, artifact_size=None, spawn=None, clock=time.monotonic, sleep=time.sleep,
                  restart_wait_s: float = 30.0, downloads=None, pi=None, add_roots=None, profile_deleted=None,
                  freetoken_state: Callable[[], Any] | None = None,
                  freetoken_control: Callable[[str], dict[str, Any]] | None = None) -> None:
         self.store, self.writer, self.switcher, self.profiles = store, writer, switcher, profiles
-        self._boot_file, self._default_boot, self.estimate_service = boot_file, default_boot, estimate_service
+        self._boot_file, self.estimate_service = boot_file, estimate_service
         self._card_probe = card_probe or _default_card_probe
         self._windows_free = windows_free_probe or _default_windows_free
         self.holds_path = Path(holds_path) if holds_path else store.path.with_name("held-models.json")
@@ -353,9 +368,17 @@ class PanelService:
         self._pi_lock = threading.Lock()
         self._stop = threading.Event()
         self._watcher: threading.Thread | None = None
-        self.last_restart: dict[str, Any] | None = None
-        self._last_restart_at: float | None = None
+        # The last failed-or-done restart and when it ended, as ONE value: now() reads it without
+        # the panel lock (a save holds that lock through an unload of up to 240 s, and the
+        # Right-now strip must not wait for it), and two separate fields could be read half
+        # old, half new (stage A deferred minor).
+        self._restart: tuple[dict[str, Any], float] | None = None
         self._last_write: float | None = None
+        # Every switcher file the panel wrote, by hash, with a generation that counts up per
+        # write: a restart accepts the switcher on a LATER panel write, never on an older text
+        # copied back by hand (PR #20 review: both hashes old then read as "applied").
+        self._write_gen = 0
+        self._written: dict[str, int] = {}
         # Test tab (part 3). The overlay is what the switcher and FreeToken's adapter see during
         # a test: the test model on one preset alone. It lives in memory and is never written to
         # the registry; the marker lets a restarted helper find a model left on test settings.
@@ -398,11 +421,18 @@ class PanelService:
         holds = self._read_holds()
         return holds if loaded is None or down else {m: t for m, t in holds.items() if m in loaded}
 
-    def _mark_written(self) -> None:
+    def _mark_written(self, text: str) -> None:
         self._last_write = self._clock()
+        self._write_gen += 1
+        self._written[config_sha256(text)] = self._write_gen
 
     def _clear_restart(self) -> None:
-        self.last_restart, self._last_restart_at = None, None
+        self._restart = None
+
+    @property
+    def last_restart(self) -> dict[str, Any] | None:
+        restart = self._restart
+        return None if restart is None else restart[0]
 
     @staticmethod
     def _named(doc: Mapping[str, Any], ids: list[str]) -> list[dict[str, str]]:
@@ -480,7 +510,12 @@ class PanelService:
             proposed = canonicalize(mutate(copy.deepcopy(current)))
             errors = validate_registry(proposed) or self._model_limit_errors(proposed)
             if errors:
-                raise RegistryValidationError(errors)
+                # "where" is a model id; the page shows it for a row it cannot place beside a
+                # dial (another model's limit), so give the model's name (stage A deferred minor).
+                names = {m.get("id"): m.get("name") for m in proposed.get("models") or [] if isinstance(m, dict)}
+                raise RegistryValidationError([
+                    {**error, "where": names.get(error["where"]) or error["where"]} if error.get("where") else error
+                    for error in errors])
             old_text = self.writer.current_text() or ""
             known, down = self._ask()
             # Unknown switcher state (fix rounds 1-2): keep every hold as it is (the watcher
@@ -491,7 +526,18 @@ class PanelService:
             # FreeToken profile-only change, which the adapter applies at the next load) go through.
             loaded = known or []
             holds = self._live_holds(known, down)
-            before = extract_model_blocks(render_config(current, {}))
+            # current as stored may not be canonical (a restored backup, a hand edit). The
+            # entries compared are what the switcher actually gets: current rendered as stored
+            # against proposed rendered. Canonicalising both sides hid a real change
+            # ("max-concurrency": "04" renders --max-concurrency 04, canonical 4), so llama-swap
+            # restarted the model with no question asked (PR #20 review). The profile comparison
+            # in _affected stays canonical: freetoken.sh pushes canonical settings, so a spelling
+            # like GpuOwnedLayers "auto" vs "auto:6" changes nothing that runs (stage A minor).
+            stored = canonicalize(current)
+            try:
+                before = extract_model_blocks(render_config(current, {}))
+            except Exception:  # noqa: BLE001 - a stored value the renderer cannot take as written
+                before = extract_model_blocks(render_config(stored, {}))
             after = extract_model_blocks(render_config(proposed, {}))
             # A removed model's hold goes with it (Stage B): its entry is no longer in the list.
             holds = {model_id: block for model_id, block in holds.items() if model_id in after}
@@ -502,7 +548,7 @@ class PanelService:
                 if moved:
                     raise PanelError(503, "switcher_unknown", _unknown_save_message(
                         [row["name"] for row in self._named(proposed, moved)]))
-            affected = self._affected(current, proposed, loaded, before, after)
+            affected = self._affected(stored, proposed, loaded, before, after)
             if affected and when_loaded is None:
                 raise ChooseRestart(self._named(proposed, affected))
             file_blocks = extract_model_blocks(old_text)
@@ -521,6 +567,10 @@ class PanelService:
             new_text = render_config(proposed, holds)
             staged = self.writer.check(new_text) if new_text != old_text else None
             try:
+                if staged is not None:
+                    # Before anything changes (PR #20 review): a copy that cannot be made used
+                    # to fail inside commit(), after the registry was already saved.
+                    self.writer.backup_hand_written()
                 if before_commit is not None:
                     before_commit(known)
                 self._unload_for_restart(proposed, restarting)
@@ -532,7 +582,7 @@ class PanelService:
             self._write_holds(holds)
             if staged is not None:
                 self.writer.commit(staged)
-                self._mark_written()
+                self._mark_written(new_text)
             self._clear_restart()
             self._ensure_profiles(proposed)
             if restarting:
@@ -566,11 +616,28 @@ class PanelService:
     def _unload_for_restart(self, doc: Mapping[str, Any], model_ids: list[str]) -> None:
         """"Restart now" puts each model away first. If the switcher does not confirm, nothing
         is saved: before this, the save went on and the page said "restarting" while the old
-        model kept running on the old settings (final review item 4)."""
+        model kept running on the old settings (final review item 4).
+
+        An exception from the unload (a dropped connection, a half answer) is the same "not
+        confirmed", in plain words, not a bare 500 (stage A deferred minor). With several
+        models, the ones already put away are named: nothing was saved, but they are no
+        longer loaded."""
+        done: list[str] = []
         for row in self._named(doc, model_ids):
-            if not self.switcher.unload(row["id"]):
-                raise PanelError(503, "restart_failed", f"Couldn't put {row['name']} away to restart it, "
-                                                        "so nothing was saved. Try again in a moment.")
+            try:
+                ok = self.switcher.unload(row["id"])
+            except Exception:  # noqa: BLE001 - reported below in plain words; detail to the log
+                logger.exception("unloading %s before a save failed", row["id"])
+                ok = False
+            if not ok:
+                message = f"Couldn't put {row['name']} away to restart it, so nothing was saved."
+                if done:
+                    names = _and_list(done)
+                    message += (f" {names} {'was' if len(done) == 1 else 'were'} already put away and "
+                                f"{'is' if len(done) == 1 else 'are'} not loaded now; load "
+                                f"{'it' if len(done) == 1 else 'them'} again from the Models list.")
+                raise PanelError(503, "restart_failed", message + " Try again in a moment.")
+            done.append(row["name"])
 
     def _plan_rewrite(self, doc: Mapping[str, Any], state: tuple[list[str] | None, bool] | None = None
                       ) -> tuple[str, dict[str, str]]:
@@ -613,13 +680,12 @@ class PanelService:
     def _rewrite(self, doc: Mapping[str, Any], state: tuple[list[str] | None, bool] | None = None) -> dict[str, str]:
         text, holds = self._plan_rewrite(doc, state)
         if self.writer.write(text):
-            self._mark_written()
+            self._mark_written(text)
         self._write_holds(holds)
         return holds
 
     def _restart_done(self, model_ids: list[str], ok: bool, message: str) -> None:
-        self.last_restart = {"models": model_ids, "ok": ok, "at": _now_iso(), "message": message}
-        self._last_restart_at = self._clock()
+        self._restart = ({"models": model_ids, "ok": ok, "at": _now_iso(), "message": message}, self._clock())
 
     def _spawn_reload(self, model_ids: list[str], text: str) -> None:
         """Start _reload_after_write, counted as a pending restart until it ends (every path)."""
@@ -644,7 +710,8 @@ class PanelService:
         # --check-config misses, its hash never changes; loading then would start the model on
         # the old settings, so give up with a plain message instead.
         if not self.wait_for_switcher(text):
-            self._restart_done(model_ids, False, RESTART_STALE_MESSAGE)
+            message = RESTART_SUPERSEDED_MESSAGE if self._superseded(text) else RESTART_STALE_MESSAGE
+            self._restart_done(model_ids, False, message)
             return
         for model_id in model_ids:
             try:
@@ -704,6 +771,7 @@ class PanelService:
             new_text = render_config(registry, {})
             staged = self.writer.check(new_text)
             try:
+                self.writer.backup_hand_written()
                 self._unload_for_restart(registry, loaded)
                 revision = self.store.save(registry, expected_revision=None)
             except BaseException:
@@ -711,7 +779,7 @@ class PanelService:
                 raise
             self.writer.backup_before_registry()
             self.writer.commit(staged)
-            self._mark_written()
+            self._mark_written(new_text)
             self._clear_restart()
             self._write_holds({})
             self._ensure_profiles(registry)
@@ -729,6 +797,8 @@ class PanelService:
             text, holds = self._plan_rewrite(doc)
             staged = self.writer.check(text) if text != self.writer.current_text() else None
             try:
+                if staged is not None:
+                    self.writer.backup_hand_written()
                 revision = self.store.restore(name)
             except BaseException:
                 if staged is not None:
@@ -736,7 +806,7 @@ class PanelService:
                 raise
             if staged is not None:
                 self.writer.commit(staged)
-                self._mark_written()
+                self._mark_written(text)
             self._write_holds(holds)
             return {"status": "restored", "revision": revision, "held": sorted(holds)}
 
@@ -1005,17 +1075,21 @@ class PanelService:
             names, floor, engines = {}, None, {}
         rows = [{"id": m, "name": names.get(m, m), "state": s} for m, s in sorted((running or {}).items())]
         self._mark_sleep(rows, engines)
-        last = self.last_restart
-        if last is not None and self._last_restart_at is not None and self._clock() - self._last_restart_at >= RESTART_SHOWN_S:
-            last = None
+        # One consistent look at the panel's own state (stage A deferred minor): the restart
+        # pair is one value, and the Test-tab fields are copied together. Not under self._lock,
+        # which a save holds through a 240 s unload: the strip must keep answering meanwhile.
+        restart, test_running, overlay_now = self._restart, self.test_running, self.test_settings
+        last = None
+        if restart is not None and self._clock() - restart[1] < RESTART_SHOWN_S:
+            last = restart[0]
         # Test tab: a leftover (model still on test settings) is shown until it unloads.
         loaded_now = {row["id"] for row in rows if row["state"] in LOADED_STATES}
         leftover = self.test_leftover
         if leftover is not None and up and leftover["model"] not in loaded_now:
             self.test_leftover = leftover = None
         test = None
-        if self.test_running:
-            overlay = self.test_settings or {}
+        if test_running:
+            overlay = overlay_now or {}
             test = {"running": True, "model": overlay.get("model"),
                     "name": names.get(overlay.get("model"), overlay.get("model")), "preset": overlay.get("preset")}
         return {"switcher": {"up": up, "running": rows, "stale": up and self._switcher_stale()},
@@ -1363,15 +1437,23 @@ class PanelService:
                                   f"boot file ({exc.__class__.__name__}: {exc}). Pick a profile on the Server tab.")
         return out
 
-    def remove_model(self, model_id: str, delete_files: bool, revision: str | None) -> dict[str, Any]:
+    def remove_model(self, model_id: str, delete_files: bool, revision: str | None,
+                     artifact: str | None = None) -> dict[str, Any]:
+        """``artifact`` is the model's files as the page's Remove question named them: a model
+        removed and added again under the same id must not have the new one's files deleted
+        after a question about the old one's (PR #20 review)."""
         with self._lock:
             doc, current_revision = self.store.load()
-            if revision != current_revision:
-                raise StaleRevision("The model list was changed somewhere else.")
             try:
                 model = find_model(doc, model_id)
             except KeyError:
-                raise PanelError(404, "not_found", NOT_FOUND_MESSAGE) from None
+                model = None
+            if model is not None and artifact is not None and model["artifact"] != artifact:
+                raise PanelError(409, "artifact_changed", ARTIFACT_CHANGED_MESSAGE)
+            if revision != current_revision:
+                raise StaleRevision("The model list was changed somewhere else.")
+            if model is None:
+                raise PanelError(404, "not_found", NOT_FOUND_MESSAGE)
             name = model["name"]
             files = model_files(model["engine"], model["artifact"]) if delete_files else []
             if delete_files:
@@ -1505,7 +1587,7 @@ class PanelService:
                 self.test_settings = None
             text, holds = self._plan_rewrite(doc)
             if self.writer.write(text):
-                self._mark_written()
+                self._mark_written(text)
             self._write_holds(holds)
             if self.test_settings is None:
                 self.clear_test_marker()
@@ -1559,16 +1641,43 @@ class PanelService:
             return None
         return {"model": str(data["model"]), "preset": data.get("preset")}
 
+    def _later_panel_write(self, expected: str, live: str) -> bool:
+        """live is a file the panel itself wrote after the one hashed as expected."""
+        gen = self._written.get(live)
+        return gen is not None and gen > self._written.get(expected, 0)
+
+    def _superseded(self, text: str) -> bool:
+        """The file on disk is neither text nor a later panel write: something else replaced it."""
+        expected = config_sha256(text)
+        on_disk = self.writer.current_text()
+        if on_disk is None:
+            return False
+        now = config_sha256(on_disk)
+        return now != expected and not self._later_panel_write(expected, now)
+
     def wait_for_switcher(self, text: str, stop: threading.Event | None = None) -> bool:
-        """True once the switcher reports text's hash (P5); False after restart_wait_s, or as
-        soon as stop is set (the Test tab's Stop)."""
+        """True once the switcher reports text's hash (P5), or the hash of a file the panel
+        wrote after text; False after restart_wait_s, as soon as stop is set (the Test tab's
+        Stop), or as soon as the switcher is on a file the panel did not write after text.
+
+        The file may be rewritten by the panel after this write and before the switcher
+        catches up (the hold watcher, a second save): comparing only against text gave up
+        although the switcher was on the newer file (stage A deferred minor). Any other file
+        (an old copy put back, a hand edit) is not accepted: its hash once read as "applied"
+        and a superseded restart loaded the model on the old settings (PR #20 review)."""
         expected = config_sha256(text)
         deadline = self._clock() + self.restart_wait_s
-        while self.switcher.config_hash() != expected:
+        while True:
+            live = self.switcher.config_hash()
+            if live is not None:
+                if live == expected or self._later_panel_write(expected, live):
+                    return True
+                on_disk = self.writer.current_text()
+                if on_disk is not None and live == config_sha256(on_disk) and self._superseded(text):
+                    return False  # the switcher is on the file that replaced ours; waiting won't help
             if self._clock() >= deadline or (stop is not None and stop.is_set()):
                 return False
             self._sleep(0.5)
-        return True
 
     # ---- holds and start-up ----
     def release_finished_holds(self) -> list[str]:
@@ -1673,12 +1782,13 @@ class AddBody(_SaveBody):
 class RemoveBody(BaseModel):
     revision: str | None = None
     deleteFiles: bool = False
+    artifact: str | None = None
 
 
 def create_panel_router(service: PanelService) -> APIRouter:
     router = APIRouter(prefix="/api/panel")
 
-    async def call(fn: Callable[..., Any], *args: Any) -> Any:
+    async def call(fn: Callable[..., Any], *args: Any, missing: str = MISSING_MESSAGE) -> Any:
         try:
             return await run_in_threadpool(fn, *args)
         except RegistryMissing:
@@ -1702,7 +1812,8 @@ def create_panel_router(service: PanelService) -> APIRouter:
         except PanelError as exc:
             return JSONResponse(status_code=exc.status, content=exc.payload)
         except KeyError as exc:
-            return JSONResponse(status_code=404, content={"detail": f"not found: {exc.args[0] if exc.args else ''}"})
+            logger.info("panel %s: not found: %r", getattr(fn, "__name__", "call"), exc.args[0] if exc.args else None)
+            return JSONResponse(status_code=404, content={"code": "not_found", "message": missing})
 
     @router.get("/registry")
     async def registry_status():
@@ -1795,11 +1906,11 @@ def create_panel_router(service: PanelService) -> APIRouter:
 
     @router.get("/add/downloads/{job_id}")
     async def add_download_status(job_id: str):
-        return await call(service.download_status, job_id)
+        return await call(service.download_status, job_id, missing=MISSING_DOWNLOAD_MESSAGE)
 
     @router.post("/add/downloads/{job_id}/cancel")
     async def add_download_cancel(job_id: str):
-        return await call(service.cancel_download, job_id)
+        return await call(service.cancel_download, job_id, missing=MISSING_DOWNLOAD_MESSAGE)
 
     @router.post("/models")
     async def add_model(body: AddBody):
@@ -1807,7 +1918,7 @@ def create_panel_router(service: PanelService) -> APIRouter:
 
     @router.post("/models/{model_id}/remove")
     async def remove_model(model_id: str, body: RemoveBody):
-        return await call(service.remove_model, model_id, body.deleteFiles, body.revision)
+        return await call(service.remove_model, model_id, body.deleteFiles, body.revision, body.artifact)
 
     return router
 

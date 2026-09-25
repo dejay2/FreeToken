@@ -105,3 +105,25 @@ def test_page_contract_matches_the_freetoken_dials():
     assert all(row["group"] in GROUP_INFO for row in ours)
     assert "chat-template" not in {row["name"] for row in ours}
     assert "chat-template" in {row["name"] for row in dial_dicts({}, "ninfer-upstream")}
+
+
+def test_graphics_card_number_only_takes_the_one_card():
+    """Deferred stage A minor 1: NInfer's parser takes any --device >= 0 (serve_options.cpp)
+    and fails only at CUDA start-up; this PC has one card, so only 0 can start."""
+    assert "--device" in source_flags("ninfer")
+    assert validate({"device": 0}) == []
+    rows = validate({"device": 1})
+    assert [row["field"] for row in rows] == ["device"] and "at most 0" in rows[0]["message"]
+
+
+@pytest.mark.parametrize("value", ["abc", [1], "1e400", float("inf")])
+def test_a_bad_number_gets_plain_words_not_python_text(value):
+    """Deferred stage A minor 2: int("abc") / float("abc") text ("invalid literal for int()
+    with base 10", "could not convert string to float") reached the page."""
+    for name in ("max-concurrency", "temperature"):
+        rows = validate({name: value}, cross=False)
+        assert len(rows) == 1, rows
+        message = rows[0]["message"]
+        for leak in ("invalid literal", "could not convert", "argument must be", "cannot convert", "base 10"):
+            assert leak not in message, message
+        assert "number" in message, message

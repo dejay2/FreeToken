@@ -156,37 +156,21 @@ def test_page_reads_the_model_and_reshapes_itself() -> None:
 
     # A model card above the settings, filled from the settings payload's model block.
     assert 'id="model-card"' in page
-    assert "body.model" in source
     assert "renderModelCard()" in source
-    # Typing or browsing a new model folder previews it before Save through the settings
-    # route's model query, and the dials are re-rendered from that response.
-    assert "/api/settings?model=" in source
-    assert "refreshModel(" in source
-    assert "dial.browse === 'model'" in source
     # Text-stored counts (layers kept on the card) go through the storedAs contract.
     assert "dial.storedAs" in source
     assert "dial.storedZero" in source
-    assert "const respelled = []" in source
-    assert "toStored(dial, count)" in source
-    assert "respelled.forEach((name) => markChanged(name))" in source
 
 
-def test_models_tab_uses_preview_download_progress_and_folder_routes() -> None:
+def test_dead_model_folder_code_is_gone():
+    """Stage A deferred minor: the panel never shows the model-folder dial (ModelPath is set per
+    model), so the folder preview (refreshModel) never ran, and the hidden "Model downloads and
+    folders" box still called /api/models on every page load."""
     page = _page()
     source = _source()
-
-    assert "<!-- models-tab -->" in page and "<!-- /models-tab -->" in page
-    assert 'id="model-repo"' in page
-    assert 'id="model-preview"' in page
-    for route in ("/api/downloads/preview", "/api/downloads", "/api/models"):
-        assert route in source
-    assert "model-download-cancel" in page
-    assert "setTimeout(pollModelDownload, 2000)" in source
-    assert "Use as model folder" in page
-    assert "dial.browse === 'model'" in source
-    assert "window.confirm" not in source
-    assert "window.alert" not in source
-    assert "window.prompt" not in source
+    for dead in ("refreshModel", "scheduleModelRefresh", "'/api/models'", "models-tools", "model-folders",
+                 "dial.browse === 'model'", "/api/settings?model="):
+        assert dead not in source and dead not in page, dead
 
 
 def _run_fit_script(script: str) -> None:

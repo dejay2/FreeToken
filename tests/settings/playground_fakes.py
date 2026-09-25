@@ -206,7 +206,7 @@ def make(tmp_path, monkeypatch, loaded=None, doc=None, with_routes=False, static
         """A fresh PanelService and runner over the same files: what a helper restart gives."""
         service = PanelService(
             store=store, writer=writer, switcher=switcher, profiles=profiles,
-            boot_file=lambda: BootFile(boot), default_boot=lambda: boot, estimate_service=FakeEstimates(),
+            boot_file=lambda: BootFile(boot), estimate_service=FakeEstimates(),
             card_probe=lambda: {"totalBytes": 32 * GIB, "usedBytes": 2 * GIB}, windows_free_probe=lambda: 40 * GIB,
             artifact_size=lambda path: 19_782_132_224, spawn=lambda fn, *args: fn(*args),
             clock=clock, sleep=clock.advance)
