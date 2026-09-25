@@ -20,3 +20,7 @@ config. It pushes the model's effective settings (`GET /api/panel/models/<id>/ef
 that helper profile (`PUT /api/profiles/<id>` with `replace: true`) and activates it before the
 boot. It adopts a running server only when that server runs the same folder, on the same
 profile, and the push reported no change.
+
+FreeToken's `sleeping` state (the card given back, the model still loaded) counts as running
+this model: the adapter adopts it, and any other adapter stops it fully before starting
+(`ninfer.sh` treats every state but `unreachable` as holding the card).

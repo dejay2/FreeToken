@@ -237,6 +237,11 @@ def create_app(
             estimate_service=app.state.estimate_service,
             downloads=download_manager,
             pi=PiSync(),
+            # Sleep: the panel's Sleep/Wake buttons and "Asleep" word go through the same
+            # server proxy as /api/server/sleep|wake. getattr is load-bearing: route tests
+            # hand in recording managers that predate sleep (see Task 7 of the sleep plan).
+            freetoken_state=lambda: process_manager.server_status().get("state"),
+            freetoken_control=getattr(process_manager, "sleep_server", None),
         )
     app.state.panel = panel
     if panel.downloads is None:

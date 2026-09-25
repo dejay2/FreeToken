@@ -260,7 +260,7 @@
     .source { color: var(--muted); margin-top: 4px; } .source.changed-here { color: var(--accent); }
     .linkish { border: 0; background: none; color: var(--accent); padding: 0; text-decoration: underline; }
     .backups { list-style: none; padding: 0; display: grid; gap: 6px; }
-    .dot.ready { background: var(--good); } .dot.starting, .dot.stopping { background: var(--warn); animation: pulse 1.2s infinite; } .dot.unknown { background: var(--bad); }
+    .dot.ready { background: var(--good); } .dot.asleep { background: var(--accent); } .dot.starting, .dot.stopping { background: var(--warn); animation: pulse 1.2s infinite; } .dot.unknown { background: var(--bad); }
     @media (max-width: 640px) { #now.status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .models-table td.row-actions .actions { justify-content: flex-start; } .models-table thead { display: none; } .models-table td { display: block; border: 0; padding: 4px 0; } .models-table tr { display: block; border-bottom: 1px solid var(--line); padding: 8px 0; } .models-table td[data-label]::before { content: attr(data-label) ": "; color: var(--muted); font-size: .84rem; } }
 
     @media (max-width: 900px) { .top-right { align-items: flex-start; } }

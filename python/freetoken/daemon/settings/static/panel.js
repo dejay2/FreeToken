@@ -12,8 +12,20 @@ const panel = { main: 'models', revision: '', models: [], now: null, busy: false
 
 function panelEsc(value) { return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 function fmtGB(bytes) { const n = Number(bytes); if (bytes == null || bytes === '' || !Number.isFinite(n)) return '—'; return `${(n / PANEL_GB).toFixed(1)} GB`; }
-const STATE_WORDS = { ready: 'Loaded', starting: 'Loading…', stopping: 'Unloading…', stopped: 'Not loaded', shutdown: 'Not loaded', unknown: 'Switcher not running' };
+const STATE_WORDS = { asleep: 'Asleep (graphics card free)', ready: 'Loaded', starting: 'Loading…', stopping: 'Unloading…', stopped: 'Not loaded', shutdown: 'Not loaded', unknown: 'Switcher not running' };
 function stateWord(value) { return STATE_WORDS[value] || String(value || 'unknown'); }
+// Sleep (docs/superpowers/specs/2026-09-25-freetoken-sleep-design.md section 2.5): a sleeping
+// FreeToken is still "ready" to the switcher; the row's `sleep` word ("asleep" | "awake" | null,
+// from /api/panel/models) is what the page shows Jay.
+function rowState(row) { return row && row.sleep === 'asleep' ? 'asleep' : (row && row.state); }
+const SLEEP_TIP = 'Frees the graphics card for games. The model stays in PC memory, so it wakes in about half a minute instead of a full load.';
+const WAKE_TIP = 'Takes the graphics card back. A chat also wakes it by itself.';
+function sleepButtonHtml(row) {
+  if (!row) return '';
+  if (row.sleep === 'asleep') return `<button class="button small primary" type="button" data-wake="${panelEsc(row.id)}" title="${panelEsc(WAKE_TIP)}">Wake</button>`;
+  if (row.sleep === 'awake') return `<button class="button small" type="button" data-sleep="${panelEsc(row.id)}" title="${panelEsc(SLEEP_TIP)}">Sleep</button>`;
+  return '';
+}
 function sourceText(source) {
   if (!source) return '';
   if (source.from === 'model') return 'changed for this model';
@@ -69,7 +81,7 @@ const STALE_WORDS = "The switcher hasn't picked up the latest settings yet.";
 function nowStripHtml(now) {
   if (!now) return '<p class="empty">Checking…</p>';
   const sw = now.switcher || {};
-  const running = !sw.up ? 'Model switcher not running' : ((sw.running || []).length ? sw.running.map((row) => `${panelEsc(row.name || row.id)} <span class="small">${panelEsc(stateWord(row.state))}</span>`).join('<br>') : 'Nothing loaded');
+  const running = !sw.up ? 'Model switcher not running' : ((sw.running || []).length ? sw.running.map((row) => `${panelEsc(row.name || row.id)} <span class="small">${panelEsc(stateWord(rowState(row)))}</span>`).join('<br>') : 'Nothing loaded');
   const card = now.card ? `${fmtGB(now.card.usedBytes)} <span class="muted">/ ${fmtGB(now.card.totalBytes)}</span>` : '—';
   const pct = now.card && now.card.totalBytes ? Math.round(Math.min(100, (now.card.usedBytes / now.card.totalBytes) * 100)) : 0;
   const win = now.windowsFreeBytes == null ? '—' : fmtGB(now.windowsFreeBytes);
@@ -90,8 +102,8 @@ function modelsTableHtml(rows, switcherUp) {
     const loaded = row.state === 'ready' || row.state === 'starting';
     const engine = row.runtimeLabel ? `${panelEsc(row.engineLabel)} <span class="small">(${panelEsc(row.runtimeLabel)})</span>` : panelEsc(row.engineLabel);
     const idle = row.idleMinutes ? `${panelEsc(row.idleMinutes)} min` : 'never';
-    const action = !switcherUp ? '' : loaded ? `<button class="button small danger" type="button" data-unload="${panelEsc(row.id)}">Unload</button>` : `<button class="button small primary" type="button" data-load="${panelEsc(row.id)}">Load</button>`;
-    return `<tr><td><span class="dot ${panelEsc(row.state)}"></span> ${panelEsc(stateWord(row.state))}${row.held ? '<div class="small">old settings until the next load</div>' : ''}</td><td><strong>${panelEsc(row.name)}</strong><div class="small">${panelEsc(row.id)}</div></td><td data-label="Engine">${engine}</td><td data-label="Preset">${panelEsc(row.activePreset || '—')}</td><td data-label="PC memory">${panelEsc(row.ramNeedGB)} GB</td><td data-label="Unload when idle">${idle}${row.idleFromSystem ? ' <span class="small">(System)</span>' : ''}</td><td class="row-actions"><div class="actions">${action}<button class="button small" type="button" data-settings="${panelEsc(row.id)}">Settings</button></div></td></tr>`;
+    const action = !switcherUp ? '' : loaded ? `${sleepButtonHtml(row)}<button class="button small danger" type="button" data-unload="${panelEsc(row.id)}">Unload</button>` : `<button class="button small primary" type="button" data-load="${panelEsc(row.id)}">Load</button>`;
+    return `<tr><td><span class="dot ${panelEsc(rowState(row))}"></span> ${panelEsc(stateWord(rowState(row)))}${row.held ? '<div class="small">old settings until the next load</div>' : ''}</td><td><strong>${panelEsc(row.name)}</strong><div class="small">${panelEsc(row.id)}</div></td><td data-label="Engine">${engine}</td><td data-label="Preset">${panelEsc(row.activePreset || '—')}</td><td data-label="PC memory">${panelEsc(row.ramNeedGB)} GB</td><td data-label="Unload when idle">${idle}${row.idleFromSystem ? ' <span class="small">(System)</span>' : ''}</td><td class="row-actions"><div class="actions">${action}<button class="button small" type="button" data-settings="${panelEsc(row.id)}">Settings</button></div></td></tr>`;
   }).join('');
   return `<table class="models-table"><thead><tr><th>Status</th><th>Model</th><th>Engine</th><th>Preset</th><th>PC memory</th><th>Unload when idle</th><th></th></tr></thead><tbody>${body}</tbody></table>`;
 }
@@ -209,7 +221,7 @@ function addedNote(body) {
 function removedNote(body) {
   return [`Removed ${body.name || body.id}.`, body.files && body.files.message, body.profile && body.profile.message, piNote(body.pi)].filter(Boolean).join(' ');
 }
-if (typeof module !== 'undefined') module.exports = { fmtGB, stateWord, sourceText, dialSourceFor, verdictWords, fitSummary, ramSummary, restartQuestion, nowStripHtml, modelsTableHtml, panelErrorText,
+if (typeof module !== 'undefined') module.exports = { fmtGB, stateWord, rowState, sleepButtonHtml, sleepModel, sourceText, dialSourceFor, verdictWords, fitSummary, ramSummary, restartQuestion, nowStripHtml, modelsTableHtml, panelErrorText,
   loadQuestion, unloadQuestion, registryProblemHtml, panelSave, answerRestart, answerConfirm, startNow, loadModel, unloadModel, panel,
   idProblem, detectionText, planSummary, downloadLine, removeQuestion, removeFilesNote, removeOkLabel, ramProblem, piNote, addedNote, removedNote,
   addState, openAdd, closeAdd, addCheckPath, addValidate, addPlan, addPathEdited, addRepoEdited, wirePanel, addDownload, addCancelDownload, pollAddJob, addSave, openRemove, answerRemove };
@@ -334,7 +346,19 @@ async function loadModels() {
   list.innerHTML = modelsTableHtml(panel.models, body.switcherUp);
   list.querySelectorAll('[data-load]').forEach((button) => button.addEventListener('click', () => loadModel(button.dataset.load)));
   list.querySelectorAll('[data-unload]').forEach((button) => button.addEventListener('click', () => unloadModel(button.dataset.unload)));
+  list.querySelectorAll('[data-sleep]').forEach((button) => button.addEventListener('click', () => sleepModel(button.dataset.sleep, 'sleep')));
+  list.querySelectorAll('[data-wake]').forEach((button) => button.addEventListener('click', () => sleepModel(button.dataset.wake, 'wake')));
   list.querySelectorAll('[data-settings]').forEach((button) => button.addEventListener('click', () => openModel(button.dataset.settings)));
+}
+// No question before Sleep or Wake: neither loses anything (chats are parked first, and a
+// chat wakes a sleeping model by itself), unlike Unload.
+async function sleepModel(id, action) {
+  const name = ((panel.models || []).find((row) => row.id === id) || {}).name || id;
+  setNotice(action === 'sleep' ? `Putting ${name} to sleep… the graphics card frees up in a few seconds.` : `Waking ${name}… about half a minute.`);
+  const { response, body } = await json(`/api/panel/models/${encodeURIComponent(id)}/${action}`, { method: 'POST' });
+  if (response.ok) setNotice(action === 'sleep' ? `${name} is asleep. The graphics card is free; a chat wakes it.` : `${name} is awake.`, 'good');
+  else setNotice(panelErrorText(body, `Could not ${action} ${name}.`), 'bad');
+  loadNow(); loadModels();
 }
 async function loadModel(id) {
   const question = loadQuestion(id, panel.models);
