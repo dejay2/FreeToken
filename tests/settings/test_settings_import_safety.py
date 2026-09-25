@@ -38,6 +38,8 @@ for name in [
     "freetoken.daemon.settings.ninfer_fit",
     "freetoken.daemon.settings.switcher",
     "freetoken.daemon.settings.panel",
+    "freetoken.daemon.settings.model_detect",
+    "freetoken.daemon.settings.pi_sync",
 ]:
     importlib.import_module(name)
 assert not any(name.split(".")[0] in FORBIDDEN for name in sys.modules)

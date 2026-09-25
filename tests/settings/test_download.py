@@ -330,3 +330,19 @@ def test_models_route_lists_model_folder_and_fit(tmp_path: Path) -> None:
     assert listed[0]["found"] is True
     assert listed[0]["architecture"] == "GptOssForCausalLM"
     assert "fit" in listed[0] and "verdict" in listed[0]["fit"]
+
+
+def test_models_route_skips_dot_named_folders(tmp_path: Path) -> None:
+    """A wizard staging folder (or any hidden folder) holding a config.json is not a model."""
+    for name in ("gpt-oss-20b", ".incoming-download-abc", ".hidden"):
+        folder = tmp_path / "models" / name
+        folder.mkdir(parents=True)
+        (folder / "config.json").write_text(json.dumps(_gpt_oss_config()), encoding="utf-8")
+        (folder / "model.safetensors").write_bytes(b"x" * 10)
+    client = _app(tmp_path, api=_FakeApi({}), config_fetcher=lambda _: _gpt_oss_config())
+    # The manager sweeps its own orphans at start; a foreign hidden folder must still be skipped.
+    assert not (tmp_path / "models" / ".incoming-download-abc").exists()
+    assert (tmp_path / "models" / ".hidden").is_dir()
+
+    listed = client.get("/api/models").json()["models"]
+    assert [item["name"] for item in listed] == ["gpt-oss-20b"]

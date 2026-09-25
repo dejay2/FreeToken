@@ -31,12 +31,13 @@ from .memory_fit import EstimateUnavailable, MemoryFitService, SettingsValidatio
 from .process_manager import LifecycleError, ProcessManager
 from .prompt_cache import create_prompt_cache_router
 from .panel import PanelService, create_panel_router
+from .pi_sync import PiSync
 from .profiles_manager import ProfileError, ProfileValidationError, ProfilesManager
 from .registry import RegistryStore
 from .swap_config import SwapConfigWriter
 from .switcher import SwitcherClient
 
-HELPER_VERSION = "2.0.0"
+HELPER_VERSION = "2.1.0"
 
 
 class SettingsBody(BaseModel):
@@ -234,8 +235,12 @@ def create_app(
             boot_file=lambda: app.state.boot_file,
             default_boot=lambda: app.state.default_boot_file,
             estimate_service=app.state.estimate_service,
+            downloads=download_manager,
+            pi=PiSync(),
         )
     app.state.panel = panel
+    if panel.downloads is None:
+        panel.downloads = download_manager
     app.include_router(create_panel_router(panel))
     app.state.started_monotonic = started
     app.include_router(create_download_router(models_dir=model_root, manager=download_manager))
@@ -262,6 +267,12 @@ def create_app(
         process_manager.boot_file = boot.path
         app.state.boot_file = boot
         refresh_model_roots()
+
+    if panel.profile_deleted is None:
+        # Removing a FreeToken model deletes its model-<id> profile; when that profile was the
+        # active one, profiles.delete() falls back to the default boot file, and the helper must
+        # follow it as the DELETE /api/profiles route does.
+        panel.profile_deleted = lambda result: set_active_boot(result["bootFilePath"])
 
     @app.get("/")
     async def root():

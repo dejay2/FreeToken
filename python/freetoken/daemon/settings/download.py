@@ -9,10 +9,14 @@ callbacks do not reliably cover local cache files or partial files.
 from __future__ import annotations
 
 import ctypes
+import errno
+import hashlib
 import json
+import logging
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -20,8 +24,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -59,6 +63,26 @@ _DOWNLOAD_IGNORE_PATTERNS = ("*/*",)
 _WEIGHT_SUFFIXES = (".safetensors",)
 _TERMINAL_STAGES = frozenset({"done", "failed", "cancelled"})
 
+# The Add model wizard (control panel Stage B). A repo's SHA256SUMS wins over the Hub's
+# per-file LFS sha256; files with neither (small git files) are not checked.
+_SUMS_NAMES = ("SHA256SUMS", "SHA256SUMS.txt")
+_NINFER_ENTRY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.ninfer$")
+_NINFER_PART = re.compile(r"^(?P<entry>.+\.ninfer)\.part-\d{4}$")  # tools/artifact/writer.py naming
+_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+_SUMS_LINE = re.compile(r"^\s*([0-9A-Fa-f]{64})\s+\*?(\S.*?)\s*$")
+_HASH_CHUNK = 8 * 1024 * 1024
+# Wizard staging folders: ``<root>/.incoming-download-<hex>``. The dot keeps them out of the
+# page's Browse list; the fixed prefix lets a later helper sweep the ones a crash left behind.
+_STAGING_PREFIX = ".incoming-"
+_STAGING_GLOB = _STAGING_PREFIX + "download-"
+# 4 MiB per read keeps a cancel within a fraction of a second even at 100 MB/s while staying
+# well under the 8 MiB hash chunk in per-call overhead.
+_STREAM_CHUNK = 4 * 1024 * 1024
+_STREAM_TIMEOUT_S = 60
+# renameat2(2) constants (linux/fs.h, fcntl.h); glibc has wrapped the call since 2.28.
+_RENAME_NOREPLACE = 1
+_AT_FDCWD = -100
+
 
 class InvalidRepository(ValueError):
     """The submitted value is not a Hugging Face ``owner/name`` repository."""
@@ -66,6 +90,45 @@ class InvalidRepository(ValueError):
 
 class DownloadConflict(RuntimeError):
     """A target folder or another active download already owns the requested work."""
+
+
+class AddUnsupported(ValueError):
+    """The repo holds nothing the engines can run."""
+
+
+class ChecksumMismatch(RuntimeError):
+    """A downloaded file does not match the checksum the repo publishes."""
+
+
+class DownloadCancelled(Exception):
+    """Raised inside the worker when the page's Cancel arrives mid-file, mid-hash or before moving."""
+
+
+logger = logging.getLogger("freetoken.daemon.settings.download")
+
+_OWN_WORDS = (InvalidRepository, DownloadConflict, AddUnsupported, ChecksumMismatch)
+
+
+def _network_like(exc: BaseException) -> bool:
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    return any((klass.__module__ or "").split(".")[0] in ("huggingface_hub", "requests", "urllib3", "urllib", "http", "socket", "ssl")
+               for klass in type(exc).__mro__)
+
+
+def _plain_job_error(exc: BaseException) -> str:
+    """The failed line the wizard shows. This module's own exceptions (and the bare RuntimeErrors
+    it raises about a file's size or arrival) already read as plain sentences; anything else,
+    a Hub HTTP error with its URL and request id above all, is logged and replaced with a
+    short reason (review item 11)."""
+    if isinstance(exc, _OWN_WORDS) or (type(exc) is RuntimeError):
+        return str(exc)
+    logger.warning("a model download failed: %s: %s", type(exc).__name__, exc)
+    if _network_like(exc):
+        return "The connection to Hugging Face was lost, so the download stopped."
+    if isinstance(exc, OSError):
+        return f"The download stopped: {exc.strerror or exc}."
+    return "Something went wrong during the download. Check the helper log for the details."
 
 
 class DownloadBody(BaseModel):
@@ -76,6 +139,7 @@ class DownloadBody(BaseModel):
 class RemoteFile:
     name: str
     size: int | None = None
+    sha256: str | None = None
 
 
 @dataclass
@@ -92,6 +156,19 @@ class DownloadJob:
     cancel_requested: bool = False
     started_at: float = field(default_factory=time.time)
     completed_at: float | None = None
+    # Add model wizard jobs (kind "add"): staging folder, final target, what to fetch.
+    kind: str = "folder"
+    engine: str | None = None
+    staging: Path | None = None
+    target: Path | None = None
+    fetch: list[RemoteFile] = field(default_factory=list)
+    finals: list[str] = field(default_factory=list)
+    sums_name: str | None = None
+    verified: list[str] = field(default_factory=list)
+    # SHA256SUMS rows read at plan time (name -> hex), and what actually checked each file:
+    # "SHA256SUMS", "published" (the Hub's LFS digest) or None (nothing could).
+    sums: dict[str, str] = field(default_factory=dict)
+    checks: dict[str, str | None] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -104,6 +181,11 @@ class DownloadJob:
             "percent": float(self.percent),
             "files": list(self.files),
             "error": self.error,
+            "kind": self.kind,
+            "engine": self.engine,
+            "verified": list(self.verified),
+            "checks": dict(self.checks),
+            "resultPath": str(self.target) if self.kind == "add" and self.stage == "done" and self.target else None,
         }
 
 
@@ -227,7 +309,9 @@ def _remote_files(info: Any) -> list[RemoteFile]:
         size = _size(_field(sibling, "size"))
         if size is None and lfs is not None:
             size = _size(_field(lfs, "size"))
-        result.append(RemoteFile(name=name, size=size))
+        digest = _field(lfs, "sha256") if lfs is not None else None
+        digest = digest.lower() if isinstance(digest, str) and _SHA_RE.fullmatch(digest.lower()) else None
+        result.append(RemoteFile(name=name, size=size, sha256=digest))
         seen.add(name)
     return result
 
@@ -267,6 +351,196 @@ def _is_downloadable_file(name: str) -> bool:
 
 def _downloadable_files(files: list[RemoteFile]) -> list[RemoteFile]:
     return [item for item in files if _is_downloadable_file(item.name)]
+
+
+def parse_sha256sums(text: str) -> dict[str, str]:
+    """``<hex>  <name>`` or ``<hex> *<name>`` lines (sha256sum's text and binary forms)."""
+    sums: dict[str, str] = {}
+    for line in text.splitlines():
+        match = _SUMS_LINE.match(line)
+        if match:
+            name = match.group(2)
+            sums[name[2:] if name.startswith("./") else name] = match.group(1).lower()
+    return sums
+
+
+def sha256_file(path: str | os.PathLike[str], cancelled: Callable[[], bool] | None = None) -> str:
+    """Hash a file; ``cancelled`` is polled once per 8 MiB so a 19 GB hash can be stopped too."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while block := fh.read(_HASH_CHUNK):
+            if cancelled is not None and cancelled():
+                raise DownloadCancelled(str(path))
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Rename ``source`` to ``destination``, refusing (FileExistsError) when the name is taken.
+
+    ``os.rename`` onto an *empty* directory silently replaces it on Linux, so an exists() check
+    followed by a rename leaves a window in which a folder created by the user is lost. Linux
+    has renameat2(RENAME_NOREPLACE), which makes the refusal atomic; it is reached through
+    ctypes because ``os`` has no wrapper. Windows ``os.rename`` refuses an existing target
+    natively. Anywhere else without the flag (EINVAL on some FUSE and 9p mounts, ENOSYS on old
+    kernels, other POSIX systems) a folder is placed by ``_move_into_new_folder``: an atomic
+    ``os.mkdir`` claims the name, then each file goes in without overwriting. A check-then-
+    rename was used here before, and a folder made in between was replaced (review, PR #17).
+    """
+    if sys.platform.startswith("linux"):
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            renameat2 = libc.renameat2
+        except (OSError, AttributeError):
+            renameat2 = None
+        if renameat2 is not None:
+            renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+            renameat2.restype = ctypes.c_int
+            result = renameat2(_AT_FDCWD, os.fsencode(source), _AT_FDCWD, os.fsencode(destination), _RENAME_NOREPLACE)
+            if result == 0:
+                return
+            code = ctypes.get_errno()
+            if code in (errno.EEXIST, errno.ENOTEMPTY):
+                raise FileExistsError(code, os.strerror(code), str(destination))
+            if code not in (errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise OSError(code, os.strerror(code), str(source), None, str(destination))
+    if sys.platform == "win32":
+        os.rename(source, destination)  # refuses an existing name (FileExistsError) by itself
+        return
+    if source.is_dir() and not source.is_symlink():
+        _move_into_new_folder(source, destination)
+        return
+    _claim_file(source, destination)
+    source.unlink(missing_ok=True)
+
+
+def _claim_file(source: Path, destination: Path) -> None:
+    """Put one file at ``destination`` without ever replacing what is there.
+
+    ``os.link`` refuses an existing name (a plain rename would silently replace it). A
+    filesystem that cannot hard-link (EPERM on WSL's drvfs mounts, EXDEV across volumes)
+    gets the same guarantee from an exclusive create of the name followed by a replace of
+    that placeholder, which is ours. With a hard link, ``source`` is left for the caller.
+    """
+    try:
+        os.link(source, destination)
+    except FileExistsError:
+        raise
+    except OSError:
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)  # FileExistsError if taken
+        os.close(fd)
+        try:
+            os.replace(source, destination)
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+
+
+def _move_into_new_folder(source: Path, destination: Path) -> None:
+    """Move folder ``source`` to the new name ``destination`` with no overwrite-capable rename:
+    ``os.mkdir`` claims the name atomically (FileExistsError if it is taken), each file is
+    linked or exclusively created inside it, and anything that clashes puts everything back."""
+    os.mkdir(destination)
+    placed: list[tuple[Path, Path]] = []  # (source file, placed file)
+    folders: list[Path] = [destination]
+    try:
+        for root, dirs, names in os.walk(source):
+            here = destination / Path(root).relative_to(source)
+            for name in sorted(dirs):
+                if (Path(root) / name).is_symlink():
+                    names.append(name)  # a link to a folder is moved as a link, never walked
+                    continue
+                os.mkdir(here / name)
+                folders.append(here / name)
+            dirs[:] = [d for d in dirs if not (Path(root) / d).is_symlink()]
+            for name in sorted(names):
+                src, dst = Path(root) / name, here / name
+                if src.is_symlink():
+                    os.symlink(os.readlink(src), dst)  # FileExistsError if the name was taken
+                else:
+                    _claim_file(src, dst)
+                placed.append((src, dst))
+    except BaseException:
+        for src, dst in reversed(placed):
+            try:
+                if src.exists() or src.is_symlink():
+                    dst.unlink()
+                else:
+                    os.replace(dst, src)
+            except OSError:
+                pass
+        for folder in reversed(folders):
+            try:
+                folder.rmdir()  # only when empty: whatever someone else put there stays
+            except OSError:
+                pass
+        raise
+    shutil.rmtree(source, ignore_errors=True)
+
+
+class _DropTokenAcrossHosts(HTTPRedirectHandler):
+    """Forward a Hub redirect (to its CDN) without the bearer token, as huggingface_hub does."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102 - stdlib signature
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urlsplit(newurl).hostname != urlsplit(req.full_url).hostname:
+            new.remove_header("Authorization")
+        return new
+
+
+def _hub_file_url(repo: str, filename: str) -> str:
+    try:
+        from huggingface_hub import hf_hub_url  # honours HF_ENDPOINT; lazy like the other Hub imports
+    except ImportError:
+        return f"https://huggingface.co/{repo}/resolve/main/{quote(filename)}"
+    return hf_hub_url(repo_id=repo, filename=filename)
+
+
+def _copy_stream(response: Any, destination: Path, cancelled: Callable[[], bool]) -> None:
+    """Copy an open response to ``destination``, polling ``cancelled`` before every chunk."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with open(destination, "wb") as fh:
+        while True:
+            if cancelled():
+                raise DownloadCancelled(destination.name)
+            block = response.read(_STREAM_CHUNK)
+            if not block:
+                return
+            fh.write(block)
+
+
+def _stream_hub_file(
+    repo: str, filename: str, destination: str | os.PathLike[str], cancelled: Callable[[], bool], *,
+    opener: Callable[..., Any] | None = None,
+) -> None:
+    """The wizard's file fetch: one plain HTTP GET of the Hub's resolve URL, written in chunks.
+
+    Why not snapshot_download: it cannot be interrupted, so a single 19 GB .ninfer could only
+    be cancelled once it had finished (and a cancel that landed after the last file ended
+    "done"). Running it in a subprocess and killing it would interrupt it, but could not carry
+    the test doubles and would leave the Hub cache's partial files to clean. A streamed copy is
+    forty lines, polls the cancel flag per 4 MiB, and the wizard already checks size and sha256
+    itself and deletes the staging folder on any failure, so the Hub client's resume and retry
+    logic adds nothing here.
+    """
+    request = Request(_hub_file_url(repo, filename), headers={"User-Agent": "freetoken-settings"})
+    token = _hub_token()
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    open_url = opener if opener is not None else build_opener(_DropTokenAcrossHosts()).open
+    with open_url(request, timeout=_STREAM_TIMEOUT_S) as response:
+        _copy_stream(response, Path(destination), cancelled)
+
+
+def _hub_token() -> str | None:
+    """The Hub's own token lookup (HF_TOKEN, then the `hf auth login` token file), so a gated
+    repo that snapshot_download could fetch is fetchable here too (review round 2, PR #17)."""
+    try:
+        # Lazy import: the daemon import-safety test blocks torch and its neighbours.
+        from huggingface_hub.utils import get_token
+    except ImportError:
+        return os.environ.get("HF_TOKEN") or None
+    return get_token()
 
 
 def _default_hf_api() -> Any:
@@ -477,12 +751,16 @@ class DownloadManager:
         pc_memory: int | Callable[[], int] | None = None,
         card_memory: int | Callable[[], int] | None = None,
         disk_free: Callable[[str | os.PathLike[str]], int] | None = None,
+        file_fetcher: Callable[..., Any] | None = None,
     ) -> None:
         self.models_dir = Path(models_dir)
         self.downloads_dir = Path(downloads_dir) if downloads_dir is not None else self.models_dir
         self._api_factory = api_factory
         self._config_fetcher = config_fetcher
         self._snapshot_downloader = snapshot_downloader or _default_snapshot_download
+        # The Add model wizard fetches one file at a time through this seam:
+        # ``fetcher(repo, filename, destination, cancelled)``; see _stream_hub_file.
+        self._file_fetcher = file_fetcher or _stream_hub_file
         # Test doubles do not have to make network calls for header metadata. The live helper,
         # which uses the default Hub API, gets a bounded Range reader unless a seam is supplied.
         self._header_fetcher = (
@@ -497,6 +775,38 @@ class DownloadManager:
         self._active_id: str | None = None
         self._partial_targets: set[str] = set()
         self._lock = threading.RLock()
+        # A helper restart mid-download leaves the worker's staging folder behind (its cleanup
+        # runs in the worker thread). No job exists yet, so every staging folder is an orphan.
+        self.sweep_staging(self.models_dir, self.downloads_dir)
+
+    def sweep_staging(self, *roots: str | os.PathLike[str]) -> list[Path]:
+        """Delete every ``.incoming-download-*`` folder under ``roots`` that no live job owns.
+
+        The folders are listed before the live jobs are read: a job is registered before its
+        worker makes its staging folder, so any folder listed here that is live is already in
+        ``owned``. Reading the jobs first let a plan_add sweep racing start_add delete the new
+        job's folder (review round 2, PR #17, when plan_add started sweeping)."""
+        listed: list[Path] = []
+        for root in {Path(root) for root in roots}:
+            try:
+                listed += list(root.iterdir())
+            except OSError:
+                continue
+        with self._lock:
+            owned = {
+                self._target_key(job.staging)
+                for job in self._jobs.values()
+                if job.staging is not None and job.stage not in _TERMINAL_STAGES
+            }
+        removed: list[Path] = []
+        for entry in listed:
+            if not entry.name.startswith(_STAGING_GLOB) or entry.is_symlink() or not entry.is_dir():
+                continue
+            if self._target_key(entry) in owned:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            removed.append(entry)
+        return removed
 
     # ---- preview and model catalogue -------------------------------------
 
@@ -589,7 +899,11 @@ class DownloadManager:
 
     def models(self) -> list[dict[str, Any]]:
         try:
-            folders = sorted((item for item in self.models_dir.iterdir() if item.is_dir()), key=lambda p: p.name.lower())
+            # Dot-named folders are the wizard's staging (and any other hidden folder), not models.
+            folders = sorted(
+                (item for item in self.models_dir.iterdir() if item.is_dir() and not item.name.startswith(".")),
+                key=lambda p: p.name.lower(),
+            )
         except (FileNotFoundError, NotADirectoryError, OSError):
             return []
         pc_bytes = _as_bytes(self._pc_memory)
@@ -660,14 +974,24 @@ class DownloadManager:
             if job is None:
                 return None
             if job.stage not in _TERMINAL_STAGES:
-                # snapshot_download cannot be interrupted mid-file.  The worker sees this flag
-                # before the next file, leaving the partial target for a later resume.
+                # Folder jobs: snapshot_download cannot be interrupted mid-file, so the worker
+                # sees this flag before the next file and leaves the partial target for a later
+                # resume.  Wizard jobs stream each file themselves and poll the flag per chunk,
+                # per hash chunk and once more before moving (see _run_add).
                 job.cancel_requested = True
             self._refresh(job)
             return job
 
     def _refresh(self, job: DownloadJob) -> None:
-        job.received_bytes = _folder_size(job.target_folder)
+        if job.kind == "add":
+            # Staging is gone once the files are placed (or deleted); count from the plan then.
+            if job.stage in ("verifying", "moving", "done"):
+                job.received_bytes = job.total_bytes
+            else:
+                received = _folder_size(job.staging) if job.staging is not None else 0
+                job.received_bytes = min(received, job.total_bytes) if job.total_bytes else received
+        else:
+            job.received_bytes = _folder_size(job.target_folder)
         if job.total_bytes:
             job.percent = min(100.0, job.received_bytes * 100.0 / job.total_bytes)
         elif job.stage == "done":
@@ -692,11 +1016,14 @@ class DownloadManager:
             job.error = error
             job.completed_at = time.time()
             self._refresh(job)
-            key = self._target_key(job.target_folder)
-            if stage in {"cancelled", "failed"} and job.target_folder.exists():
-                self._partial_targets.add(key)
-            elif stage == "done":
-                self._partial_targets.discard(key)
+            if job.kind != "add":
+                # Wizard jobs never leave a resumable partial target: their staging folder
+                # is deleted instead (see _abandon).
+                key = self._target_key(job.target_folder)
+                if stage in {"cancelled", "failed"} and job.target_folder.exists():
+                    self._partial_targets.add(key)
+                elif stage == "done":
+                    self._partial_targets.discard(key)
             if self._active_id == job_id:
                 self._active_id = None
 
@@ -775,6 +1102,262 @@ class DownloadManager:
                 except TypeError:
                     raise first_error
 
+    # ---- Add model wizard (control panel Stage B) -------------------------
+
+    def _fetch_file(self, repo: str, filename: str, destination: Path, cancelled: Callable[[], bool]) -> None:
+        self._file_fetcher(repo, filename, destination, cancelled)
+
+    def _read_sums(self, repo: str, sums: RemoteFile | None) -> dict[str, str]:
+        """The repo's SHA256SUMS rows, read at plan time so each file's label says what will
+        actually check it (a file the list leaves out falls back to the Hub digest or nothing)."""
+        if sums is None:
+            return {}
+        with tempfile.TemporaryDirectory(prefix="freetoken-sums-") as temporary:
+            path = Path(temporary) / sums.name
+            self._fetch_file(repo, sums.name, path, lambda: False)
+            return parse_sha256sums(path.read_text(encoding="utf-8", errors="replace"))
+
+    @staticmethod
+    def _check_label(item: RemoteFile, sums: dict[str, str]) -> str | None:
+        if item.name in sums:
+            return "SHA256SUMS"
+        return "published" if item.sha256 else None
+
+    def _plan_add(
+        self, value: str, entry: str | None, folder_root: str | os.PathLike[str], ninfer_root: str | os.PathLike[str]
+    ) -> tuple[dict[str, Any], list[RemoteFile], RemoteFile | None, dict[str, str]]:
+        repo = parse_repo(value)
+        _, name = repo.split("/", 1)
+        listing = [item for item in self._hub_files(repo) if _is_top_level_file(item.name)]
+        by_name = {item.name: item for item in listing}
+        sums = next((by_name[n] for n in _SUMS_NAMES if n in by_name), None)
+        entries = sorted(n for n in by_name if _NINFER_ENTRY.fullmatch(n))
+        architecture = None
+        if entries:
+            if entry is not None and entry not in entries:
+                raise InvalidRepository(f"{entry} is not in that repo.")
+            engine, root = "ninfer", Path(ninfer_root)
+            chosen = entry or (entries[0] if len(entries) == 1 else None)
+            parts = sorted(n for n in by_name if (m := _NINFER_PART.match(n)) and m.group("entry") == chosen)
+            fetch = [by_name[chosen], *(by_name[n] for n in parts)] if chosen else []
+            finals = [chosen, *parts] if chosen else []
+            target = root / chosen if chosen else None
+        elif "config.json" in by_name:
+            info = describe_config(self._config(repo), name)
+            if not info.supported:
+                raise AddUnsupported(
+                    f"This model's design ({info.architecture or 'not named in its config.json'}) "
+                    "is not supported by your engines."
+                )
+            engine, root, chosen, architecture = "freetoken", Path(folder_root), None, info.architecture
+            fetch, finals, target = _downloadable_files(listing), [name], Path(folder_root) / name
+        else:
+            raise AddUnsupported(
+                "This repo has no NInfer file (.ninfer) and no model folder (config.json), "
+                "so it is not supported by your engines."
+            )
+        rows = self._read_sums(repo, sums) if fetch else {}
+        total = sum(item.size or 0 for item in fetch)
+        # A helper restart's orphaned staging (possibly a half-fetched 19 GB file) holds drive
+        # space the plan would otherwise count as used; it goes before the free space is read,
+        # in both roots, for the plan as well as the start (review round 2, PR #17).
+        self.sweep_staging(folder_root, ninfer_root)
+        try:
+            free = max(0, int(self._disk_free(root)))
+        except (TypeError, ValueError, OSError):
+            free = 0
+        plan = {
+            "repo": repo,
+            "name": name,
+            "engine": engine,
+            "kind": "ninfer" if engine == "ninfer" else "folder",
+            "entries": entries,
+            "entry": chosen,
+            "architecture": architecture,
+            "files": [
+                {
+                    "name": item.name,
+                    "bytes": int(item.size or 0),
+                    "check": self._check_label(item, rows),
+                }
+                for item in fetch
+            ],
+            "sumsFile": sums.name if sums is not None else None,
+            "totalBytes": int(total),
+            "root": str(root),
+            "target": str(target) if target else None,
+            "finals": finals,
+            "exists": any((root / final).exists() for final in finals),
+            "diskFreeBytes": free,
+            "diskFits": free >= total,
+        }
+        return plan, fetch, sums, rows
+
+    def plan_add(
+        self, value: str, entry: str | None = None, *, folder_root: str | os.PathLike[str],
+        ninfer_root: str | os.PathLike[str],
+    ) -> dict[str, Any]:
+        """Describe what an Add-model download would fetch and where it would land."""
+        return self._plan_add(value, entry, folder_root, ninfer_root)[0]
+
+    def start_add(
+        self, value: str, entry: str | None = None, *, folder_root: str | os.PathLike[str],
+        ninfer_root: str | os.PathLike[str],
+    ) -> DownloadJob:
+        plan, fetch, sums, rows = self._plan_add(value, entry, folder_root, ninfer_root)
+        if not fetch:
+            raise InvalidRepository("Pick which NInfer file to download.")
+        if plan["exists"]:
+            raise DownloadConflict("It is already on this PC, so it was not downloaded again. Add it from “On this PC”.")
+        if not plan["diskFits"]:
+            raise DownloadConflict(
+                f"Not enough drive space: it needs {plan['totalBytes'] / GIB:.1f} GB and "
+                f"{plan['diskFreeBytes'] / GIB:.1f} GB is free."
+            )
+        with self._lock:
+            if self._active_id is not None:
+                active = self._jobs.get(self._active_id)
+                raise DownloadConflict(f"Another model download is already {active.stage if active else 'running'}.")
+            # Orphans from a helper restart go now, while it is certain no job owns them.
+            self.sweep_staging(folder_root, ninfer_root)
+            job_id = f"download-{uuid.uuid4().hex[:12]}"
+            # The dot keeps the staging folder out of the page's Browse list.
+            staging = Path(plan["root"]) / f"{_STAGING_PREFIX}{job_id}"
+            job = DownloadJob(
+                job_id=job_id,
+                repo=plan["repo"],
+                target_folder=staging,
+                total_bytes=plan["totalBytes"],
+                kind="add",
+                engine=plan["engine"],
+                staging=staging,
+                target=Path(plan["target"]),
+                fetch=list(fetch),
+                finals=plan["finals"],
+                sums_name=sums.name if sums is not None else None,
+                sums=dict(rows),
+            )
+            self._jobs[job_id] = job
+            self._active_id = job_id
+            threading.Thread(
+                target=self._run_add, args=(job_id,), name=f"settings-add-{job_id[-6:]}", daemon=True
+            ).start()
+            return job
+
+    def latest_add(self) -> dict[str, Any] | None:
+        with self._lock:
+            jobs = [job for job in self._jobs.values() if job.kind == "add"]
+            if not jobs:
+                return None
+            self._refresh(jobs[-1])
+            return jobs[-1].as_dict()
+
+    def _abandon(self, job_id: str, stage: str, error: str | None = None) -> None:
+        """Spec error table: a failed or cancelled download leaves no partial files."""
+        job = self._jobs[job_id]
+        if job.staging is not None:
+            shutil.rmtree(job.staging, ignore_errors=True)
+        self._finish(job_id, stage, error)
+
+    def _run_add(self, job_id: str) -> None:
+        with self._lock:
+            job = self._jobs[job_id]
+        self._set_stage(job_id, "downloading")
+
+        def cancelled() -> bool:
+            return self._cancelled(job_id)
+
+        try:
+            job.staging.mkdir(parents=True)
+            for item in job.fetch:
+                if cancelled():
+                    raise DownloadCancelled(item.name)
+                path = job.staging / item.name
+                self._fetch_file(job.repo, item.name, path, cancelled)
+                if not path.is_file():
+                    raise RuntimeError(f"{item.name} did not arrive from Hugging Face.")
+                if item.size is not None and path.stat().st_size != item.size:
+                    raise RuntimeError(
+                        f"{item.name} arrived with the wrong size ({path.stat().st_size:,} bytes, "
+                        f"expected {item.size:,})."
+                    )
+                if item.name.endswith((".safetensors", ".ninfer")) or _NINFER_PART.match(item.name):
+                    release_completed_file(path)
+                with self._lock:
+                    job.files.append(item.name)
+            self._set_stage(job_id, "verifying")
+            # The repo's own list wins over the Hub's published LFS digests; a file in neither is
+            # labelled so (None) rather than claimed as checked.
+            expected: dict[str, tuple[str, str]] = {item.name: ("published", item.sha256) for item in job.fetch if item.sha256}
+            expected.update({name: ("SHA256SUMS", digest) for name, digest in job.sums.items()})
+            for item in job.fetch:
+                source, want = expected.get(item.name, (None, None))
+                with self._lock:
+                    job.checks[item.name] = source
+                if want is None:
+                    continue
+                digest = sha256_file(job.staging / item.name, cancelled)
+                if item.name.endswith((".safetensors", ".ninfer")) or _NINFER_PART.match(item.name):
+                    # Hashing reads the whole file back into the page cache; drop it again, as
+                    # after the write, or a 19 GB verify refills the RAM the release freed (review
+                    # round 2, PR #17). Chosen over hashing while streaming: that would move the
+                    # hash into every file_fetcher, and the repo's SHA256SUMS is only read later.
+                    release_completed_file(job.staging / item.name)
+                if digest != want:
+                    raise ChecksumMismatch(
+                        f"{item.name} does not match the checksum the repo publishes, so the download was deleted."
+                    )
+                with self._lock:
+                    job.verified.append(item.name)
+            # A cancel that landed after the last chunk (or during a hash-free verify) must not
+            # end "done": this is the last look before anything leaves the staging folder.
+            if cancelled():
+                raise DownloadCancelled("moving")
+            self._set_stage(job_id, "moving")
+            self._place(job)
+            self._finish(job_id, "done")
+        except DownloadCancelled:
+            self._abandon(job_id, "cancelled")
+        except Exception as exc:  # noqa: BLE001 - a failed download must not kill the helper
+            self._abandon(job_id, "failed", _plain_job_error(exc))
+
+    @staticmethod
+    def _claim_and_move(source: Path, destination: Path) -> None:
+        """Put one file at ``destination`` without ever replacing what is there (_claim_file)."""
+        _claim_file(source, destination)
+
+    @classmethod
+    def _place(cls, job: DownloadJob) -> None:
+        """Move the checked files into place without ever overwriting: a folder is renamed only
+        when its name is free; a file is linked, which fails when the name exists. Anything
+        already placed is taken back if a later file cannot be."""
+        staging, target = job.staging, job.target
+        if job.engine == "freetoken":
+            shutil.rmtree(staging / ".cache", ignore_errors=True)
+            try:
+                _rename_noreplace(staging, target)
+            except FileExistsError as exc:
+                raise DownloadConflict(
+                    f"{target.name} appeared in {target.parent} while downloading; nothing was overwritten."
+                ) from exc
+            return
+        placed: list[Path] = []
+        try:
+            for name in job.finals:
+                destination = target.parent / name
+                try:
+                    cls._claim_and_move(staging / name, destination)
+                except FileExistsError as exc:
+                    raise DownloadConflict(
+                        f"{name} appeared in {destination.parent} while downloading; nothing was overwritten."
+                    ) from exc
+                placed.append(destination)
+        except BaseException:
+            for path in placed:
+                path.unlink(missing_ok=True)
+            raise
+        shutil.rmtree(staging, ignore_errors=True)
+
 
 # ---- FastAPI routers ------------------------------------------------------
 
@@ -791,6 +1374,7 @@ def create_router(
     pc_memory: int | Callable[[], int] | None = None,
     card_memory: int | Callable[[], int] | None = None,
     disk_free: Callable[[str | os.PathLike[str]], int] | None = None,
+    file_fetcher: Callable[..., Any] | None = None,
 ) -> APIRouter:
     """Build the downloads and model-list routes for one app instance.
 
@@ -811,6 +1395,7 @@ def create_router(
             pc_memory=pc_memory,
             card_memory=card_memory,
             disk_free=disk_free,
+            file_fetcher=file_fetcher,
         )
     downloads = APIRouter(prefix="/api/downloads", tags=["downloads"])
     models = APIRouter(tags=["models"])
@@ -866,7 +1451,10 @@ create_download_router = create_router
 
 
 __all__ = [
+    "AddUnsupported",
+    "ChecksumMismatch",
     "DownloadBody",
+    "DownloadCancelled",
     "DownloadConflict",
     "DownloadJob",
     "DownloadManager",
@@ -878,6 +1466,8 @@ __all__ = [
     "parse_hf_repo",
     "parse_huggingface_repo",
     "parse_repo",
+    "parse_sha256sums",
     "pc_memory_bytes",
     "physical_memory_bytes",
+    "sha256_file",
 ]

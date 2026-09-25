@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from freetoken.daemon.settings.app import create_app
-from freetoken.daemon.settings.browse import is_model_folder, list_directory, resolve_start
+from freetoken.daemon.settings.browse import BROWSE_KINDS, is_model_folder, list_directory, resolve_start
 from freetoken.daemon.settings.process_manager import ProcessManager
 from freetoken.daemon.settings.profiles_manager import ProfilesManager
 
@@ -86,3 +86,18 @@ def test_browse_route_lists_and_rejects_bad_kind(tmp_path):
     assert client.get("/api/browse", params={"kind": "everything"}).status_code == 422
     doc = client.get("/api/settings").json()
     assert {group["name"] for group in doc["groups"]} >= {dial["group"] for dial in doc["dials"]}
+
+
+def test_add_kind_lists_ninfer_files_and_model_folders(tmp_path):
+    _tree(tmp_path)
+    for name in ("quasar.ninfer", "twin.ninfer", "twin.ninfer.part-0001"):
+        (tmp_path / name).write_bytes(b"x")
+    (tmp_path / ".incoming-download-1").mkdir()
+    listing = list_directory(str(tmp_path), "add")
+    names = {entry["name"]: entry for entry in listing["entries"]}
+    assert set(names) == {"Some-Model", "Pictures", "quasar.ninfer", "twin.ninfer"}
+    assert names["Some-Model"]["isModel"] is True and names["quasar.ninfer"]["isModel"] is True
+    assert names["quasar.ninfer"]["kind"] == "file" and names["Pictures"]["isModel"] is False
+    assert list_directory(str(tmp_path / "Some-Model"), "add")["isModel"] is True
+    # The route accepts the new kind through the shared BROWSE_KINDS tuple.
+    assert "add" in BROWSE_KINDS

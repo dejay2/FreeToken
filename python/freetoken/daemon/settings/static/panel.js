@@ -3,11 +3,12 @@
    The Models list, the "Right now" strip, the System / NInfer defaults / FreeToken defaults
    tabs and each model's settings. Dials are drawn by index.html's renderer: a view fills
    state.dials, state.groups, state.settings and state.saved, sets state.view and calls
-   renderSettings(). The helpers above the browser section are pure and exported for node. */
+   renderSettings(). The helpers above the browser section are pure and exported for node.
+   Stage B (spec section 7): the Add a model wizard and the Remove question. */
 
 const PANEL_NOW_MS = 5000;
 const PANEL_GB = 1024 ** 3;
-const panel = { main: 'models', revision: '', models: [], now: null, busy: false, fit: null, fitDraft: '', nowTimer: null, nowLoop: false, restartResolve: null, confirmResolve: null, presetMode: 'add' };
+const panel = { main: 'models', revision: '', models: [], now: null, busy: false, fit: null, fitDraft: '', nowTimer: null, nowLoop: false, restartResolve: null, confirmResolve: null, presetMode: 'add', removeResolve: null };
 
 function panelEsc(value) { return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 function fmtGB(bytes) { const n = Number(bytes); if (bytes == null || bytes === '' || !Number.isFinite(n)) return '—'; return `${(n / PANEL_GB).toFixed(1)} GB`; }
@@ -122,8 +123,96 @@ function registryProblemHtml(body) {
   }
   return `<div class="panel-head"><div><h2>The model list is damaged</h2><p class="small">${panelEsc(body.message || '')}</p><p class="small">Nothing was changed. Restore the last good backup:</p></div></div>${backups ? `<ul class="backups">${backups}</ul>` : '<p class="empty">No backups were found.</p>'}`;
 }
+// ---- Stage B: add and remove (spec section 7) ----
+const ADD_ID_RE = /^[a-z0-9][a-z0-9._-]{0,62}$/; // registry.MODEL_ID_RE (a test keeps them equal)
+const ADD_ID_RULE = 'Use 1 to 63 small letters, numbers, dots, dashes or underscores, starting with a letter or number.';
+// The stage names are download.py's DownloadJob.stage values.
+const ADD_STAGE_WORDS = { queued: 'Waiting to start', downloading: 'Downloading', verifying: 'Checking the download', moving: 'Putting it in place', done: 'Downloaded', failed: 'Download failed', cancelled: 'Download cancelled' };
+const ADD_TERMINAL = new Set(['done', 'failed', 'cancelled']);
+const ADD_POLL_MS = 1500;
+// pollGen numbers the poll loop: only the newest loop's answers are shown (review item 4).
+// checkSeq / planSeq number the detect and plan requests the same way (item 6). seenJob is the
+// finished download already shown once on opening (item 3). cancelling holds "Cancelling…" until
+// a poll says cancelled (item 5). saving keeps Save off while the POST runs (item 6).
+const addState = { found: null, plan: null, job: null, timer: null, roots: {}, pollGen: 0, checkSeq: 0, planSeq: 0, seenJob: null, cancelling: false, saving: false };
+const ADD_LOST_TOUCH = 'Lost touch with the settings page, trying again…';
+const ADD_KEEPS_GOING = 'The download keeps going. Open Add a model to see it.';
+function idProblem(id, rows) {
+  const text = String(id ?? '').trim();
+  if (!ADD_ID_RE.test(text)) return ADD_ID_RULE;
+  const wanted = text.toLowerCase();
+  const owner = (rows || []).find((row) => String(row.id).toLowerCase() === wanted || (row.aliases || []).some((alias) => String(alias).toLowerCase() === wanted));
+  return owner ? `That id is already used by ${owner.name || owner.id}.` : '';
+}
+// /api/panel/add/detect: {kind, format, engineLabel, runtimeLabel, bytes, reason, already}.
+function detectionText(found) {
+  if (!found) return '';
+  if (found.kind === 'unsupported') return found.reason || 'Not supported by your engines.';
+  const engine = found.runtimeLabel ? `${found.engineLabel} (${found.runtimeLabel})` : found.engineLabel;
+  const already = found.already ? ` It is already in the list as ${found.already}.` : '';
+  return `This is a ${found.format || 'model'} for ${engine}, ${fmtGB(found.bytes)}.${already}`;
+}
+// /api/panel/add/plan: {kind: 'ninfer'|'folder', entry, entries, name, files: [{name, bytes, check}],
+// totalBytes, target, exists, diskFits, diskFreeBytes}. check is "SHA256SUMS", "published" or null.
+function planSummary(plan) {
+  if (!plan) return '';
+  if (plan.kind === 'ninfer' && !plan.entry) return `This repo has ${(plan.entries || []).length} NInfer files. Pick one.`;
+  const what = plan.kind === 'ninfer' ? `NInfer file ${plan.entry}` : `model folder ${plan.name}`;
+  const files = plan.files || [];
+  const checked = files.filter((file) => file.check).length;
+  const sums = !checked ? ' The repo publishes no checksums, so the files cannot be checked.' : checked === files.length ? ` All ${files.length} files will be checked against the checksums the repo publishes.` : ` ${checked} of ${files.length} files will be checked against the checksums the repo publishes.`;
+  const space = plan.diskFits === false ? ` Not enough drive space: ${fmtGB(plan.diskFreeBytes)} free.` : '';
+  const exists = plan.exists ? ' It is already on this PC, so use “On this PC” to add it.' : '';
+  return `Downloads the ${what} (${fmtGB(plan.totalBytes)}) into ${plan.target}.${sums}${space}${exists}`;
+}
+// A download job: {id, stage, percent, receivedBytes, totalBytes, error, verified, resultPath}.
+// Server errors end with a full stop, so the failed line reads as two sentences.
+function downloadLine(job) {
+  if (!job) return '';
+  const words = ADD_STAGE_WORDS[job.stage] || String(job.stage || '');
+  if (job.stage === 'failed') return `${words}: ${job.error || 'no reason was given.'} Its partial files were deleted.`;
+  if (job.stage === 'cancelled') return `${words}. Its partial files were deleted.`;
+  const sizes = job.totalBytes ? ` · ${fmtGB(job.receivedBytes)} of ${fmtGB(job.totalBytes)}` : '';
+  const checked = job.stage === 'done' && (job.verified || []).length ? ` · ${job.verified.length} file(s) matched the published checksums` : '';
+  return `${words} · ${Math.round(Number(job.percent) || 0)}%${sizes}${checked}`;
+}
+function removeQuestion(row, loaded) {
+  return `Remove ${row.name || row.id} from the list?${loaded ? ' It is loaded now and will be put away first.' : ''} Apps will no longer see it.`;
+}
+// What "Also delete the model files" would do: a NInfer model is one file plus its part files;
+// a FreeToken model is a folder, and its settings profile goes with it (review item 8).
+function removeFilesNote(view) {
+  const where = view.artifact || 'its files';
+  if (view.engine === 'freetoken') return `If you tick this, the model folder at ${where} is deleted for good, and so is its settings profile.`;
+  return `If you tick this, the model file (and its part files) at ${where} are deleted for good.`;
+}
+function removeOkLabel(deleteFiles) { return deleteFiles ? 'Remove and delete files' : 'Remove'; }
+// The RAM box: whole gigabytes from 0 to 512 (the input's own min/max, checked here too because
+// a typed value ignores them; review item 7).
+function ramProblem(value) {
+  const text = String(value ?? '').trim();
+  const n = Number(text);
+  if (!text || !Number.isFinite(n) || n < 0 || n > 512) return 'Use a number of gigabytes from 0 to 512.';
+  return '';
+}
+// pi_sync's answer: {status: 'updated'|'not_updated', message, notes}.
+function piNote(pi) {
+  if (!pi) return '';
+  const notes = (pi.notes || []).join(' ');
+  if (pi.status === 'not_updated') return `Pi not updated: ${pi.message}`;
+  if (pi.status === 'updated') return `Pi updated.${notes ? ` ${notes}` : ''}`;
+  return notes;
+}
+function addedNote(body) {
+  return [`Added ${body.name || body.id}.`, ...(body.adjusted || []), piNote(body.pi)].filter(Boolean).join(' ');
+}
+function removedNote(body) {
+  return [`Removed ${body.name || body.id}.`, body.files && body.files.message, body.profile && body.profile.message, piNote(body.pi)].filter(Boolean).join(' ');
+}
 if (typeof module !== 'undefined') module.exports = { fmtGB, stateWord, sourceText, dialSourceFor, verdictWords, fitSummary, ramSummary, restartQuestion, nowStripHtml, modelsTableHtml, panelErrorText,
-  loadQuestion, unloadQuestion, registryProblemHtml, panelSave, answerRestart, answerConfirm, startNow, loadModel, unloadModel, panel };
+  loadQuestion, unloadQuestion, registryProblemHtml, panelSave, answerRestart, answerConfirm, startNow, loadModel, unloadModel, panel,
+  idProblem, detectionText, planSummary, downloadLine, removeQuestion, removeFilesNote, removeOkLabel, ramProblem, piNote, addedNote, removedNote,
+  addState, openAdd, closeAdd, addCheckPath, addValidate, addPlan, addPathEdited, addRepoEdited, wirePanel, addDownload, addCancelDownload, pollAddJob, addSave, openRemove, answerRemove };
 
 /* ---------- browser side: uses index.html's state, json, $, setNotice and dial renderer ---------- */
 const postJson = (url, payload) => json(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload ?? {}) });
@@ -298,6 +387,7 @@ function applyView(body, url) {
   $('view-back').hidden = body.kind !== 'model';
   $('preset-tools').hidden = body.kind !== 'model';
   $('panel-fit').hidden = body.kind !== 'model';
+  $('model-remove').hidden = body.kind !== 'model';
   $('preset-form').hidden = true;
   if (body.kind === 'model') renderPresetPicker();
   showEditor(true);
@@ -378,6 +468,252 @@ function answerConfirm(yes) {
   $('confirm-ask').hidden = true;
   const resolve = panel.confirmResolve;
   panel.confirmResolve = null;
+  if (resolve) resolve(!!yes);
+}
+
+/* ---------- Stage B: add a model, remove a model ---------- */
+function addSource(which) {
+  $('add-pc').hidden = which !== 'pc';
+  $('add-link').hidden = which !== 'link';
+  document.querySelectorAll('[data-add-source]').forEach((button) => button.setAttribute('aria-selected', String(button.dataset.addSource === which)));
+}
+function addReset() {
+  addState.found = null;
+  $('add-step-found').hidden = true;
+  $('add-step-identity').hidden = true;
+  $('add-errors').textContent = '';
+  $('add-save').disabled = true;
+}
+async function openAdd() {
+  if (!leaveGuard()) return;
+  addReset();
+  addState.plan = null;
+  addState.cancelling = false;
+  $('add-path').value = ''; $('add-repo').value = '';
+  ['add-plan-card', 'add-entry', 'add-download-actions', 'add-progress', 'add-last-download'].forEach((id) => { $(id).hidden = true; });
+  addSource('pc');
+  $('add-wizard').hidden = false;
+  $('add-path').focus();
+  const { response, body } = await json('/api/panel/add/info');
+  if (!response.ok || $('add-wizard').hidden) return;
+  addState.roots = body.roots || {};
+  // A download started earlier keeps running in the helper; reopening the wizard picks it up.
+  const job = body.download;
+  if (!job) return;
+  if (!ADD_TERMINAL.has(job.stage)) { addSource('link'); addState.job = job; renderAddJob(job); startAddPoll(); return; }
+  // One that finished while the wizard was closed: a good download is offered as the path to
+  // add; a failed or cancelled one is said once, then left alone.
+  if (job.stage === 'done' && job.resultPath) {
+    addState.job = job;
+    $('add-last-download').hidden = false;
+    $('add-last-download').textContent = `Your download finished: ${downloadLine(job)}`;
+    $('add-path').value = job.resultPath;
+    await addCheckPath(job.resultPath);
+    return;
+  }
+  if (job.id !== addState.seenJob) { addState.seenJob = job.id; addState.job = job; addSource('link'); renderAddJob(job); }
+}
+function closeAdd() {
+  const wasOpen = !$('add-wizard').hidden;
+  $('add-wizard').hidden = true;
+  clearTimeout(addState.timer); addState.timer = null;
+  addState.pollGen += 1; // an answer still on its way is dropped
+  if (wasOpen && addState.job && !ADD_TERMINAL.has(addState.job.stage)) setNotice(ADD_KEEPS_GOING);
+}
+function addBrowse() {
+  openBrowser('add', 'add', { title: 'Choose a model file or folder', start: addState.roots.ninfer || '', onPick: (path) => { $('add-path').value = path; addCheckPath(path); } });
+}
+async function addCheckPath(path) {
+  addReset();
+  const seq = ++addState.checkSeq;
+  const text = String(path ?? '').trim();
+  if (!text) return;
+  $('add-step-found').hidden = false;
+  $('add-found-text').className = '';
+  $('add-found-text').textContent = 'Checking…';
+  const { response, body } = await postJson('/api/panel/add/detect', { path: text });
+  if (seq !== addState.checkSeq) return; // a newer check has been sent; its answer wins
+  if (registryProblem(response, body)) { closeAdd(); await backToRegistryProblem(body); return; }
+  if (!response.ok) { $('add-found-text').textContent = panelErrorText(body, 'Could not check that path.'); $('add-found-text').className = 'error'; return; }
+  showFound(body);
+}
+function showFound(found) {
+  addState.found = found;
+  const ok = found.kind !== 'unsupported' && !found.already;
+  $('add-step-found').hidden = false;
+  $('add-found-text').textContent = detectionText(found);
+  $('add-found-text').className = ok ? '' : 'error';
+  $('add-step-identity').hidden = !ok;
+  if (ok) { $('add-id').value = found.suggested.id; $('add-name').value = found.suggested.name; $('add-ram').value = String(found.suggested.ramNeedGB); }
+  addValidate();
+}
+function addValidate() {
+  const found = addState.found;
+  const usable = !!found && found.kind !== 'unsupported' && !found.already;
+  const problem = usable ? idProblem($('add-id').value, panel.models) : '';
+  const ram = usable ? ramProblem($('add-ram').value) : '';
+  $('add-id-error').textContent = problem;
+  $('add-ram-error').textContent = ram;
+  $('add-ram').className = ram ? 'bad' : '';
+  $('add-save').disabled = addState.saving || !usable || !!problem || !!ram || !String($('add-name').value ?? '').trim();
+}
+// Typing in the path or link field makes the last answer stale: an Add or Download must never
+// act on a path or repo other than the one on screen, and a check still on its way for the
+// old text is dropped (review round 2, PR #17).
+function addPathEdited() {
+  addState.checkSeq += 1;
+  addReset();
+}
+function addRepoEdited() {
+  addState.planSeq += 1;
+  addState.plan = null;
+  $('add-download').disabled = true;
+  ['add-plan-card', 'add-entry', 'add-download-actions'].forEach((id) => { $(id).hidden = true; });
+}
+async function addPlan() {
+  addReset();
+  const seq = ++addState.planSeq;
+  $('add-download-actions').hidden = true;
+  const entry = $('add-entry').hidden ? null : ($('add-entry').value || null);
+  $('add-plan-card').hidden = false;
+  $('add-plan-card').textContent = 'Reading the repo…';
+  const { response, body } = await postJson('/api/panel/add/plan', { link: String($('add-repo').value ?? '').trim(), entry });
+  if (seq !== addState.planSeq) return; // a newer plan request has been sent; its answer wins
+  if (!response.ok) { addState.plan = null; $('add-plan-card').textContent = panelErrorText(body, 'Could not read that link.'); return; }
+  addState.plan = body;
+  $('add-plan-card').textContent = planSummary(body);
+  const pick = body.kind === 'ninfer' && (body.entries || []).length > 1;
+  $('add-entry').hidden = !pick;
+  if (pick && !entry) $('add-entry').innerHTML = `<option value="">Pick a NInfer file…</option>${body.entries.map((name) => `<option value="${panelEsc(name)}">${panelEsc(name)}</option>`).join('')}`;
+  const ready = body.kind === 'folder' || !!body.entry;
+  $('add-download-actions').hidden = !ready;
+  $('add-download').disabled = !ready || !!body.exists || !body.diskFits;
+}
+async function addDownload() {
+  const plan = addState.plan;
+  if (!plan || $('add-download').disabled) return;
+  $('add-download').disabled = true;
+  // plan.repo is the canonical owner/name, which the route's parse_repo accepts as a link.
+  const { response, body } = await postJson('/api/panel/add/downloads', { link: plan.repo, entry: plan.entry || null });
+  if (!response.ok) { $('add-download').disabled = false; $('add-plan-card').textContent = panelErrorText(body, 'Could not start the download.'); return; }
+  addState.job = body;
+  addState.cancelling = false;
+  $('add-last-download').hidden = true;
+  renderAddJob(body);
+  startAddPoll();
+}
+function renderAddJob(job) {
+  const over = ADD_TERMINAL.has(job.stage);
+  if (over) addState.cancelling = false;
+  $('add-progress').hidden = false;
+  $('add-progress-stage').textContent = addState.cancelling ? 'Cancelling…' : (ADD_STAGE_WORDS[job.stage] || job.stage);
+  $('add-progress-bar').style.width = `${Math.max(0, Math.min(100, Number(job.percent) || 0))}%`;
+  $('add-progress-detail').textContent = downloadLine(job);
+  $('add-download-cancel').disabled = over || addState.cancelling;
+}
+// One poll loop at a time: a new start retires the old loop, whose in-flight answer is dropped.
+function startAddPoll() {
+  clearTimeout(addState.timer); addState.timer = null;
+  addState.pollGen += 1;
+  return pollAddJob(addState.pollGen);
+}
+async function pollAddJob(gen = addState.pollGen) {
+  if (gen !== addState.pollGen) return;
+  clearTimeout(addState.timer); addState.timer = null;
+  const job = addState.job;
+  if (!job) return;
+  let answer;
+  try {
+    answer = await json(`/api/panel/add/downloads/${encodeURIComponent(job.id)}`);
+  } catch (_) {
+    // The helper is restarting or the network blinked: say so and keep asking (item 2).
+    if (gen !== addState.pollGen) return;
+    $('add-progress-detail').textContent = ADD_LOST_TOUCH;
+    if (!$('add-wizard').hidden) addState.timer = setTimeout(() => pollAddJob(gen), ADD_POLL_MS);
+    return;
+  }
+  if (gen !== addState.pollGen) return;
+  const { response, body } = answer;
+  if (response.status === 404) { $('add-progress-detail').textContent = 'The settings page restarted and lost this download. Start it again.'; $('add-download').disabled = false; $('add-download-cancel').disabled = true; addState.cancelling = false; return; }
+  const current = response.ok ? body : job;
+  addState.job = current;
+  renderAddJob(current);
+  if (current.stage === 'done') { $('add-path').value = current.resultPath || ''; await addCheckPath(current.resultPath); return; }
+  if (current.stage === 'failed' || current.stage === 'cancelled') { $('add-download').disabled = false; return; }
+  if (!$('add-wizard').hidden) addState.timer = setTimeout(() => pollAddJob(gen), ADD_POLL_MS);
+}
+async function addCancelDownload() {
+  const job = addState.job;
+  if (!job || addState.cancelling || ADD_TERMINAL.has(job.stage)) return;
+  // The helper only flags the job; the worker stops at its next chunk. The button stays off and
+  // the stage reads "Cancelling…" until a poll brings back "cancelled" (item 5).
+  addState.cancelling = true;
+  renderAddJob(job);
+  let answer;
+  try { answer = await postJson(`/api/panel/add/downloads/${encodeURIComponent(job.id)}/cancel`, {}); } catch (_) { answer = { response: { ok: false }, body: {} }; }
+  if (addState.job !== job && !(addState.job && addState.job.id === job.id)) return;
+  if (!answer.response.ok) { addState.cancelling = false; renderAddJob(addState.job); $('add-progress-detail').textContent = panelErrorText(answer.body, 'Could not cancel the download. Try again.'); return; }
+  if (ADD_TERMINAL.has(answer.body.stage)) { addState.job = answer.body; renderAddJob(answer.body); }
+}
+async function addSave() {
+  const found = addState.found;
+  if (!found || addState.saving || $('add-save').disabled) return;
+  addState.saving = true;
+  $('add-save').disabled = true;
+  $('add-errors').textContent = '';
+  try {
+    const { response, body } = await postJson('/api/panel/models', { revision: panel.revision, path: found.path, id: String($('add-id').value ?? '').trim(), name: String($('add-name').value ?? '').trim(), ramNeedGB: $('add-ram').value });
+    addState.saving = false;
+    if (response.status === 409 && body.code === 'stale_revision') { await loadModels(); $('add-errors').textContent = 'The model list changed meanwhile. Check the details and press Add model again.'; addValidate(); return; }
+    if (registryProblem(response, body)) { closeAdd(); await backToRegistryProblem(body); return; }
+    // 422 here is {detail: [{field: 'add.…', message}]} or a plain {message}; 409 already_added and
+    // 503 switcher_unknown carry plain words too. panelErrorText picks the words out of each.
+    if (!response.ok) { $('add-errors').textContent = panelErrorText(body, 'Could not add the model.'); addValidate(); return; }
+    panel.revision = body.revision || panel.revision;
+    closeAdd();
+    setNotice(addedNote(body), body.pi && body.pi.status === 'not_updated' ? 'warn' : 'good');
+    await loadModels();
+    loadNow();
+  } finally {
+    addState.saving = false;
+  }
+}
+
+async function openRemove() {
+  const view = state.view;
+  if (!view || view.kind !== 'model' || panel.busy || !leaveGuard()) return;
+  const row = (panel.models || []).find((item) => item.id === view.id) || { id: view.id, name: view.name };
+  $('remove-ask-text').textContent = removeQuestion(row, isLoadedState(view.state));
+  $('remove-files').checked = false; // spec: "also delete the model files" is off by default, every time
+  $('remove-files-note').textContent = removeFilesNote(view);
+  $('remove-ask-ok').textContent = removeOkLabel(false);
+  $('remove-ask').hidden = false;
+  $('remove-ask-cancel').focus();
+  const yes = await new Promise((resolve) => { panel.removeResolve = resolve; });
+  if (!yes || panel.busy) return;
+  // Busy while the remove runs (item 1): the unload it may do takes seconds, and a second press
+  // of Remove, Save or Load meanwhile would race it.
+  panel.busy = true; setBusy(true);
+  try {
+    const { response, body } = await postJson(`/api/panel/models/${encodeURIComponent(view.id)}/remove`, { revision: panel.revision, deleteFiles: !!$('remove-files').checked });
+    if (response.status === 409 && body.code === 'stale_revision') { setNotice(body.message, 'bad'); await reopenView(); return; }
+    if (registryProblem(response, body)) { await backToRegistryProblem(body); return; }
+    // 409 files_missing / files_unsafe / files_shared and 503 switcher_unknown / unload_failed all
+    // carry plain words that say nothing was removed.
+    if (!response.ok) { setNotice(panelErrorText(body, 'Could not remove the model.'), 'bad'); return; }
+    panel.revision = body.revision || panel.revision;
+    clearView();
+    showMain('models');
+    setNotice(removedNote(body), (body.files && !body.files.deleted) || (body.profile && body.profile.message) || (body.pi && body.pi.status === 'not_updated') ? 'warn' : 'good');
+    loadNow();
+  } finally {
+    panel.busy = false; setBusy(false);
+  }
+}
+function answerRemove(yes) {
+  $('remove-ask').hidden = true;
+  const resolve = panel.removeResolve;
+  panel.removeResolve = null;
   if (resolve) resolve(!!yes);
 }
 
@@ -492,6 +828,26 @@ function wirePanel() {
   $('restart-ask-cancel').addEventListener('click', () => answerRestart(null));
   $('confirm-ask-ok').addEventListener('click', () => answerConfirm(true));
   $('confirm-ask-cancel').addEventListener('click', () => answerConfirm(false));
+  $('add-model').addEventListener('click', openAdd);
+  $('add-close').addEventListener('click', closeAdd);
+  $('add-cancel').addEventListener('click', closeAdd);
+  document.querySelectorAll('[data-add-source]').forEach((button) => button.addEventListener('click', () => { addReset(); addSource(button.dataset.addSource); }));
+  $('add-browse').addEventListener('click', addBrowse);
+  $('add-check').addEventListener('click', () => addCheckPath($('add-path').value));
+  $('add-path').addEventListener('input', addPathEdited);
+  $('add-repo').addEventListener('input', addRepoEdited);
+  $('add-path').addEventListener('keydown', (event) => { if (event.key === 'Enter') addCheckPath($('add-path').value); });
+  $('add-plan').addEventListener('click', () => { $('add-entry').hidden = true; addPlan(); });
+  $('add-repo').addEventListener('keydown', (event) => { if (event.key === 'Enter') { $('add-entry').hidden = true; addPlan(); } });
+  $('add-entry').addEventListener('change', addPlan);
+  $('add-download').addEventListener('click', addDownload);
+  $('add-download-cancel').addEventListener('click', addCancelDownload);
+  ['add-id', 'add-name', 'add-ram'].forEach((id) => $(id).addEventListener('input', addValidate));
+  $('add-save').addEventListener('click', addSave);
+  $('model-remove').addEventListener('click', openRemove);
+  $('remove-files').addEventListener('change', () => { $('remove-ask-ok').textContent = removeOkLabel(!!$('remove-files').checked); });
+  $('remove-ask-ok').addEventListener('click', () => answerRemove(true));
+  $('remove-ask-cancel').addEventListener('click', () => answerRemove(false));
 }
 async function panelBoot() {
   wirePanel();

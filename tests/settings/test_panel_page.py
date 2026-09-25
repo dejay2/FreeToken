@@ -313,3 +313,442 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(busy, [true, false]);
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """)
+
+
+# ---- Stage B: add and remove ----
+def test_add_and_remove_speak_plain_words():
+    _node(r"""
+const rows = [{id: 'quasar-27b', name: 'QUASAR', aliases: []}, {id: 'qwen3.8-flash', name: 'Flash', aliases: ['Qwen3.8-Flash-Next-NVFP4']}];
+assert.equal(p.idProblem('small_9b', rows), '');
+assert.equal(p.idProblem('Bad Id', rows), 'Use 1 to 63 small letters, numbers, dots, dashes or underscores, starting with a letter or number.');
+assert.equal(p.idProblem('qwen3.8-flash-next-nvfp4', rows), 'That id is already used by Flash.');
+assert.equal(p.idProblem('QUASAR-27B', rows), 'Use 1 to 63 small letters, numbers, dots, dashes or underscores, starting with a letter or number.');
+assert.equal(p.detectionText({kind: 'unsupported', reason: 'This file is not a NInfer model (those end in .ninfer). It is not supported by your engines.'}),
+  'This file is not a NInfer model (those end in .ninfer). It is not supported by your engines.');
+assert.equal(p.detectionText({kind: 'ninfer', format: 'NInfer v3 file', engineLabel: 'NInfer', runtimeLabel: 'upstream runtime', bytes: 5 * G}),
+  'This is a NInfer v3 file for NInfer (upstream runtime), 5.0 GB.');
+assert.equal(p.detectionText({kind: 'ninfer', format: 'NInfer v2 file', engineLabel: 'NInfer', runtimeLabel: 'QUASAR runtime', bytes: 18.4 * G, already: 'QUASAR'}),
+  'This is a NInfer v2 file for NInfer (QUASAR runtime), 18.4 GB. It is already in the list as QUASAR.');
+const plan = {kind: 'ninfer', entry: 'small.ninfer', entries: ['small.ninfer'], totalBytes: 5 * G, target: '/h/ninfer-work/models/small.ninfer',
+  files: [{name: 'small.ninfer', check: 'published'}, {name: 'small.ninfer.part-0001', check: 'published'}], diskFits: true, diskFreeBytes: 900 * G, exists: false};
+assert.equal(p.planSummary(plan), 'Downloads the NInfer file small.ninfer (5.0 GB) into /h/ninfer-work/models/small.ninfer. All 2 files will be checked against the checksums the repo publishes.');
+assert.match(p.planSummary({...plan, files: [{name: 'a', check: null}]}), /publishes no checksums/);
+assert.match(p.planSummary({...plan, diskFits: false, diskFreeBytes: 2 * G}), /Not enough drive space: 2\.0 GB free\./);
+assert.match(p.planSummary({...plan, exists: true}), /already on this PC/);
+assert.equal(p.planSummary({kind: 'ninfer', entry: null, entries: ['a.ninfer', 'b.ninfer'], files: []}), 'This repo has 2 NInfer files. Pick one.');
+assert.equal(p.downloadLine({stage: 'downloading', percent: 41.6, receivedBytes: 2 * G, totalBytes: 5 * G}), 'Downloading · 42% · 2.0 GB of 5.0 GB');
+assert.equal(p.downloadLine({stage: 'failed', error: 'small.ninfer does not match the checksum the repo publishes, so the download was deleted.'}),
+  'Download failed: small.ninfer does not match the checksum the repo publishes, so the download was deleted. Its partial files were deleted.');
+assert.equal(p.downloadLine({stage: 'done', percent: 100, receivedBytes: 5 * G, totalBytes: 5 * G, verified: ['a', 'b']}),
+  'Downloaded · 100% · 5.0 GB of 5.0 GB · 2 file(s) matched the published checksums');
+assert.equal(p.removeQuestion({id: 'q', name: 'QUASAR'}, true), 'Remove QUASAR from the list? It is loaded now and will be put away first. Apps will no longer see it.');
+assert.equal(p.removeQuestion({id: 'q'}, false), 'Remove q from the list? Apps will no longer see it.');
+assert.equal(p.piNote({status: 'not_updated', message: "Pi's files could not be read."}), "Pi not updated: Pi's files could not be read.");
+assert.equal(p.addedNote({id: 't', name: 'Tiny', adjusted: ['Longest chat set to 8,192, the most this model allows.'], pi: {status: 'updated', notes: []}}),
+  'Added Tiny. Longest chat set to 8,192, the most this model allows. Pi updated.');
+assert.equal(p.removedNote({id: 'q', name: 'QUASAR', files: {deleted: true, message: 'Its files were deleted.'}, pi: {status: 'updated', notes: ['Pi still starts with q by default; pick another default model in Pi.']}}),
+  'Removed QUASAR. Its files were deleted. Pi updated. Pi still starts with q by default; pick another default model in Pi.');
+""")
+
+
+_FAKE_PAGE = r"""
+const nodes = {};
+global.$ = (id) => (nodes[id] ||= {hidden: true, textContent: '', innerHTML: '', value: '', className: '', disabled: false, checked: false, style: {}, addEventListener() {}, querySelectorAll: () => [], focus() {}});
+global.document = {hidden: false, querySelectorAll: () => [], querySelector: () => null};
+const notes = []; global.setNotice = (message) => notes.push(message);
+global.changedNames = () => [];
+const busy = []; global.setBusy = (value) => busy.push(value);
+const posts = [];
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+"""
+
+
+def test_the_wizard_checks_a_path_then_adds_it():
+    _node(_FAKE_PAGE + r"""
+global.state = {view: null};
+global.json = async (url, options = {}) => {
+  if (options.method === 'POST') posts.push({url, body: JSON.parse(options.body || '{}')});
+  if (url === '/api/panel/add/detect') return {response: {ok: true, status: 200}, body: {kind: 'ninfer', path: '/h/ninfer-work/models/small_9b.ninfer',
+    engine: 'ninfer', runtime: 'ninfer-upstream', engineLabel: 'NInfer', runtimeLabel: 'upstream runtime', format: 'NInfer v3 file', bytes: 5 * G,
+    already: null, suggested: {id: 'small_9b', name: 'small 9b (NInfer)', ramNeedGB: 5}}};
+  if (url === '/api/panel/models' && options.method === 'POST') return {response: {ok: true, status: 200},
+    body: {status: 'added', id: 'small_9b', name: 'small 9b (NInfer)', revision: 'r2', adjusted: [], pi: {status: 'updated', notes: []}}};
+  return {response: {ok: true, status: 200}, body: {models: [], switcher: {up: true, running: []}}};
+};
+(async () => {
+  p.panel.revision = 'r1';
+  p.panel.models = [{id: 'quasar-27b', name: 'QUASAR', aliases: []}];
+  $('add-wizard').hidden = false;
+  await p.addCheckPath('/h/ninfer-work/models/small_9b.ninfer');
+  assert.equal($('add-found-text').textContent, 'This is a NInfer v3 file for NInfer (upstream runtime), 5.0 GB.');
+  assert.equal($('add-step-identity').hidden, false);
+  assert.equal($('add-id').value, 'small_9b');
+  assert.equal($('add-save').disabled, false);
+  $('add-id').value = 'quasar-27b'; p.addValidate();
+  assert.equal($('add-save').disabled, true);
+  assert.equal($('add-id-error').textContent, 'That id is already used by QUASAR.');
+  $('add-id').value = 'small_9b'; p.addValidate();
+  await p.addSave();
+  const sent = posts.find((row) => row.url === '/api/panel/models').body;
+  assert.deepEqual(sent, {revision: 'r1', path: '/h/ninfer-work/models/small_9b.ninfer', id: 'small_9b', name: 'small 9b (NInfer)', ramNeedGB: '5'});
+  assert.equal($('add-wizard').hidden, true);
+  assert.equal(p.panel.revision, 'r2');
+  assert.ok(notes.includes('Added small 9b (NInfer). Pi updated.'), notes.join(' / '));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
+
+
+def test_an_unsupported_or_known_path_offers_no_save():
+    _node(_FAKE_PAGE + r"""
+global.state = {view: null};
+let answer = {kind: 'unsupported', path: '/x/notes.txt', reason: 'This file is not a NInfer model (those end in .ninfer). It is not supported by your engines.', suggested: null};
+global.json = async (url) => ({response: {ok: true, status: 200}, body: answer});
+(async () => {
+  await p.addCheckPath('/x/notes.txt');
+  assert.equal($('add-step-identity').hidden, true);
+  assert.equal($('add-save').disabled, true);
+  assert.equal($('add-found-text').className, 'error');
+  answer = {kind: 'ninfer', path: '/q.ninfer', format: 'NInfer v2 file', engineLabel: 'NInfer', runtimeLabel: 'QUASAR runtime', bytes: G, already: 'QUASAR', suggested: {id: 'q-2', name: 'q', ramNeedGB: 1}};
+  await p.addCheckPath('/q.ninfer');
+  assert.equal($('add-save').disabled, true);
+  assert.match($('add-found-text').textContent, /already in the list as QUASAR/);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
+
+
+def test_remove_asks_with_delete_files_off_and_cancel_sends_nothing():
+    _node(_FAKE_PAGE + r"""
+global.state = {view: {kind: 'model', id: 'q', name: 'QUASAR', state: 'ready', artifact: '~/ninfer-work/models/q.ninfer', url: '/api/panel/views/model/q'}, settings: {}, saved: {}};
+global.json = async (url, options = {}) => {
+  if (options.method === 'POST') posts.push({url, body: JSON.parse(options.body || '{}')});
+  return {response: {ok: true, status: 200}, body: {status: 'removed', id: 'q', name: 'QUASAR', revision: 'r2', files: null,
+    pi: {status: 'updated', notes: []}, models: [], switcher: {up: true, running: []}}};
+};
+(async () => {
+  p.panel.revision = 'r1';
+  $('remove-files').checked = true;              // left over from an earlier question
+  const first = p.openRemove(); await tick();
+  assert.equal($('remove-ask').hidden, false);
+  assert.equal($('remove-files').checked, false);
+  assert.equal($('remove-ask-text').textContent, 'Remove QUASAR from the list? It is loaded now and will be put away first. Apps will no longer see it.');
+  assert.match($('remove-files-note').textContent, /~\/ninfer-work\/models\/q\.ninfer/);
+  p.answerRemove(false); await first;
+  assert.deepEqual(posts, []);
+  const second = p.openRemove(); await tick();
+  p.answerRemove(true); await second;
+  assert.deepEqual(posts[0], {url: '/api/panel/models/q/remove', body: {revision: 'r1', deleteFiles: false}});
+  assert.ok(notes.includes('Removed QUASAR. Pi updated.'), notes.join(' / '));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
+
+
+def test_stage_b_page_contract():
+    from freetoken.daemon.settings.registry import MODEL_ID_RE
+
+    page, js = PAGE.read_text(encoding="utf-8"), PANEL_JS.read_text(encoding="utf-8")
+    for present in ('id="add-model"', 'id="add-wizard"', 'data-add-source="pc"', 'data-add-source="link"', 'id="add-path"',
+                    'id="add-browse"', 'id="add-check"', 'id="add-repo"', 'id="add-plan"', 'id="add-entry"',
+                    'id="add-download"', 'id="add-download-cancel"', 'id="add-progress"', 'id="add-id"', 'id="add-name"',
+                    'id="add-ram"', 'id="add-save"', 'id="model-remove"', 'id="remove-ask"', 'id="remove-ask-ok"',
+                    'id="remove-ask-cancel"', 'Also delete the model files', 'id="add-ram-error"', 'id="add-last-download"'):
+        assert present in page, present
+    assert '<input id="remove-files" type="checkbox">' in page, "the delete checkbox starts unticked"
+    for route in ("/api/panel/add/info", "/api/panel/add/detect", "/api/panel/add/plan", "/api/panel/add/downloads",
+                  "/remove", "'/api/panel/models'"):
+        assert route in js, route
+    assert MODEL_ID_RE.pattern == "^[a-z0-9][a-z0-9._-]{0,62}$"
+    assert "/^[a-z0-9][a-z0-9._-]{0,62}$/" in js, "the page's id rule must match registry.MODEL_ID_RE"
+    assert "options.onPick" in page and "if (onPick)" in page
+    for banned in ("window.confirm", "window.alert", "window.prompt"):
+        assert banned not in js
+
+
+# ---- Stage B review fixes (task 6 review) ----
+def test_remove_words_and_ram_rule():
+    """Items 7 and 8: the delete-files note names what goes, the OK button says so when ticked,
+    and the RAM box only takes 0 to 512."""
+    _node(r"""
+assert.equal(p.removeFilesNote({engine: 'ninfer', artifact: '~/ninfer-work/models/q.ninfer'}),
+  'If you tick this, the model file (and its part files) at ~/ninfer-work/models/q.ninfer are deleted for good.');
+assert.equal(p.removeFilesNote({engine: 'freetoken', artifact: '~/models/Flash'}),
+  'If you tick this, the model folder at ~/models/Flash is deleted for good, and so is its settings profile.');
+assert.equal(p.removeOkLabel(true), 'Remove and delete files');
+assert.equal(p.removeOkLabel(false), 'Remove');
+assert.equal(p.ramProblem('6'), '');
+assert.equal(p.ramProblem(0), '');
+assert.equal(p.ramProblem('512'), '');
+for (const bad of ['', '-1', '513', 'lots', '1e400']) assert.equal(p.ramProblem(bad), 'Use a number of gigabytes from 0 to 512.', bad);
+""")
+
+
+def test_remove_is_busy_while_it_runs_and_focuses_cancel():
+    """Item 1 and 9: one remove at a time, the page's buttons off meanwhile; Cancel has focus."""
+    _node(_FAKE_PAGE + r"""
+global.state = {view: {kind: 'model', id: 'q', name: 'QUASAR', engine: 'ninfer', state: 'ready', artifact: '~/ninfer-work/models/q.ninfer', url: '/api/panel/views/model/q'}, settings: {}, saved: {}};
+const focused = []; nodes['remove-ask-cancel'] = {...$('remove-ask-cancel'), focus() { focused.push('cancel'); }};
+let release;
+global.json = (url, options = {}) => {
+  if (options.method === 'POST') { posts.push(url); return new Promise((resolve) => { release = () => resolve({response: {ok: true, status: 200}, body: {status: 'removed', id: 'q', name: 'QUASAR', revision: 'r2', pi: {status: 'updated', notes: []}}}); }); }
+  return Promise.resolve({response: {ok: true, status: 200}, body: {models: [], switcher: {up: true, running: []}}});
+};
+(async () => {
+  p.panel.revision = 'r1';
+  const first = p.openRemove(); await tick();
+  assert.deepEqual(focused, ['cancel']);
+  assert.equal($('remove-ask-ok').textContent, 'Remove');
+  assert.equal($('remove-files-note').textContent, 'If you tick this, the model file (and its part files) at ~/ninfer-work/models/q.ninfer are deleted for good.');
+  p.answerRemove(true); await tick();
+  assert.deepEqual(busy, [true]);
+  assert.equal(p.panel.busy, true);
+  await p.openRemove();                                  // a second press while it runs: nothing
+  assert.equal($('remove-ask').hidden, true);
+  assert.equal(posts.length, 1);
+  release(); await first;
+  assert.deepEqual(busy, [true, false]);
+  assert.equal(p.panel.busy, false);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
+
+
+def test_a_failed_remove_clears_busy():
+    _node(_FAKE_PAGE + r"""
+global.state = {view: {kind: 'model', id: 'q', name: 'QUASAR', engine: 'ninfer', state: 'stopped', artifact: '/q', url: '/api/panel/views/model/q'}, settings: {}, saved: {}};
+global.json = async (url, options = {}) => (options.method === 'POST' ? {response: {ok: false, status: 503}, body: {code: 'switcher_unknown', message: "Can't tell whether QUASAR is loaded right now."}} : {response: {ok: true, status: 200}, body: {}});
+(async () => {
+  const run = p.openRemove(); await tick();
+  p.answerRemove(true); await run;
+  assert.deepEqual(busy, [true, false]);
+  assert.ok(notes.includes("Can't tell whether QUASAR is loaded right now."), notes.join(' / '));
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
+
+
+_POLL_PAGE = _FAKE_PAGE + r"""
+global.state = {view: null};
+const timers = [];
+global.setTimeout = (fn, ms) => { timers.push({fn, ms}); return timers.length; };
+global.clearTimeout = () => {};
+let jobAnswer = {stage: 'downloading', id: 'j1', percent: 10, receivedBytes: G, totalBytes: 10 * G};
+let throwNext = false;
+const gets = [];
+global.json = async (url, options = {}) => {
+  if (options.method === 'POST') { posts.push({url, body: JSON.parse(options.body || '{}')}); }
+  if (url.startsWith('/api/panel/add/downloads/') && !options.method) {
+    gets.push(url);
+    if (throwNext) { throwNext = false; throw new TypeError('Failed to fetch'); }
+    return {response: {ok: true, status: 200}, body: {...jobAnswer}};
+  }
+  if (url.endsWith('/cancel')) return {response: {ok: true, status: 200}, body: {...jobAnswer}};
+  if (url === '/api/panel/add/detect') return {response: {ok: true, status: 200}, body: {kind: 'ninfer', path: '/n/small.ninfer', engineLabel: 'NInfer', runtimeLabel: 'upstream runtime', format: 'NInfer v3 file', bytes: G, already: null, suggested: {id: 'small', name: 'small', ramNeedGB: 2}}};
+  if (url === '/api/panel/add/info') return {response: {ok: true, status: 200}, body: {roots: {}, download: infoJob}};
+  return {response: {ok: true, status: 200}, body: {}};
+};
+let infoJob = null;
+"""
+
+
+def test_a_lost_poll_says_so_and_tries_again():
+    """Item 2: a network error while polling shows a line and reschedules instead of dying."""
+    _node(_POLL_PAGE + r"""
+(async () => {
+  $('add-wizard').hidden = false;
+  p.addState.job = {id: 'j1', stage: 'downloading'};
+  throwNext = true;
+  await p.pollAddJob(p.addState.pollGen);
+  assert.equal($('add-progress-detail').textContent, 'Lost touch with the settings page, trying again…');
+  assert.equal(timers.length, 1);
+  timers[0].fn(); await tick(); await tick();
+  assert.equal(gets.length, 2);
+  assert.match($('add-progress-detail').textContent, /Downloading · 10%/);
+  assert.equal(timers.length, 2);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
+
+
+def test_only_the_newest_poll_loop_speaks():
+    """Item 4: a second loop (say, the wizard reopened) retires the first; its late answer is dropped."""
+    _node(_POLL_PAGE + r"""
+(async () => {
+  $('add-wizard').hidden = false;
+  p.addState.job = {id: 'j1', stage: 'downloading'};
+  let releaseOld;
+  const realJson = global.json;
+  global.json = (url, options) => new Promise((resolve) => { releaseOld = () => resolve(realJson(url, options)); });
+  const old = p.pollAddJob(p.addState.pollGen);
+  global.json = realJson;
+  infoJob = {id: 'j1', stage: 'downloading', percent: 55, receivedBytes: 5 * G, totalBytes: 10 * G};
+  jobAnswer = {...infoJob};
+  await p.openAdd();                                    // reopening starts the one and only loop
+  assert.match($('add-progress-detail').textContent, /55%/);
+  const before = timers.length;
+  jobAnswer = {id: 'j1', stage: 'downloading', percent: 12};
+  releaseOld(); await old; await tick();
+  assert.match($('add-progress-detail').textContent, /55%/, 'the retired loop must not overwrite the page');
+  assert.equal(timers.length, before, 'the retired loop must not reschedule');
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
+
+
+def test_cancel_stays_off_until_the_poll_says_cancelled():
+    """Item 5."""
+    _node(_POLL_PAGE + r"""
+(async () => {
+  $('add-wizard').hidden = false;
+  p.addState.job = {id: 'j1', stage: 'downloading', percent: 10};
+  await p.addCancelDownload();
+  assert.equal($('add-download-cancel').disabled, true);
+  assert.equal($('add-progress-stage').textContent, 'Cancelling…');
+  await p.pollAddJob(p.addState.pollGen);              // the worker has not stopped yet
+  assert.equal($('add-download-cancel').disabled, true);
+  assert.equal($('add-progress-stage').textContent, 'Cancelling…');
+  await p.addCancelDownload();                          // a second press sends nothing more
+  assert.equal(posts.filter((row) => row.url.endsWith('/cancel')).length, 1);
+  jobAnswer = {id: 'j1', stage: 'cancelled', percent: 10};
+  await p.pollAddJob(p.addState.pollGen);
+  assert.equal($('add-progress-stage').textContent, 'Download cancelled');
+  assert.equal($('add-download-cancel').disabled, true);
+  assert.equal($('add-download').disabled, false);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
+
+
+def test_reopening_shows_a_finished_download_once():
+    """Item 3: done fills the path and checks it; failed is said once, then left alone."""
+    _node(_POLL_PAGE + r"""
+(async () => {
+  infoJob = {id: 'j9', stage: 'done', percent: 100, receivedBytes: G, totalBytes: G, verified: ['a'], resultPath: '/n/small.ninfer'};
+  await p.openAdd();
+  assert.equal($('add-last-download').hidden, false);
+  assert.match($('add-last-download').textContent, /^Your download finished: Downloaded · 100%/);
+  assert.equal($('add-path').value, '/n/small.ninfer');
+  assert.equal($('add-id').value, 'small');
+  assert.equal($('add-pc').hidden, false);
+  assert.equal(gets.length, 0, 'a finished job is not polled');
+  infoJob = {id: 'j10', stage: 'failed', percent: 30, error: 'small.ninfer arrived with the wrong size.'};
+  await p.openAdd();
+  assert.equal($('add-link').hidden, false);
+  assert.equal($('add-progress').hidden, false);
+  assert.match($('add-progress-detail').textContent, /^Download failed: small\.ninfer arrived with the wrong size\./);
+  assert.equal(timers.length, 0);
+  await p.openAdd();                                    // the same failure is not repeated
+  assert.equal($('add-progress').hidden, true);
+  assert.equal($('add-pc').hidden, false);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
+
+
+def test_closing_during_a_download_says_it_keeps_going_and_opening_focuses_the_path():
+    """Items 9 and 10."""
+    _node(_POLL_PAGE + r"""
+const focused = []; nodes['add-path'] = {...$('add-path'), focus() { focused.push('path'); }};
+(async () => {
+  infoJob = {id: 'j1', stage: 'downloading', percent: 5};
+  await p.openAdd();
+  assert.deepEqual(focused, ['path']);
+  p.closeAdd();
+  assert.ok(notes.includes('The download keeps going. Open Add a model to see it.'), notes.join(' / '));
+  notes.length = 0;
+  infoJob = null; p.addState.job = null;
+  await p.openAdd(); p.closeAdd();
+  assert.deepEqual(notes, []);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
+
+
+def test_saving_holds_the_button_and_older_answers_lose():
+    """Item 6: addValidate keeps Save off while the POST runs; a slow detect or plan answer that
+    arrives after a newer one is dropped."""
+    _node(_POLL_PAGE + r"""
+(async () => {
+  $('add-wizard').hidden = false;
+  await p.addCheckPath('/n/small.ninfer');
+  assert.equal($('add-save').disabled, false);
+  $('add-ram').value = '600'; p.addValidate();           // item 7 on the page
+  assert.equal($('add-save').disabled, true);
+  assert.equal($('add-ram-error').textContent, 'Use a number of gigabytes from 0 to 512.');
+  assert.equal($('add-ram').className, 'bad');
+  $('add-ram').value = '2'; p.addValidate();
+  assert.equal($('add-save').disabled, false);
+  assert.equal($('add-ram').className, '');
+  let releaseSave;
+  const realJson = global.json;
+  global.json = (url, options = {}) => url === '/api/panel/models' && options.method === 'POST'
+    ? new Promise((resolve) => { releaseSave = () => resolve({response: {ok: false, status: 422}, body: {detail: [{field: 'add.id', message: 'That id is taken.'}]}}); })
+    : realJson(url, options);
+  const saving = p.addSave(); await tick();
+  assert.equal(p.addState.saving, true);
+  p.addValidate();                                       // an input event during the save
+  assert.equal($('add-save').disabled, true);
+  releaseSave(); await saving;
+  assert.equal(p.addState.saving, false);
+  assert.equal($('add-errors').textContent, 'That id is taken.');
+  assert.equal($('add-save').disabled, false);
+  // Two detects in flight: the first answer arrives last and must not win.
+  const answers = [];
+  global.json = (url, options = {}) => url === '/api/panel/add/detect'
+    ? new Promise((resolve) => { answers.push(() => resolve({response: {ok: true, status: 200}, body: {kind: 'ninfer', path: JSON.parse(options.body).path, engineLabel: 'NInfer', format: 'NInfer v3 file', bytes: G, already: null, suggested: {id: JSON.parse(options.body).path.slice(3, -7), name: 'x', ramNeedGB: 1}}})); })
+    : realJson(url, options);
+  const one = p.addCheckPath('/n/first.ninfer');
+  const two = p.addCheckPath('/n/second.ninfer');
+  answers[1](); await two;
+  assert.equal($('add-id').value, 'second');
+  answers[0](); await one;
+  assert.equal($('add-id').value, 'second', 'the older detect answer must not overwrite the newer one');
+  // The same for two plans.
+  const plans = [];
+  global.json = (url, options = {}) => url === '/api/panel/add/plan'
+    ? new Promise((resolve) => { plans.push(() => resolve({response: {ok: true, status: 200}, body: {kind: 'ninfer', entry: JSON.parse(options.body).link, entries: [JSON.parse(options.body).link], name: 'x', files: [], totalBytes: G, target: '/t', diskFits: true, exists: false}})); })
+    : realJson(url, options);
+  $('add-repo').value = 'o/first'; const planOne = p.addPlan();
+  $('add-repo').value = 'o/second'; const planTwo = p.addPlan();
+  plans[1](); await planTwo;
+  assert.match($('add-plan-card').textContent, /NInfer file o\/second/);
+  plans[0](); await planOne;
+  assert.match($('add-plan-card').textContent, /NInfer file o\/second/, 'the older plan answer must not overwrite the newer one');
+  assert.equal(p.addState.plan.entry, 'o/second');
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
+
+
+def test_editing_the_path_or_link_drops_the_old_answer():
+    """Review round 2, PR #17: after the path is edited, Add is off and the identity hidden, and a
+    check still on its way is dropped; after the link is edited, Download is off."""
+    _node(_POLL_PAGE + r"""
+const listeners = {};
+const realDollar = global.$;
+global.$ = (id) => { const node = realDollar(id); node.addEventListener = (kind, fn) => { listeners[`${id}:${kind}`] = fn; }; return node; };
+p.wirePanel();
+(async () => {
+  $('add-wizard').hidden = false;
+  await p.addCheckPath('/n/small.ninfer');
+  assert.equal($('add-save').disabled, false);
+  assert.equal($('add-step-identity').hidden, false);
+  $('add-path').value = '/n/other.ninfer'; listeners['add-path:input']();
+  assert.equal($('add-save').disabled, true);
+  assert.equal($('add-step-identity').hidden, true);
+  assert.equal(p.addState.found, null);
+  // A check sent before the edit answers after it: it must not come back.
+  let answer;
+  const realJson = global.json;
+  global.json = (url, options = {}) => url === '/api/panel/add/detect'
+    ? new Promise((resolve) => { answer = () => resolve({response: {ok: true, status: 200}, body: {kind: 'ninfer', path: '/n/small.ninfer', engineLabel: 'NInfer', format: 'NInfer v3 file', bytes: G, already: null, suggested: {id: 'small', name: 'small', ramNeedGB: 2}}}); })
+    : realJson(url, options);
+  const pending = p.addCheckPath('/n/small.ninfer'); await tick();
+  $('add-path').value = '/n/else.ninfer'; listeners['add-path:input']();
+  answer(); await pending;
+  assert.equal(p.addState.found, null);
+  assert.equal($('add-save').disabled, true);
+  assert.equal($('add-step-identity').hidden, true);
+  // The link: a ready plan, then an edit.
+  global.json = async (url) => url === '/api/panel/add/plan'
+    ? {response: {ok: true, status: 200}, body: {repo: 'o/first', kind: 'folder', name: 'x', files: [], totalBytes: G, target: '/t', diskFits: true, exists: false}}
+    : realJson(url);
+  $('add-repo').value = 'o/first'; await p.addPlan();
+  assert.equal($('add-download').disabled, false);
+  $('add-repo').value = 'o/second'; listeners['add-repo:input']();
+  assert.equal($('add-download').disabled, true);
+  assert.equal(p.addState.plan, null);
+  posts.length = 0; await p.addDownload();
+  assert.equal(posts.length, 0, 'a download must not start from the old plan');
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")
