@@ -1,7 +1,7 @@
 """One-time conversion of an EXL3 ``ngram_embedding.safetensors`` into FreeToken's table.
 
 Usage (serving box): ``.venv/bin/python scripts/exl3/convert_ngram_table.py <model-dir>``
-[--device cuda] [--chunk-rows 32768] [--dtype fp8|bf16|auto]
+[--device cuda] [--chunk-rows 32768] [--dtype fp8|auto]
 
 Writes ``freetoken-ple-000NN-of-000MM.safetensors`` (8 table shards per file) plus
 ``freetoken-ple.index.json`` into <model-dir>. turboderp's files are left untouched.
@@ -241,7 +241,8 @@ def main(argv=None) -> int:
     parser.add_argument("model_dir")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--chunk-rows", type=int, default=32768)
-    parser.add_argument("--dtype", choices=("fp8", "bf16", "auto"), default="auto")
+    # no bf16: the loader serves only F8_E4M3 tables (R1), so a bf16 run would write ~100 GB for nothing
+    parser.add_argument("--dtype", choices=("fp8", "auto"), default="auto")
     args = parser.parse_args(argv)
     try:
         report = convert_table(args.model_dir, device=args.device,

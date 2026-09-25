@@ -23,3 +23,12 @@ def test_workspace_is_prepared_after_weights_and_before_the_budget_snapshot():
     graphs = source.index("GraphRunner(")
     assert install < prepare < snapshot < kv < graphs
     assert source.count("prepare_exl3_dense_workspace(") == 1
+
+
+def test_workspace_hook_is_keyed_on_exl3():
+    # an NVFP4/bf16 boot must never import kernel/exl3.py (it loads exllamav3_ext at import)
+    from freetoken.engine.engine import Engine
+
+    source = inspect.getsource(Engine.__init__)
+    guard = source.index('getattr(config.model_config, "linear_storage", "bf16") == "exl3"')
+    assert guard < source.index("from freetoken.kernel.exl3_linear import prepare_exl3_dense_workspace")

@@ -178,7 +178,8 @@ function detectionText(found) {
   if (found.kind === 'unsupported') return found.reason || 'Not supported by your engines.';
   const engine = found.runtimeLabel ? `${found.engineLabel} (${found.runtimeLabel})` : found.engineLabel;
   const already = found.already ? ` It is already in the list as ${found.already}.` : '';
-  return `This is a ${found.format || 'model'} for ${engine}, ${fmtGB(found.bytes)}.${already}`;
+  const note = found.reason ? ` ${found.reason}` : '';  // e.g. an EXL3 word table that still needs converting
+  return `This is a ${found.format || 'model'} for ${engine}, ${fmtGB(found.bytes)}.${already}${note}`;
 }
 // /api/panel/add/plan: {kind: 'ninfer'|'folder', entry, entries, name, files: [{name, bytes, check}],
 // totalBytes, target, exists, diskFits, diskFreeBytes}. check is "SHA256SUMS", "published" or null.

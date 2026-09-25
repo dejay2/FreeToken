@@ -437,10 +437,12 @@ class Engine:
         # Dense EXL3 linears share one fixed fp16 workspace. Allocated here, after the weights
         # (it sizes itself from the built Exl3Linear tree) and before the post-weights free
         # snapshot below, so the MoE cache and KV budgets see it as spent and every CUDA graph
-        # captured later binds its fixed addresses. No-op for every other checkpoint.
-        from freetoken.kernel.exl3_linear import prepare_exl3_dense_workspace
+        # captured later binds its fixed addresses. Keyed on EXL3 so other checkpoints never
+        # import exllamav3_ext (kernel/exl3.py loads it at import).
+        if getattr(config.model_config, "linear_storage", "bf16") == "exl3":
+            from freetoken.kernel.exl3_linear import prepare_exl3_dense_workspace
 
-        prepare_exl3_dense_workspace(self.model, self.device)
+            prepare_exl3_dense_workspace(self.model, self.device)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
 

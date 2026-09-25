@@ -331,6 +331,8 @@ assert.equal(p.detectionText({kind: 'ninfer', format: 'NInfer v3 file', engineLa
   'This is a NInfer v3 file for NInfer (upstream runtime), 5.0 GB.');
 assert.equal(p.detectionText({kind: 'ninfer', format: 'NInfer v2 file', engineLabel: 'NInfer', runtimeLabel: 'QUASAR runtime', bytes: 18.4 * G, already: 'QUASAR'}),
   'This is a NInfer v2 file for NInfer (QUASAR runtime), 18.4 GB. It is already in the list as QUASAR.');
+assert.equal(p.detectionText({kind: 'freetoken', format: 'X model folder', engineLabel: 'FreeToken', runtimeLabel: '', bytes: 5 * G, reason: 'EXL3 word table not converted yet: run it.'}),
+  'This is a X model folder for FreeToken, 5.0 GB. EXL3 word table not converted yet: run it.');
 const plan = {kind: 'ninfer', entry: 'small.ninfer', entries: ['small.ninfer'], totalBytes: 5 * G, target: '/h/ninfer-work/models/small.ninfer',
   files: [{name: 'small.ninfer', check: 'published'}, {name: 'small.ninfer.part-0001', check: 'published'}], diskFits: true, diskFreeBytes: 900 * G, exists: false};
 assert.equal(p.planSummary(plan), 'Downloads the NInfer file small.ninfer (5.0 GB) into /h/ninfer-work/models/small.ninfer. All 2 files will be checked against the checksums the repo publishes.');
