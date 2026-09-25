@@ -554,8 +554,13 @@ def create_app(
 
     @app.post("/api/server/{action}", status_code=202)
     async def server_action(action: str, body: ServerActionBody | None = None):
+        if action in {"sleep", "wake"}:
+            # Sleep keeps the process: no lifecycle job (sleep design section 3.4). The reply
+            # is the model server's own, with its status code; 503 when nothing answered.
+            result = await run_in_threadpool(process_manager.sleep_server, action)
+            return JSONResponse(result, status_code=int(result.get("httpStatus") or 503))
         if action not in {"start", "stop", "restart"}:
-            raise HTTPException(status_code=422, detail="action must be start, stop, or restart")
+            raise HTTPException(status_code=422, detail="action must be start, stop, restart, sleep or wake")
         body = body or ServerActionBody()
         if body.settings is not None and action == "stop":
             raise HTTPException(status_code=422, detail="settings are accepted only for start or restart")

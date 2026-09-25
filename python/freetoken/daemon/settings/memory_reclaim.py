@@ -437,7 +437,7 @@ def watch(settings_port, engine_port):
                     enabled=(
                         governor.get("enabled", False)
                         and server.get("reachable", False)
-                        and server.get("state") in ("serving", "rebuilding")
+                        and server.get("state") in ("serving", "rebuilding", "sleeping")
                         and os.environ.get("FREETOKEN_CACHE_RECLAIM", "1") != "0"
                     ),
                 )

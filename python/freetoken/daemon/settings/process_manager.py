@@ -620,6 +620,35 @@ class ProcessManager:
                 return snippet or signature
         return None
 
+    # ---- sleep -----------------------------------------------------------
+
+    def sleep_server(self, action: str, *, timeout: float = 330.0) -> dict[str, Any]:
+        """POST /v1/sleep or /v1/wake on the model server: its reply plus ``httpStatus``.
+
+        No job and no GPU lock: sleep keeps the process, so nothing here can race a Start or
+        Stop the way a lifecycle action would. ``timeout`` sits above the server's own 300 s
+        wake wait (api_server.WAKE_WAIT_S) so the server's verdict, not a client timeout, is
+        what the page shows. ``httpStatus`` 0 means the server did not answer at all.
+        """
+        if action not in {"sleep", "wake"}:
+            raise ValueError("action must be sleep or wake")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/v1/{action}", data=b"", method="POST",
+            headers={"Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = json.loads(response.read().decode("utf-8") or "{}")
+                return {**body, "httpStatus": int(response.status)}
+        except urllib.error.HTTPError as exc:
+            try:
+                body = json.loads(exc.read().decode("utf-8") or "{}")
+            except Exception:  # noqa: BLE001 - a non-JSON error page
+                body = {}
+            return {"status": "failed", **body, "httpStatus": int(exc.code)}
+        except OSError as exc:
+            return {"status": "unreachable", "error": str(exc), "httpStatus": 0}
+
     # ---- status and log helpers -----------------------------------------
 
     def server_status(self) -> dict[str, Any]:
