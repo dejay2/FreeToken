@@ -30,6 +30,8 @@ from freetoken.message import (
     CacheRebuildResultMsg,
     CacheResidencyBackendMsg,
     CacheResidencyResultMsg,
+    CacheSleepBackendMsg,
+    CacheSleepResultMsg,
     CacheStepBackendMsg,
     CacheStepResultMsg,
     DetokenizeMsg,
@@ -213,6 +215,10 @@ class Scheduler(SchedulerIOMixin):
         # (see _note_maintenance_progress) correlate to the operation holding the API gate.
         self._maintenance_request_id: str | None = None
         self._maintenance_progress_at = -float("inf")
+        # Chats that reached the scheduler while the engine sleeps (design section 3.4): held
+        # here, never admitted against the one-page sleep pool, and admitted after the wake.
+        self._sleep_held: list[UserMsg] = []
+        self._auto_wake_seq = 0
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -279,6 +285,8 @@ class Scheduler(SchedulerIOMixin):
         (Timer 1). next_park_delay_ms returns None once nothing is pending or parkable, and
         the loop would then block on the queue with no timer at all -- a quiet server would
         never wake for its own shrink (spec rule 4)."""
+        if self._asleep():
+            return None  # nothing to park, shrink or expire until a message arrives
         delays = [
             self.cache_manager.next_park_delay_ms(),
             None
@@ -297,6 +305,10 @@ class Scheduler(SchedulerIOMixin):
             # runs on every poll. Parking and the integrity check walk the page table and the
             # pools a failed teardown left in an unknown state -- and the controller is
             # disabled, so its idle plan is a no-op anyway. Wait for the restart, do nothing.
+            return
+        if self._asleep():
+            # Asleep: the pools are one page and the prefix tree is empty, so there is nothing to
+            # park, check or grow (design section 3.2). Messages still wake the loop.
             return
         if coordinator := getattr(self, "prefix_coordinator", None):
             coordinator.expire()
@@ -1163,7 +1175,7 @@ class Scheduler(SchedulerIOMixin):
         """Rule 2/4/8 at an idle safe point: escalate capacity-blocked requests, execute the
         controller's one plan, then drain the held FIFO according to the outcome."""
         c = self._kv_dynamic
-        if c is None or not c.enabled or self._pending_rebuild is not None:
+        if c is None or not c.enabled or self._pending_rebuild is not None or self._asleep():
             # A manual rebuild or governor step already holds the one-operation-at-a-time slot
             # (rule 9): yield and plan at the next idle point, after its geometry re-snapshot.
             return
@@ -1338,6 +1350,11 @@ class Scheduler(SchedulerIOMixin):
             for held in controller.disable(reason):
                 self._release_request_tensors(held.msg)
                 uids.append(held.uid)
+        # Chats held for a wake that will now never run (getattr: the latch tests' shells).
+        for held_msg in getattr(self, "_sleep_held", None) or ():
+            self._release_request_tensors(held_msg)
+            uids.append(held_msg.uid)
+        self._sleep_held = []
         if uids:
             self.send_result([
                 ErrorReplyMsg(
@@ -1367,7 +1384,10 @@ class Scheduler(SchedulerIOMixin):
         elif isinstance(msg, PrefixCacheBackendMsg):
             result = (
                 {"status": "failed", "result": {}, "error": "cache rebuild failed; server needs a restart"}
-                if self._engine_failed is not None else self.prefix_coordinator.command(msg)
+                if self._engine_failed is not None
+                else {"status": "failed", "result": {}, "error": "the model is asleep; wake it first"}
+                if self._asleep()
+                else self.prefix_coordinator.command(msg)
             )
             self.send_result([PrefixCacheResultMsg(request_id=msg.request_id, **result)])
         elif isinstance(msg, UserMsg):
@@ -1396,6 +1416,12 @@ class Scheduler(SchedulerIOMixin):
             if msg.mm_items and self.engine.encoder_cache is None:
                 self.send_result([ErrorReplyMsg(uid=msg.uid, error="image input is not supported by this server")])
                 return
+            if self._asleep():
+                # Never admit against the one-page sleep pool: _admit_user_msg's clip would drop
+                # the chat as too long. Hold it and wake (review focus 3). It got here past the
+                # API's gate before the sleep reply landed (tokenizer workers keep no order).
+                self._hold_for_wake(msg)
+                return
             # Rule 2: with the dynamic KV pool on, the clip and the fit are judged against
             # the CEILING, not today's pool, and a request that needs more room than the pool
             # holds is held here instead of being admitted into a pool that cannot take it.
@@ -1415,6 +1441,9 @@ class Scheduler(SchedulerIOMixin):
             kv_dynamic = getattr(self, "_kv_dynamic", None)
             if kv_dynamic is not None:
                 kv_dynamic.on_abort(msg.uid)
+            held = getattr(self, "_sleep_held", None)
+            if held:
+                self._sleep_held = [m for m in held if m.uid != msg.uid]
             tombstones = getattr(self, "_abort_tombstones", None)
             if tombstones is None:
                 tombstones = self._abort_tombstones = {}
@@ -1464,7 +1493,9 @@ class Scheduler(SchedulerIOMixin):
                 if is_moe_only
                 else (self._prefill_has_chunked_continuation() or self.decode_manager.runnable)
             )
-            if not self.cache_manager.supports_runtime_rebuild:
+            if self._asleep():
+                self._reply_rebuild(msg.request_id, "rejected", "the model is asleep; wake it first")
+            elif not self.cache_manager.supports_runtime_rebuild:
                 self._reply_rebuild(
                     msg.request_id, "unsupported", "this model's cache does not support runtime rebuild"
                 )
@@ -1503,6 +1534,22 @@ class Scheduler(SchedulerIOMixin):
                     self._reply_step(msg.request_id, "ok", noop)
                 else:
                     self._queue_maintenance(msg)
+        elif isinstance(msg, CacheSleepBackendMsg):
+            if self.config.tp_info.size > 1:
+                self._reply_sleep(msg.request_id, msg.action, "unsupported", error="sleep is unsupported under TP > 1")
+            elif not self.cache_manager.supports_runtime_rebuild:
+                self._reply_sleep(msg.request_id, msg.action, "unsupported",
+                                  error="this model's cache does not support runtime rebuild")
+            elif self._pending_rebuild is not None:
+                self._reply_sleep(msg.request_id, msg.action, "busy", error="another cache operation is queued")
+            elif msg.action == "sleep" and not self._asleep() and self._sleep_busy():
+                # Design D11: refuse on arrival, like an if_idle rebuild. Queued, a sleep would
+                # wait out the chat (the loops hold non-MoE-only work until decode is idle)
+                # with the API's gate shut, and every new chat meanwhile would queue behind it.
+                self._reply_sleep(msg.request_id, "sleep", "busy",
+                                  error="a chat is running; try again when it ends")
+            else:
+                self._queue_maintenance(msg)
         elif isinstance(msg, CacheResidencyBackendMsg):
             try:
                 rep = self.engine.residency_report()
@@ -1576,6 +1623,8 @@ class Scheduler(SchedulerIOMixin):
             error = "server latched failed: cache rebuild failed; server needs a restart"
             if isinstance(msg, CacheRebuildBackendMsg):
                 self._reply_rebuild(msg.request_id, "failed", error=error)
+            elif isinstance(msg, CacheSleepBackendMsg):
+                self._reply_sleep(msg.request_id, msg.action, "failed", error=error)
             else:
                 self._reply_step(msg.request_id, "failed", error=error)
             return
@@ -1775,6 +1824,15 @@ class Scheduler(SchedulerIOMixin):
         from freetoken.engine.engine import CacheRebuildRejected
 
         is_idle = not (self.prefill_manager.runnable or self.decode_manager.runnable)
+        rebuild = self.rebuild_cache
+        if self._asleep():
+            # Design D8: while asleep the card belongs to a game. Only the RAM axis's down rung
+            # runs, and engine.asleep_rebuild lets it spill to the SSD and nothing else.
+            if (msg.axis, msg.direction) != ("ram", "down"):
+                self._reply_step(msg.request_id, "rejected",
+                                 error="asleep: only SSD spills run while the model sleeps")
+                return "rejected"
+            rebuild = self.engine.asleep_rebuild
         self.engine.rebuild_teardown_started = False
         try:
             res = self.engine.step_memory(
@@ -1782,7 +1840,7 @@ class Scheduler(SchedulerIOMixin):
                 direction=msg.direction,
                 ram_tight=msg.ram_tight,
                 is_idle=is_idle,
-                rebuild=self.rebuild_cache,
+                rebuild=rebuild,
             )
         except CacheRebuildRejected as e:
             logger.warning(f"cache step rejected: {e}")
@@ -1826,7 +1884,10 @@ class Scheduler(SchedulerIOMixin):
         # card back bytes the governor deliberately took. Only "ok" changed the geometry:
         # "rejected" retains the old one and "failed" leaves it unknown (and the controller
         # about to be disabled). Outside the finally so the maintenance hook is already gone.
-        if outcome == "ok" and not str(msg.request_id).startswith("auto-kv:"):
+        # Not after a sleep: the budget and the policy describe the AWAKE pools, and the wake
+        # restores exactly those (wake_engine re-snapshots the budget itself).
+        went_to_sleep = isinstance(msg, CacheSleepBackendMsg) and msg.action == "sleep"
+        if outcome == "ok" and not str(msg.request_id).startswith("auto-kv:") and not went_to_sleep:
             # NOT gated on the controller: validate_rebuild's byte-neutral swap allowance reads
             # pool_budget_bytes whether or not the dynamic pool is on, so a stale budget after a
             # governor step would mis-judge the NEXT operator rebuild too. _send_kv_dynamic_status
@@ -1841,6 +1902,9 @@ class Scheduler(SchedulerIOMixin):
                 # uncommitted charges and Timer 1 (external review of 8d566de).
                 self._kv_dynamic.replace_policy(self._build_kv_dynamic_policy(self.config))
             self._send_kv_dynamic_status()
+        # A chat held while this operation ran (or while a sleep that just finished was queued)
+        # needs a wake of its own.
+        self._maybe_auto_wake()
         return outcome
 
     def _execute_pending_operation(self, msg) -> str:
@@ -1854,6 +1918,8 @@ class Scheduler(SchedulerIOMixin):
 
         if isinstance(msg, CacheStepBackendMsg):
             return self._execute_pending_step(msg)
+        if isinstance(msg, CacheSleepBackendMsg):
+            return self._execute_pending_sleep(msg)
         requested = {
             "moe_cache_size": msg.moe_cache_size,
             "num_pages": msg.num_pages,
@@ -1925,6 +1991,166 @@ class Scheduler(SchedulerIOMixin):
         self._log_cache_geometry("Cache rebuilt")
         self._reply_rebuild(msg.request_id, "ok")
         return "ok"
+
+    # ---- sleep (docs/superpowers/specs/2026-09-25-freetoken-sleep-design.md) ----
+
+    def _asleep(self) -> bool:
+        """engine.sleep_snapshot is the one source of truth (None = awake)."""
+        return getattr(getattr(self, "engine", None), "sleep_snapshot", None) is not None
+
+    def _sleep_busy(self) -> bool:
+        """Design D11: anything pending, running or held refuses a sleep ("busy")."""
+        kv_dynamic = getattr(self, "_kv_dynamic", None)
+        return bool(
+            self.prefill_manager.runnable
+            or self.decode_manager.runnable
+            or getattr(self, "_sleep_held", None)
+            or (kv_dynamic is not None and kv_dynamic.has_held())
+        )
+
+    def _reply_sleep(
+        self, request_id: str, action: str, status: str, *, result: dict | None = None,
+        error: str | None = None,
+    ) -> None:
+        res = result or {}
+        self.send_result([
+            CacheSleepResultMsg(
+                request_id=request_id,
+                action=action,
+                status=status,
+                # the engine's state AFTER this operation, whatever its status: the API's
+                # asleep flag follows it (a refused wake leaves the model asleep)
+                asleep=self._asleep(),
+                released_bytes=int(res.get("released_bytes", 0) or 0),
+                vram_free_bytes=int(res.get("vram_free_bytes", 0) or 0),
+                elapsed_s=float(res.get("elapsed_s", 0.0) or 0.0),
+                error=error,
+            )
+        ])
+
+    def _execute_pending_sleep(self, msg: CacheSleepBackendMsg) -> str:
+        """Sleep or wake at the safe point; rule 8's three outcomes, like a rebuild."""
+        from freetoken.engine.engine import CacheRebuildRejected
+
+        engine = self.engine
+        action = msg.action
+        if action == "sleep" and not self._asleep():
+            if self._sleep_busy():
+                # Admitted after the sleep was queued (it was idle on arrival).
+                self._reply_sleep(msg.request_id, "sleep", "busy",
+                                  error="a chat is running; try again when it ends")
+                return "rejected"
+            try:
+                engine.sleep_preflight()  # refuse before a single conversation is parked
+            except CacheRebuildRejected as e:
+                logger.warning(f"sleep refused: {e}")
+                self._reply_sleep(msg.request_id, "sleep", "rejected", error=str(e))
+                return "rejected"
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            if coordinator := getattr(self, "prefix_coordinator", None):
+                coordinator.before_rebuild()
+            if getattr(self.cache_manager, "park_store", None) is not None:
+                # Park every eligible conversation to RAM before the KV pool goes: chats survive
+                # a sleep and restore on their next turn (cache.py prepare_rebuild).
+                self.cache_manager.prepare_rebuild()
+            self._note_maintenance_progress("sleep:parked", force=True)
+        engine.rebuild_teardown_started = False
+        changed = False
+        try:
+            result = engine.sleep() if action == "sleep" else engine.wake()
+            changed = not result.get("note")  # a note means "already asleep/awake": no change
+            if changed:
+                # Inside the try: page managers left pointing at freed pools are a failure
+                # after teardown (latch), never a crash of the scheduler process.
+                self._rethread_after_sleep()
+        except CacheRebuildRejected as e:
+            # SleepRefused: refused before anything moved, or a failed wake that went back to
+            # sleep. Either way the engine is in a known state.
+            logger.warning(f"{action} refused: {e}")
+            if action == "wake" and getattr(engine, "rebuild_teardown_started", False):
+                # The way back to sleep (release_to_sleep force_pools) re-made the KV and GDN
+                # pools, so the page managers must follow them to the new one-page table.
+                try:
+                    self._rethread_after_sleep()
+                except Exception as e2:  # noqa: BLE001
+                    return self._sleep_failed(msg, f"{e}; re-threading the sleep pools failed: {e2!r}")
+            self._reply_sleep(msg.request_id, action, "rejected", error=str(e))
+            if action == "wake":
+                self._refuse_held(f"the model is asleep and could not wake: {e}")
+            return "rejected"
+        except Exception as e:  # noqa: BLE001
+            if not getattr(engine, "rebuild_teardown_started", True):
+                logger.error(f"{action} failed before teardown: {e!r}; engine untouched")
+                self._reply_sleep(msg.request_id, action, "rejected", error=repr(e))
+                if action == "wake":
+                    self._refuse_held(f"the model is asleep and could not wake: {e!r}")
+                return "rejected"
+            # WakeFailed lands here too: the wake AND the way back to sleep both failed.
+            return self._sleep_failed(msg, repr(e))
+        if changed:
+            self._log_cache_geometry("Asleep" if action == "sleep" else "Awake")
+        self._reply_sleep(msg.request_id, action, "ok", result=result)
+        if action == "wake":
+            self._admit_held()
+        return "ok"
+
+    def _sleep_failed(self, msg: CacheSleepBackendMsg, error: str) -> str:
+        logger.error(f"{msg.action} failed after teardown: {error}; latching failed")
+        self._reply_sleep(msg.request_id, msg.action, "failed", error=error)
+        # The latch error-replies the held chats along with everything else.
+        self._latch_engine_failed(f"{msg.action} failed: {error}")
+        return "failed"
+
+    def _rethread_after_sleep(self) -> None:
+        """Point the page managers at the pools sleep or wake just re-made: rebuild_cache's
+        tail for a KV + GDN resize (a new prefix tree; parked prefixes restore into it)."""
+        self.cache_manager.rebuild(self.engine.num_pages, self.engine.page_table)
+        self.table_manager.rebuild(self.engine.page_table)
+        self.token_pool = self.table_manager.token_pool
+        if coordinator := getattr(self, "prefix_coordinator", None):
+            coordinator.max_seq_len = self.engine.max_seq_len
+        self.cache_manager.check_integrity()
+        chunk_cap = self.cache_manager.prefill_chunk_budget
+        self.prefill_budget = (
+            min(self.config.max_extend_tokens, chunk_cap) if chunk_cap else self.config.max_extend_tokens
+        )
+
+    def _hold_for_wake(self, msg: UserMsg) -> None:
+        held = getattr(self, "_sleep_held", None)
+        if held is None:
+            held = self._sleep_held = []
+        held.append(msg)
+        self._maybe_auto_wake()
+
+    def _maybe_auto_wake(self) -> None:
+        """Queue a wake for held chats unless one (or any other operation) is already queued;
+        _execute_pending_rebuild calls this again when that operation ends."""
+        if (not self._asleep() or not getattr(self, "_sleep_held", None)
+                or self._pending_rebuild is not None or self._engine_failed is not None):
+            return
+        self._auto_wake_seq = getattr(self, "_auto_wake_seq", 0) + 1
+        request_id = f"auto-wake:{self._auto_wake_seq}"
+        # Rule 9, as for auto-kv: the frontend opens its own record on this begin and closes it
+        # on the CacheSleepResultMsg that _execute_pending_sleep always sends.
+        self.send_result([
+            MaintenanceBeginMsg(request_id=request_id, kind="wake", detail="a chat arrived while asleep")
+        ])
+        self._queue_maintenance(CacheSleepBackendMsg(request_id=request_id, action="wake"))
+
+    def _admit_held(self) -> None:
+        held, self._sleep_held = getattr(self, "_sleep_held", None) or [], []
+        for held_msg in held:
+            if not self._queue_for_kv_dynamic(held_msg):
+                self._admit_user_msg(held_msg)
+
+    def _refuse_held(self, error: str) -> None:
+        held, self._sleep_held = getattr(self, "_sleep_held", None) or [], []
+        if not held:
+            return
+        self.send_result([ErrorReplyMsg(uid=m.uid, error=error, code="server_error") for m in held])
+        for held_msg in held:
+            self._drop_raw_picture(held_msg)
 
     def _current_cache_geometry(self) -> dict:
         """The pools' current (serving) sizes as rebuild_cache kwargs — the rollback snapshot and
