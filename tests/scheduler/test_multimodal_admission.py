@@ -272,3 +272,67 @@ def test_private_picture_placeholder_tokens_never_match_shared_prefix_cache():
 
     assert CacheManager.match_req(cache, pending) == "empty-handle"
     assert matched[0].numel() == 0
+
+
+class _Stream:
+    def __init__(self, name):
+        self.name, self.waited_on = name, []
+
+    def wait_stream(self, other):
+        self.waited_on.append(other.name)
+
+
+def _stream_harness(monkeypatch, scheduler, *, exl3: bool):
+    """Fake CUDA streams: the scheduler runs on ``sched`` while ``engine`` may be busy."""
+    from freetoken.kernel import exl3_launch
+
+    sched, engine = _Stream("sched"), _Stream("engine")
+    state = {"current": sched}
+
+    class _StreamCtx:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            self.prev, state["current"] = state["current"], self.stream
+
+        def __exit__(self, *exc):
+            state["current"] = self.prev
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: state["current"])
+    monkeypatch.setattr(torch.cuda, "stream", _StreamCtx)
+    scheduler.engine.stream = engine
+    scheduler.config.model_config.vision_config.exl3 = exl3
+    seen = []
+    model = scheduler.engine.model
+    original = model.encode_images
+
+    def encode(pixels, grid):
+        seen.append((state["current"].name, exl3_launch._full_label(None)))
+        return original(pixels, grid)
+
+    model.encode_images = encode
+    return sched, engine, seen
+
+
+def test_exl3_picture_encode_runs_on_the_engine_stream_after_the_scheduling_stream(monkeypatch):
+    # H-D (hang investigation 2026-09-25): encoding an EXL3 tower on the scheduling stream
+    # while a batch runs on the engine stream puts ExLlamaV3 kernels on two streams at once.
+    scheduler, _calls, added, sent = _scheduler()
+    sched, engine, seen = _stream_harness(monkeypatch, scheduler, exl3=True)
+
+    Scheduler._process_one_msg(scheduler, _message(uid=90))
+
+    assert sent == [] and len(added) == 1
+    assert seen == [("engine", "picture")]
+    assert engine.waited_on == ["sched"]
+
+
+def test_bf16_picture_encode_keeps_its_stream(monkeypatch):
+    scheduler, _calls, added, sent = _scheduler()
+    sched, engine, seen = _stream_harness(monkeypatch, scheduler, exl3=False)
+
+    Scheduler._process_one_msg(scheduler, _message(uid=91))
+
+    assert sent == [] and len(added) == 1
+    assert seen == [("sched", "?")] and engine.waited_on == []

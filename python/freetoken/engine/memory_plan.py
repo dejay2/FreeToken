@@ -273,11 +273,14 @@ def _expert_slot_bytes(config) -> tuple[int, str, str, int]:
 
     import torch
     from freetoken.engine.cache_budget import expert_bytes_per_slot
-    from freetoken.moe.offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
+    from freetoken.moe.offload_cache import (
+        _BANK_BYTES_PER_EXPERT,
+        _BANK_SCHEMAS,
+        bank_bytes_per_expert,
+    )
 
     source_format, runtime_format = _expert_format(config)
-    formula = _BANK_BYTES_PER_EXPERT.get(source_format)
-    if formula is None:
+    if source_format not in _BANK_BYTES_PER_EXPERT:
         raise ValueError(f"unsupported expert-bank geometry {source_format!r}")
     hidden = int(getattr(config.model_config, "hidden_size", 0) or 0)
     intermediate = int(getattr(config.model_config, "moe_intermediate_size", 0) or 0)
@@ -294,7 +297,10 @@ def _expert_slot_bytes(config) -> tuple[int, str, str, int]:
         )
     else:
         local_intermediate = _ceil_div(intermediate, tp)
-    total = int(formula(hidden, local_intermediate))
+    # EXL3 rows follow the checkpoint's routed K (model_config.exl3_expert_k; GLM K=2, Qwen K=3).
+    total = int(
+        bank_bytes_per_expert(source_format, hidden, local_intermediate, config.model_config)
+    )
     fixed_alpha = 0
     if source_format == "nvfp4" and runtime_format in {"nvfp4_marlin", "nvfp4_b12x"}:
         # The native per-row global banks are folded into one alpha per expert during repack;

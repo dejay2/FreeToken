@@ -63,6 +63,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
         conv_kernel_size, rms_norm_eps, layer_id, output_gate: str = "sigmoid",
         expert_quant: str = "none", attn_quant: str = "none", dense_quant: str = "none",
+        linear_storage: str = "bf16",
     ):
         self.layer_id = layer_id
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
@@ -86,9 +87,21 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         self._block_fp8 = expert_quant == "fp8_block"
         self._pertensor_fp8 = attn_quant == "fp8_pertensor"
         self._fp8 = self._block_fp8 or self._pertensor_fp8
+        self._exl3 = linear_storage == "exl3"
 
         self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
-        if self._fp8:
+        if self._exl3:
+            from freetoken.kernel.exl3_linear import Exl3ColMerged
+
+            # EXL3 packs qkv and z (K=5) but ships b and a as plain fp16 [num_v_heads, hidden]:
+            # mirror the fp8 split -- two packed GEMMs for qkv|z plus one bf16 GEMM for b|a.
+            self.in_proj_qkvz = Exl3ColMerged(
+                hidden_size, [("in_proj_qkv", self.conv_dim), ("in_proj_z", self.value_dim)]
+            )
+            self.in_proj_ba = LinearColParallelMerged(
+                hidden_size, [num_v_heads, num_v_heads], has_bias=False
+            )
+        elif self._fp8:
             ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
             self.in_proj_qkvz = ColMerged(
                 hidden_size, [self.conv_dim, self.value_dim], has_bias=False
@@ -114,9 +127,14 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / compressed-tensors
         # NVFP4 (W4A16) / bf16. in_proj_* stay bf16 in every mode (above), so a compressed-tensors
         # NVFP4 checkpoint (attn_quant=="nvfp4") only makes out_proj native FP4.
-        self.out_proj = make_replicated_quant(
-            expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
-        )
+        if self._exl3:
+            from freetoken.kernel.exl3_linear import Exl3Linear
+
+            self.out_proj = Exl3Linear(self.value_dim, hidden_size)
+        else:
+            self.out_proj = make_replicated_quant(
+                expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
+            )
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
         beta = b.sigmoid()
@@ -177,7 +195,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
-        if self._fp8:
+        if self._fp8 or self._exl3:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
             ba = self.in_proj_ba.forward(hidden_states)

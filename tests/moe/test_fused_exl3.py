@@ -6,6 +6,7 @@ import json
 import os
 from collections import defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -891,3 +892,85 @@ def test_packed_decode_falls_back_once_at_the_route_index_limit(monkeypatch):
     assert torch.count_nonzero(first) > 0
     assert len(warnings) == 1
     assert "falling back" in warnings[0][0][0]
+
+
+def test_graph_rule_accepts_top10_on_mgemm():
+    from freetoken.moe.fused_exl3 import decode_is_graph_safe
+
+    cfg = SimpleNamespace(max_running_req=1, cuda_graph_bs=None, cuda_graph_max_bs=1,
+                          exl3_expert_op="mgemm",
+                          model_config=SimpleNamespace(num_experts_per_tok=10))
+    assert decode_is_graph_safe(cfg)
+
+
+def test_graph_rule_keeps_reconstruct_limit():
+    from freetoken.moe.fused_exl3 import decode_is_graph_safe
+
+    cfg = SimpleNamespace(max_running_req=1, cuda_graph_bs=None, cuda_graph_max_bs=1,
+                          exl3_expert_op="reconstruct",
+                          model_config=SimpleNamespace(num_experts_per_tok=10))
+    assert not decode_is_graph_safe(cfg)
+
+
+def test_graph_rule_mgemm_caps_top_k_at_the_route_list():
+    from freetoken.kernel.exl3_mgemm import EXL3_MGEMM_MAX_INDICES
+    from freetoken.moe.fused_exl3 import decode_is_graph_safe
+
+    def cfg(top_k):
+        return SimpleNamespace(max_running_req=1, cuda_graph_bs=None, cuda_graph_max_bs=1,
+                               exl3_expert_op="mgemm",
+                               model_config=SimpleNamespace(num_experts_per_tok=top_k))
+
+    assert decode_is_graph_safe(cfg(EXL3_MGEMM_MAX_INDICES))
+    assert not decode_is_graph_safe(cfg(EXL3_MGEMM_MAX_INDICES + 1))
+
+
+def test_prepare_scratch_records_k_and_sizes_the_reconstruct_banks(monkeypatch):
+    from freetoken.moe.fused_exl3 import prepare_exl3_scratch
+
+    scratch = prepare_exl3_scratch(
+        device="cpu", hidden_size=H, intermediate_size=I, max_tokens=4, chunk_experts=2, k=3
+    )
+    assert scratch.k == 3
+    assert scratch.reconstruct_banks[0].shape == (2, H // 16, I // 16, 48)
+    assert scratch.reconstruct_banks[6].shape == (2, I // 16, H // 16, 48)
+    assert prepare_exl3_scratch(
+        device="cpu", hidden_size=H, intermediate_size=I, max_tokens=4, chunk_experts=2
+    ).k == 2
+
+
+def test_validate_banks_rejects_a_k_other_than_the_scratch():
+    from freetoken.moe.fused_exl3 import _validate_banks
+
+    with pytest.raises(ValueError, match="gate_trellis shape"):
+        _validate_banks(
+            _banks(2), hidden_size=H, intermediate_size=I, device=torch.device("cpu"), k=3
+        )
+    assert len(_validate_banks(
+        _banks(2), hidden_size=H, intermediate_size=I, device=torch.device("cpu"), k=2
+    )) == 9
+
+
+def test_mgemm_tables_accept_any_k_and_refuse_mixed_k():
+    from freetoken.kernel.exl3_mgemm import Exl3MgemmBanks
+
+    if not torch.cuda.is_available():
+        pytest.skip("pointer tables are card-only")
+    dev = torch.device("cuda")
+
+    def banks(ks):
+        out = []
+        for k in ks:
+            out += [
+                torch.zeros((2, H // 16, I // 16, 16 * k), dtype=torch.int16, device=dev),
+                torch.zeros((2, H), dtype=torch.float16, device=dev),
+                torch.zeros((2, I), dtype=torch.float16, device=dev),
+            ]
+        return out
+
+    assert Exl3MgemmBanks.from_banks(banks((3, 3, 3))).k == 3
+    assert Exl3MgemmBanks.from_banks(banks((2, 2, 2))).k == 2
+    with pytest.raises(ValueError, match="one K"):
+        Exl3MgemmBanks.from_banks(banks((3, 2, 3)))
+    with pytest.raises(ValueError, match="K=9"):
+        Exl3MgemmBanks.from_banks(banks((9, 9, 9)))

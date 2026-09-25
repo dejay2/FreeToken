@@ -6,11 +6,14 @@ experts each layer has, and how many bytes one expert occupies in the offload ba
 ``config.json`` (and, when present, FTW metadata) plus the small safetensors headers needed to
 identify demand-paged PLE/n-gram tensors; weight payloads are never opened.
 
-The per-expert byte formulas are copied from ``freetoken.moe.offload_cache._BANK_BYTES_PER_EXPERT``
-(which cannot be imported here: it pulls in torch). Keep the two in step. Checked against the
-shipping Qwen3.8-Flash-Next-NVFP4 build: nvfp4(2560, 640) = 2,772,480 bytes per expert, i.e. the
-2.77 MB per slot, 2.58 GiB per 1,000 slots and 1.32 GiB per 512-expert layer quoted in
-``docs/research/memory-audit-qwen38-rtx5090.md``.
+The per-expert byte formulas (``expert_bytes``) are copied from
+``freetoken.moe.offload_cache.bank_bytes_per_expert`` / ``_exl3_bytes`` (which cannot be imported
+here: it pulls in torch). Keep the two in step -- ``tests/settings/test_model_info.py`` checks
+them equal for exl3. Checked against the shipping Qwen3.8-Flash-Next-NVFP4 build: nvfp4(2560, 640)
+= 2,772,480 bytes per expert, i.e. the 2.77 MB per slot, 2.58 GiB per 1,000 slots and 1.32 GiB per
+512-expert layer quoted in ``docs/research/memory-audit-qwen38-rtx5090.md``. exl3(2560, 640, k=3)
+= 1,862,400 bytes per expert (Qwen Flash 3.05bpw), matching the K=3 measurement noted beside
+``_exl3_bytes`` in ``offload_cache.py``.
 """
 
 from __future__ import annotations
@@ -71,6 +74,12 @@ def ple_bytes_from_header(header: bytes | bytearray | memoryview) -> int:
     except (UnicodeDecodeError, ValueError, TypeError):
         return 0
     if not isinstance(document, dict):
+        return 0
+    metadata = document.get("__metadata__")
+    if isinstance(metadata, dict) and metadata.get("format") == "exl3_ngram_trellis":
+        # turboderp's un-converted ngram_embedding.safetensors, not FreeToken's PLE table --
+        # scripts/exl3/convert_ngram_table.py writes freetoken-ple-*.safetensors instead, which
+        # carries no such marker and is still counted below.
         return 0
 
     total = 0
@@ -134,7 +143,43 @@ FORMAT_LABELS = {
     "nvfp4": "4-bit (NVFP4)",
     "mxfp4": "4-bit (MXFP4)",
     "ds_fp4": "4-bit (DeepSeek FP4)",
+    # exl3's real label is built with the checkpoint's own K in describe_config (bits varies
+    # per export, e.g. Qwen Flash 3.05bpw -> K=3); this entry is only the "unknown fmt" fallback.
+    "exl3": "EXL3",
 }
+
+
+def expert_bytes(fmt: str, H: int, I: int, *, k: int = 2) -> int:
+    """Bytes of one (expert, layer) offload-bank row.
+
+    Torch-free mirror of ``freetoken.moe.offload_cache.bank_bytes_per_expert`` (which cannot be
+    imported here: it pulls in torch); ``tests/settings/test_model_info.py`` checks the two
+    formulas agree. EXL3 rows depend on the checkpoint's routed K (3-bit codes for Qwen Flash's
+    3.05bpw export, 2-bit for GLM-5.3's 2.05bpw export) -- every other format ignores ``k``.
+    """
+    if fmt == "exl3":
+        tiles = (H // 16) * (I // 16)
+        return 3 * tiles * 16 * k * 2 + 2 * (H + I) * 2 + (I + H) * 2
+    return int(BYTES_PER_EXPERT[fmt](H, I))
+
+
+def _exl3_expert_k(quant: dict[str, Any]) -> int | None:
+    """The routed-expert code width K from a checkpoint's ``bits`` (bpw) figure.
+
+    Returns ``None`` when ``bits`` is missing, null, non-numeric, or gives a K outside a sane
+    1..8 range -- a garbled value must size the estimate as unknown rather than silently guess
+    K=2 (fix round 1, Critical: ``int(float(None))`` used to raise uncaught here and propagate
+    out of ``read_model`` into ``panel._model_limit_errors``' all-models loop, breaking registry
+    save/validate for every model on the page over one bad EXL3 entry).
+    """
+    bits = quant.get("bits")  # no default: an absent key is "unknown", same as an explicit null
+    try:
+        k = int(float(bits))
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= k <= 8:
+        return None
+    return k
 
 
 @dataclass
@@ -211,6 +256,8 @@ def expert_format(config: dict[str, Any]) -> str:
         return "bf16"
     algo = str(quant.get("quant_algo") or "").upper()
     method = str(quant.get("quant_method") or "").lower()
+    if method == "exl3":
+        return "exl3"
     if algo == "NVFP4" or method == "nvfp4":
         return "nvfp4"
     if algo == "MXFP4" or method == "mxfp4":
@@ -275,10 +322,28 @@ def describe_config(
     if info.is_moe:
         fmt = expert_format(config)
         info.expert_format = fmt
-        info.expert_format_label = FORMAT_LABELS.get(fmt, fmt or "unknown")
-        formula = BYTES_PER_EXPERT.get(fmt)
-        if formula and info.hidden_size and info.moe_intermediate_size:
-            info.bytes_per_expert = int(formula(info.hidden_size, info.moe_intermediate_size))
+        if fmt == "exl3":
+            quant = config.get("quantization_config")
+            quant = quant if isinstance(quant, dict) else {}
+            # bits is a per-checkpoint bpw figure (e.g. 3.05 for Qwen Flash, 2.05 for GLM-5.3);
+            # the routed-expert code width K is its integer part.
+            k = _exl3_expert_k(quant)
+            if k is None:
+                info.expert_format_label = "EXL3 (unknown bits)"
+                info.extra["exl3_bits_error"] = (
+                    f"quantization_config.bits = {quant.get('bits')!r} is not a usable EXL3 K "
+                    "(1..8); the expert size is unknown."
+                )
+            else:
+                info.extra["exl3_expert_k"] = k
+                info.expert_format_label = f"EXL3 ({k}-bit experts)"
+                if info.hidden_size and info.moe_intermediate_size:
+                    info.bytes_per_expert = expert_bytes(fmt, info.hidden_size, info.moe_intermediate_size, k=k)
+        else:
+            info.expert_format_label = FORMAT_LABELS.get(fmt, fmt or "unknown")
+            if fmt in BYTES_PER_EXPERT and info.hidden_size and info.moe_intermediate_size:
+                info.bytes_per_expert = expert_bytes(fmt, info.hidden_size, info.moe_intermediate_size)
+        if info.bytes_per_expert is not None:
             info.bytes_per_layer = info.bytes_per_expert * info.num_experts
             info.total_expert_bytes = info.bytes_per_layer * info.num_moe_layers
     return info
@@ -363,6 +428,7 @@ __all__ = [
     "REFERENCE_ARCHITECTURE",
     "SUPPORTED_ARCHITECTURES",
     "describe_config",
+    "expert_bytes",
     "expert_format",
     "gib",
     "ple_bytes_from_header",

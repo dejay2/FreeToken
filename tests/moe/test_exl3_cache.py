@@ -109,3 +109,49 @@ def test_forced_parallel_exl3_load_uses_the_established_serial_fallback(monkeypa
             False, parallel=True, decode_target="gpu",
         )
     assert calls == []
+
+
+def test_bank_bytes_follow_k():
+    from freetoken.moe.offload_cache import bank_bytes_per_expert
+
+    glm = bank_bytes_per_expert("exl3", 4096, 2048, SimpleNamespace(exl3_expert_k=2))
+    assert glm == 6_328_320  # the GLM-5.3 2.05bpw figure measured 2026-09-04
+    qwen = bank_bytes_per_expert("exl3", 2560, 640, SimpleNamespace(exl3_expert_k=3))
+    assert qwen == 3 * 160 * 40 * 48 * 2 + 2 * (2560 + 640) * 2 + (640 + 2560) * 2
+    assert qwen == 1_862_400
+    assert bank_bytes_per_expert("nvfp4", 2560, 640, SimpleNamespace()) == 2_772_480
+    # A config without the field (every non-Qwen EXL3 build) keeps GLM's K=2.
+    assert bank_bytes_per_expert("exl3", 4096, 2048, SimpleNamespace()) == 6_328_320
+
+
+def test_aot_row_bytes_follow_k():
+    from freetoken.kernel.aot_models import expert_bank_row_bytes
+
+    rows = expert_bank_row_bytes("exl3", 2560, 640, k=3)
+    assert rows["gate_trellis"] == rows["up_trellis"] == rows["down_trellis"] == 160 * 40 * 48 * 2
+    assert sum(rows.values()) == 1_862_400
+    assert expert_bank_row_bytes("exl3", 4096, 2048) == expert_bank_row_bytes("exl3", 4096, 2048, k=2)
+
+
+def test_bank_bytes_estimate_and_slot_plan_use_config_k():
+    from freetoken.moe.expert_banks import bank_bytes_estimate
+
+    cfg = SimpleNamespace(
+        expert_quant="exl3", exl3_expert_k=3, num_moe_layers=48, num_experts=512,
+        hidden_size=2560, moe_intermediate_size=640,
+    )
+    assert bank_bytes_estimate(cfg) == 48 * 512 * 1_862_400
+
+
+def test_memory_plan_slot_bytes_use_config_k():
+    from freetoken.engine import memory_plan
+
+    config = SimpleNamespace(
+        tp_info=SimpleNamespace(size=1, rank=0),
+        model_config=SimpleNamespace(
+            is_moe=True, expert_quant="exl3", exl3_expert_k=3, num_moe_layers=48,
+            num_experts=512, hidden_size=2560, moe_intermediate_size=640,
+        ),
+    )
+    per_slot, source, runtime, fixed = memory_plan._expert_slot_bytes(config)
+    assert (per_slot, source, runtime, fixed) == (1_862_400, "exl3", "exl3", 0)

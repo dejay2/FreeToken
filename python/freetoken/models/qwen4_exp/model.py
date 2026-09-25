@@ -54,6 +54,7 @@ def build_linear_mixer(config: ModelConfig, layer_id: int) -> BaseOP:
         expert_quant="none" if config.expert_quant == "fp8_block" else config.expert_quant,
         attn_quant=config.attn_quant,
         dense_quant=config.dense_quant,
+        linear_storage=getattr(config, "linear_storage", "bf16"),
     )
 
 
@@ -220,7 +221,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         # would drag all 1.27 GB over PCIe per token: host residency is only a win untied.
         self._embed_host = embed_host_enabled() and not config.tie_word_embeddings
         self.model = Qwen4ExpModel(config)
-        if getattr(config, "lm_head_quant", "none") == "nvfp4":
+        if getattr(config, "lm_head_quant", "none") == "exl3":
+            from freetoken.kernel.exl3_linear import Exl3LMHead
+
+            assert not config.tie_word_embeddings, "EXL3 lm_head assumes untied embeddings"
+            self.lm_head = Exl3LMHead(
+                num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
+            )
+        elif getattr(config, "lm_head_quant", "none") == "nvfp4":
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
 
             assert not config.tie_word_embeddings, "NVFP4 lm_head assumes untied embeddings"
@@ -457,6 +465,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 constants,
                 max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
                 max_extend_tokens=engine_config.max_extend_tokens,
+                # EXL3 graphs never return from replay while a WAIT is pending: gate instead
+                allow_wait_sync=getattr(self._config, "linear_storage", "bf16") != "exl3",
             )
             self._ple_table = disk_table
             for ple in ple_layers:

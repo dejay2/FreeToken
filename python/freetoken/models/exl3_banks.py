@@ -1,4 +1,8 @@
-"""Serial safetensors loader for the fixed K=2/mul1 GLM EXL3 expert banks.
+"""Serial safetensors loader for the mul1 EXL3 routed-expert banks, one K per checkpoint.
+
+One K per checkpoint (GLM 2.05bpw K=2, Qwen Flash 3.05bpw K=3): the config's
+``exl3_expert_k`` names it and every routed trellis header must agree before any bank is
+allocated, so a mixed-K checkpoint is refused rather than half-loaded.
 
 The proof keeps the routed experts compressed in per-layer host banks for streaming
 layers.  A layer marked GPU_OWNED by the ambient residency plan instead receives the
@@ -6,8 +10,8 @@ same nine compressed banks as device tensors, so its experts never consume host-
 memory.  Each selected expert is reconstructed by the card-side operation later; this
 module only validates and places the nine stored bank components.  The loader deliberately
 reads one safetensors tensor at a time on Windows through ``DirectShard`` so the
-operating-system file cache does not retain a second copy beside the roughly 71.29 GiB
-of streaming banks.
+operating-system file cache does not retain a second copy beside the multi-GiB bank set
+(71.29 GiB of streaming banks for GLM-5.3 2.05bpw).
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ from freetoken.utils import download_hf_weight
 
 # The cache and the reconstruct-first operation both consume this order.  The scalar
 # ``mul1`` marker is validated from the checkpoint but is intentionally not a bank: the
-# proof fixes one codebook and one K for every routed projection.
+# proof fixes one codebook for every routed projection, and one K per checkpoint.
 EXL3_BANK_NAMES = (
     "gate_trellis",
     "gate_suh",
@@ -44,7 +48,6 @@ EXL3_BANK_NAMES = (
 _EXL3_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 _EXL3_COMPONENTS = ("trellis", "suh", "svh", "mul1")
 _EXL3_BANK_COMPONENTS = ("trellis", "suh", "svh")
-_EXL3_K = 2
 
 # This is deliberately broad after ``experts.<id>``.  Unknown projections and component
 # names must fail loudly instead of being mistaken for unrelated model tensors; layer 45
@@ -183,12 +186,22 @@ def _config_geometry(config) -> tuple[int, int, int, int, int]:
     return num_bank_layers, experts, hidden, intermediate, first
 
 
-def _expected_shape(proj: str, kind: str, hidden: int, intermediate: int) -> tuple[int, ...]:
+def _config_k(config) -> int:
+    """The routed experts' K from ``ModelConfig.exl3_expert_k`` (GLM leaves the default 2)."""
+    k = int(getattr(config, "exl3_expert_k", 2))
+    if not 1 <= k <= 8:
+        raise ValueError(f"EXL3 exl3_expert_k must be in 1..8, got {k}")
+    return k
+
+
+def _expected_shape(
+    proj: str, kind: str, hidden: int, intermediate: int, k: int
+) -> tuple[int, ...]:
     if proj in ("gate_proj", "up_proj"):
-        trellis = (hidden // 16, intermediate // 16, 16 * _EXL3_K)
+        trellis = (hidden // 16, intermediate // 16, 16 * k)
         input_size, output_size = hidden, intermediate
     elif proj == "down_proj":
-        trellis = (intermediate // 16, hidden // 16, 16 * _EXL3_K)
+        trellis = (intermediate // 16, hidden // 16, 16 * k)
         input_size, output_size = intermediate, hidden
     else:
         raise ValueError(f"unsupported EXL3 expert projection {proj!r}")
@@ -215,9 +228,15 @@ def _expected_dtype(kind: str) -> str:
 
 def _collect_records(
     weight_map: dict[str, str], config
-) -> tuple[dict[tuple[int, int, str, str], Exl3ExpertRecord], tuple[int, int, int, int, int]]:
-    """Collect and validate routed names before allocating any bank storage."""
+) -> tuple[
+    dict[tuple[int, int, str, str], Exl3ExpertRecord], tuple[int, int, int, int, int, int]
+]:
+    """Collect and validate routed names before allocating any bank storage.
+
+    The returned geometry is ``(layers, experts, hidden, intermediate, first, k)``.
+    """
     num_layers, experts, hidden, intermediate, first = _config_geometry(config)
+    k = _config_k(config)
     records: dict[tuple[int, int, str, str], Exl3ExpertRecord] = {}
     components: dict[tuple[int, int, str], set[str]] = {}
     for name, shard in weight_map.items():
@@ -291,16 +310,16 @@ def _collect_records(
             f"EXL3 checkpoint has {len(records)} routed components; "
             f"expected {expected_records} for {num_layers} layers x {experts} experts"
         )
-    return records, (num_layers, experts, hidden, intermediate, first)
+    return records, (num_layers, experts, hidden, intermediate, first, k)
 
 
 def _validate_headers(
     folder: str,
     records: dict[tuple[int, int, str, str], Exl3ExpertRecord],
-    geometry: tuple[int, int, int, int, int],
+    geometry: tuple[int, int, int, int, int, int],
 ) -> dict[str, list[Exl3ExpertRecord]]:
-    """Validate all component headers before allocating the roughly 71 GiB bank set."""
-    _num_layers, _experts, hidden, intermediate, _first = geometry
+    """Validate all component headers before allocating the multi-GiB bank set."""
+    _num_layers, _experts, hidden, intermediate, _first, k = geometry
     by_shard: dict[str, list[Exl3ExpertRecord]] = {}
     for record in records.values():
         by_shard.setdefault(record.shard, []).append(record)
@@ -317,17 +336,18 @@ def _validate_headers(
                     f"EXL3 index names {record.name!r}, but shard {shard!r} has no such tensor"
                 )
             shape = tuple(meta.get("shape", ()))
-            expected_shape = _expected_shape(record.proj, record.kind, hidden, intermediate)
+            expected_shape = _expected_shape(record.proj, record.kind, hidden, intermediate, k)
             if record.kind == "trellis":
                 last = shape[-1] if shape else 0
                 if not last or last % 16:
                     raise ValueError(
                         f"EXL3 {record.name!r} has trellis shape {shape}; cannot derive an integer K"
                     )
-                k = last // 16
-                if k != _EXL3_K:
+                found = last // 16
+                if found != k:
                     raise ValueError(
-                        f"EXL3 {record.name!r} has K={k}; the proof accepts K=2 only"
+                        f"EXL3 {record.name!r} has K={found}; the config expects K={k} "
+                        "for every routed expert"
                     )
             if shape != expected_shape:
                 raise ValueError(
@@ -348,8 +368,8 @@ def _open_shard(path: str, *, whole: bool = False):
     """Open a shard for per-tensor reads, using the shared Windows direct reader.
 
     Unlike the other model loaders, EXL3 cannot accept a cached-read fallback: its pinned
-    banks already consume roughly 71.29 GiB, so a second Windows file-cache copy can exhaust
-    host memory before the model is ready. ``DirectShard`` therefore receives its strict
+    banks already are the multi-GiB bank set (71.29 GiB for GLM-5.3), so a second Windows
+    file-cache copy can exhaust host memory before the model is ready. ``DirectShard`` therefore receives its strict
     mode here, while the generic reader keeps its existing fallback for other formats.
     """
     if whole:
@@ -399,10 +419,12 @@ def _preflight_windows_reads(folder: str, by_shard: dict[str, list[Exl3ExpertRec
 # --------------------------------------------------------------------------------------
 
 
-def _bank_specs(experts: int, hidden: int, intermediate: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
-    """Return the nine fixed [expert, ...] bank shapes in cache registration order."""
-    trellis_gate_up = (experts, hidden // 16, intermediate // 16, 16 * _EXL3_K)
-    trellis_down = (experts, intermediate // 16, hidden // 16, 16 * _EXL3_K)
+def _bank_specs(
+    experts: int, hidden: int, intermediate: int, k: int
+) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    """Return the nine [expert, ...] bank shapes for one K in cache registration order."""
+    trellis_gate_up = (experts, hidden // 16, intermediate // 16, 16 * k)
+    trellis_down = (experts, intermediate // 16, hidden // 16, 16 * k)
     return {
         "gate_trellis": (trellis_gate_up, torch.int16),
         "gate_suh": ((experts, hidden), torch.float16),
@@ -416,15 +438,56 @@ def _bank_specs(experts: int, hidden: int, intermediate: int) -> dict[str, tuple
     }
 
 
+def stack_exl3_experts(
+    tensor_of: Callable[[str], torch.Tensor],
+    *,
+    prefix: str,
+    experts: int,
+    hidden: int,
+    intermediate: int,
+    k: int,
+) -> dict[str, torch.Tensor]:
+    """Stack ``{prefix}.{e}.{proj}.{kind}`` tensors into the nine CPU banks, one row per expert.
+
+    For an expert set that is not a model layer -- the MTP head's 512 routed experts
+    (``mtp.layers.0.mlp.experts``, K=3 in 3.05bpw_h5_ng5) -- read through any tensor getter.
+    Every component is checked against the one-K geometry before it is copied, the ``mul1``
+    marker included, so a mixed-K or mis-shaped expert fails by name instead of decoding
+    garbage. Returns plain CPU tensors in ``EXL3_BANK_NAMES`` order.
+    """
+    if not 1 <= int(k) <= 8:
+        raise ValueError(f"EXL3 K must be in 1..8, got {k}")
+    banks = {
+        name: torch.empty(shape, dtype=dtype)
+        for name, (shape, dtype) in _bank_specs(experts, hidden, intermediate, k).items()
+    }
+    for expert in range(experts):
+        for proj in _EXL3_PROJECTIONS:
+            for kind in _EXL3_COMPONENTS:
+                name = f"{prefix}.{expert}.{proj}.{kind}"
+                tensor = tensor_of(name)
+                expected_shape = _expected_shape(proj, kind, hidden, intermediate, k)
+                expected_dtype = _ST_DTYPE[_expected_dtype(kind)]
+                if tuple(tensor.shape) != expected_shape or tensor.dtype != expected_dtype:
+                    raise ValueError(
+                        f"EXL3 tensor {name!r} arrived as shape={tuple(tensor.shape)}, "
+                        f"dtype={tensor.dtype}; expected shape={expected_shape}, "
+                        f"dtype={expected_dtype} ({kind}, K={k})"
+                    )
+                if kind in _EXL3_BANK_COMPONENTS:
+                    banks[_bank_name(proj, kind)][expert].copy_(tensor)
+    return {name: banks[name] for name in EXL3_BANK_NAMES}
+
+
 def _alloc_banks(
-    num_layers: int, experts: int, hidden: int, intermediate: int
+    num_layers: int, experts: int, hidden: int, intermediate: int, k: int
 ) -> dict[str, list]:
     from freetoken.moe.host_banks import alloc_layer_banks
 
     # alloc_layer_banks reads the engine's ambient residency plan: streaming layers get
     # HostBank storage, while GPU_OWNED layers get GpuOwnedBank device tensors and are filled
     # synchronously by this placement loop (the inference-mode thread rule matters here).
-    return alloc_layer_banks(_bank_specs(experts, hidden, intermediate), num_layers)
+    return alloc_layer_banks(_bank_specs(experts, hidden, intermediate, k), num_layers)
 
 
 def _bank_name(proj: str, kind: str) -> str:
@@ -434,8 +497,10 @@ def _bank_name(proj: str, kind: str) -> str:
     return f"{prefix}_{kind}"
 
 
-def _validate_loaded_tensor(record: Exl3ExpertRecord, tensor: torch.Tensor, hidden: int, intermediate: int) -> None:
-    expected_shape = _expected_shape(record.proj, record.kind, hidden, intermediate)
+def _validate_loaded_tensor(
+    record: Exl3ExpertRecord, tensor: torch.Tensor, hidden: int, intermediate: int, k: int
+) -> None:
+    expected_shape = _expected_shape(record.proj, record.kind, hidden, intermediate, k)
     expected_dtype = _ST_DTYPE[_expected_dtype(record.kind)]
     if tuple(tensor.shape) != expected_shape or tensor.dtype != expected_dtype:
         raise ValueError(
@@ -448,12 +513,12 @@ def _place_records(
     folder: str,
     by_shard: dict[str, list[Exl3ExpertRecord]],
     banks: dict[str, list],
-    geometry: tuple[int, int, int, int, int],
+    geometry: tuple[int, int, int, int, int, int],
     sink,
     drop_page_cache: Callable[[str], None],
     primary: bool,
 ) -> tuple[int, int]:
-    num_layers, experts, hidden, intermediate, _first = geometry
+    num_layers, experts, hidden, intermediate, _first, k = geometry
     from freetoken.moe.host_banks import LayerCompletionTracker
 
     # Each routed expert contributes nine bank rows; the marker records are checked and
@@ -480,7 +545,7 @@ def _place_records(
                         )
                     tensor = reader.get_tensor(record.name)
                     try:
-                        _validate_loaded_tensor(record, tensor, hidden, intermediate)
+                        _validate_loaded_tensor(record, tensor, hidden, intermediate, k)
                         completed.add(record.identity)
                         placed_records += 1
                         if record.kind == "mul1":
@@ -522,7 +587,7 @@ def load_exl3_expert_source_banks(
     primary: bool = True,
     layer_sink=None,
 ) -> dict[str, list[torch.Tensor]]:
-    """Load routed GLM EXL3 experts into nine per-layer source banks.
+    """Load routed EXL3 experts (GLM K=2, Qwen Flash K=3) into nine per-layer source banks.
 
     Streaming layers use pinned host banks; GPU_OWNED layers use resident device banks from
     the ambient residency plan and are filled on this placement thread. Validation is split
@@ -536,11 +601,11 @@ def load_exl3_expert_source_banks(
     weight_map = _weight_map(folder)
     records, geometry = _collect_records(weight_map, config)
     by_shard = _validate_headers(folder, records, geometry)
-    # A direct-open failure must stop before the ~71.29 GiB bank allocation; otherwise the
+    # A direct-open failure must stop before the multi-GiB bank allocation; otherwise the
     # generic DirectShard fallback could leave a cached second copy on the Windows standby list.
     _preflight_windows_reads(folder, by_shard)
-    num_layers, experts, hidden, intermediate, _first = geometry
-    banks = _alloc_banks(num_layers, experts, hidden, intermediate)
+    num_layers, experts, hidden, intermediate, _first, k = geometry
+    banks = _alloc_banks(num_layers, experts, hidden, intermediate, k)
 
     if layer_sink is not None:
         _place_records(
@@ -564,14 +629,15 @@ load_exl3_expert_sources = load_exl3_expert_source_banks
 def dummy_exl3_expert_sources(config) -> dict[str, list[torch.Tensor]]:
     """Fabricate zero EXL3 source banks for model-shape tests and dummy boots."""
     num_layers, experts, hidden, intermediate, _first = _config_geometry(config)
-    specs = _bank_specs(experts, hidden, intermediate)
+    k = _config_k(config)
+    specs = _bank_specs(experts, hidden, intermediate, k)
     if not torch.cuda.is_available():
         return {
             name: [torch.zeros(shape, dtype=dtype) for _ in range(num_layers)]
             for name, (shape, dtype) in specs.items()
         }
 
-    banks = _alloc_banks(num_layers, experts, hidden, intermediate)
+    banks = _alloc_banks(num_layers, experts, hidden, intermediate, k)
     for name in EXL3_BANK_NAMES:
         for bank in banks[name]:
             bank.fill.zero_()
@@ -589,4 +655,5 @@ __all__ = [
     "dummy_exl3_expert_sources",
     "load_exl3_expert_source_banks",
     "load_exl3_expert_sources",
+    "stack_exl3_experts",
 ]

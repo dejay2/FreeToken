@@ -16,6 +16,7 @@ from freetoken.daemon.settings.dials import (
     stored_count,
     validate_settings,
 )
+from freetoken.daemon.settings import model_info
 from freetoken.daemon.settings.model_info import SUPPORTED_ARCHITECTURES, expert_format, read_model
 from freetoken.daemon.settings.process_manager import ProcessManager
 from freetoken.daemon.settings.profiles_manager import ProfilesManager
@@ -136,6 +137,98 @@ def test_expert_format_detection():
     assert expert_format({"quantization_config": {"quant_method": "fp8", "weight_block_size": [128, 128]}}) == "fp8_block"
     assert expert_format({"quantization_config": {"quant_method": "mxfp4"}}) == "mxfp4"
     assert expert_format({"quantization_config": {"quant_method": "mystery"}}) == ""
+
+
+def test_exl3_expert_format_and_size(tmp_path):
+    cfg = {"architectures": ["Qwen4ExpForConditionalGeneration"],
+           "quantization_config": {"quant_method": "exl3", "bits": 3.05, "head_bits": 5},
+           "text_config": {"hidden_size": 2560, "moe_intermediate_size": 640, "num_experts": 512,
+                           "num_hidden_layers": 48, "num_experts_per_tok": 10}}
+    assert model_info.expert_format(cfg) == "exl3"
+    info = model_info.describe_config(cfg, "q")
+    assert info.expert_format_label == "EXL3 (3-bit experts)"
+    assert info.bytes_per_expert == 3 * 160 * 40 * 48 * 2 + 2 * (2560 + 640) * 2 + (640 + 2560) * 2
+    assert info.extra["exl3_expert_k"] == 3
+
+
+def test_exl3_bytes_match_engine_formula():
+    from types import SimpleNamespace
+
+    from freetoken.moe.offload_cache import bank_bytes_per_expert  # torch import is fine in tests
+
+    assert model_info.expert_bytes("exl3", 2560, 640, k=3) == bank_bytes_per_expert(
+        "exl3", 2560, 640, SimpleNamespace(exl3_expert_k=3))
+
+
+def test_exl3_garbled_bits_gives_an_unknown_size_not_a_crash(tmp_path):
+    """Fix round 1, Critical: int(float(None)) used to raise uncaught out of describe_config
+    (and therefore out of read_model), breaking panel._model_limit_errors' all-models loop for
+    every model on the page over one bad EXL3 entry. None/non-numeric/out-of-range bits must
+    leave the estimate unknown instead of guessing K=2."""
+    base = {"architectures": ["Qwen4ExpForConditionalGeneration"],
+            "text_config": {"hidden_size": 2560, "moe_intermediate_size": 640, "num_experts": 512,
+                             "num_hidden_layers": 48, "num_experts_per_tok": 10}}
+    for bad_bits in (None, "unknown", 12.5):
+        cfg = {**base, "quantization_config": {"quant_method": "exl3", "bits": bad_bits}}
+        info = model_info.describe_config(cfg, "q")
+        assert info.expert_format == "exl3"
+        assert info.expert_format_label == "EXL3 (unknown bits)"
+        assert info.bytes_per_expert is None
+        assert info.bytes_per_layer is None
+        assert info.total_expert_bytes is None
+        assert "exl3_expert_k" not in info.extra
+        assert "exl3_bits_error" in info.extra
+
+
+def test_exl3_missing_bits_key_gives_an_unknown_size_not_a_silent_guess():
+    """Fix round 2: quantization_config with no "bits" key at all (e.g. {"quant_method": "exl3"})
+    used to fall back to a silent K=2 default (``quant.get("bits", 2)``), contradicting the
+    round-1 fix's own docstring ("Returns None when bits is missing"). An absent key must be
+    treated the same as an explicit null."""
+    cfg = {"architectures": ["Qwen4ExpForConditionalGeneration"],
+           "quantization_config": {"quant_method": "exl3"},
+           "text_config": {"hidden_size": 2560, "moe_intermediate_size": 640, "num_experts": 512,
+                           "num_hidden_layers": 48, "num_experts_per_tok": 10}}
+    info = model_info.describe_config(cfg, "q")
+    assert info.expert_format == "exl3"
+    assert info.expert_format_label == "EXL3 (unknown bits)"
+    assert info.bytes_per_expert is None
+    assert info.bytes_per_layer is None
+    assert info.total_expert_bytes is None
+    assert "exl3_expert_k" not in info.extra
+    assert "exl3_bits_error" in info.extra
+
+
+def test_a_garbled_exl3_model_does_not_break_reading_the_others(tmp_path):
+    """The shape of panel._model_limit_errors' loop: read_model() over several registered
+    models, one of which has a garbled EXL3 bits value, must not raise and must still size the
+    healthy models correctly."""
+    garbled = tmp_path / "Garbled-EXL3"
+    garbled.mkdir()
+    (garbled / "config.json").write_text(json.dumps({
+        "architectures": ["Qwen4ExpForConditionalGeneration"],
+        "quantization_config": {"quant_method": "exl3", "bits": None},
+        "text_config": {"hidden_size": 2560, "moe_intermediate_size": 640, "num_experts": 512,
+                        "num_hidden_layers": 48, "num_experts_per_tok": 10},
+    }), encoding="utf-8")
+    (garbled / "model.safetensors").write_bytes(struct.pack("<Q", 2) + b"{}")
+
+    nvfp4 = _qwen_like(tmp_path / "Qwen-Like")
+
+    infos = [read_model(str(folder)) for folder in (garbled, nvfp4)]
+
+    assert infos[0].found and infos[0].expert_format == "exl3" and infos[0].bytes_per_expert is None
+    assert infos[1].found and infos[1].expert_format == "nvfp4" and infos[1].bytes_per_expert == 2_772_480
+
+
+def test_ple_bytes_skips_the_unconverted_exl3_trellis_table():
+    """turboderp's ngram_embedding.safetensors is not FreeToken's PLE table; only the converted
+    freetoken-ple-*.safetensors shards (no such metadata marker) should be counted."""
+    header = json.dumps({
+        "ngram_embedding.head_offsets": {"dtype": "I64", "shape": [1], "data_offsets": [0, 8]},
+        "__metadata__": {"format": "exl3_ngram_trellis", "version": "1"},
+    }).encode("utf-8")
+    assert model_info.ple_bytes_from_header(header) == 0
 
 
 def test_supported_architectures_mirror_the_engine_registry():

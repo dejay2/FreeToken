@@ -92,6 +92,7 @@ from typing import Callable, Mapping, Sequence
 
 import torch
 
+from freetoken.kernel import exl3_launch
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -296,7 +297,11 @@ class SpecDraftGraphRunner:
                 graph.register_generator_state(generator)
             self._stream.wait_stream(entry_stream)
             warmed = True
-            with torch.cuda.stream(self._stream):
+            # fenced both ways (wait_stream + device synchronize): EXL3 strict mode must accept it
+            with (
+                torch.cuda.stream(self._stream),
+                exl3_launch.fenced_side_stream("mtp-draft-graph-warmup"),
+            ):
                 run()
             entry_stream.wait_stream(self._stream)
             torch.cuda.synchronize(self.device)

@@ -284,3 +284,41 @@ def test_eos_token_id_list_uses_the_first_entry():
     hf = _hf_config()
     hf.text_config.eos_token_id = [base, base + 1]
     assert parse_config(hf).qwen4_args.ngram_boundary_token_id == base
+
+
+_EXL3_QUANT = {"quant_method": "exl3", "version": "1.4.4", "bits": 3.05, "head_bits": 5,
+               "codebook": "mul1", "out_scales": "always", "vision_bits": 5, "mtp_bits": 3}
+
+
+def test_exl3_checkpoint_sets_exl3_flags(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_DENSE_QUANT", raising=False)
+    hf = _hf_config()
+    hf.quantization_config = dict(_EXL3_QUANT)
+    cfg = parse_config(hf)
+    assert (cfg.expert_quant, cfg.lm_head_quant, cfg.linear_storage) == ("exl3", "exl3", "exl3")
+    assert (cfg.attn_quant, cfg.dense_quant) == ("none", "none")
+    assert cfg.exl3_expert_k == 3
+
+
+def test_exl3_dense_override_only_touches_bf16_projections(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_DENSE_QUANT", "int8")
+    hf = _hf_config()
+    hf.quantization_config = dict(_EXL3_QUANT)
+    cfg = parse_config(hf)
+    assert cfg.lm_head_quant == "exl3" and cfg.linear_storage == "exl3"
+    assert cfg.dense_quant == "int8"  # HC projections, bf16 in the EXL3 checkpoint
+
+
+def test_exl3_refuses_mcg_codebook():
+    hf = _hf_config()
+    hf.quantization_config = dict(_EXL3_QUANT, codebook="mcg")
+    with pytest.raises(ValueError, match="mul1"):
+        parse_config(hf)
+
+
+def test_nvfp4_flags_unchanged(monkeypatch):
+    monkeypatch.delenv("FREETOKEN_DENSE_QUANT", raising=False)
+    cfg = parse_config(_hf_config())
+    assert cfg.linear_storage == "bf16"
+    assert (cfg.expert_quant, cfg.attn_quant, cfg.dense_quant, cfg.lm_head_quant) == (
+        "nvfp4", "none", "none", "none")

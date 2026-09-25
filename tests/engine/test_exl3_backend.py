@@ -264,3 +264,24 @@ def test_exl3_rejects_a_graph_wider_than_the_fixed_decode_arena():
     )
     with pytest.raises(ValueError, match=r"pass --cuda-graph-max-bs 0"):
         _adjust_config(config)
+
+
+def test_exl3_top10_mgemm_keeps_the_one_row_graph():
+    # Qwen3.8-Flash-Next routes 10 experts per token; the packed route list holds 128.
+    from freetoken.engine.engine import _adjust_config
+
+    config = _config(moe_backend="offload", max_running_req=1, cuda_graph_bs=None,
+                     cuda_graph_max_bs=None, exl3_expert_op="mgemm")
+    config.model_config.num_experts_per_tok = 10
+    _adjust_config(config)
+    assert config.cuda_graph_max_bs == 1
+
+
+def test_exl3_top10_reconstruct_still_needs_graphs_off():
+    from freetoken.engine.engine import _adjust_config
+
+    config = _config(moe_backend="offload", max_running_req=1, cuda_graph_bs=[1],
+                     cuda_graph_max_bs=1, exl3_expert_op="reconstruct")
+    config.model_config.num_experts_per_tok = 10
+    with pytest.raises(ValueError, match=r"pass --cuda-graph-max-bs 0"):
+        _adjust_config(config)

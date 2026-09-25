@@ -60,7 +60,7 @@ def _tensor(layer: int, expert: int, proj: str, kind: str, *, k: int = 2) -> tor
     return torch.tensor(value, dtype=torch.int32)
 
 
-def _write_checkpoint(tmp_path, mutate=None, *, include_mtp=True) -> str:
+def _write_checkpoint(tmp_path, mutate=None, *, include_mtp=True, k: int = 2) -> str:
     weight_map: dict[str, str] = {}
     for layer in range(_FIRST, _FIRST + _NUM_LAYERS + (1 if include_mtp else 0)):
         shard = f"model-{layer:05d}.safetensors"
@@ -72,7 +72,7 @@ def _write_checkpoint(tmp_path, mutate=None, *, include_mtp=True) -> str:
                         f"model.language_model.layers.{layer}.mlp.experts.{expert}."
                         f"{proj}.{kind}"
                     )
-                    value = _tensor(layer, expert, proj, kind)
+                    value = _tensor(layer, expert, proj, kind, k=k)
                     if mutate is not None:
                         name, value = mutate(name, value)
                     if value is None:
@@ -325,3 +325,47 @@ def test_gpu_owned_layers_use_device_banks_and_skip_host_settling(tmp_path, monk
     assert len(set(item[0] for item in settled)) == len(EXL3_BANK_NAMES)
     assert banks["gate_suh"][0][0, 0].item() == pytest.approx(30.0, abs=0.1)
     assert banks["gate_suh"][1][0, 0].item() == pytest.approx(40.0, abs=0.1)
+
+
+# Qwen3.8-Flash-Next 3.05bpw ships K=3 routed experts; ModelConfig.exl3_expert_k carries the
+# config's K and every trellis header must agree with it (one K per checkpoint).
+def test_loads_k3_banks(tmp_path, monkeypatch):
+    monkeypatch.setenv("FREETOKEN_SKIP_BANK_PIN", "1")
+    cfg = SimpleNamespace(**vars(_CONFIG), exl3_expert_k=3)
+    folder = _write_checkpoint(tmp_path, k=3)
+    sources = load_exl3_expert_sources(folder, cfg, drop_page_cache=lambda path: None, primary=False)
+    assert sources["gate_trellis"][0].shape[-1] == 48
+    assert sources["down_trellis"][0].shape == (_E, _I // 16, _H // 16, 48)
+    assert torch.equal(sources["up_trellis"][1][1], _tensor(4, 1, "up_proj", "trellis", k=3))
+
+
+def test_refuses_k_other_than_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("FREETOKEN_SKIP_BANK_PIN", "1")
+    cfg = SimpleNamespace(**vars(_CONFIG), exl3_expert_k=2)
+    folder = _write_checkpoint(tmp_path, k=3)
+    with pytest.raises(ValueError, match="K=3"):
+        load_exl3_expert_sources(folder, cfg, drop_page_cache=lambda path: None, primary=False)
+
+
+def test_refuses_mixed_expert_k(tmp_path, monkeypatch):
+    monkeypatch.setenv("FREETOKEN_SKIP_BANK_PIN", "1")
+    cfg = SimpleNamespace(**vars(_CONFIG), exl3_expert_k=3)
+
+    def mutate(name, value):
+        if ".experts.1.down_proj.trellis" in name:
+            return name, value[..., :32].contiguous()  # K=2 among K=3
+        return name, value
+
+    folder = _write_checkpoint(tmp_path, mutate, k=3)
+    with pytest.raises(ValueError, match="K=2; the config expects K=3"):
+        load_exl3_expert_sources(folder, cfg, drop_page_cache=lambda path: None, primary=False)
+
+
+def test_dummy_sources_follow_config_k():
+    from freetoken.models.exl3_banks import dummy_exl3_expert_sources
+
+    cfg = SimpleNamespace(**vars(_CONFIG), exl3_expert_k=3)
+    if torch.cuda.is_available():
+        pytest.skip("CPU-shape check; the CUDA branch pins host banks")
+    sources = dummy_exl3_expert_sources(cfg)
+    assert sources["gate_trellis"][0].shape == (_E, _H // 16, _I // 16, 48)

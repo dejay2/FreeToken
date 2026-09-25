@@ -85,10 +85,17 @@ class Qwen4ExpIndexer(BaseOP):
         self.head_dim = args.index_head_dim
         self.eps = config.rms_norm_eps
         self._split = [self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim]
-        self.index_qk_proj = make_dense_replicated(
-            getattr(config, "dense_quant", "none"), args.hidden_size, sum(self._split),
-            has_bias=False,
-        )
+        if getattr(config, "linear_storage", "bf16") == "exl3":
+            from freetoken.kernel.exl3_linear import Exl3Linear
+
+            # 3.05bpw_h5_ng5 stores index_qk_proj at K=3 (the rest of attention is K=5); the
+            # load adopts whatever K the checkpoint's trellis carries.
+            self.index_qk_proj = Exl3Linear(args.hidden_size, sum(self._split), k_hint=3)
+        else:
+            self.index_qk_proj = make_dense_replicated(
+                getattr(config, "dense_quant", "none"), args.hidden_size, sum(self._split),
+                has_bias=False,
+            )
         self.q_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
         self.k_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
 
@@ -128,12 +135,25 @@ class Qwen4ExpAttention(BaseOP):
         # The modelopt ignore list keeps every ``self_attn`` weight bf16 in the checkpoint,
         # so these follow ``dense_quant`` (the load-time int8 conversion), not a storage format.
         dense_quant = getattr(config, "dense_quant", "none")
-        self.qkv_proj = make_dense_col_merged(
-            dense_quant, config.hidden_size, self._qkv_split, has_bias=False
-        )
-        self.o_proj = make_dense_replicated(
-            dense_quant, self.qo_attn_dim, config.hidden_size, has_bias=False
-        )
+        if getattr(config, "linear_storage", "bf16") == "exl3":
+            from freetoken.kernel.exl3_linear import Exl3ColMerged, Exl3Linear
+
+            # EXL3 ships q/k/v separately packed (trellis tensors cannot be concatenated), so
+            # qkv_proj is one GEMM per part with the outputs concatenated in the same
+            # [2*qo | kv | kv] order the split below expects; q carries the output gate.
+            self.qkv_proj = Exl3ColMerged(config.hidden_size, [
+                ("q_proj", self.qo_attn_dim * 2),
+                ("k_proj", self.kv_attn_dim),
+                ("v_proj", self.kv_attn_dim),
+            ])
+            self.o_proj = Exl3Linear(self.qo_attn_dim, config.hidden_size)
+        else:
+            self.qkv_proj = make_dense_col_merged(
+                dense_quant, config.hidden_size, self._qkv_split, has_bias=False
+            )
+            self.o_proj = make_dense_replicated(
+                dense_quant, self.qo_attn_dim, config.hidden_size, has_bias=False
+            )
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.rotary = Qwen4MRoPE(config)

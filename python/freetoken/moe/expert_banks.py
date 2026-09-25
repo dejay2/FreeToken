@@ -24,7 +24,7 @@ import torch
 
 from freetoken.utils import init_logger
 
-from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
+from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS, bank_bytes_per_expert
 
 logger = init_logger(__name__)
 
@@ -293,7 +293,7 @@ def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
 
 
 def _exl3_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
-    """Load the fixed K=2/mul1 EXL3 routed banks for graphics-card execution only.
+    """Load the mul1 EXL3 routed banks (one K per checkpoint) for graphics-card execution only.
 
     The proof loader is deliberately serial: its Windows path reads each safetensors
     tensor through ``DirectShard`` without retaining a second cached shard copy. A
@@ -449,14 +449,15 @@ def bank_bytes_estimate(model_config, gpu_owned: int = 0) -> int | None:
     fmt = expert_quant if expert_quant != "none" else (
         getattr(model_config, "moe_weight_format", None) or "bf16"
     )
-    per_expert = _BANK_BYTES_PER_EXPERT.get(fmt)
     layers = getattr(model_config, "num_moe_layers", None)
     experts = getattr(model_config, "num_experts", None)
     hidden = getattr(model_config, "hidden_size", None)
     inter = getattr(model_config, "moe_intermediate_size", None)
-    if per_expert is None or not all((layers, experts, hidden, inter)):
+    if fmt not in _BANK_BYTES_PER_EXPERT or not all((layers, experts, hidden, inter)):
         return None
-    return max(0, layers - gpu_owned) * experts * per_expert(hidden, inter)
+    # EXL3 rows follow the checkpoint's routed K (Qwen Flash K=3 is 1.5x GLM's K=2 trellis).
+    per_expert = bank_bytes_per_expert(fmt, hidden, inter, model_config)
+    return max(0, layers - gpu_owned) * experts * per_expert
 
 
 def load_expert_banks(

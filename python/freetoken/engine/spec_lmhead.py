@@ -64,7 +64,7 @@ from freetoken.kernel.triton.int8_linear import int8_linear, quantize_int8_rows
 _DRAFT_LMHEAD_ENV = "FREETOKEN_MTP_SPEC_DRAFT_LMHEAD"
 _PLACEMENTS = ("bf16", "int8", "nvfp4")
 # Heads that are already quantized: copying them would cost VRAM to lose accuracy.
-_QUANTIZED_HEADS = ("Nvfp4LMHead", "Int8LMHead")
+_QUANTIZED_HEADS = ("Nvfp4LMHead", "Int8LMHead", "Exl3LMHead")
 
 
 def resolve_draft_lmhead_placement(environ: Mapping[str, str] | None = None) -> str:

@@ -62,9 +62,10 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # (set_alphas), so they are not banks
     "nvfp4_marlin": ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale"),
     "nvfp4_b12x": ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale"),
-    # turboderp EXL3 K=2 routed experts: trellis [in/16, out/16, 32] plus
-    # independent input/output FP16 factors for gate, up and down. The marker is
-    # validated while loading but does not need a bank because this proof fixes mul1.
+    # turboderp EXL3 routed experts, one K per checkpoint (GLM 2.05bpw K=2, Qwen Flash
+    # 3.05bpw K=3): trellis [in/16, out/16, 16*K] plus independent input/output FP16
+    # factors for gate, up and down. The marker is validated while loading but does not
+    # need a bank because this proof fixes mul1.
     "exl3": (
         "gate_trellis",
         "gate_suh",
@@ -96,6 +97,14 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
 from freetoken.kernel.aot_models import fp8_block_scale_pad
 
 
+def _exl3_bytes(H: int, I: int, k: int = 2) -> int:
+    # 16*K uint16 per 16x16 tile for gate, up and down, plus fp16 suh/svh per projection.
+    # GLM-5.3 2.05bpw (K=2, H=4096, I=2048): 6,328,320 B; Qwen Flash 3.05bpw (K=3, H=2560,
+    # I=640): 1,862,400 B.
+    tiles = (H // 16) * (I // 16)
+    return 3 * tiles * 16 * k * 2 + 2 * (H + I) * 2 + (I + H) * 2
+
+
 # bytes per (expert, layer) as f(hidden, moe_intermediate), from the bank shapes above; keep in sync with _BANK_SCHEMAS
 # keyed by the config-time format tag (expert_quant / moe_weight_format), not quant_format: "mxfp4" sizes the mxfp4_triton banks, "nvfp4" also covers its repacked variants
 _BANK_BYTES_PER_EXPERT = {
@@ -106,19 +115,24 @@ _BANK_BYTES_PER_EXPERT = {
     ) * 2,
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
-    # GLM-5.3-Flash EXL3 proof: K=2, mul1, three independent projections.
-    # At H=4096/I=2048 this is 6,328,320 bytes per expert row; the three
-    # trellises account for 6,291,456 bytes and the six factor vectors 36,864.
-    # The leading 2 counts gate/up; the final trellis uses the transposed shape.
-    "exl3": lambda H, I: (
-        2 * (H // 16) * (I // 16) * 32 * 2  # gate + up trellises
-        + 2 * H * 2 + 2 * I * 2  # gate + up suh/svh
-        + (I // 16) * (H // 16) * 32 * 2  # down trellis
-        + I * 2 + H * 2  # down suh/svh
-    ),
+    # EXL3 at the K=2 default (GLM-5.3 2.05bpw: 6,328,320 bytes per expert row). K is a
+    # per-checkpoint value, so size an EXL3 row through bank_bytes_per_expert instead.
+    "exl3": _exl3_bytes,
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
 }
+
+def bank_bytes_per_expert(fmt: str, hidden: int, intermediate: int, model_config) -> int:
+    """Bytes of one (expert, layer) bank row: the only way callers size a bank row.
+
+    EXL3 rows depend on the checkpoint's routed K (``model_config.exl3_expert_k``, default 2);
+    every other format is a function of the two widths alone. Raises ``KeyError`` for an
+    unknown format.
+    """
+    if fmt == "exl3":
+        return _exl3_bytes(hidden, intermediate, int(getattr(model_config, "exl3_expert_k", 2)))
+    return _BANK_BYTES_PER_EXPERT[fmt](hidden, intermediate)
+
 
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert
 # dimension; moe_align_block_size requires round_up(experts, 32) < 1024, i.e. <= 992.

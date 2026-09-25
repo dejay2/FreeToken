@@ -114,10 +114,60 @@ _FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
     ), 16),
 }
 
+# EXL3 checkpoints (turboderp 3.05bpw_h5_ng5) store every quantized linear as four components.
+_EXL3_COMPONENT_SUFFIXES = (".trellis", ".suh", ".svh", ".mul1")
+# Checkpoint part -> nested module path inside the Exl3ColMerged that replaces a bf16 fusion:
+# trellis tensors cannot be concatenated, so each part keeps its own tensors under the merged op.
+_EXL3_NESTED = {
+    ".self_attn.q_proj.": ".self_attn.qkv_proj.q_proj.",
+    ".self_attn.k_proj.": ".self_attn.qkv_proj.k_proj.",
+    ".self_attn.v_proj.": ".self_attn.qkv_proj.v_proj.",
+    ".linear_attn.in_proj_qkv.": ".linear_attn.in_proj_qkvz.in_proj_qkv.",
+    ".linear_attn.in_proj_z.": ".linear_attn.in_proj_qkvz.in_proj_z.",
+    ".mlp.shared_expert.gate_proj.": ".mlp.shared_expert.gate_up_proj.gate_proj.",
+    ".mlp.shared_expert.up_proj.": ".mlp.shared_expert.gate_up_proj.up_proj.",
+}
+# bf16 fusions that still apply to an EXL3 checkpoint: HC as today, and GDN b|a (fp16 in the
+# checkpoint) now that qkv|z are packed separately.
+_EXL3_FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
+    key: value for key, value in _FUSIONS.items() if "hyper_connection" in key
+}
+_EXL3_FUSIONS[".linear_attn.in_proj_ba.weight"] = (
+    (".linear_attn.in_proj_b.weight", ".linear_attn.in_proj_a.weight"), 0)
 
-def _rename(raw_name: str, *, include_vision: bool = False) -> str | None:
+
+def is_exl3_checkpoint(model_path: str) -> bool:
+    """True when the checkpoint's ``config.json`` declares ``quant_method: exl3``."""
+    folder = download_hf_weight(model_path)
+    try:
+        with open(os.path.join(folder, "config.json"), encoding="utf-8") as fh:
+            quant = json.load(fh).get("quantization_config") or {}
+    except FileNotFoundError:
+        return False
+    return str(quant.get("quant_method") or "").lower() == "exl3"
+
+
+def _exl3_rename(name: str) -> str:
+    """Nest an EXL3 component of a fused projection's part under its merged module."""
+    if not name.endswith(_EXL3_COMPONENT_SUFFIXES):
+        return name
+    for part, nested in _EXL3_NESTED.items():
+        if part in name:
+            return name.replace(part, nested, 1)
+    return name
+
+
+# EXL3 vision: the checkpoint ships packed q/k/v projections (attn.{q,k,v}_proj.{trellis,suh,
+# svh,mul1,bias}) alongside a bf16 attn.qkv.{weight,bias} that the tower actually loads (task 7,
+# spec 2026-09-25 section 5). The packed parts are dead weight -- drop them by name.
+_EXL3_VISION_QKV_PART_RE = re.compile(r"^(model\.)?visual\.blocks\.\d+\.attn\.[qkv]_proj\.")
+
+
+def _rename(raw_name: str, *, include_vision: bool = False, exl3: bool = False) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
     if raw_name.startswith("mtp."):
+        return None
+    if exl3 and include_vision and _EXL3_VISION_QKV_PART_RE.match(raw_name):
         return None
     if raw_name.startswith("model.visual."):
         return "visual." + raw_name[len("model.visual.") :] if include_vision else None
@@ -137,10 +187,13 @@ def _rename(raw_name: str, *, include_vision: bool = False) -> str | None:
 
 
 def _try_fuse(
-    name: str, tensor: torch.Tensor, buf: dict[str, dict[int, torch.Tensor]]
+    name: str,
+    tensor: torch.Tensor,
+    buf: dict[str, dict[int, torch.Tensor]],
+    fusions: dict[str, tuple[tuple[str, ...], int]] = _FUSIONS,
 ) -> tuple[str, torch.Tensor] | tuple[()] | None:
     """Buffer a fusion part; return the merged ``(name, tensor)`` once all parts arrive, ``()`` while incomplete, ``None`` if ``name`` is not a fusion part."""
-    for fused_suffix, (parts, pad_to) in _FUSIONS.items():
+    for fused_suffix, (parts, pad_to) in fusions.items():
         for idx, part in enumerate(parts):
             if not name.endswith(part):
                 continue
@@ -178,6 +231,10 @@ def iter_weights(
 
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the
     routed experts are NVFP4 and always come from :func:`load_nvfp4_expert_sources`.
+
+    EXL3 checkpoints (``quant_method: exl3``): the packed ``.trellis/.suh/.svh/.mul1``
+    components pass through unfused, the parts of a bf16 fusion nested under the merged op
+    (:func:`_exl3_rename`); only the HC and GDN ``b|a`` fusions remain (``_EXL3_FUSIONS``).
     """
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
@@ -185,16 +242,20 @@ def iter_weights(
         return
 
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
+    exl3 = is_exl3_checkpoint(model_path)
+    fusions = _EXL3_FUSIONS if exl3 else _FUSIONS
     include_vision = include_vision and vision_load_enabled()
     stream_vision = include_vision and vision_execution_mode() == "layer-stream"
     # ``mmap``: install the picture tensors as zero-copy views over a read-only mapping
     # of their shard extent instead of reading 856 MiB into process RAM. ``None`` means
     # today's resident behaviour -- either the flag says ``ram`` or the mapping was refused.
-    mapped_vision = (
-        open_mmap_vision_weights(model_path)
-        if stream_vision and vision_weights_backing() == "mmap"
-        else None
-    )
+    want_mapped = stream_vision and vision_weights_backing() == "mmap"
+    if want_mapped and exl3:
+        # The mapped view assumes the tower is one contiguous bf16 extent (see
+        # open_mmap_vision_weights); an EXL3 tower interleaves packed int16/fp16 components.
+        logger.info("EXL3 checkpoint: picture weights served from RAM (mmap needs one bf16 extent)")
+        want_mapped = False
+    mapped_vision = open_mmap_vision_weights(model_path) if want_mapped else None
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -218,9 +279,11 @@ def iter_weights(
                     safetensors.safe_open(file, framework="pt", device="cpu")
                 )
             for raw_name in raw_names:
-                name = _rename(raw_name, include_vision=include_vision)
+                name = _rename(raw_name, include_vision=include_vision, exl3=exl3)
                 if name is None:
                     continue
+                if exl3:
+                    name = _exl3_rename(name)
                 if mapped_vision is not None and name.startswith("visual."):
                     tensor = mapped_vision.tensor(name)
                 else:
@@ -229,9 +292,9 @@ def iter_weights(
                 if name.startswith("visual."):
                     from freetoken.models.vision_weight import require_dense_vision_weight
 
-                    require_dense_vision_weight(name, tensor)
+                    require_dense_vision_weight(name, tensor, exl3=exl3)
                 yielded = True
-                fused = _try_fuse(name, tensor, fuse_buf)
+                fused = _try_fuse(name, tensor, fuse_buf, fusions)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
                         yield fused
@@ -725,6 +788,15 @@ def _safetensors_header(path: str) -> tuple[dict, int]:
 
 def _ple_table_files(folder: str) -> list[str]:
     """Shards holding a piece of the n-gram table, from the index when there is one."""
+    # EXL3 checkpoints carry a trellis-packed table FreeToken does not serve; the one-time
+    # converter (scripts/exl3/convert_ngram_table.py) writes the FP8 table beside it and lists
+    # it here, leaving the checkpoint's own index untouched.
+    sidecar = os.path.join(folder, "freetoken-ple.index.json")
+    if os.path.exists(sidecar):
+        with open(sidecar, encoding="utf-8") as fh:
+            weight_map = json.load(fh)["weight_map"]
+        files = {shard for name, shard in weight_map.items() if _PLE_TABLE_INFIX in name}
+        return sorted(os.path.join(folder, shard) for shard in files)
     index = os.path.join(folder, "model.safetensors.index.json")
     if not os.path.exists(index):
         return sorted(iter_weight_files(folder))
@@ -737,6 +809,11 @@ def _ple_table_files(folder: str) -> list[str]:
 def _ple_layout(model_path: str, qwen4_args) -> PleLayout:
     """Parse and validate the PLE shards."""
     folder = download_hf_weight(model_path)
+    if (os.path.exists(os.path.join(folder, "ngram_embedding.safetensors"))
+            and not os.path.exists(os.path.join(folder, "freetoken-ple.index.json"))):
+        raise ValueError(
+            f"{folder} holds an EXL3 trellis n-gram table FreeToken does not serve; convert it once: "
+            f"python scripts/exl3/convert_ngram_table.py {folder}")
     parts: dict[int, tuple[str, int, int]] = {}  # shard index -> (path, file offset, bytes)
     scale: torch.Tensor | None = None
     rows = cols = 0

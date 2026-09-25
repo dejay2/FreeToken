@@ -399,7 +399,9 @@ def load_weight(
             if name.startswith(VISION_KEY_PREFIXES):
                 from freetoken.models.vision_weight import require_dense_vision_weight
 
-                require_dense_vision_weight(name, tensor)
+                # FTW's dense shard never stores EXL3 vision components -- conversion always
+                # replays a resident (bf16) tower -- so this path is never the exl3 one.
+                require_dense_vision_weight(name, tensor, exl3=False)
             yield name, tensor
         return
 

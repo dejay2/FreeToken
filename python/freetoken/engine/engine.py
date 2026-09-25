@@ -434,6 +434,15 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self._install_model_weights(config)
+        # Dense EXL3 linears share one fixed fp16 workspace. Allocated here, after the weights
+        # (it sizes itself from the built Exl3Linear tree) and before the post-weights free
+        # snapshot below, so the MoE cache and KV budgets see it as spent and every CUDA graph
+        # captured later binds its fixed addresses. Keyed on EXL3 so other checkpoints never
+        # import exllamav3_ext (kernel/exl3.py loads it at import).
+        if getattr(config.model_config, "linear_storage", "bf16") == "exl3":
+            from freetoken.kernel.exl3_linear import prepare_exl3_dense_workspace
+
+            prepare_exl3_dense_workspace(self.model, self.device)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
 
@@ -1238,6 +1247,9 @@ class Engine:
                     int(config.cuda_graph_max_bs or 0),
                 ),
                 enable_mgemm=cache.exl3_expert_op == "mgemm",
+                # Routed trellis K (GLM 2.05bpw K=2, Qwen Flash 3.05bpw K=3); the reconstruct
+                # staging banks are sized 16*K wide and the bank check refuses any other K.
+                k=int(getattr(config.model_config, "exl3_expert_k", 2)),
             )
             cache.exl3_scratch = scratch
             for layer in layers:

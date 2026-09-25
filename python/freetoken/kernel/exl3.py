@@ -32,6 +32,8 @@ from typing import Tuple
 
 import torch
 
+from freetoken.kernel import exl3_launch as _launch
+
 
 # Import the optional extension before CUDA graph capture.  CPU-only imports keep the
 # reference path available when the proof wheel is not installed; the card path reports a
@@ -288,6 +290,17 @@ def reconstruct_reference(
     return result
 
 
+def _reconstruct_had_slice(work, trellis, suh, svh, *, k: int, mul1: bool) -> None:
+    """The wheel's reconstruct kernel, through the EXL3 launch choke point
+    (kernel/exl3_launch.py: cross-stream serialisation, strict-stream and trace modes)."""
+    ext = _exllamav3_ext
+    _launch.launch(
+        "reconstruct",
+        lambda: ext.reconstruct_had_slice(work, trellis, suh, svh, k, False, mul1, 0),
+        device=work.device, m=0, k=int(work.shape[0]), n=int(work.shape[1]), bits=int(k),
+    )
+
+
 def reconstruct(
     trellis: torch.Tensor,
     suh: torch.Tensor,
@@ -332,16 +345,7 @@ def reconstruct(
             "EXL3 CUDA reconstruction needs the ExLlamaV3 v1.4.6 exllamav3_ext wheel"
         )
 
-    _exllamav3_ext.reconstruct_had_slice(
-        work,
-        trellis,
-        suh,
-        svh,
-        k,
-        False,
-        codebook == "mul1",
-        0,
-    )
+    _reconstruct_had_slice(work, trellis, suh, svh, k=k, mul1=codebook == "mul1")
     out.copy_(work.T)
     return out
 

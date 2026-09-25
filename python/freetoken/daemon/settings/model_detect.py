@@ -263,6 +263,7 @@ def detect(path: str, *, taken: Iterable[str] = ()) -> dict[str, Any]:
         return out
     target = Path(os.path.abspath(target))
     out["path"] = str(target)
+    warning = ""
     try:
         if target.is_file():
             if PART_RE.match(target.name):
@@ -285,13 +286,18 @@ def detect(path: str, *, taken: Iterable[str] = ()) -> dict[str, Any]:
             engine, runtime, size, files = "freetoken", "freetoken", info.weight_bytes, [str(target)]
             stem, ram = target.name, suggest_ram_gb("freetoken", info.weight_bytes, info)
             out["format"] = f"{info.architecture} model folder"
+            if info.expert_format == "exl3" and not (target / "freetoken-ple.index.json").is_file():
+                # scripts/exl3/convert_ngram_table.py has not been run yet: the folder still
+                # only has turboderp's ngram_embedding.safetensors, which FreeToken's PLE
+                # loader cannot read (weight.py:717 wants F8_E4M3 freetoken-ple-* shards).
+                warning = f"EXL3 word table not converted yet: run scripts/exl3/convert_ngram_table.py {target}"
         else:
             raise NotAModel("Nothing was found at that path.")
     except NotAModel as exc:
         out["reason"] = str(exc)
         return out
     out.update(kind=engine, engine=engine, runtime=runtime, engineLabel=ENGINE_LABELS[engine],
-               runtimeLabel=RUNTIME_LABELS.get(runtime, ""), bytes=int(size), files=files,
+               runtimeLabel=RUNTIME_LABELS.get(runtime, ""), bytes=int(size), files=files, reason=warning,
                suggested={"id": suggest_id(stem, taken), "name": suggest_name(stem, engine), "ramNeedGB": ram})
     return out
 

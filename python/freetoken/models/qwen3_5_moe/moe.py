@@ -23,7 +23,16 @@ class _SharedExpert(BaseOP):
     """Always-present shared SwiGLU expert of width ``shared_expert_intermediate_size``."""
 
     def __init__(self, config: ModelConfig, hidden_size: int, intermediate_size: int):
-        if getattr(config, "expert_quant", "none") == "fp8_block":
+        if getattr(config, "linear_storage", "bf16") == "exl3":
+            # EXL3 checkpoint: gate/up/down ship packed (K=5); gate|up become one GEMM per
+            # part concatenated in the [gate | up] order silu_and_mul expects.
+            from freetoken.kernel.exl3_linear import Exl3ColMerged, Exl3Linear
+
+            self.gate_up_proj = Exl3ColMerged(
+                hidden_size, [("gate_proj", intermediate_size), ("up_proj", intermediate_size)]
+            )
+            self.down_proj = Exl3Linear(intermediate_size, hidden_size)
+        elif getattr(config, "expert_quant", "none") == "fp8_block":
             self.gate_up_proj = Fp8BlockColMerged(
                 hidden_size, [intermediate_size, intermediate_size], has_bias=False
             )
