@@ -696,3 +696,16 @@ def test_b_still_yields_when_another_app_asks_for_as_model(tmp_path, monkeypatch
     job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b"}, {"model": "twin-27b"}]})
     assert job["status"] == "yielded" and ("load", "twin-27b") not in env.switcher.calls
     assert job["message"] == f"Another app started using {FABLE}, so the test stopped to let it through."
+
+
+def test_a_refused_load_is_marked_as_not_loaded(tmp_path, monkeypatch):
+    """Live 2026-09-25: the memory gate refused FreeToken and the row read "already loaded"."""
+    env = make(tmp_path, monkeypatch, loaded={"quasar-27b": "ready"})
+
+    def gate(model_id):
+        if model_id == "fable-27b":
+            raise SwitcherError(503, "not_enough_memory", "not enough free memory to load fable-27b")
+
+    env.switcher.on_load = gate
+    job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b"}]})
+    assert job["status"] == "failed" and job["sides"][0]["loadFailed"] is True

@@ -64,7 +64,7 @@ function metricValue(side, key) {
 function metricText(side, key) {
   const s = (side && side.stats) || {};
   switch (key) {
-    case 'loadMs': return side && side.loadMs != null ? fmtMs(side.loadMs) : 'already loaded';
+    case 'loadMs': return side && side.loadFailed ? 'did not load' : (side && side.loadMs != null ? fmtMs(side.loadMs) : 'already loaded');
     case 'firstWordMs': case 'totalMs': return fmtMs(s[key]);
     case 'writeTps': return fmtRate(s);
     case 'promptTokens': return tokensWords(s.promptTokens, false, s.cachedTokens);

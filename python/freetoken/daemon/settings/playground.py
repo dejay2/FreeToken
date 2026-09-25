@@ -39,6 +39,7 @@ import json
 import os
 import re
 import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -490,7 +491,7 @@ class PlaygroundRunner:
         return {"key": key, "model": model_id, "name": model["name"], "engine": model["engine"], "preset": preset,
                 "runPreset": self.panel.test_preset_key(model_id, preset),
                 "settingsLabel": f"preset “{preset}”" if preset else "Saved settings",
-                "sampling": sampling, "answer": "", "reasoning": "", "stats": None, "loadMs": None, "error": None}
+                "sampling": sampling, "answer": "", "reasoning": "", "stats": None, "loadMs": None, "loadFailed": False, "error": None}
 
     # ---- the plan ----
     def _steps(self, sides: list[dict[str, Any]], before: str | None, held: bool, warmup: bool, put_back: bool,
@@ -728,6 +729,9 @@ class PlaygroundRunner:
         finally:
             with self._lock:
                 self._loading = None
+                # A load that failed or was stopped still shows as a load, never "already loaded"
+                # (seen live 2026-09-25: the memory gate refused FreeToken after 5 min).
+                side["loadFailed"] = sys.exc_info()[0] is not None
         self._ours = model
         with self._lock:
             side["loadMs"] = (side["loadMs"] or 0) + max(0, round((self._clock() - started) * 1000))
