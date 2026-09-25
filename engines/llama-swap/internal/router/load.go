@@ -19,6 +19,25 @@ type Loader interface {
 // is ready or its load failed. The grant it receives is handed straight back
 // with a ServeDone, as if a request had been served and finished.
 func (b *baseRouter) Load(ctx context.Context, modelID string) error {
+	return b.load(ctx, modelID, false)
+}
+
+// FreeToken patch P8: FreeLoader is implemented by local routers that can load
+// a model only when nothing else is on the card or on its way there.
+type FreeLoader interface {
+	LoadIfFree(ctx context.Context, modelID string) error
+}
+
+// LoadIfFree is Load without preemption: the scheduler refuses it with
+// scheduler.NotFreeError (409 busy) at admission, on the run loop, when any
+// other model is running, loading, waiting in the memory gate, queued or
+// holding requests. A refused load cancels nothing (Load would supersede a
+// colliding not-ready swap, P1).
+func (b *baseRouter) LoadIfFree(ctx context.Context, modelID string) error {
+	return b.load(ctx, modelID, true)
+}
+
+func (b *baseRouter) load(ctx context.Context, modelID string, ifFree bool) error {
 	if b.shuttingDown.Load() {
 		return fmt.Errorf("%s is shutting down", b.name)
 	}
@@ -34,6 +53,10 @@ func (b *baseRouter) Load(ctx context.Context, modelID string) error {
 		Admit:      make(chan error, 1),
 		Respond:    make(chan scheduler.HandlerResp),
 		PositionCh: make(chan int, 1),
+		IfFree:     ifFree, // FreeToken patch P8
+		// FreeToken patch P8 (round 2): a cancelled load nobody else joined
+		// never boots later (it may be parked in the memory gate).
+		AbortSwapIfLast: true,
 	}
 	shutdownErr := fmt.Errorf("%s is shutting down", b.name)
 	select {

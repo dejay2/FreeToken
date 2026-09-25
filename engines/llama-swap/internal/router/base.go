@@ -26,6 +26,12 @@ type unloadReq struct {
 	targets []string
 	timeout time.Duration
 	respond chan struct{}
+	// FreeToken patch P7: ifIdle refuses the unload (*busy set true, nothing
+	// stopped) when the scheduler still holds a request for a target. busy is
+	// a pointer because the request travels by value; it is written before
+	// respond is closed.
+	ifIdle bool
+	busy   *bool
 }
 
 // baseRouter owns the channels, run-loop, and process machinery shared by every
@@ -167,7 +173,13 @@ func (b *baseRouter) run() {
 			b.notifyProcessed()
 
 		case req := <-b.unloadCh:
-			b.schedule.OnUnload(req.targets, req.timeout)
+			// FreeToken patch P7: the idle check runs here, on the run loop,
+			// in the same step as the stop, so no request can be admitted in between.
+			if req.ifIdle && b.anyBusy(req.targets) {
+				*req.busy = true
+			} else {
+				b.schedule.OnUnload(req.targets, req.timeout)
+			}
 			close(req.respond)
 			b.notifyProcessed()
 
@@ -605,7 +617,12 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		Admit:      make(chan error, 1),
 		Respond:    make(chan scheduler.HandlerResp),
 		PositionCh: make(chan int, 1),
+		// FreeToken patch P8 (round 2): a chat request can ask for the
+		// if-free admission a load gets with ?ifFree=1. The header is
+		// llama-swap's own and is not passed on to the engine.
+		IfFree: req.Header.Get(scheduler.IfFreeHeader) == "1",
 	}
+	req.Header.Del(scheduler.IfFreeHeader) // FreeToken patch P8 (round 2)
 
 	select {
 	case b.handlerCh <- hr:

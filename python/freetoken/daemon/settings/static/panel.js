@@ -77,8 +77,12 @@ function nowStripHtml(now) {
   const held = (now.held || []).length ? `<div class="sub">Old settings until the next load: ${panelEsc(now.held.map((id) => ((sw.running || []).find((row) => row.id === id) || {}).name || id).join(', '))}</div>` : '';
   const restart = now.lastRestart && !now.lastRestart.ok ? `<div class="error">${panelEsc(now.lastRestart.message)}</div>` : '';
   const stale = sw.up && sw.stale ? `<div class="error">${STALE_WORDS}</div>` : '';
+  const test = now.test && now.test.running
+    ? `<div class="sub">${now.test.model ? `Test running: ${panelEsc(now.test.name || now.test.model)} on preset “${panelEsc(now.test.preset)}”` : 'A test is running on the Test tab.'}</div>` : '';
+  const leftover = now.testLeftover
+    ? `<div class="error">${panelEsc(now.testLeftover.name || now.testLeftover.model)} is still on test settings${now.testLeftover.preset ? ` (preset “${panelEsc(now.testLeftover.preset)}”)` : ''} because an app was using it. It goes back to its saved settings at its next load.</div>` : '';
   return [
-    `<div class="stat"><span class="small">Loaded</span><strong class="now-list">${running}</strong>${held}${stale}${restart}</div>`,
+    `<div class="stat"><span class="small">Loaded</span><strong class="now-list">${running}</strong>${held}${test}${leftover}${stale}${restart}</div>`,
     `<div class="stat"><span class="small">Graphics card</span><strong>${card}</strong><div class="bar" aria-label="Graphics card memory used"><span style="width:${pct}%"></span></div></div>`,
     `<div class="stat"><span class="small">Windows free memory</span><strong>${win}</strong></div>`,
     `<div class="stat"><span class="small">Cushion kept free</span><strong>${cushion}</strong></div>`,
@@ -210,7 +214,7 @@ function removedNote(body) {
   return [`Removed ${body.name || body.id}.`, body.files && body.files.message, body.profile && body.profile.message, piNote(body.pi)].filter(Boolean).join(' ');
 }
 if (typeof module !== 'undefined') module.exports = { fmtGB, stateWord, sourceText, dialSourceFor, verdictWords, fitSummary, ramSummary, restartQuestion, nowStripHtml, modelsTableHtml, panelErrorText,
-  loadQuestion, unloadQuestion, registryProblemHtml, panelSave, answerRestart, answerConfirm, startNow, loadModel, unloadModel, panel,
+  loadQuestion, unloadQuestion, registryProblemHtml, panelSave, answerRestart, answerConfirm, startNow, loadModel, unloadModel, panel, applyView,
   idProblem, detectionText, planSummary, downloadLine, removeQuestion, removeFilesNote, removeOkLabel, ramProblem, piNote, addedNote, removedNote,
   addState, openAdd, closeAdd, addCheckPath, addValidate, addPlan, addPathEdited, addRepoEdited, wirePanel, addDownload, addCancelDownload, pollAddJob, addSave, openRemove, answerRemove };
 
@@ -253,9 +257,12 @@ function leaveGuard() { if (state.view && changedNames().length) { setNotice('Sa
 function clearView() { state.view = null; state.settings = {}; state.saved = {}; state.dials = []; state.groups = []; state.model = null; }
 
 function showMain(name) {
-  panel.main = ['models', 'system', 'ninfer', 'freetoken'].includes(name) ? name : 'models';
+  panel.main = ['models', 'system', 'ninfer', 'freetoken', 'test'].includes(name) ? name : 'models';
   document.querySelectorAll('[data-main]').forEach((button) => button.setAttribute('aria-selected', String(button.dataset.main === panel.main)));
   try { localStorage.setItem('ft-main', panel.main); } catch (_) {}
+  const testView = $('test-view');
+  if (testView) testView.hidden = panel.main !== 'test';
+  if (panel.main === 'test') { clearView(); showEditor(false); $('models-view').hidden = true; if (typeof pgOpen === 'function') pgOpen(); return; }
   if (panel.main === 'models') { clearView(); showEditor(false); loadModels(); return; }
   openView(panel.main === 'system' ? '/api/panel/views/system' : `/api/panel/views/engine/${panel.main}`);
 }
@@ -372,6 +379,8 @@ function viewNote(body) {
   return `${body.engineLabel}${body.runtimeLabel ? ` (${body.runtimeLabel})` : ''} · ${body.id} · ${stateWord(body.state)}`;
 }
 function applyView(body, url) {
+  // A slow view answer arriving after a switch to the Test tab must not paint the editor over it.
+  if (panel.main === 'test') return;
   state.view = { ...body, url };
   panel.revision = body.revision || panel.revision;
   state.settings = JSON.parse(JSON.stringify(body.settings || {}));
