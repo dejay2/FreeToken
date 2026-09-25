@@ -345,3 +345,20 @@ peers:
 		t.Fatalf("LoadConfigFromReader error = %v, want peer FQN conflict", err)
 	}
 }
+
+// FreeToken patch P4: a malformed peer clamp range fails loading like a model's does.
+func TestPeerConfig_RejectsMalformedClampParams(t *testing.T) {
+	yamlData := `
+proxy: https://openrouter.ai/api
+apiKey: sk-test
+models:
+  - model_a
+filters:
+  clampParams:
+    temperature: [.nan, 2]
+`
+	var config PeerConfig
+	if err := yaml.Unmarshal([]byte(yamlData), &config); err == nil {
+		t.Fatal("expected a NaN peer clamp bound to be rejected")
+	}
+}
