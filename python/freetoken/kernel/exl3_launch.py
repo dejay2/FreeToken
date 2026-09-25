@@ -24,7 +24,8 @@ Every ``exl3_gemm`` (kernel/exl3_linear.py), ``reconstruct_had_slice`` (kernel/e
    first-prefill kernel mix did NOT hang on the box (tiny-test-report.md, 2026-09-25 16:57),
    which leaves cross-stream overlap as the concrete suspect.
 
-   The rule: remember the stream of the previous EXL3 launch on each device; when a launch
+   The rule: remember the stream of the previous EXL3 launch on each device (eager and captured
+   launches tracked apart, so a capture in between never hides the last eager stream); when a launch
    arrives on a different stream, record an event on the old stream and make the new stream
    wait on it before launching. Stream order then puts the new kernel after everything the old
    stream had queued, including the previous EXL3 kernel.
@@ -51,9 +52,12 @@ Every ``exl3_gemm`` (kernel/exl3_linear.py), ``reconstruct_had_slice`` (kernel/e
 
 2. ``FREETOKEN_EXL3_STRICT_STREAM=1`` (debug): the first stream a device sees an EXL3 launch
    on outside capture becomes its home stream; an eager launch on any other stream raises a
-   RuntimeError naming the op, label and shape instead of launching. Captured launches are not
-   checked (they run at replay, on the replay stream). Use it in a debug boot to discover any
-   cross-stream caller.
+   RuntimeError naming the op, label and shape instead of launching, logged at ERROR first so a
+   caller's broad ``except`` cannot swallow it silently. Captured launches are not checked
+   (they run at replay, on the replay stream). Launches inside :class:`fenced_side_stream` are
+   accepted: the two known, fully fenced eager side-stream warm-ups are the MTP graph warm-ups
+   in ``engine/spec_graph.py`` (``mtp-verify-graph-warmup``) and ``engine/spec_draft_graph.py``
+   (``mtp-draft-graph-warmup``). Use it in a debug boot to discover any cross-stream caller.
 
 3. ``FREETOKEN_EXL3_TRACE=<file>`` (debug only, slow): one line before (BEGIN) and after (END)
    each launch -- monotonic time, pid, op, caller label, M/K/N, K bits, stream id, capturing --
@@ -76,6 +80,10 @@ from typing import Callable
 
 import torch
 
+from freetoken.utils import init_logger
+
+logger = init_logger(__name__)
+
 STRICT_ENV = "FREETOKEN_EXL3_STRICT_STREAM"
 TRACE_ENV = "FREETOKEN_EXL3_TRACE"
 
@@ -94,13 +102,17 @@ class _CudaOps:
         with torch.cuda.stream(stream):
             return bool(torch.cuda.is_current_stream_capturing())
 
+    def current_capturing(self, device: torch.device) -> bool:
+        return bool(torch.cuda.is_current_stream_capturing())
+
     def new_event(self):
         return torch.cuda.Event()
 
 
 _OPS = _CudaOps()
 _LOCK = threading.RLock()
-_LAST_STREAM: dict[object, object] = {}
+_LAST_EAGER: dict[object, object] = {}
+_LAST_CAPTURED: dict[object, object] = {}
 _HOME_STREAM: dict[object, object] = {}
 _SCOPE = threading.local()
 _TRACE_FILE = None
@@ -110,7 +122,8 @@ _TRACE_PATH: str | None = None
 def _reset_for_tests() -> None:
     global _TRACE_FILE, _TRACE_PATH
     with _LOCK:
-        _LAST_STREAM.clear()
+        _LAST_EAGER.clear()
+        _LAST_CAPTURED.clear()
         _HOME_STREAM.clear()
         if _TRACE_FILE is not None:
             _TRACE_FILE.close()
@@ -139,6 +152,32 @@ class scope:  # noqa: N801 - used like a function: ``with exl3_launch.scope("L3.
     def __exit__(self, *exc) -> None:
         if self.name is not None:
             _SCOPE.stack.pop()
+
+
+class fenced_side_stream:  # noqa: N801 - used like a function
+    """Mark eager EXL3 launches in this block as a known, fully fenced side-stream warm-up.
+
+    Strict mode accepts them (they do not raise and do not claim the home stream) and trace
+    mode logs a FENCED line before their BEGIN. Serialisation still applies. Use it ONLY where
+    the side stream is fenced both ways and the device is synchronised around it, so nothing
+    EXL3 can overlap. The two sites today are the MTP graph warm-ups, each an eager run on the
+    capture side stream fenced by ``wait_stream`` both ways plus ``torch.cuda.synchronize``:
+    ``engine/spec_graph.py`` (``SpecGraphRunner`` verify-graph warm-up, name
+    ``mtp-verify-graph-warmup``) and ``engine/spec_draft_graph.py`` (draft-graph warm-up, name
+    ``mtp-draft-graph-warmup``). Without this, a strict boot raised there and the capture's
+    broad ``except Exception`` silently marked the graph width unsupported."""
+
+    __slots__ = ("name", "_prev")
+
+    def __init__(self, name: str):
+        self.name = str(name)
+
+    def __enter__(self) -> None:
+        self._prev = getattr(_SCOPE, "fenced", None)
+        _SCOPE.fenced = self.name
+
+    def __exit__(self, *exc) -> None:
+        _SCOPE.fenced = self._prev
 
 
 def _full_label(label: str | None) -> str:
@@ -196,27 +235,41 @@ def launch(
     with _LOCK:
         fh = _trace_file()
         stream = _OPS.current_stream(device)
+        capturing = _OPS.current_capturing(device)
         key = _dev_key(device)
-        prev = _LAST_STREAM.get(key)
+        # Eager and captured launches are tracked apart: a capture in between must not hide
+        # the last eager stream ("eager on E -> captured on S -> eager on X" still makes X
+        # wait on E), and a captured fork only ever waits on a stream of the same capture.
+        slot = _LAST_CAPTURED if capturing else _LAST_EAGER
+        prev = slot.get(key)
         switched = prev is not None and prev != stream
         if not (switched or strict or fh):
-            # Hot path (every launch of a text-only serve): one stream query and a compare.
+            # Hot path (every launch of a text-only serve): two stream queries and a compare.
             result = fn()
-            _LAST_STREAM[key] = stream
+            slot[key] = stream
             return result
-        capturing = _OPS.is_capturing(stream)
         desc = f"op={op} label={_full_label(label)} m={m} k={k} n={n} bits={bits}"
+        fenced = getattr(_SCOPE, "fenced", None)
 
-        if strict and not capturing:
+        if strict and not capturing and fenced is None:
             home = _HOME_STREAM.setdefault(key, stream)
             if home != stream:
-                raise RuntimeError(
+                message = (
                     f"EXL3 launch on a second CUDA stream ({STRICT_ENV}=1): {desc} "
                     f"arrived on stream {_stream_id(stream)}, but this device's EXL3 home "
                     f"stream is {_stream_id(home)}"
                 )
+                # Logged before raising: a caller's broad ``except Exception`` (the MTP graph
+                # capture treats failures as "width unsupported") must not swallow it silently.
+                logger.error(message)
+                if fh:
+                    _trace(fh, "STRICT-FAIL", f"{desc} stream={_stream_id(stream)}")
+                raise RuntimeError(message)
 
         if switched:
+            # An eager launch waits only on an eager stream that is not capturing now (a
+            # captured record cannot be waited on from outside the capture); a captured launch
+            # only on a stream still capturing (the same capture: the wait is a graph edge).
             prev_capturing = _OPS.is_capturing(prev)
             if prev_capturing == capturing:
                 event = _OPS.new_event()
@@ -229,13 +282,15 @@ def launch(
                 _trace(fh, "SKIP-WAIT", f"{desc} from={_stream_id(prev)} to={_stream_id(stream)} "
                                         f"prev_capturing={prev_capturing} capturing={capturing}")
 
+        fields = f"{desc} stream={_stream_id(stream)} capturing={'yes' if capturing else 'no'}"
         if fh:
-            fields = f"{desc} stream={_stream_id(stream)} capturing={'yes' if capturing else 'no'}"
+            if fenced is not None and not capturing:
+                _trace(fh, "FENCED", f"{desc} stream={_stream_id(stream)} fence={fenced}")
             _trace(fh, "BEGIN", fields)
             started = time.monotonic()
         try:
             result = fn()
-            _LAST_STREAM[key] = stream
+            slot[key] = stream
             if fh and not capturing:
                 # Debug only: proves the kernel finished before END is written.
                 stream.synchronize()
@@ -248,4 +303,4 @@ def launch(
         return result
 
 
-__all__ = ["STRICT_ENV", "TRACE_ENV", "launch", "scope"]
+__all__ = ["STRICT_ENV", "TRACE_ENV", "fenced_side_stream", "launch", "scope"]

@@ -47,6 +47,9 @@ class FakeOps:
     def is_capturing(self, stream):
         return stream.capturing
 
+    def current_capturing(self, device):
+        return self.current.capturing
+
     def new_event(self):
         return FakeEvent(self.log)
 
@@ -118,6 +121,78 @@ def test_no_wait_between_an_eager_and_a_captured_launch(ops):
     other = FakeStream("other", ops.log, capturing=True)
     _go(ops, other)
     assert [e for e in ops.log if e[0] in ("record", "wait")] == []
+
+
+def test_a_capture_in_between_does_not_hide_the_last_eager_stream(ops):
+    # review minor 1: eager on E -> captured on S -> eager on X must make X wait on E
+    e = FakeStream("E", ops.log)
+    s = FakeStream("S", ops.log, capturing=True)
+    x = FakeStream("X", ops.log)
+    _go(ops, e)
+    _go(ops, s)
+    s.capturing = False
+    _go(ops, x)
+    assert ("record", "E") in ops.log and ("wait", "X", "E") in ops.log
+    assert ("record", "S") not in ops.log
+
+
+def test_eager_launch_does_not_wait_on_a_stream_that_is_capturing_now(ops):
+    engine = FakeStream("engine", ops.log)
+    _go(ops, engine)
+    engine.capturing = True
+    _go(ops, engine)  # captured on engine
+    other = FakeStream("other", ops.log)
+    _go(ops, other)  # eager while engine captures: recording on engine would be captured
+    assert [e for e in ops.log if e[0] in ("record", "wait")] == []
+
+
+def test_strict_accepts_a_fenced_side_stream_warmup(ops, monkeypatch, tmp_path):
+    # review Important: the MTP graph warm-ups run eager on the capture side stream, fenced
+    # both ways; strict must not raise there (the capture's except Exception swallowed it).
+    monkeypatch.setenv(L.STRICT_ENV, "1")
+    path = tmp_path / "t"
+    monkeypatch.setenv(L.TRACE_ENV, str(path))
+    engine, side = FakeStream("engine", ops.log), FakeStream("side", ops.log)
+    _go(ops, engine)
+    with L.fenced_side_stream("mtp-verify-graph-warmup"):
+        _go(ops, side)
+    assert ("kernel", "side", "exl3_gemm") in ops.log
+    text = path.read_text()
+    assert " FENCED " in text and "fence=mtp-verify-graph-warmup" in text
+    _go(ops, engine)  # home stays engine
+    with pytest.raises(RuntimeError):
+        _go(ops, side)  # outside the fence it is a violation again
+
+
+def test_a_fenced_block_does_not_claim_the_home_stream(ops, monkeypatch):
+    monkeypatch.setenv(L.STRICT_ENV, "1")
+    side, engine = FakeStream("side", ops.log), FakeStream("engine", ops.log)
+    with L.fenced_side_stream("warm"):
+        _go(ops, side)
+    _go(ops, engine)
+    with pytest.raises(RuntimeError):
+        _go(ops, side)
+
+
+def test_strict_violation_is_logged_at_error_before_raising(ops, monkeypatch):
+    monkeypatch.setenv(L.STRICT_ENV, "1")
+    errors = []
+    monkeypatch.setattr(L.logger, "error", lambda msg, *a: errors.append(msg % a if a else msg))
+    _go(ops, FakeStream("engine", ops.log))
+    try:
+        _go(ops, FakeStream("sched", ops.log), label="x")
+    except RuntimeError:
+        pass  # a broad except in the caller must still leave the log line
+    assert len(errors) == 1 and "second CUDA stream" in errors[0] and "label=x" in errors[0]
+
+
+def test_the_mtp_graph_warmups_are_fenced():
+    import inspect
+
+    from freetoken.engine import spec_draft_graph, spec_graph
+
+    assert 'fenced_side_stream("mtp-verify-graph-warmup")' in inspect.getsource(spec_graph)
+    assert 'fenced_side_stream("mtp-draft-graph-warmup")' in inspect.getsource(spec_draft_graph)
 
 
 def test_cpu_tensors_bypass_the_stream_rules():
