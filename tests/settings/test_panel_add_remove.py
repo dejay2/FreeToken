@@ -474,6 +474,41 @@ def test_hub_errors_are_told_apart(box, monkeypatch):
     monkeypatch.setattr(box.hub, "model_info", raising(ConnectionError("Name or service not known")))
     answer = box.client.post("/api/panel/add/plan", json={"link": "owner/small-9b"})
     assert answer.status_code == 502 and answer.json()["code"] == "hub_error" and "Hugging Face" in answer.json()["message"]
+    # Review item 11: the Hub's own text (URL, request id) is logged, never shown.
+    assert "Name or service not known" not in answer.json()["message"]
+    raw = "404 Client Error for url: https://huggingface.co/api/models/owner/small-9b (Request ID: Root=1-abc)"
+    http_error = type("HfHubHTTPError", (OSError,), {"__module__": "huggingface_hub.utils._errors"})(raw)
+    http_error.response = SimpleNamespace(status_code=404)
+    monkeypatch.setattr(box.hub, "model_info", raising(http_error))
+    answer = box.client.post("/api/panel/add/plan", json={"link": "owner/small-9b"})
+    assert answer.status_code == 502 and answer.json()["code"] == "hub_error"
+    assert answer.json()["message"] == "Hugging Face has no model repo at that link. Check the owner and name."
+    gated = type("GatedRepoError", (OSError,), {"__module__": "huggingface_hub.utils._errors"})(raw)
+    monkeypatch.setattr(box.hub, "model_info", raising(gated))
+    assert "gated or private" in box.client.post("/api/panel/add/plan", json={"link": "owner/small-9b"}).json()["message"]
+
+
+def test_a_download_that_loses_the_hub_fails_in_plain_words(box, tmp_path, monkeypatch, caplog):
+    """Review item 11: a Hub HTTP error mid-download carries a URL and request id; the job's
+    error line says the connection was lost and the raw text goes to the helper log."""
+    source = tmp_path / "src"
+    source.mkdir()
+    write_v3(source / "small_9b.ninfer", parts=1)
+    box.hub.files = {p.name: p.read_bytes() for p in sorted(source.iterdir())}
+    raw = "500 Server Error for url: https://huggingface.co/owner/small-9b/resolve/main/x (Request ID: Root=1-abc)"
+    http_error = type("HfHubHTTPError", (OSError,), {"__module__": "huggingface_hub.utils._errors"})(raw)
+
+    def fetch(repo, name, destination, cancelled):
+        if name.endswith(".part-0001"):
+            raise http_error
+        return box.hub.fetch(repo, name, destination, cancelled)
+    monkeypatch.setattr(box.service.downloads, "_file_fetcher", fetch)
+    job = box.client.post("/api/panel/add/downloads", json={"link": "owner/small-9b"}).json()
+    done = wait_job(box, job["id"])
+    assert done["stage"] == "failed"
+    assert done["error"] == "The connection to Hugging Face was lost, so the download stopped."
+    assert "Request ID" in caplog.text and "huggingface.co" in caplog.text
+    assert not (box.ninfer / "small_9b.ninfer").exists()
 
 
 def test_removing_an_unknown_model_says_reload(box):

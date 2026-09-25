@@ -236,6 +236,28 @@ def _is_network_error(exc: BaseException) -> bool:
     return False
 
 
+def _hub_reason(exc: BaseException) -> str:
+    """Plain words for a Hub failure. The exception's own text carries the request URL, the
+    Hub's request id and its HTML, none of which belong on the page (review item 11): the
+    class name and HTTP status are enough to say what happened, and the detail goes to the log."""
+    names = {klass.__name__ for klass in type(exc).__mro__}
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if "GatedRepoError" in names or status in (401, 403):
+        return "That repo is gated or private on Hugging Face, so it cannot be read from here."
+    if "RepositoryNotFoundError" in names or "RevisionNotFoundError" in names or status == 404:
+        return "Hugging Face has no model repo at that link. Check the owner and name."
+    if "EntryNotFoundError" in names:
+        return "A file the repo lists is missing from Hugging Face."
+    if status == 429:
+        return "Hugging Face is asking this PC to slow down. Try again in a minute."
+    if isinstance(status, int) and status >= 500:
+        return "Hugging Face is having trouble right now. Try again later."
+    if isinstance(exc, TimeoutError) or "Timeout" in "".join(names):
+        return "Hugging Face did not answer in time. Try again."
+    return "Couldn't reach Hugging Face. Check the internet connection and try again."
+
+
 def _after_save(step: str, fn: Callable[[], dict[str, Any]], fallback: Mapping[str, Any],
                 words: str) -> dict[str, Any]:
     """Run one step that follows a completed add/remove. The list change already happened,
@@ -985,8 +1007,10 @@ class PanelService:
             raise PanelError(409, "download_conflict", str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - told apart below; nothing here may escape as a bare 500
             if _is_network_error(exc):
-                # The Hub's own errors (no such repo, gated, no network), in plain words.
-                raise PanelError(502, "hub_error", f"Couldn't read that repo from Hugging Face: {exc}") from exc
+                # The Hub's own errors (no such repo, gated, no network), in plain words; the
+                # raw text (URL, request id) goes to the helper log only.
+                logger.warning("Hugging Face %s failed: %s: %s", method, type(exc).__name__, exc)
+                raise PanelError(502, "hub_error", _hub_reason(exc)) from exc
             if isinstance(exc, OSError):
                 # A local file problem is not the Hub's fault: a full disk is 507, the rest 500.
                 full = exc.errno in (errno.ENOSPC, errno.EDQUOT)

@@ -217,6 +217,7 @@
     #browser { z-index: 50; } /* opened from the Add model wizard, it must sit on top of it */
     .add-field { display: grid; gap: 4px; margin-top: 10px; }
     .add-field input { width: 100%; }
+    .add-field input.bad { border-color: var(--bad); outline: 1px solid var(--bad); }
     .add-source { margin-bottom: 10px; }
     #add-wizard section { margin-top: 14px; }
     .crumbs { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
@@ -549,6 +550,7 @@
         <div id="add-pc">
           <p class="small">Pick a NInfer file (it ends in .ninfer) or a model folder (config.json plus .safetensors files).</p>
           <div class="path-row"><input id="add-path" type="text" spellcheck="false" placeholder="~/ninfer-work/models/… or ~/models/…" aria-label="Model file or folder"><button class="button" type="button" id="add-browse">Browse…</button><button class="button primary" type="button" id="add-check">Check</button></div>
+          <p class="small" id="add-last-download" hidden aria-live="polite"></p>
         </div>
         <div id="add-link" hidden>
           <p class="small">Paste a Hugging Face link. NInfer files go to the NInfer models folder and model folders to the models folder. Nothing already on the PC is overwritten, and the files are checked against the checksums the repo publishes.</p>
@@ -563,7 +565,7 @@
           <p class="small">Step 3 of 3: how it shows up in apps</p>
           <div class="add-field"><label for="add-id">Id (the name apps ask for)</label><input id="add-id" type="text" maxlength="63" spellcheck="false"><p class="small error" id="add-id-error"></p></div>
           <div class="add-field"><label for="add-name">Name in apps</label><input id="add-name" type="text" maxlength="120"></div>
-          <div class="add-field"><label for="add-ram">PC memory it needs (GB)</label><input id="add-ram" type="number" min="0" max="512" step="1"><p class="small">Suggested from the model's size. The switcher waits until this much PC memory is free before loading it.</p></div>
+          <div class="add-field"><label for="add-ram">PC memory it needs (GB)</label><input id="add-ram" type="number" min="0" max="512" step="1"><p class="small error" id="add-ram-error"></p><p class="small">Suggested from the model's size. The switcher waits until this much PC memory is free before loading it.</p></div>
         </section>
         <p class="error" id="add-errors" aria-live="polite"></p>
       </div>

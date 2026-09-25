@@ -130,6 +130,13 @@ const ADD_ID_RULE = 'Use 1 to 63 small letters, numbers, dots, dashes or undersc
 const ADD_STAGE_WORDS = { queued: 'Waiting to start', downloading: 'Downloading', verifying: 'Checking the download', moving: 'Putting it in place', done: 'Downloaded', failed: 'Download failed', cancelled: 'Download cancelled' };
 const ADD_TERMINAL = new Set(['done', 'failed', 'cancelled']);
 const ADD_POLL_MS = 1500;
+// pollGen numbers the poll loop: only the newest loop's answers are shown (review item 4).
+// checkSeq / planSeq number the detect and plan requests the same way (item 6). seenJob is the
+// finished download already shown once on opening (item 3). cancelling holds "Cancelling…" until
+// a poll says cancelled (item 5). saving keeps Save off while the POST runs (item 6).
+const addState = { found: null, plan: null, job: null, timer: null, roots: {}, pollGen: 0, checkSeq: 0, planSeq: 0, seenJob: null, cancelling: false, saving: false };
+const ADD_LOST_TOUCH = 'Lost touch with the settings page, trying again…';
+const ADD_KEEPS_GOING = 'The download keeps going. Open Add a model to see it.';
 function idProblem(id, rows) {
   const text = String(id ?? '').trim();
   if (!ADD_ID_RE.test(text)) return ADD_ID_RULE;
@@ -172,6 +179,22 @@ function downloadLine(job) {
 function removeQuestion(row, loaded) {
   return `Remove ${row.name || row.id} from the list?${loaded ? ' It is loaded now and will be put away first.' : ''} Apps will no longer see it.`;
 }
+// What "Also delete the model files" would do: a NInfer model is one file plus its part files;
+// a FreeToken model is a folder, and its settings profile goes with it (review item 8).
+function removeFilesNote(view) {
+  const where = view.artifact || 'its files';
+  if (view.engine === 'freetoken') return `If you tick this, the model folder at ${where} is deleted for good, and so is its settings profile.`;
+  return `If you tick this, the model file (and its part files) at ${where} are deleted for good.`;
+}
+function removeOkLabel(deleteFiles) { return deleteFiles ? 'Remove and delete files' : 'Remove'; }
+// The RAM box: whole gigabytes from 0 to 512 (the input's own min/max, checked here too because
+// a typed value ignores them; review item 7).
+function ramProblem(value) {
+  const text = String(value ?? '').trim();
+  const n = Number(text);
+  if (!text || !Number.isFinite(n) || n < 0 || n > 512) return 'Use a number of gigabytes from 0 to 512.';
+  return '';
+}
 // pi_sync's answer: {status: 'updated'|'not_updated', message, notes}.
 function piNote(pi) {
   if (!pi) return '';
@@ -188,7 +211,8 @@ function removedNote(body) {
 }
 if (typeof module !== 'undefined') module.exports = { fmtGB, stateWord, sourceText, dialSourceFor, verdictWords, fitSummary, ramSummary, restartQuestion, nowStripHtml, modelsTableHtml, panelErrorText,
   loadQuestion, unloadQuestion, registryProblemHtml, panelSave, answerRestart, answerConfirm, startNow, loadModel, unloadModel, panel,
-  idProblem, detectionText, planSummary, downloadLine, removeQuestion, piNote, addedNote, removedNote, addCheckPath, addValidate, addSave, openRemove, answerRemove };
+  idProblem, detectionText, planSummary, downloadLine, removeQuestion, removeFilesNote, removeOkLabel, ramProblem, piNote, addedNote, removedNote,
+  addState, openAdd, closeAdd, addCheckPath, addValidate, addPlan, addDownload, addCancelDownload, pollAddJob, addSave, openRemove, answerRemove };
 
 /* ---------- browser side: uses index.html's state, json, $, setNotice and dial renderer ---------- */
 const postJson = (url, payload) => json(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload ?? {}) });
@@ -448,7 +472,6 @@ function answerConfirm(yes) {
 }
 
 /* ---------- Stage B: add a model, remove a model ---------- */
-const addState = { found: null, plan: null, job: null, timer: null, roots: {} };
 function addSource(which) {
   $('add-pc').hidden = which !== 'pc';
   $('add-link').hidden = which !== 'link';
@@ -465,29 +488,51 @@ async function openAdd() {
   if (!leaveGuard()) return;
   addReset();
   addState.plan = null;
+  addState.cancelling = false;
   $('add-path').value = ''; $('add-repo').value = '';
-  ['add-plan-card', 'add-entry', 'add-download-actions', 'add-progress'].forEach((id) => { $(id).hidden = true; });
+  ['add-plan-card', 'add-entry', 'add-download-actions', 'add-progress', 'add-last-download'].forEach((id) => { $(id).hidden = true; });
   addSource('pc');
   $('add-wizard').hidden = false;
+  $('add-path').focus();
   const { response, body } = await json('/api/panel/add/info');
-  if (!response.ok) return;
+  if (!response.ok || $('add-wizard').hidden) return;
   addState.roots = body.roots || {};
   // A download started earlier keeps running in the helper; reopening the wizard picks it up.
   const job = body.download;
-  if (job && !ADD_TERMINAL.has(job.stage)) { addSource('link'); addState.job = job; renderAddJob(job); pollAddJob(); }
+  if (!job) return;
+  if (!ADD_TERMINAL.has(job.stage)) { addSource('link'); addState.job = job; renderAddJob(job); startAddPoll(); return; }
+  // One that finished while the wizard was closed: a good download is offered as the path to
+  // add; a failed or cancelled one is said once, then left alone.
+  if (job.stage === 'done' && job.resultPath) {
+    addState.job = job;
+    $('add-last-download').hidden = false;
+    $('add-last-download').textContent = `Your download finished: ${downloadLine(job)}`;
+    $('add-path').value = job.resultPath;
+    await addCheckPath(job.resultPath);
+    return;
+  }
+  if (job.id !== addState.seenJob) { addState.seenJob = job.id; addState.job = job; addSource('link'); renderAddJob(job); }
 }
-function closeAdd() { $('add-wizard').hidden = true; clearTimeout(addState.timer); addState.timer = null; }
+function closeAdd() {
+  const wasOpen = !$('add-wizard').hidden;
+  $('add-wizard').hidden = true;
+  clearTimeout(addState.timer); addState.timer = null;
+  addState.pollGen += 1; // an answer still on its way is dropped
+  if (wasOpen && addState.job && !ADD_TERMINAL.has(addState.job.stage)) setNotice(ADD_KEEPS_GOING);
+}
 function addBrowse() {
   openBrowser('add', 'add', { title: 'Choose a model file or folder', start: addState.roots.ninfer || '', onPick: (path) => { $('add-path').value = path; addCheckPath(path); } });
 }
 async function addCheckPath(path) {
   addReset();
+  const seq = ++addState.checkSeq;
   const text = String(path ?? '').trim();
   if (!text) return;
   $('add-step-found').hidden = false;
   $('add-found-text').className = '';
   $('add-found-text').textContent = 'Checking…';
   const { response, body } = await postJson('/api/panel/add/detect', { path: text });
+  if (seq !== addState.checkSeq) return; // a newer check has been sent; its answer wins
   if (registryProblem(response, body)) { closeAdd(); await backToRegistryProblem(body); return; }
   if (!response.ok) { $('add-found-text').textContent = panelErrorText(body, 'Could not check that path.'); $('add-found-text').className = 'error'; return; }
   showFound(body);
@@ -506,16 +551,21 @@ function addValidate() {
   const found = addState.found;
   const usable = !!found && found.kind !== 'unsupported' && !found.already;
   const problem = usable ? idProblem($('add-id').value, panel.models) : '';
+  const ram = usable ? ramProblem($('add-ram').value) : '';
   $('add-id-error').textContent = problem;
-  $('add-save').disabled = !usable || !!problem || !String($('add-name').value ?? '').trim();
+  $('add-ram-error').textContent = ram;
+  $('add-ram').className = ram ? 'bad' : '';
+  $('add-save').disabled = addState.saving || !usable || !!problem || !!ram || !String($('add-name').value ?? '').trim();
 }
 async function addPlan() {
   addReset();
+  const seq = ++addState.planSeq;
   $('add-download-actions').hidden = true;
   const entry = $('add-entry').hidden ? null : ($('add-entry').value || null);
   $('add-plan-card').hidden = false;
   $('add-plan-card').textContent = 'Reading the repo…';
   const { response, body } = await postJson('/api/panel/add/plan', { link: String($('add-repo').value ?? '').trim(), entry });
+  if (seq !== addState.planSeq) return; // a newer plan request has been sent; its answer wins
   if (!response.ok) { addState.plan = null; $('add-plan-card').textContent = panelErrorText(body, 'Could not read that link.'); return; }
   addState.plan = body;
   $('add-plan-card').textContent = planSummary(body);
@@ -534,75 +584,118 @@ async function addDownload() {
   const { response, body } = await postJson('/api/panel/add/downloads', { link: plan.repo, entry: plan.entry || null });
   if (!response.ok) { $('add-download').disabled = false; $('add-plan-card').textContent = panelErrorText(body, 'Could not start the download.'); return; }
   addState.job = body;
+  addState.cancelling = false;
+  $('add-last-download').hidden = true;
   renderAddJob(body);
-  pollAddJob();
+  startAddPoll();
 }
 function renderAddJob(job) {
+  const over = ADD_TERMINAL.has(job.stage);
+  if (over) addState.cancelling = false;
   $('add-progress').hidden = false;
-  $('add-progress-stage').textContent = ADD_STAGE_WORDS[job.stage] || job.stage;
+  $('add-progress-stage').textContent = addState.cancelling ? 'Cancelling…' : (ADD_STAGE_WORDS[job.stage] || job.stage);
   $('add-progress-bar').style.width = `${Math.max(0, Math.min(100, Number(job.percent) || 0))}%`;
   $('add-progress-detail').textContent = downloadLine(job);
-  $('add-download-cancel').disabled = ADD_TERMINAL.has(job.stage);
+  $('add-download-cancel').disabled = over || addState.cancelling;
 }
-async function pollAddJob() {
+// One poll loop at a time: a new start retires the old loop, whose in-flight answer is dropped.
+function startAddPoll() {
+  clearTimeout(addState.timer); addState.timer = null;
+  addState.pollGen += 1;
+  return pollAddJob(addState.pollGen);
+}
+async function pollAddJob(gen = addState.pollGen) {
+  if (gen !== addState.pollGen) return;
   clearTimeout(addState.timer); addState.timer = null;
   const job = addState.job;
   if (!job) return;
-  const { response, body } = await json(`/api/panel/add/downloads/${encodeURIComponent(job.id)}`);
-  if (response.status === 404) { $('add-progress-detail').textContent = 'The settings page restarted and lost this download. Start it again.'; $('add-download').disabled = false; return; }
+  let answer;
+  try {
+    answer = await json(`/api/panel/add/downloads/${encodeURIComponent(job.id)}`);
+  } catch (_) {
+    // The helper is restarting or the network blinked: say so and keep asking (item 2).
+    if (gen !== addState.pollGen) return;
+    $('add-progress-detail').textContent = ADD_LOST_TOUCH;
+    if (!$('add-wizard').hidden) addState.timer = setTimeout(() => pollAddJob(gen), ADD_POLL_MS);
+    return;
+  }
+  if (gen !== addState.pollGen) return;
+  const { response, body } = answer;
+  if (response.status === 404) { $('add-progress-detail').textContent = 'The settings page restarted and lost this download. Start it again.'; $('add-download').disabled = false; $('add-download-cancel').disabled = true; addState.cancelling = false; return; }
   const current = response.ok ? body : job;
   addState.job = current;
   renderAddJob(current);
   if (current.stage === 'done') { $('add-path').value = current.resultPath || ''; await addCheckPath(current.resultPath); return; }
   if (current.stage === 'failed' || current.stage === 'cancelled') { $('add-download').disabled = false; return; }
-  if (!$('add-wizard').hidden) addState.timer = setTimeout(pollAddJob, ADD_POLL_MS);
+  if (!$('add-wizard').hidden) addState.timer = setTimeout(() => pollAddJob(gen), ADD_POLL_MS);
 }
 async function addCancelDownload() {
   const job = addState.job;
-  if (!job) return;
-  $('add-download-cancel').disabled = true;
-  const { response, body } = await postJson(`/api/panel/add/downloads/${encodeURIComponent(job.id)}/cancel`, {});
-  if (response.ok) { addState.job = body; renderAddJob(body); }
+  if (!job || addState.cancelling || ADD_TERMINAL.has(job.stage)) return;
+  // The helper only flags the job; the worker stops at its next chunk. The button stays off and
+  // the stage reads "Cancelling…" until a poll brings back "cancelled" (item 5).
+  addState.cancelling = true;
+  renderAddJob(job);
+  let answer;
+  try { answer = await postJson(`/api/panel/add/downloads/${encodeURIComponent(job.id)}/cancel`, {}); } catch (_) { answer = { response: { ok: false }, body: {} }; }
+  if (addState.job !== job && !(addState.job && addState.job.id === job.id)) return;
+  if (!answer.response.ok) { addState.cancelling = false; renderAddJob(addState.job); $('add-progress-detail').textContent = panelErrorText(answer.body, 'Could not cancel the download. Try again.'); return; }
+  if (ADD_TERMINAL.has(answer.body.stage)) { addState.job = answer.body; renderAddJob(answer.body); }
 }
 async function addSave() {
   const found = addState.found;
-  if (!found || $('add-save').disabled) return;
+  if (!found || addState.saving || $('add-save').disabled) return;
+  addState.saving = true;
   $('add-save').disabled = true;
   $('add-errors').textContent = '';
-  const { response, body } = await postJson('/api/panel/models', { revision: panel.revision, path: found.path, id: String($('add-id').value ?? '').trim(), name: String($('add-name').value ?? '').trim(), ramNeedGB: $('add-ram').value });
-  if (response.status === 409 && body.code === 'stale_revision') { await loadModels(); $('add-errors').textContent = 'The model list changed meanwhile. Check the details and press Add model again.'; addValidate(); return; }
-  if (registryProblem(response, body)) { closeAdd(); await backToRegistryProblem(body); return; }
-  // 422 here is {detail: [{field: 'add.…', message}]} or a plain {message}; 409 already_added and
-  // 503 switcher_unknown carry plain words too. panelErrorText picks the words out of each.
-  if (!response.ok) { $('add-errors').textContent = panelErrorText(body, 'Could not add the model.'); addValidate(); return; }
-  panel.revision = body.revision || panel.revision;
-  closeAdd();
-  setNotice(addedNote(body), body.pi && body.pi.status === 'not_updated' ? 'warn' : 'good');
-  await loadModels();
-  loadNow();
+  try {
+    const { response, body } = await postJson('/api/panel/models', { revision: panel.revision, path: found.path, id: String($('add-id').value ?? '').trim(), name: String($('add-name').value ?? '').trim(), ramNeedGB: $('add-ram').value });
+    addState.saving = false;
+    if (response.status === 409 && body.code === 'stale_revision') { await loadModels(); $('add-errors').textContent = 'The model list changed meanwhile. Check the details and press Add model again.'; addValidate(); return; }
+    if (registryProblem(response, body)) { closeAdd(); await backToRegistryProblem(body); return; }
+    // 422 here is {detail: [{field: 'add.…', message}]} or a plain {message}; 409 already_added and
+    // 503 switcher_unknown carry plain words too. panelErrorText picks the words out of each.
+    if (!response.ok) { $('add-errors').textContent = panelErrorText(body, 'Could not add the model.'); addValidate(); return; }
+    panel.revision = body.revision || panel.revision;
+    closeAdd();
+    setNotice(addedNote(body), body.pi && body.pi.status === 'not_updated' ? 'warn' : 'good');
+    await loadModels();
+    loadNow();
+  } finally {
+    addState.saving = false;
+  }
 }
 
 async function openRemove() {
   const view = state.view;
-  if (!view || view.kind !== 'model' || !leaveGuard()) return;
+  if (!view || view.kind !== 'model' || panel.busy || !leaveGuard()) return;
   const row = (panel.models || []).find((item) => item.id === view.id) || { id: view.id, name: view.name };
   $('remove-ask-text').textContent = removeQuestion(row, isLoadedState(view.state));
   $('remove-files').checked = false; // spec: "also delete the model files" is off by default, every time
-  $('remove-files-note').textContent = `Ticked, this also deletes ${view.artifact || 'its files'} from the drive. That cannot be undone.`;
+  $('remove-files-note').textContent = removeFilesNote(view);
+  $('remove-ask-ok').textContent = removeOkLabel(false);
   $('remove-ask').hidden = false;
+  $('remove-ask-cancel').focus();
   const yes = await new Promise((resolve) => { panel.removeResolve = resolve; });
-  if (!yes) return;
-  const { response, body } = await postJson(`/api/panel/models/${encodeURIComponent(view.id)}/remove`, { revision: panel.revision, deleteFiles: !!$('remove-files').checked });
-  if (response.status === 409 && body.code === 'stale_revision') { setNotice(body.message, 'bad'); await reopenView(); return; }
-  if (registryProblem(response, body)) { await backToRegistryProblem(body); return; }
-  // 409 files_missing / files_unsafe / files_shared and 503 switcher_unknown / unload_failed all
-  // carry plain words that say nothing was removed.
-  if (!response.ok) { setNotice(panelErrorText(body, 'Could not remove the model.'), 'bad'); return; }
-  panel.revision = body.revision || panel.revision;
-  clearView();
-  showMain('models');
-  setNotice(removedNote(body), (body.files && !body.files.deleted) || (body.profile && body.profile.message) || (body.pi && body.pi.status === 'not_updated') ? 'warn' : 'good');
-  loadNow();
+  if (!yes || panel.busy) return;
+  // Busy while the remove runs (item 1): the unload it may do takes seconds, and a second press
+  // of Remove, Save or Load meanwhile would race it.
+  panel.busy = true; setBusy(true);
+  try {
+    const { response, body } = await postJson(`/api/panel/models/${encodeURIComponent(view.id)}/remove`, { revision: panel.revision, deleteFiles: !!$('remove-files').checked });
+    if (response.status === 409 && body.code === 'stale_revision') { setNotice(body.message, 'bad'); await reopenView(); return; }
+    if (registryProblem(response, body)) { await backToRegistryProblem(body); return; }
+    // 409 files_missing / files_unsafe / files_shared and 503 switcher_unknown / unload_failed all
+    // carry plain words that say nothing was removed.
+    if (!response.ok) { setNotice(panelErrorText(body, 'Could not remove the model.'), 'bad'); return; }
+    panel.revision = body.revision || panel.revision;
+    clearView();
+    showMain('models');
+    setNotice(removedNote(body), (body.files && !body.files.deleted) || (body.profile && body.profile.message) || (body.pi && body.pi.status === 'not_updated') ? 'warn' : 'good');
+    loadNow();
+  } finally {
+    panel.busy = false; setBusy(false);
+  }
 }
 function answerRemove(yes) {
   $('remove-ask').hidden = true;
@@ -737,6 +830,7 @@ function wirePanel() {
   ['add-id', 'add-name', 'add-ram'].forEach((id) => $(id).addEventListener('input', addValidate));
   $('add-save').addEventListener('click', addSave);
   $('model-remove').addEventListener('click', openRemove);
+  $('remove-files').addEventListener('change', () => { $('remove-ask-ok').textContent = removeOkLabel(!!$('remove-files').checked); });
   $('remove-ask-ok').addEventListener('click', () => answerRemove(true));
   $('remove-ask-cancel').addEventListener('click', () => answerRemove(false));
 }

@@ -12,6 +12,7 @@ import ctypes
 import errno
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -101,6 +102,33 @@ class ChecksumMismatch(RuntimeError):
 
 class DownloadCancelled(Exception):
     """Raised inside the worker when the page's Cancel arrives mid-file, mid-hash or before moving."""
+
+
+logger = logging.getLogger("freetoken.daemon.settings.download")
+
+_OWN_WORDS = (InvalidRepository, DownloadConflict, AddUnsupported, ChecksumMismatch)
+
+
+def _network_like(exc: BaseException) -> bool:
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    return any((klass.__module__ or "").split(".")[0] in ("huggingface_hub", "requests", "urllib3", "urllib", "http", "socket", "ssl")
+               for klass in type(exc).__mro__)
+
+
+def _plain_job_error(exc: BaseException) -> str:
+    """The failed line the wizard shows. This module's own exceptions (and the bare RuntimeErrors
+    it raises about a file's size or arrival) already read as plain sentences; anything else,
+    a Hub HTTP error with its URL and request id above all, is logged and replaced with a
+    short reason (review item 11)."""
+    if isinstance(exc, _OWN_WORDS) or (type(exc) is RuntimeError):
+        return str(exc)
+    logger.warning("a model download failed: %s: %s", type(exc).__name__, exc)
+    if _network_like(exc):
+        return "The connection to Hugging Face was lost, so the download stopped."
+    if isinstance(exc, OSError):
+        return f"The download stopped: {exc.strerror or exc}."
+    return "Something went wrong during the download. Check the helper log for the details."
 
 
 class DownloadBody(BaseModel):
@@ -1192,7 +1220,7 @@ class DownloadManager:
         except DownloadCancelled:
             self._abandon(job_id, "cancelled")
         except Exception as exc:  # noqa: BLE001 - a failed download must not kill the helper
-            self._abandon(job_id, "failed", str(exc))
+            self._abandon(job_id, "failed", _plain_job_error(exc))
 
     @staticmethod
     def _claim_and_move(source: Path, destination: Path) -> None:
