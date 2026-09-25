@@ -91,3 +91,17 @@ def test_exl3_layer_stream_block_copy(exl3_vision_config):
     for key, value in target.state_dict().items():
         assert torch.equal(value, source_state[key]), key
     assert torch.equal(target.attn.proj.trellis, source.attn.proj.trellis)
+
+
+def test_exl3_vision_mlp_pads_intermediate_to_128(exl3_vision_config):
+    """Qwen3.8-Flash-Next's tower has intermediate 4304; the EXL3 checkpoint stores
+    linear_fc1 as [1152 -> 4352] (bias 4352) and linear_fc2 as [4352 -> 1152], exllamav3's
+    MLP pad_to=128 (found on the first box boot, 2026-09-25: 4304 % 128 != 0 refused)."""
+    import dataclasses
+
+    from freetoken.models.qwen4_exp.vision import Qwen4VisionMLP
+
+    cfg = dataclasses.replace(exl3_vision_config, intermediate_size=200)
+    mlp = Qwen4VisionMLP(cfg)
+    assert mlp.linear_fc1.out_features == 256 and mlp.linear_fc2.in_features == 256
+    assert mlp.linear_fc1.bias.shape == (256,)

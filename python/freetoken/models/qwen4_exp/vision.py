@@ -158,8 +158,16 @@ class Qwen4VisionAttention(BaseOP):
 
 class Qwen4VisionMLP(BaseOP):
     def __init__(self, config: Qwen4VisionConfig):
-        self.linear_fc1 = _vision_linear(config, config.hidden_size, config.intermediate_size)
-        self.linear_fc2 = _vision_linear(config, config.intermediate_size, config.hidden_size)
+        intermediate = config.intermediate_size
+        if getattr(config, "exl3", False):
+            # exllamav3's MLP pads the intermediate width to 128 (pad_to=128): the 3.05bpw
+            # checkpoint stores fc1 as [1152 -> 4352] with a 4352 bias and fc2 as
+            # [4352 -> 1152] for the tower's 4304. fc1's padded outputs go through the
+            # activation into fc2 untrimmed, exactly as the quantizer saw them (first box
+            # boot, 2026-09-25: the unpadded 4304 was refused by the out % 128 rule).
+            intermediate = (intermediate + 127) // 128 * 128
+        self.linear_fc1 = _vision_linear(config, config.hidden_size, intermediate)
+        self.linear_fc2 = _vision_linear(config, intermediate, config.hidden_size)
         self.hidden_act = config.hidden_act
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
