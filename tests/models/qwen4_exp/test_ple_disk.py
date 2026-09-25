@@ -332,3 +332,14 @@ def test_graph_sync_protocol(tmp_path, monkeypatch):
     gated, _, _ = _make_table(tmp_path)
     assert not gated._wait_sync
     assert gated.host_fill_batch(_decode_batch([3, 4], 5), use_graph=True) is None
+
+
+def test_exl3_never_uses_wait_sync():
+    # EXL3 decode graphs deadlock on the flag WAIT (replay never returns, so the deferred fill
+    # never signals): auto and gate fall back to launch-gating, an explicit wait is refused.
+    from freetoken.models.qwen4_exp.ple_disk import DiskRowTable
+
+    assert DiskRowTable._probe_wait_sync(None, "auto", False) is False
+    assert DiskRowTable._probe_wait_sync(None, "gate", False) is False
+    with pytest.raises(RuntimeError, match="deadlocks with EXL3"):
+        DiskRowTable._probe_wait_sync(None, "wait", False)

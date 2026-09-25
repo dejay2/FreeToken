@@ -111,6 +111,7 @@ class DiskRowTable:
         max_graph_rows: int = 256,
         max_extend_tokens: int = 8192,
         dtype: torch.dtype = torch.bfloat16,
+        allow_wait_sync: bool = True,
     ) -> None:
         from freetoken.kernel import _ple_store
 
@@ -155,7 +156,7 @@ class DiskRowTable:
         self._eager_pinned.zero_()  # the warmup prefill stages nothing and reads whatever sits here
         self._eager_dev = torch.empty(eager_bytes, dtype=torch.uint8, device=self._device)
         # probe picks flag-sync (graph WAITs at the consume, host fills then signals) or launch-gating
-        self._wait_sync = self._probe_wait_sync(os.getenv(_SYNC_ENV, "auto"))
+        self._wait_sync = self._probe_wait_sync(os.getenv(_SYNC_ENV, "auto"), allow_wait_sync)
         # one flag for all graphs: the readback event orders a fill after the previous graph, so signals never overlap
         self._flag = alloc_pinned_tensor(1, dtype=torch.int64)
         self._flag.zero_()
@@ -164,9 +165,24 @@ class DiskRowTable:
         sync = "wait-sync" if self._wait_sync else "launch-gating"
         logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
 
-    def _probe_wait_sync(self, mode: str) -> bool:
+    def _probe_wait_sync(self, mode: str, allowed: bool = True) -> bool:
         from freetoken.kernel import _ple_store
 
+        if not allowed:
+            # EXL3 checkpoints (allowed=False): wait-sync deadlocks. The captured decode graph
+            # WAITs on self._flag, and the host raises the flag only after graph.replay()
+            # returns (forward_host_ctx's deferred fill). With ExLlamaV3 kernels in the graph
+            # the replay itself never returned: py-spy put the scheduler inside
+            # torch.cuda.graphs.replay with the GPU at desktop idle (~10%), on the first decode
+            # step. RTX 5090 / WSL, EXL3 Qwen3.8-Flash-Next, 2026-09-25: wait-sync hung on
+            # the first request twice (the 15:33 boot froze the PC; the 21:01 repeat was
+            # killed by a stall guard), launch-gating served 8/8 prompts at 57-63 tok/s.
+            if mode == "wait":
+                raise RuntimeError(
+                    f"{_SYNC_ENV}=wait deadlocks with EXL3 weights (the decode graph replay "
+                    "never returns while the graph waits on the PLE flag); use gate or auto"
+                )
+            return False
         if mode == "gate":
             return False
         scratch = alloc_pinned_tensor(1, dtype=torch.int64)

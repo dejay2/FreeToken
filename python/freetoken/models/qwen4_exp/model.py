@@ -465,6 +465,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 constants,
                 max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
                 max_extend_tokens=engine_config.max_extend_tokens,
+                # EXL3 graphs never return from replay while a WAIT is pending: gate instead
+                allow_wait_sync=getattr(self._config, "linear_storage", "bf16") != "exl3",
             )
             self._ple_table = disk_table
             for ple in ple_layers:
