@@ -111,14 +111,28 @@ def spec_conf_log_enabled(environ: Mapping[str, str] | None = None) -> bool:
 
 def resolve_spec_expert_placement(
     environ: Mapping[str, str] | None = None,
+    *,
+    model_config=None,
 ) -> tuple[str, Path | None]:
     """Which expert banks the draft head puts on the card, and where they come from.
 
     Parsed here rather than on ``EngineConfig``: the placement is a private bank layout of
     this head, not a serving flag. The default is the exact bf16 banks read from the target
     checkpoint -- the placement that shipped, unchanged.
+
+    An EXL3 checkpoint (target ``expert_quant == "exl3"``) has no bf16 MTP banks to read: its
+    head's routed experts ship packed, so the placement is ``exl3`` and an explicit other
+    format is refused rather than silently ignored.
     """
     env = os.environ if environ is None else environ
+    if getattr(model_config, "expert_quant", None) == "exl3":
+        named = (env.get(_EXPERT_FORMAT_ENV, "") or "").strip().lower()
+        if named not in ("", "exl3"):
+            raise ValueError(
+                "this EXL3 checkpoint's MTP experts are EXL3; unset "
+                f"{_EXPERT_FORMAT_ENV} (the placement is exl3; got {named!r})"
+            )
+        return "exl3", None
     placement = (env.get(_EXPERT_FORMAT_ENV, "") or "bf16").strip().lower() or "bf16"
     if placement not in {"bf16", "nvfp4"}:
         raise ValueError(f"{_EXPERT_FORMAT_ENV} must be bf16 or nvfp4, got {placement!r}")
@@ -152,6 +166,7 @@ def resolve_draft_cut_mode(spec_decode) -> str:
 
 def spec_expert_runner_type(placement: str):
     from freetoken.models.qwen4_exp.mtp_spike import (
+        MTPExl3GPUExpertRunner,
         MTPGPUExpertRunner,
         MTPNVFP4GPUExpertRunner,
     )
@@ -160,19 +175,30 @@ def spec_expert_runner_type(placement: str):
         return MTPGPUExpertRunner
     if placement == "nvfp4":
         return MTPNVFP4GPUExpertRunner
-    raise ValueError(f"MTP draft expert placement must be bf16 or nvfp4, got {placement!r}")
+    if placement == "exl3":
+        return MTPExl3GPUExpertRunner
+    raise ValueError(
+        "MTP draft expert placement must be bf16 or nvfp4 (exl3 on an EXL3 checkpoint), "
+        f"got {placement!r}"
+    )
 
 
-def load_spec_expert_banks(placement: str, manifest: Path | None, store):
-    """The banks the placement asks for: the checkpoint's exact rows, or the NVFP4 six."""
+def load_spec_expert_banks(placement: str, manifest: Path | None, store, *, model_config=None):
+    """The banks the placement asks for: the checkpoint's exact rows, the NVFP4 six, or the
+    EXL3 checkpoint's packed nine (geometry and K from ``model_config``)."""
 
     from freetoken.models.qwen4_exp.mtp_spike import (
         MTPBF16ExpertBanks,
+        MTPExl3ExpertBanks,
         MTPNVFP4ExpertBanks,
     )
 
     if placement == "bf16":
         return MTPBF16ExpertBanks.from_store(store)
+    if placement == "exl3":
+        if model_config is None:
+            raise ValueError("the exl3 draft placement needs the MTP model config")
+        return MTPExl3ExpertBanks.from_store(store, model_config)
     if manifest is None:
         raise ValueError(f"the nvfp4 draft placement needs {_NVFP4_MANIFEST_ENV}")
     return MTPNVFP4ExpertBanks.from_manifest(manifest, validate_hashes=True)
@@ -365,19 +391,36 @@ class SpecDraftHead:
             build_mtp_weight_plan,
         )
 
-        self.expert_placement, manifest = resolve_spec_expert_placement()
+        self.expert_placement, manifest = resolve_spec_expert_placement(
+            model_config=self.engine.config.model_config
+        )
+        exl3 = getattr(self.mtp_config, "linear_storage", "bf16") == "exl3"
         model_state = self.model.state_dict()
         with MTPWeightStore(self.engine.config.model_path) as store:
-            plan = build_mtp_weight_plan(store.keys, model_state.keys())
+            plan = build_mtp_weight_plan(store.keys, model_state.keys(), exl3=exl3)
+            # Cast to the model's declared dtype, as the engine's own loader does: the EXL3
+            # build ships the head's router, HC and pre_fc_norm_hidden fp16 (the packed
+            # suh/svh/trellis/mul1 are declared in their own dtypes and pass through). A no-op
+            # on the bf16/NVFP4 builds, whose dense MTP tensors are bf16 already.
             cpu_weights = {
-                entry.model_name: store.materialize(entry, device=torch.device("cpu"))
+                entry.model_name: store.materialize(entry, device=torch.device("cpu")).to(
+                    dtype=model_state[entry.model_name].dtype
+                )
                 for entry in plan.entries
                 if not entry.expert
             }
-            banks = load_spec_expert_banks(self.expert_placement, manifest, store)
+            banks = load_spec_expert_banks(
+                self.expert_placement, manifest, store, model_config=self.mtp_config
+            )
         self.staged_model = MTPStagedModelRunner(
             self.model, cpu_weights, device=self.device, resident=True
         )
+        if exl3:
+            from freetoken.kernel.exl3_linear import require_exl3_dense_workspace_fits
+
+            # The head's packed linears share the target's fixed dense workspace (allocated
+            # before any graph capture); it cannot grow now, so refuse a head that outsizes it.
+            require_exl3_dense_workspace_fits(self.model, self.device)
         extra = (
             # ``max_gather_rows`` is the widest CALL that stays on the (chunked) gather path,
             # so a buffered flush never pays the expert-major loop's host round trip; the
@@ -385,7 +428,7 @@ class SpecDraftHead:
             # so its pass width is the widest per-cycle call -- the accepted run, ``1 + depth``
             # rows -- and nothing wider.
             {"max_gather_rows": self._max_flush_rows}
-            if self.expert_placement == "bf16"
+            if self.expert_placement in ("bf16", "exl3")
             else {
                 "max_gather_tokens": self.depth + 1,
                 "max_gather_rows": self._max_flush_rows,

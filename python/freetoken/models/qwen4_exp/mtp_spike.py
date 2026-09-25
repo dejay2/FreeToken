@@ -11,10 +11,13 @@ import copy
 import gc
 import hashlib
 import json
+import re
+import struct
 import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Iterable, Iterator
 
 import safetensors
@@ -120,6 +123,10 @@ def derive_mtp_model_config(base: ModelConfig) -> ModelConfig:
         attn_quant="none",
         dense_quant="none",
         moe_backend="fused",
+        # ``linear_storage`` and ``exl3_expert_k`` deliberately survive (``replace`` carries
+        # them): on an EXL3 checkpoint the head's attention, shared expert and fc layers ship
+        # packed, so the derived layer must build them as Exl3Linear exactly as the target
+        # does. The routed experts are still an external bank placement (MTPExl3ExpertBanks).
     )
 
 
@@ -1008,6 +1015,202 @@ class MTPNVFP4GPUExpertRunner(MTPGPUExpertRunner):
         return result
 
 
+class MTPExl3ExpertBanks:
+    """The EXL3 checkpoint's MTP routed experts, kept packed: nine CPU banks, one K.
+
+    3.05bpw_h5_ng5 ships the head's 512 experts as ``mtp.layers.0.mlp.experts.E.{gate,up,
+    down}_proj.{trellis,suh,svh,mul1}`` at K=3 -- the same layout and K as the target's routed
+    experts, ~1.9 MB an expert (~0.95 GB for all 512 against ~5 GB for the bf16 banks).
+    """
+
+    quant_format = "exl3"
+    num_layers = 1
+
+    def __init__(self, banks: dict[str, torch.Tensor], k: int) -> None:
+        from freetoken.models.exl3_banks import EXL3_BANK_NAMES
+
+        if list(banks) != list(EXL3_BANK_NAMES):
+            raise ValueError(
+                f"MTP EXL3 banks must be {EXL3_BANK_NAMES} in order, got {tuple(banks)}"
+            )
+        gate = banks["gate_trellis"]
+        experts, hidden_tiles, intermediate_tiles, width = gate.shape
+        if width != 16 * int(k):
+            raise ValueError(f"MTP EXL3 trellis width {width} is not 16*K for K={k}")
+        self.banks = dict(banks)
+        self.k = int(k)
+        self.num_experts = int(experts)
+        self.hidden_size = int(hidden_tiles) * 16
+        self.intermediate_size = int(intermediate_tiles) * 16
+        self.total_bytes = sum(t.numel() * t.element_size() for t in self.banks.values())
+        from freetoken.moe.offload_cache import bank_bytes_per_expert
+
+        self.bytes_per_expert = bank_bytes_per_expert(
+            "exl3",
+            self.hidden_size,
+            self.intermediate_size,
+            SimpleNamespace(exl3_expert_k=self.k),
+        )
+
+    @classmethod
+    def from_store(cls, store: "MTPWeightStore", config) -> "MTPExl3ExpertBanks":
+        from freetoken.models.exl3_banks import stack_exl3_experts
+
+        k = int(config.exl3_expert_k)
+        return cls(
+            stack_exl3_experts(
+                store.tensor,
+                prefix="mtp.layers.0.mlp.experts",
+                experts=int(config.num_experts),
+                hidden=int(config.hidden_size),
+                intermediate=int(config.moe_intermediate_size),
+                k=k,
+            ),
+            k,
+        )
+
+
+class MTPExl3GPUExpertRunner:
+    """Device-resident EXL3 MTP routed experts through the packed ``exl3_mgemm`` path.
+
+    Nothing is reconstructed: the nine banks go to the card once and every call runs gate, up,
+    SiLU and the weighted down straight off the trellis. The wheel's route list holds
+    ``EXL3_MGEMM_MAX_INDICES`` (128) entries, so a call is tiled to ``128 // top_k`` rows --
+    12 at the head's top_k 10 -- which keeps every per-cycle call (1..1+depth rows) one tile
+    and a priming chunk a fixed, sync-free sequence of tiles.
+    """
+
+    def __init__(
+        self,
+        banks,
+        *,
+        top_k: int,
+        activation: str,
+        renormalize: bool,
+        max_tokens: int,
+        num_threads: int,
+        device: torch.device,
+        max_gather_rows: int | None = None,
+    ) -> None:
+        from freetoken.kernel import exl3_mgemm as mgemm
+        from freetoken.models.exl3_banks import EXL3_BANK_NAMES
+
+        if getattr(banks, "quant_format", None) != "exl3":
+            raise ValueError(
+                "MTP EXL3 expert runner needs exl3 banks, got "
+                f"{getattr(banks, 'quant_format', None)!r}"
+            )
+        if activation not in {"silu", "swish"}:
+            raise ValueError(f"MTP EXL3 experts support silu, got {activation!r}")
+        if not 1 <= top_k <= banks.num_experts:
+            raise ValueError(f"invalid MTP top_k={top_k} for {banks.num_experts} experts")
+        if top_k > mgemm.EXL3_MGEMM_MAX_INDICES:
+            raise ValueError(f"MTP top_k={top_k} exceeds the EXL3 route list")
+        if max_tokens < 1:
+            raise ValueError(f"MTP max_tokens must be positive, got {max_tokens}")
+        del num_threads, max_gather_rows  # no CPU pool; the packed path has no gather budget
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        self.top_k = int(top_k)
+        self.renormalize = bool(renormalize)
+        self.max_tokens = int(max_tokens)
+        self.device = device
+        self.stats = MTPExpertStats()
+        self.tile_rows = mgemm.EXL3_MGEMM_MAX_INDICES // self.top_k
+        self.banks9 = {name: banks.banks[name].to(device).contiguous() for name in EXL3_BANK_NAMES}
+        self.banks = _MTPBankGeometry(
+            num_experts=int(banks.num_experts),
+            hidden_size=int(banks.hidden_size),
+            intermediate_size=int(banks.intermediate_size),
+            bytes_per_expert=int(banks.bytes_per_expert),
+        )
+        self.resident_bytes = sum(t.numel() * t.element_size() for t in self.banks9.values())
+        self.tables = mgemm.Exl3MgemmBanks.from_banks([self.banks9[n] for n in EXL3_BANK_NAMES])
+        self.scratch = mgemm.prepare_exl3_mgemm_scratch(
+            device=device,
+            max_rows=mgemm.EXL3_MGEMM_MAX_INDICES,
+            max_features=max(self.banks.hidden_size, self.banks.intermediate_size),
+            preallocate_fused=True,
+        )
+
+    def route(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from freetoken.moe.fused import fused_topk
+
+        if router_logits.shape != (hidden_states.shape[0], self.banks.num_experts):
+            raise ValueError(
+                "MTP router logits must be "
+                f"[{hidden_states.shape[0]}, {self.banks.num_experts}], got "
+                f"{tuple(router_logits.shape)}"
+            )
+        return fused_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+        )
+
+    def run_routed(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        from freetoken.kernel import exl3_mgemm as mgemm
+
+        tokens = int(hidden_states.shape[0])
+        if not 1 <= tokens <= self.max_tokens:
+            raise ValueError(
+                f"MTP expert calls support at most {self.max_tokens} tokens, got {tokens}"
+            )
+        if hidden_states.device != self.device or hidden_states.dtype is not torch.bfloat16:
+            raise ValueError(
+                f"MTP expert hidden states must be bfloat16 on {self.device}, got "
+                f"{hidden_states.device}/{hidden_states.dtype}"
+            )
+        expected = (tokens, self.top_k)
+        if tuple(topk_weights.shape) != expected or not topk_weights.dtype.is_floating_point:
+            raise ValueError(f"MTP top-k weights must be floating {expected}")
+        if tuple(topk_ids.shape) != expected or topk_ids.dtype is not torch.int32:
+            raise ValueError(f"MTP top-k ids must be int32 {expected}")
+        if topk_weights.device != self.device or topk_ids.device != self.device:
+            raise ValueError("MTP routing tensors must use the runner device")
+
+        step = self.tile_rows
+        parts = [
+            mgemm.fused_experts_exl3_mgemm(
+                hidden_states[lo : lo + step],
+                self.tables,
+                topk_weights[lo : lo + step],
+                topk_ids[lo : lo + step],
+                activation="silu",
+                swiglu_limit=None,
+                scratch=self.scratch,
+            )
+            for lo in range(0, tokens, step)
+        ]
+        result = parts[0] if len(parts) == 1 else torch.cat(parts)
+
+        self.stats.calls += 1
+        self.stats.tokens += tokens
+        self.stats.logical_expert_bytes += tokens * self.top_k * self.banks.bytes_per_expert
+        return result
+
+    def forward(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> torch.Tensor:
+        weights, ids = self.route(hidden_states, router_logits)
+        return self.run_routed(hidden_states, weights, ids)
+
+    def raise_if_unhealthy(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
 class MTPExactExpertRunner(MTPCPUExpertRunner):
     """Exact file-backed BF16 placement."""
 
@@ -1109,11 +1312,36 @@ class MTPStagedModelRunner:
         missing = set(self.cpu_weights) - used
         if missing:
             raise ValueError(f"unstaged MTP dense weights: {sorted(missing)}")
+        self._adopt_exl3_k()
         if self.resident:
             for names in self.groups.values():
                 for name in names:
                     owner, attr = _resolve_state_owner(self.model, name)
                     setattr(owner, attr, self.cpu_weights[name].to(self.device))
+
+    def _adopt_exl3_k(self) -> None:
+        """Give each packed linear the K its loaded trellis carries.
+
+        Staging swaps tensors in by ``setattr``, which bypasses ``Exl3Linear.load_state_dict``
+        -- the one place a linear adopts the checkpoint's K. The GEMM reads K off the trellis
+        shape, but the reconstruct path (rows > GEMM_MAX_ROWS: fc_hidden sees hc_count rows a
+        token, so a 128-row priming chunk is 512) passes ``op.k`` explicitly.
+        """
+        from freetoken.kernel.exl3_linear import Exl3Linear, validate_exl3_parts
+
+        for name in self.cpu_weights:
+            if not name.endswith(".trellis"):
+                continue
+            owner, _attr = _resolve_state_owner(self.model, name)
+            if not isinstance(owner, Exl3Linear):
+                continue
+            base = name[: -len(".trellis")]
+            owner.k = validate_exl3_parts(
+                base,
+                *(self.cpu_weights[f"{base}.{part}"] for part in ("trellis", "suh", "svh", "mul1")),
+                owner.in_features,
+                owner.out_features,
+            )
 
     @property
     def max_component_bytes(self) -> int:
@@ -1213,12 +1441,21 @@ class Qwen4ExpMTPModel(BaseOP):
         self.pre_fc_norm_hidden = GroupedPlusOneRMSNorm(
             width, config.rms_norm_eps, num_groups=1
         )
-        self.fc_embedding = LinearReplicated(
-            config.hidden_size, config.hidden_size, has_bias=False
-        )
-        self.fc_hidden = LinearReplicated(
-            config.hidden_size, config.hidden_size, has_bias=False
-        )
+        if getattr(config, "linear_storage", "bf16") == "exl3":
+            from freetoken.kernel.exl3_linear import Exl3Linear
+
+            # 3.05bpw_h5_ng5 headers: mtp.fc_embedding/fc_hidden.trellis [160, 160, 64] -> K=4.
+            # The load adopts whatever K the trellis carries. Exl3Linear.forward flattens the
+            # leading dims, so fc_hidden on [T, hc, H] works as the bf16 linear does.
+            self.fc_embedding = Exl3Linear(config.hidden_size, config.hidden_size, k_hint=4)
+            self.fc_hidden = Exl3Linear(config.hidden_size, config.hidden_size, k_hint=4)
+        else:
+            self.fc_embedding = LinearReplicated(
+                config.hidden_size, config.hidden_size, has_bias=False
+            )
+            self.fc_hidden = LinearReplicated(
+                config.hidden_size, config.hidden_size, has_bias=False
+            )
         layer = Qwen4ExpDecoderLayer(config, layer_id=0)
         # The normal fused layer declares per-expert GPU parameters.  Replace that child with
         # the checkpoint's two stacked BF16 banks before state-dict traversal/materialization.
@@ -1713,10 +1950,38 @@ class MTPWeightPlan:
         return {entry.model_name for entry in self.entries if entry.expert}
 
 
+_EXL3_COMPONENT_SUFFIXES = (".trellis", ".suh", ".svh", ".mul1")
+# ``mtp.layers.0.mlp.experts.<E>.<proj>.<kind>``: the EXL3 checkpoint's per-expert routed
+# tensors. The expert bank loader (MTPExl3ExpertBanks) consumes them, not the dense plan.
+_EXL3_EXPERT_RAW_RE = re.compile(r"^mtp\.layers\.0\.mlp\.experts\.\d+\.")
+
+
+def _exl3_unnest(model_name: str) -> str:
+    """Reverse ``weight._EXL3_NESTED``: a nested Exl3ColMerged part back to its checkpoint path."""
+    from .weight import _EXL3_NESTED
+
+    for part, nested in _EXL3_NESTED.items():
+        if nested in f".{model_name}":
+            return f".{model_name}".replace(nested, part, 1)[1:]
+    return model_name
+
+
 def build_mtp_weight_plan(
-    raw_names: Iterable[str], expected_model_names: Iterable[str]
+    raw_names: Iterable[str],
+    expected_model_names: Iterable[str],
+    *,
+    exl3: bool = False,
+    strict: bool = True,
 ) -> MTPWeightPlan:
-    """Map every raw MTP tensor exactly once to the private model's state contract."""
+    """Map every raw MTP tensor exactly once to the private model's state contract.
+
+    ``exl3``: the checkpoint ships the head packed (3.05bpw_h5_ng5). A model name ending in an
+    EXL3 component reads ``mtp.<checkpoint path>`` (the q|k|v and shared gate|up parts are
+    un-nested, never concatenated -- trellis tensors cannot be), only the HC fusions remain,
+    the stacked-expert model names get no dense source, and the per-expert raw tensors are
+    left to the expert bank loader. ``strict=False`` (tests only) skips the every-raw-name-used
+    check so a partial model list can be planned.
+    """
 
     raw_list = list(raw_names)
     duplicate = sorted({name for name in raw_list if raw_list.count(name) > 1})
@@ -1732,9 +1997,21 @@ def build_mtp_weight_plan(
     model_list = list(expected_model_names)
     if len(model_list) != len(set(model_list)):
         raise ValueError("duplicate MTP model state name")
+    fusions = (
+        {key: value for key, value in _MTP_FUSIONS.items() if "hyper_connection" in key}
+        if exl3
+        else _MTP_FUSIONS
+    )
     for model_name in sorted(model_list):
-        if model_name in _MTP_FUSIONS:
-            sources, pad_to = _MTP_FUSIONS[model_name]
+        if exl3 and model_name in _EXPERT_MODEL_NAMES:
+            # The checkpoint has no stacked bf16 bank to materialize; MTPExl3ExpertBanks reads
+            # the per-expert packed tensors and the runner owns execution.
+            entries.append(MTPWeightEntry(model_name=model_name, raw_names=(), expert=True))
+            continue
+        if model_name in fusions:
+            sources, pad_to = fusions[model_name]
+        elif exl3 and model_name.endswith(_EXL3_COMPONENT_SUFFIXES):
+            sources, pad_to = (f"mtp.{_exl3_unnest(model_name)}",), 0
         else:
             sources, pad_to = (f"mtp.{model_name}",), 0
         missing = [name for name in sources if name not in raw_set]
@@ -1753,10 +2030,52 @@ def build_mtp_weight_plan(
             )
         )
 
-    extra = sorted(raw_set - used)
+    unused = raw_set - used
+    if exl3:
+        unused = {name for name in unused if not _EXL3_EXPERT_RAW_RE.match(name)}
+        if not strict:
+            unused = {
+                name for name in unused if not name.endswith(_EXL3_COMPONENT_SUFFIXES)
+            }
+    extra = sorted(unused)
     if extra:
         raise ValueError(f"unexpected MTP source: {extra}")
     return MTPWeightPlan(tuple(entries))
+
+
+def _safetensors_keys(path: Path) -> list[str]:
+    with path.open("rb") as handle:
+        (length,) = struct.unpack("<Q", handle.read(8))
+        header = json.loads(handle.read(length))
+    return [name for name in header if name != "__metadata__"]
+
+
+def _unindexed_mtp_tensors(folder: Path, weight_map: dict[str, str]) -> dict[str, str]:
+    """MTP tensors shipped in a safetensors file the index does not list.
+
+    The EXL3 3.05bpw_h5_ng5 build carries ``mtp.hyper_connection_mixer.{hc_norm,
+    input_mix_weight_down,input_mix_weight_up}.weight`` (fp16, [10240] / [320, 10240] /
+    [10240, 320]) only in ``mtp_hyper_connection_mixer_patch.safetensors``, absent from
+    ``model.safetensors.index.json``; the NVFP4 build indexes the same three (bf16). A file is
+    taken only when EVERY key in it is ``mtp.``-prefixed, so the unindexed PLE/n-gram tables
+    (``model.language_model.*``) are never opened past their header, and a patch that would
+    redefine an indexed tensor is refused rather than silently shadowing it.
+    """
+    indexed = set(weight_map.values())
+    found: dict[str, str] = {}
+    for path in sorted(folder.glob("*.safetensors")):
+        if path.name in indexed:
+            continue
+        keys = _safetensors_keys(path)
+        if not keys or not all(name.startswith("mtp.") for name in keys):
+            continue
+        clash = sorted(name for name in keys if name in weight_map or name in found)
+        if clash:
+            raise ValueError(
+                f"unindexed MTP file {path.name} redefines indexed tensors: {clash}"
+            )
+        found.update({name: path.name for name in keys})
+    return found
 
 
 class MTPWeightStore:
@@ -1771,6 +2090,7 @@ class MTPWeightStore:
         self._weight_map = {
             name: shard for name, shard in weight_map.items() if name.startswith("mtp.")
         }
+        self._weight_map.update(_unindexed_mtp_tensors(self.model_path, weight_map))
         self.keys = tuple(sorted(self._weight_map))
         self._stack: ExitStack | None = None
         self._files: dict[str, object] = {}
@@ -1840,6 +2160,8 @@ __all__ = [
     "MTPBF16ExpertBanks",
     "MTPCPUExpertRunner",
     "MTPExactExpertRunner",
+    "MTPExl3ExpertBanks",
+    "MTPExl3GPUExpertRunner",
     "MTPGPUExpertRunner",
     "MTPNVFP4ExpertBanks",
     "MTPNVFP4ExpertRunner",

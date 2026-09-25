@@ -438,6 +438,47 @@ def _bank_specs(
     }
 
 
+def stack_exl3_experts(
+    tensor_of: Callable[[str], torch.Tensor],
+    *,
+    prefix: str,
+    experts: int,
+    hidden: int,
+    intermediate: int,
+    k: int,
+) -> dict[str, torch.Tensor]:
+    """Stack ``{prefix}.{e}.{proj}.{kind}`` tensors into the nine CPU banks, one row per expert.
+
+    For an expert set that is not a model layer -- the MTP head's 512 routed experts
+    (``mtp.layers.0.mlp.experts``, K=3 in 3.05bpw_h5_ng5) -- read through any tensor getter.
+    Every component is checked against the one-K geometry before it is copied, the ``mul1``
+    marker included, so a mixed-K or mis-shaped expert fails by name instead of decoding
+    garbage. Returns plain CPU tensors in ``EXL3_BANK_NAMES`` order.
+    """
+    if not 1 <= int(k) <= 8:
+        raise ValueError(f"EXL3 K must be in 1..8, got {k}")
+    banks = {
+        name: torch.empty(shape, dtype=dtype)
+        for name, (shape, dtype) in _bank_specs(experts, hidden, intermediate, k).items()
+    }
+    for expert in range(experts):
+        for proj in _EXL3_PROJECTIONS:
+            for kind in _EXL3_COMPONENTS:
+                name = f"{prefix}.{expert}.{proj}.{kind}"
+                tensor = tensor_of(name)
+                expected_shape = _expected_shape(proj, kind, hidden, intermediate, k)
+                expected_dtype = _ST_DTYPE[_expected_dtype(kind)]
+                if tuple(tensor.shape) != expected_shape or tensor.dtype != expected_dtype:
+                    raise ValueError(
+                        f"EXL3 tensor {name!r} arrived as shape={tuple(tensor.shape)}, "
+                        f"dtype={tensor.dtype}; expected shape={expected_shape}, "
+                        f"dtype={expected_dtype} ({kind}, K={k})"
+                    )
+                if kind in _EXL3_BANK_COMPONENTS:
+                    banks[_bank_name(proj, kind)][expert].copy_(tensor)
+    return {name: banks[name] for name in EXL3_BANK_NAMES}
+
+
 def _alloc_banks(
     num_layers: int, experts: int, hidden: int, intermediate: int, k: int
 ) -> dict[str, list]:
@@ -614,4 +655,5 @@ __all__ = [
     "dummy_exl3_expert_sources",
     "load_exl3_expert_source_banks",
     "load_exl3_expert_sources",
+    "stack_exl3_experts",
 ]
