@@ -811,6 +811,35 @@ class OffloadMoeCache:
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
 
+    def release_slots(self) -> int:
+        """Sleep: free the GPU slot cache and return the bytes it held.
+
+        Every streaming expert copy on the card goes; the host banks (``bank_sources``), the
+        GPU-owned layers' ``resident_banks`` and the per-layer bookkeeping stay, so
+        :meth:`rebuild` brings the cache back cold at any size. :meth:`rebuild`'s own floor
+        (``num_experts`` slots: 512 x 2,772,480 B = 1.32 GiB for Qwen3.8-Flash-Next, per
+        docs/research/memory-audit-qwen38-rtx5090.md; 2x that with prefill overlap) is why
+        sleep needs this instead. Between forwards only, like ``rebuild``
+        (docs/superpowers/specs/2026-09-25-freetoken-sleep-design.md section 3.2).
+        ``prefill_overlap`` is left as it was so a later ``rebuild`` re-creates the double
+        buffers; ``evict_slots``/``src_indices`` keep their old (tiny, int32) size, as
+        ``rebuild`` reallocates them. A second call finds nothing on the card and returns 0.
+        """
+        freed = sum(int(t.numel()) * t.element_size() for t in self.bank_caches.values())
+        self._teardown_prefill_overlap()  # its views alias the slot cache
+        self.banks = []
+        self.bank_caches = {}
+        self.cache_size = 0
+        self._build_fused_copy_plan()  # no banks: resets the descriptors and returns
+        self.slot_for_id.fill_(-1)
+        self.id_of_slot = torch.empty((0,), dtype=torch.int32, device=self.device)
+        self.usage = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._reset_prefetch()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+            torch.cuda.empty_cache()
+        return freed
+
     def set_alphas(
         self, gate_up_alpha: torch.Tensor | None, down_alpha: torch.Tensor | None
     ) -> None:
