@@ -351,6 +351,13 @@ class ModelConfig:
     # it bf16. Separate from dense_quant because only some NVFP4 checkpoints quantize lm_head
     # (modelopt MIXED_PRECISION does; pure NVFP4 leaves it bf16).
     lm_head_quant: str = "none"
+    # Storage format of the non-expert linears in the checkpoint. "exl3" (turboderp's EXL3
+    # builds) keeps every quantized linear packed at runtime (kernel/exl3_linear.py); "bf16"
+    # is every other checkpoint, where dense_quant/attn_quant pick load-time conversions.
+    linear_storage: str = "bf16"
+    # K (bits per weight) of the routed EXL3 experts; one K for every routed expert, checked
+    # against the trellis headers at load (models/exl3_banks.py). GLM-5.3 2.05bpw is 2.
+    exl3_expert_k: int = 2
     shared_expert_intermediate_size: int = 0
     use_qk_norm: bool = False
     # ----- DeepSeek/GLM-style MoE extensions (default keeps other models intact) -----

@@ -31,6 +31,9 @@ class Qwen4VisionConfig:
     in_channels: int
     hidden_act: str
     deepstack_visual_indexes: Tuple[int, ...]
+    # True when the tower's own linears arrive EXL3-packed (turboderp builds); a later task
+    # adds exl3_k derived from quantization_config's vision_bits. False for every other build.
+    exl3: bool = False
 
 
 @dataclass(frozen=True)
@@ -155,7 +158,7 @@ def _ignored(patterns, module_name: str) -> bool:
     return any(fnmatch(module_name, pat) for pat in patterns)
 
 
-def _parse_vision_config(hf_config: Any) -> Qwen4VisionConfig | None:
+def _parse_vision_config(hf_config: Any, exl3: bool = False) -> Qwen4VisionConfig | None:
     vision = getattr(hf_config, "vision_config", None)
     if vision is None or not vision_load_enabled():
         return None
@@ -174,6 +177,7 @@ def _parse_vision_config(hf_config: Any) -> Qwen4VisionConfig | None:
         deepstack_visual_indexes=tuple(
             int(i) for i in (getattr(vision, "deepstack_visual_indexes", None) or ())
         ),
+        exl3=exl3,
     )
 
 
@@ -221,6 +225,9 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
+    linear_storage = "bf16"
+    exl3_expert_k = 2
+    vision_exl3 = False
     get = _quant_get(hf_config)
     if get is None:
         expert_quant = attn_quant = dense_quant = lm_head_quant = "none"
@@ -235,6 +242,18 @@ def parse_config(hf_config: Any) -> ModelConfig:
             assert bs == (128, 128), f"only 128x128 block-fp8 is supported, got {bs}"
             expert_quant = "fp8_block"
             attn_quant = dense_quant = lm_head_quant = "none"
+        elif algo == "exl3":
+            # turboderp EXL3: every linear except routers, gates, GDN a/b, HC and PLE
+            # projections is trellis-packed (3.05bpw_h5_ng5 headers, 2026-09-25): experts K=3,
+            # attention/GDN/shared/lm_head K=5. `bits` is the average; the expert K is its floor.
+            codebook = str(get("codebook") or "mul1").lower()
+            if codebook != "mul1":
+                raise ValueError(f"EXL3 codebook {codebook!r} is unsupported; only mul1 is")
+            expert_quant = lm_head_quant = "exl3"
+            attn_quant = dense_quant = "none"
+            linear_storage = "exl3"
+            exl3_expert_k = int(float(get("bits")))
+            vision_exl3 = True
         else:
             is_fp4 = "fp4" in algo
             ignore = list(get("ignore") or [])
@@ -280,7 +299,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         (mrope_half + 1) // 3,
         mrope_half // 3,
     )
-    vision_config = _parse_vision_config(hf_config)
+    vision_config = _parse_vision_config(hf_config, exl3=vision_exl3)
     full_rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=rotary_dim,
@@ -382,6 +401,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attn_quant=attn_quant,
         dense_quant=dense_quant,
         lm_head_quant=lm_head_quant,
+        linear_storage=linear_storage,
+        exl3_expert_k=exl3_expert_k,
         qwen4_args=qwen4_args,
         slot_states=ple_slot_states(qwen4_args),
     )
