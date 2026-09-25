@@ -105,3 +105,50 @@ def test_exl3_vision_mlp_pads_intermediate_to_128(exl3_vision_config):
     mlp = Qwen4VisionMLP(cfg)
     assert mlp.linear_fc1.out_features == 256 and mlp.linear_fc2.in_features == 256
     assert mlp.linear_fc1.bias.shape == (256,)
+
+
+def test_exl3_vision_mlp_loads_the_real_padded_checkpoint_shapes(exl3_vision_config):
+    """Review of b3cfda1 against the 3.05bpw_h5_ng5 checkpoint facts: intermediate 4304 in the
+    config, fc1 stored [1152 -> 4352] (trellis 72x272, bias 4352: exllamav3 Linear zero-pads
+    the bias to the padded width, modules/linear.py pad1) and fc2 [4352 -> 1152] (trellis
+    272x72, bias 1152; exllamav3 MLP builds down with allow_input_padding and
+    trim_padded_out, so fc1's padded outputs feed fc2 untrimmed)."""
+    import dataclasses
+
+    from freetoken.models.qwen4_exp.vision import Qwen4VisionMLP
+
+    cfg = dataclasses.replace(exl3_vision_config, hidden_size=1152, intermediate_size=4304)
+    mlp = Qwen4VisionMLP(cfg)
+
+    def packed(fin, fout, k=5):
+        return {
+            "trellis": torch.zeros(fin // 16, fout // 16, 16 * k, dtype=torch.int16),
+            "suh": torch.zeros(fin, dtype=torch.float16),
+            "svh": torch.zeros(fout, dtype=torch.float16),
+            "mul1": torch.tensor(0, dtype=torch.int32),
+            "bias": torch.zeros(fout, dtype=torch.float16),
+        }
+
+    state = {f"linear_fc1.{n}": t for n, t in packed(1152, 4352).items()}
+    state.update({f"linear_fc2.{n}": t for n, t in packed(4352, 1152).items()})
+    mlp.linear_fc1.load_state_dict(state, prefix="linear_fc1", _internal=True)
+    mlp.linear_fc2.load_state_dict(state, prefix="linear_fc2", _internal=True)
+    assert state == {}
+    assert mlp.linear_fc1.trellis.shape == (72, 272, 80)
+    assert mlp.linear_fc2.trellis.shape == (272, 72, 80)
+    assert mlp.linear_fc1.bias.shape == (4352,) and mlp.linear_fc2.bias.shape == (1152,)
+
+
+def test_bf16_vision_mlp_keeps_the_unpadded_intermediate_width():
+    """The padding is EXL3-only: the NVFP4/bf16 tower keeps the config's 4304."""
+    import dataclasses
+
+    from freetoken.models.qwen4_exp.vision import Qwen4VisionMLP
+
+    from .test_vision import _config
+
+    cfg = dataclasses.replace(_config(), intermediate_size=4304)
+    assert not getattr(cfg, "exl3", False)
+    mlp = Qwen4VisionMLP(cfg)
+    assert mlp.linear_fc1.weight.shape[0] == 4304
+    assert mlp.linear_fc2.weight.shape[1] == 4304
