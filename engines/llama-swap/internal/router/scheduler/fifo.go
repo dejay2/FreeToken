@@ -349,6 +349,22 @@ func (s *FIFO) OnShutdown(err error) {
 	}
 }
 
+// FreeToken patch P5: OnReconfigure implements Scheduler.
+func (s *FIFO) OnReconfigure(conf config.Config, planner Swapper) {
+	s.cfg = conf.Routing.Scheduler.Settings.Fifo
+	s.planner = planner
+	limits := make(map[string]int, len(conf.Models))
+	for id, mc := range conf.Models {
+		limit := defaultConcurrencyLimit
+		if mc.ConcurrencyLimit > 0 {
+			limit = mc.ConcurrencyLimit
+		}
+		limits[id] = limit
+	}
+	s.limits = limits
+	s.drainQueue()
+}
+
 // grantHandler hands the caller a tracked handler for modelID and, only if the
 // caller was still there to receive it, bumps the in-flight count. Incrementing
 // when the grant failed would strand the counter and block future evictions.

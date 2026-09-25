@@ -66,6 +66,10 @@ type Scheduler interface {
 	// swap waiters and queued requests). Process teardown is the baseRouter's
 	// responsibility.
 	OnShutdown(err error)
+	// FreeToken patch P5: OnReconfigure takes a reloaded config and planner
+	// without dropping in-flight swaps, queued requests or in-flight counts.
+	// The router has already stopped changed and removed models via OnUnload.
+	OnReconfigure(conf config.Config, planner Swapper)
 }
 
 // Effects is implemented by the baseRouter. The scheduler calls back through it

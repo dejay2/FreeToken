@@ -44,6 +44,11 @@ def main(argv: list[str] | None = None) -> int:
         log_path=args.log_file,
         version=HELPER_VERSION,
     )
+    # Control panel (Stage A): make the switcher file match the registry, then keep releasing
+    # "next time" holds once their model unloads (panel.py).
+    panel = app.state.panel
+    panel.sync_config()
+    panel.start_hold_watcher()
     # Start the memory governor with the helper, not only from a page-driven Start: a helper
     # restart adopts a model server that is already serving (helper 1.3.0), and without this
     # the adopted server ran with no governor at all (seen live 2026-09-07 18:06: status stuck
@@ -60,6 +65,7 @@ def main(argv: list[str] | None = None) -> int:
 
         uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info")
     finally:
+        panel.stop_hold_watcher()
         process_manager.stop_watchdog()
         process_manager.stop_governor()
         process_manager.close()

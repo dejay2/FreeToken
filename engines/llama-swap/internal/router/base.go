@@ -70,6 +70,20 @@ type baseRouter struct {
 	// FreeToken patch P2: nil when the memory gate is disabled.
 	memGate *memgate.Gate
 
+	// FreeToken patch P5: stateMu guards config, processes, memGate and
+	// procCancels, which applyReconfig swaps from the run loop. The run loop
+	// reads them without the lock (it is the only writer); other goroutines
+	// use snapshot().
+	stateMu     sync.RWMutex
+	procCancels map[string]context.CancelFunc
+	factory     ProcessFactory
+	plannerFor  func(config.Config) (scheduler.Swapper, []string, error)
+	reconfigCh  chan *reconfigReq
+	// generation counts committed reconfigures; a plan prepared from an older
+	// generation is refused (ErrStaleReconfigure). Written by the run loop
+	// under stateMu.
+	generation uint64
+
 	// testProcessed, when non-nil, receives one event after each handlerReq
 	// or swapDone has been fully processed by run(). Tests use it to wait
 	// for run() to reach a deterministic state without sleeping. serveDone
@@ -80,6 +94,13 @@ type baseRouter struct {
 
 // FreeToken patch P1: swapHandle identifies one swap goroutine's cancel func.
 type swapHandle struct{ cancel context.CancelFunc }
+
+// FreeToken patch P5: swapEnv is the table one swap goroutine works from.
+type swapEnv struct {
+	config    config.Config
+	processes map[string]process.Process
+	memGate   *memgate.Gate
+}
 
 func newBaseRouter(
 	name string,
@@ -106,7 +127,9 @@ func newBaseRouter(
 		swapDoneCh:  make(chan scheduler.SwapDone),
 		serveDoneCh: make(chan scheduler.ServeDoneEvent),
 		runDone:     make(chan struct{}),
-		swapCancels: make(map[string]*swapHandle), // FreeToken patch P1
+		swapCancels: make(map[string]*swapHandle),        // FreeToken patch P1
+		procCancels: make(map[string]context.CancelFunc), // FreeToken patch P5
+		reconfigCh:  make(chan *reconfigReq),             // FreeToken patch P5
 	}
 	sched, err := scheduler.New(conf, name, logger, planner, b)
 	if err != nil {
@@ -114,29 +137,8 @@ func newBaseRouter(
 	}
 	b.schedule = sched
 
-	// FreeToken patch P2: build the memory gate from config.
-	if mg := conf.MemoryGate; mg.Probe == "windows" {
-		floor, wait := mg.FloorGB, mg.WaitSeconds
-		if floor <= 0 {
-			floor = 6
-		}
-		if wait <= 0 {
-			wait = 300
-		}
-		b.memGate = &memgate.Gate{
-			Probe:   memgate.WindowsProbe(memgate.RunWindowsFreeKB, 2*time.Second),
-			FloorGB: floor,
-			Wait:    time.Duration(wait) * time.Second,
-			Poll:    5 * time.Second,
-			Logf:    b.logger.Infof,
-			Warnf:   b.logger.Warnf,
-		}
-		// FreeToken patch P2: skip the wait for a FreeToken the helper runs
-		// but llama-swap did not start (final review 2026-09-24).
-		if mg.HelperURL != "" {
-			b.memGate.Bypass = memgate.HelperBypass(mg.HelperURL, nil)
-		}
-	}
+	// FreeToken patch P2 (construction moved to newMemGate by P5).
+	b.memGate = newMemGate(conf, logger)
 
 	return b, nil
 }
@@ -175,6 +177,10 @@ func (b *baseRouter) run() {
 
 		case ev := <-b.serveDoneCh:
 			b.schedule.OnServeDone(ev)
+
+		case req := <-b.reconfigCh: // FreeToken patch P5
+			b.applyReconfig(req)
+			b.notifyProcessed()
 		}
 	}
 }
@@ -224,6 +230,9 @@ func (b *baseRouter) StartSwap(modelID string, evict []string) {
 	}
 	b.swapCancels[modelID] = h
 	b.swapMu.Unlock()
+	// FreeToken patch P5: the swap works from the table as it is now; a reload
+	// landing meanwhile swaps b.processes but must not change it under us.
+	env := swapEnv{config: b.config, processes: b.processes, memGate: b.memGate}
 	go func() {
 		defer func() {
 			b.swapMu.Lock()
@@ -233,7 +242,7 @@ func (b *baseRouter) StartSwap(modelID string, evict []string) {
 			b.swapMu.Unlock()
 			cancel()
 		}()
-		b.doSwap(ctx, modelID, evict)
+		b.doSwap(ctx, env, modelID, evict) // FreeToken patch P5
 	}()
 }
 
@@ -311,8 +320,9 @@ func (b *baseRouter) trackedServe(modelID string, p process.Process) http.Handle
 }
 
 // FreeToken patch P1: doSwap takes the swap's cancellable context.
-func (b *baseRouter) doSwap(ctx context.Context, modelID string, toStop []string) {
-	timeout := b.healthCheckTimeout()
+// FreeToken patch P5: it also takes the swapEnv captured by StartSwap.
+func (b *baseRouter) doSwap(ctx context.Context, env swapEnv, modelID string, toStop []string) {
+	timeout := healthCheckTimeoutOf(env.config) // FreeToken patch P5
 
 	var wg sync.WaitGroup
 	for _, mID := range toStop {
@@ -322,7 +332,7 @@ func (b *baseRouter) doSwap(ctx context.Context, modelID string, toStop []string
 			if err := p.Stop(timeout); err != nil {
 				b.logger.Warnf("%s: stopping %s failed: %v", b.name, id, err)
 			}
-		}(b.processes[mID], mID)
+		}(env.processes[mID], mID) // FreeToken patch P5
 	}
 	wg.Wait()
 
@@ -334,14 +344,14 @@ func (b *baseRouter) doSwap(ctx context.Context, modelID string, toStop []string
 	// the same decision inside the process, where the state is owned.
 	var err error
 	// FreeToken patch P2: evicted models are stopped; now wait for room.
-	if mc, ok := b.config.Models[modelID]; ok && ctx.Err() == nil {
-		err = b.memGate.WaitForRoom(ctx, modelID, mc.RamNeedGB)
+	if mc, ok := env.config.Models[modelID]; ok && ctx.Err() == nil { // FreeToken patch P5
+		err = env.memGate.WaitForRoom(ctx, modelID, mc.RamNeedGB) // FreeToken patch P5
 	}
 	// FreeToken patch P1: a superseded swap must not start its target, and
 	// starts through the swap context so CancelSwap aborts EnsureReady.
 	if err == nil {
 		if err = ctx.Err(); err == nil {
-			target := b.processes[modelID]
+			target := env.processes[modelID] // FreeToken patch P5
 			err = target.EnsureReady(ctx, timeout)
 		}
 	}
@@ -420,7 +430,13 @@ func (b *baseRouter) handleShutdown(req shutdownReq) {
 }
 
 func (b *baseRouter) healthCheckTimeout() time.Duration {
-	t := time.Duration(b.config.HealthCheckTimeout) * time.Second
+	cfg, _ := b.snapshot() // FreeToken patch P5
+	return healthCheckTimeoutOf(cfg)
+}
+
+// FreeToken patch P5: healthCheckTimeoutOf reads the timeout from one config.
+func healthCheckTimeoutOf(cfg config.Config) time.Duration {
+	t := time.Duration(cfg.HealthCheckTimeout) * time.Second
 	if t <= 0 {
 		return 30 * time.Second
 	}
@@ -432,30 +448,34 @@ func (b *baseRouter) healthCheckTimeout() time.Duration {
 // model value is rewritten to the global default on parse), so no zero handling
 // is needed here.
 func (b *baseRouter) unloadTimeout(modelID string) time.Duration {
-	if mc, ok := b.config.Models[modelID]; ok {
+	cfg, _ := b.snapshot() // FreeToken patch P5
+	if mc, ok := cfg.Models[modelID]; ok {
 		return time.Duration(mc.UnloadTimeout) * time.Second
 	}
-	return time.Duration(b.config.UnloadTimeout) * time.Second
+	return time.Duration(cfg.UnloadTimeout) * time.Second
 }
 
 func (b *baseRouter) Handles(model string) bool {
-	_, ok := b.processes[model]
+	_, procs := b.snapshot() // FreeToken patch P5
+	_, ok := procs[model]
 	return ok
 }
 
 func (b *baseRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
-	if p, ok := b.processes[modelID]; ok {
+	_, procs := b.snapshot() // FreeToken patch P5
+	if p, ok := procs[modelID]; ok {
 		return p.Logger(), true
 	}
 	return nil, false
 }
 
 // RunningModels returns the current state of every process that is not stopped
-// or shut down. The processes map keys are fixed at construction and State()
-// is a snapshot, so this is safe to call without the run loop.
+// or shut down. The table is swapped whole on reload (P5), so a snapshot is
+// safe to read without the run loop.
 func (b *baseRouter) RunningModels() map[string]process.ProcessState {
+	_, procs := b.snapshot() // FreeToken patch P5
 	running := make(map[string]process.ProcessState)
-	for id, p := range b.processes {
+	for id, p := range procs {
 		st := p.State()
 		if st == process.StateStopped || st == process.StateShutdown {
 			continue
@@ -489,8 +509,9 @@ func (b *baseRouter) RunningModels() map[string]process.ProcessState {
 func (b *baseRouter) Unload(timeout time.Duration, models ...string) {
 	targets := models
 	if len(targets) == 0 {
-		targets = make([]string, 0, len(b.processes))
-		for id := range b.processes {
+		_, procs := b.snapshot() // FreeToken patch P5
+		targets = make([]string, 0, len(procs))
+		for id := range procs {
 			targets = append(targets, id)
 		}
 	}
@@ -547,8 +568,9 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		swaputil.SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
 		return
 	}
+	cfg, procs := b.snapshot() // FreeToken patch P5
 
-	data, err := swaputil.FetchContext(req, b.config)
+	data, err := swaputil.FetchContext(req, cfg) // FreeToken patch P5
 	if err != nil {
 		swaputil.SendError(w, req, err)
 		return
@@ -559,8 +581,8 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// prevent another request from swapping the process out. A process may stop
 	// immediately after this readiness check; dropping that websocket is the
 	// intended tradeoff of opting out of lifecycle tracking.
-	if swaputil.ShouldIgnoreWebsocket(req, b.config) {
-		p, ok := b.processes[data.ModelID]
+	if swaputil.ShouldIgnoreWebsocket(req, cfg) { // FreeToken patch P5
+		p, ok := procs[data.ModelID] // FreeToken patch P5
 		if !ok {
 			swaputil.SendError(w, req, scheduler.ErrModelNotFound)
 			return
@@ -613,7 +635,7 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	isModelReady := false
-	if p, ok := b.processes[data.ModelID]; ok {
+	if p, ok := procs[data.ModelID]; ok { // FreeToken patch P5
 		isModelReady = p.State() == process.StateReady
 	}
 	shouldShowLoading := data.Streaming && data.SendLoadingState && isLoadingPath(req.URL.Path) && !isModelReady

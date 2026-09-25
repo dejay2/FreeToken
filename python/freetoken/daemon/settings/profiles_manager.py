@@ -55,6 +55,8 @@ PRESET_PROFILES: tuple[dict[str, Any], ...] = (
 
 
 _PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+# Control panel profiles: one per FreeToken model in the registry, id model-<registry id>.
+MODEL_PROFILE_RE = re.compile(r"^model-[a-z0-9][a-z0-9._-]{0,62}$")
 _UNSET = object()
 _DEFAULT_LAUNCHER_RELATIVE = r"..\scripts\start-freetoken-windows.ps1"
 
@@ -217,6 +219,52 @@ class ProfilesManager:
             self._write_custom(profiles)
             return self._profile_payload(item)
         raise KeyError(profile_id)
+
+    def upsert(
+        self,
+        profile_id: str,
+        *,
+        name: str,
+        description: str,
+        settings: dict[str, Any],
+        create_only: bool = False,
+    ) -> dict[str, Any]:
+        """Create or replace a control panel profile (model-<id>) as a whole.
+
+        The control panel owns these profiles: the adapter pushes a model's full effective
+        settings at every load, so they replace rather than merge (a setting reset to the
+        engine default must not survive from an earlier push). ``changed`` tells the adapter
+        whether a running server on this profile still matches.
+        """
+        if not MODEL_PROFILE_RE.fullmatch(str(profile_id)):
+            raise ProfileError("only control panel profiles (model-<id>) can be created by id")
+        if not isinstance(name, str) or not name.strip():
+            raise ProfileValidationError([{"field": "name", "message": "Profile name is required"}])
+        if not isinstance(settings, dict):
+            raise ProfileValidationError([{"field": "settings", "message": "must be an object"}])
+        errors = validate_settings(settings, ceilings_only=True)
+        if errors:
+            raise ProfileValidationError(errors)
+        profiles = self._custom()
+        existing = next((item for item in profiles if item["id"] == profile_id), None)
+        if existing is not None and create_only:
+            return {**self._profile_payload(existing), "changed": False}
+        item = {
+            "id": profile_id,
+            "name": name.strip(),
+            "description": description,
+            "isPreset": False,
+            "label": "profile",
+            "kind": "profile",
+            "settings": dict(settings),
+            "bootFile": self._relative_profile_file(profile_id),
+        }
+        changed = existing is None or existing["settings"] != item["settings"] or existing["name"] != item["name"]
+        if changed or not self.profile_path(profile_id).is_file():
+            profiles = [entry for entry in profiles if entry["id"] != profile_id] + [item]
+            self._write_profile_file(item)
+            self._write_custom(profiles)
+        return {**self._profile_payload(item), "changed": changed}
 
     def sync_active(self, settings: dict[str, Any]) -> None:
         """Keep the JSON snapshot and generated file in step with an edited active profile."""
@@ -496,6 +544,7 @@ ProfileManager = ProfilesManager
 
 
 __all__ = [
+    "MODEL_PROFILE_RE",
     "PRESET_PROFILES",
     "ProfileError",
     "ProfileManager",

@@ -162,7 +162,7 @@ def test_status_logs_and_lifecycle_job_routes(tmp_path):
     client, _ = make_client(tmp_path)
     status = client.get("/api/status")
     assert status.status_code == 200
-    assert status.json()["helper"]["version"] == "1.5.0"
+    assert status.json()["helper"]["version"] == "2.0.0"
     auto = status.json()["autoRestart"]
     assert auto["enabled"] is True and auto["gave_up"] is False and "restarts_last_hour" in auto
     saved = client.put("/api/settings", json={"settings": {"FREETOKEN_AUTO_RESTART": False}})
@@ -303,3 +303,15 @@ def test_saving_or_starting_an_under_floor_slot_pair_is_refused(tmp_path):
     )
     assert saved.status_code == 200, saved.text
     assert "-MoECacheSize 5120" in boot.read_text(encoding="utf-8")
+
+
+def test_put_profile_with_replace_creates_a_model_profile(tmp_path):
+    client, _ = make_client(tmp_path)
+    body = {"name": "Flash", "settings": {"KVDtype": "fp8"}, "replace": True}
+    first = client.put("/api/profiles/model-flash", json=body)
+    assert first.status_code == 200, first.text
+    assert first.json()["changed"] is True
+    assert client.put("/api/profiles/model-flash", json=body).json()["changed"] is False
+    assert client.put("/api/profiles/model-other", json={"name": "x", "settings": {}}).status_code == 404
+    assert client.post("/api/profiles/model-flash/activate").status_code == 200
+    assert client.get("/api/settings").json()["activeProfile"] == "model-flash"
