@@ -84,6 +84,50 @@ def test_stack_exl3_experts_refuses_a_wrong_k():
                            hidden=128, intermediate=256, k=3)
 
 
+@pytest.mark.parametrize("stray", [
+    "mtp.layers.0.mlp.experts.7.surprise.weight",
+    "mtp.layers.0.mlp.experts.1.gate_proj.bias",
+    "mtp.layers.0.mlp.experts.1.gate_proj.trellis.extra",
+])
+def test_plan_rejects_unknown_tensors_under_the_experts_prefix(stray):
+    raw = _raw_exl3_mtp_names() + [stray]
+    with pytest.raises(ValueError, match="unexpected MTP source") as info:
+        M.build_mtp_weight_plan(raw, [], exl3=True, strict=False)
+    assert stray in str(info.value)
+
+
+def _expert_store(ids, H=128, I=256, k=3):
+    from types import SimpleNamespace
+
+    tensors = {}
+    for e in ids:
+        for proj, (fin, fout) in (("gate_proj", (H, I)), ("up_proj", (H, I)), ("down_proj", (I, H))):
+            base = f"mtp.layers.0.mlp.experts.{e}.{proj}"
+            tensors[f"{base}.trellis"] = torch.zeros((fin // 16, fout // 16, 16 * k), dtype=torch.int16)
+            tensors[f"{base}.suh"] = torch.ones(fin, dtype=torch.float16)
+            tensors[f"{base}.svh"] = torch.ones(fout, dtype=torch.float16)
+            tensors[f"{base}.mul1"] = torch.tensor(0, dtype=torch.int32)
+    cfg = SimpleNamespace(num_experts=2, hidden_size=H, moe_intermediate_size=I, exl3_expert_k=k)
+    return SimpleNamespace(tensor=tensors.__getitem__, keys=tuple(tensors)), cfg
+
+
+def test_from_store_refuses_an_out_of_range_expert_id():
+    store, cfg = _expert_store([0, 1, 600])
+    with pytest.raises(ValueError, match=r"experts\.600\.gate_proj\.trellis"):
+        M.MTPExl3ExpertBanks.from_store(store, cfg)
+
+
+def test_from_store_refuses_a_missing_expert_id():
+    store, cfg = _expert_store([0])
+    with pytest.raises(ValueError, match=r"missing ids \[1\]"):
+        M.MTPExl3ExpertBanks.from_store(store, cfg)
+
+
+def test_from_store_accepts_exactly_the_configured_ids():
+    store, cfg = _expert_store([0, 1])
+    assert M.MTPExl3ExpertBanks.from_store(store, cfg).num_experts == 2
+
+
 def test_placement_is_exl3_for_exl3_checkpoints():
     from types import SimpleNamespace
     from freetoken.engine.spec_draft import resolve_spec_expert_placement
@@ -108,7 +152,7 @@ def test_exl3_runner_type_and_bank_loader_are_wired():
             tensors[f"{base}.suh"] = torch.ones(fin, dtype=torch.float16)
             tensors[f"{base}.svh"] = torch.ones(fout, dtype=torch.float16)
             tensors[f"{base}.mul1"] = torch.tensor(0, dtype=torch.int32)
-    store = SimpleNamespace(tensor=tensors.__getitem__)
+    store = SimpleNamespace(tensor=tensors.__getitem__, keys=tuple(tensors))
     cfg = SimpleNamespace(num_experts=E, hidden_size=H, moe_intermediate_size=I, exl3_expert_k=k)
     banks = load_spec_expert_banks("exl3", None, store, model_config=cfg)
     assert isinstance(banks, M.MTPExl3ExpertBanks)

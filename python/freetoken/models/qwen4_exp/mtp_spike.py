@@ -1056,12 +1056,31 @@ class MTPExl3ExpertBanks:
     def from_store(cls, store: "MTPWeightStore", config) -> "MTPExl3ExpertBanks":
         from freetoken.models.exl3_banks import stack_exl3_experts
 
+        experts = int(config.num_experts)
+        prefix = "mtp.layers.0.mlp.experts."
+        found: dict[int, list[str]] = {}
+        for name in store.keys:
+            if name.startswith(prefix):
+                match = _EXL3_EXPERT_RAW_RE.match(name)
+                expert = int(match.group("expert")) if match else -1
+                found.setdefault(expert, []).append(name)
+        if set(found) != set(range(experts)):
+            stray = sorted(
+                name for expert, names in found.items() if not 0 <= expert < experts
+                for name in names
+            )
+            absent = sorted(set(range(experts)) - set(found))
+            raise ValueError(
+                f"MTP EXL3 expert ids must be exactly 0..{experts - 1}: "
+                f"unexpected {stray[:8]}{' ...' if len(stray) > 8 else ''}, "
+                f"missing ids {absent[:8]}{' ...' if len(absent) > 8 else ''}"
+            )
         k = int(config.exl3_expert_k)
         return cls(
             stack_exl3_experts(
                 store.tensor,
                 prefix="mtp.layers.0.mlp.experts",
-                experts=int(config.num_experts),
+                experts=experts,
                 hidden=int(config.hidden_size),
                 intermediate=int(config.moe_intermediate_size),
                 k=k,
@@ -1953,7 +1972,14 @@ class MTPWeightPlan:
 _EXL3_COMPONENT_SUFFIXES = (".trellis", ".suh", ".svh", ".mul1")
 # ``mtp.layers.0.mlp.experts.<E>.<proj>.<kind>``: the EXL3 checkpoint's per-expert routed
 # tensors. The expert bank loader (MTPExl3ExpertBanks) consumes them, not the dense plan.
-_EXL3_EXPERT_RAW_RE = re.compile(r"^mtp\.layers\.0\.mlp\.experts\.\d+\.")
+# Anchored to the exact per-expert component name: anything else under the experts prefix
+# (an unknown projection or component) stays an "unexpected MTP source" instead of being
+# silently dropped, since stack_exl3_experts only reads the names it knows. Out-of-range ids
+# are refused by MTPExl3ExpertBanks.from_store, which checks the ids are exactly range(E).
+_EXL3_EXPERT_RAW_RE = re.compile(
+    r"^mtp\.layers\.0\.mlp\.experts\.(?P<expert>\d+)\.(gate|up|down)_proj\."
+    r"(trellis|suh|svh|mul1)$"
+)
 
 
 def _exl3_unnest(model_name: str) -> str:
