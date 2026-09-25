@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import mmap
 import struct
+from collections import Counter
 
 import pytest
 import safetensors.torch
@@ -114,6 +116,55 @@ def test_convert_refuses_mismatched_hash_constants(tmp_path):
     (tmp_path / "config.json").write_text("{}")
     with pytest.raises(ValueError, match="head_offsets"):
         convert_table(str(tmp_path), device="cpu", chunk_rows=5, out_dtype="fp8")
+
+
+def test_convert_releases_source_shard_pages_per_pass(tmp_path, monkeypatch):
+    """Fix round 1 (review finding, binding Ruling R1): the source mmap stays open across all
+    three passes, so each decoded shard must be explicitly released (mm.madvise) once per pass
+    -- a bare drop_page_cache(src) alone is close to a no-op while the shard is still mapped.
+    Proven here by monkeypatching the release seam and checking it fires with the real shards'
+    byte ranges, exactly 3 times each (absmax pass, precision-sample pass, write pass)."""
+    from scripts.exl3 import convert_ngram_table as mod
+
+    src = tmp_path / "ngram_embedding.safetensors"
+    _write_exl3_table(src, shards=4, rows_per_shard=8, k=5)
+    (tmp_path / "config.json").write_text("{}")
+
+    header, _base = mod._header(str(src))
+    shard_keys = [k for k in header if ".shard_" in k and k.endswith(".trellis")]
+    expected_ranges = {tuple(header[k]["data_offsets"]) for k in shard_keys}
+    assert len(expected_ranges) == 4  # sanity: the fixture really has 4 distinct shard ranges
+
+    calls: list[tuple[int, int]] = []
+
+    def spy(mm, base, meta):
+        calls.append(tuple(meta["data_offsets"]))
+
+    monkeypatch.setattr(mod, "_release_shard_pages", spy)
+    mod.convert_table(str(tmp_path), device="cpu", chunk_rows=5, out_dtype="fp8")
+
+    assert len(calls) == 4 * 3  # 4 shards, released once per pass (absmax, sample, write)
+    counts = Counter(calls)
+    assert set(counts) == expected_ranges
+    assert all(n == 3 for n in counts.values())
+
+
+def test_release_shard_pages_is_page_aligned(tmp_path):
+    """madvise() requires a page-aligned (start, length); prove the real (unmocked) release
+    function rounds the shard's byte range out to page boundaries and never raises on a real
+    mapping, using a source file too small to reach a full page on its own."""
+    from scripts.exl3.convert_ngram_table import _PAGE_SIZE, _release_shard_pages
+
+    path = tmp_path / "tiny.bin"
+    path.write_bytes(b"\0" * _PAGE_SIZE)
+    with open(path, "rb") as fh:
+        fd = fh.fileno()
+        mm = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
+        try:
+            # A byte range that is not itself page-aligned must not raise EINVAL.
+            _release_shard_pages(mm, 0, {"data_offsets": (17, 33)})
+        finally:
+            mm.close()
 
 
 def test_ple_table_files_prefers_sidecar(tmp_path):

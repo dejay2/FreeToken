@@ -8,10 +8,21 @@ Writes ``freetoken-ple-000NN-of-000MM.safetensors`` (8 table shards per file) pl
 Never holds more than one table shard in host memory. Spec 2026-09-25 section 4.
 
 Ruling R1 (2026-09-25 plan review): the converter must not squeeze the running box's memory.
-After every decode of a source table shard, and after writing every output file, its page
-cache is dropped with ``freetoken.models.loader.drop_page_cache`` (a no-op where unsupported,
-e.g. Windows or a missing ``posix_fadvise``) -- see the ``drop_page_cache`` calls below. The
-same ruling says: if the precision gate below would pick bf16 (median per-row relative RMS
+The source file is opened as one whole-file mmap that stays open across all three passes
+(opened once in ``convert_table``, closed only at the end), so a bare
+``drop_page_cache(src)`` -- ``posix_fadvise(DONTNEED)`` on a *separate* fd -- is close to a
+no-op on its own: Linux's ``invalidate_mapping_pages`` skips pages currently mapped into a
+process's page tables, so a decoded shard's bytes stay resident until the mmap closes. After
+every decode of a source table shard, :func:`_release_shard_pages` first
+``mm.madvise(MADV_DONTNEED, ...)``s that shard's page-aligned byte range on the *live* mapping
+to drop this process's page-table entries, and only then is ``drop_page_cache(src)`` able to
+actually reclaim the underlying page cache. Output files get a plain ``drop_page_cache`` after
+each write (no live mapping there to fight). fix round 1 (review finding, binding): the
+original version only called ``drop_page_cache(src)`` per shard and never released the mmap's
+own hold on the pages, so it could keep close to the full source table resident for the whole
+run despite the per-shard docstring claim below.
+
+The same ruling says: if the precision gate below would pick bf16 (median per-row relative RMS
 error > ``_GATE``), stop after the report pass and do not write a bf16 table -- FreeToken's
 loader only accepts F8_E4M3 (``weight.py:717``) and adding bf16 support to it is out of scope
 for this task. :class:`Fp8GateExceeded` carries the finished report so the caller can inspect
@@ -40,6 +51,7 @@ _FP8_MAX = 448.0
 _SHARDS_PER_FILE = 8
 _GATE = 0.05  # median per-row relative RMS error allowed for the fp8 table
 _SAMPLE_ROWS = 1_000_000
+_PAGE_SIZE = mmap.PAGESIZE
 
 
 class Fp8GateExceeded(RuntimeError):
@@ -79,6 +91,29 @@ def _find(header, suffix):
     if len(keys) != 1:
         raise ValueError(f"expected one *{suffix} tensor, found {len(keys)}")
     return keys[0]
+
+
+def _release_shard_pages(mm: mmap.mmap, base: int, meta: dict) -> None:
+    """Drop a decoded shard's pages from the *live* source mmap (fix round 1, Ruling R1).
+
+    ``mm`` stays open across all three passes, so its mapped pages pin the shard resident even
+    after ``drop_page_cache(src)`` runs against a separate fd. ``madvise`` requires a
+    page-aligned ``(start, length)``, so the shard's byte range is rounded out to page
+    boundaries before the call; rounding out (never in) means this can only touch a
+    neighbouring shard's not-yet-decoded boundary page, which is harmless -- it will simply be
+    re-faulted in fresh when that shard's turn comes. Best-effort: ``madvise`` is unsupported on
+    Windows, so any failure here is swallowed rather than failing the conversion over a
+    memory-management hint.
+    """
+    begin, end = meta["data_offsets"]
+    start = base + begin
+    stop = base + end
+    aligned_start = (start // _PAGE_SIZE) * _PAGE_SIZE
+    aligned_len = ((stop - aligned_start + _PAGE_SIZE - 1) // _PAGE_SIZE) * _PAGE_SIZE
+    try:
+        mm.madvise(mmap.MADV_DONTNEED, aligned_start, aligned_len)
+    except (AttributeError, OSError, ValueError):
+        pass
 
 
 def _decode_shard(mm, base, meta, k, rows_start, head_offsets, head_bias, codebook, device, chunk):
@@ -132,6 +167,7 @@ def convert_table(model_dir: str, *, device: str = "cuda", chunk_rows: int = 327
             dec = _decode_shard(mm, base, header[key], k, i * rows_per_shard, head_offsets,
                                 head_bias, codebook, device, chunk_rows)
             absmax = max(absmax, float(dec.abs().max()))
+            _release_shard_pages(mm, base, header[key])  # R1 fix round 1: unmap before fadvise
             drop_page_cache(src)  # R1: never let the checkpoint linger in page cache mid-run
         scale = absmax / _FP8_MAX if absmax > 0 else 1.0
         sample_every = max(1, (rows_per_shard * len(shard_keys)) // _SAMPLE_ROWS)
@@ -139,6 +175,7 @@ def convert_table(model_dir: str, *, device: str = "cuda", chunk_rows: int = 327
         for i, key in enumerate(shard_keys):
             dec = _decode_shard(mm, base, header[key], k, i * rows_per_shard, head_offsets,
                                 head_bias, codebook, device, chunk_rows)[::sample_every]
+            _release_shard_pages(mm, base, header[key])  # R1 fix round 1: unmap before fadvise
             drop_page_cache(src)  # R1
             fp8 = (dec / scale).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn).float() * scale
             denom = dec.pow(2).mean(1).sqrt().clamp_min(1e-12)
@@ -169,6 +206,7 @@ def convert_table(model_dir: str, *, device: str = "cuda", chunk_rows: int = 327
             for i in range(f * _SHARDS_PER_FILE, min(len(shard_keys), (f + 1) * _SHARDS_PER_FILE)):
                 dec = _decode_shard(mm, base, header[shard_keys[i]], k, i * rows_per_shard,
                                     head_offsets, head_bias, codebook, device, chunk_rows)
+                _release_shard_pages(mm, base, header[shard_keys[i]])  # R1 fix round 1
                 drop_page_cache(src)  # R1
                 out_key = f"{prefix}.shard_{i}.weight"
                 if dtype == "fp8":
