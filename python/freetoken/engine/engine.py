@@ -1245,6 +1245,9 @@ class Engine:
                     int(config.cuda_graph_max_bs or 0),
                 ),
                 enable_mgemm=cache.exl3_expert_op == "mgemm",
+                # Routed trellis K (GLM 2.05bpw K=2, Qwen Flash 3.05bpw K=3); the reconstruct
+                # staging banks are sized 16*K wide and the bank check refuses any other K.
+                k=int(getattr(config.model_config, "exl3_expert_k", 2)),
             )
             cache.exl3_scratch = scratch
             for layer in layers:

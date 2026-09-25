@@ -14,7 +14,7 @@ import torch
 
 from freetoken.kernel import exl3 as _exl3_kernel
 from freetoken.kernel.exl3_mgemm import EXL3_MGEMM_MAX_INDICES
-from freetoken.moe.exl3_ops import EXL3_EXPERT_OPS
+from freetoken.moe.exl3_ops import DEFAULT_EXL3_EXPERT_OP, EXL3_EXPERT_OPS
 from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl
 from freetoken.utils import init_logger
 
@@ -23,7 +23,6 @@ logger = init_logger(__name__)
 
 _MAX_TOP_K = 64
 _MAX_RECONSTRUCT_EXPERTS = 8
-_EXL3_K = 2
 _EXL3_CODEBOOK = "mul1"
 
 
@@ -39,6 +38,8 @@ class Exl3Scratch:
     max_top_k: int
     decode_max_tokens: int
     decode_top_k: int
+    # Routed-expert trellis K for this checkpoint (GLM 2.05bpw K=2, Qwen Flash 3.05bpw K=3).
+    k: int
     gate_up: torch.Tensor
     down: torch.Tensor
     reconstruct_work: torch.Tensor
@@ -80,6 +81,7 @@ def prepare_exl3_scratch(
     chunk_experts=_MAX_RECONSTRUCT_EXPERTS,
     decode_max_tokens=1,
     enable_mgemm=False,
+    k: int = 2,
 ) -> Exl3Scratch:
     """Allocate the one reusable EXL3 workspace.
 
@@ -95,6 +97,9 @@ def prepare_exl3_scratch(
     max_tokens = int(max_tokens)
     chunk_experts = int(chunk_experts)
     decode_max_tokens = int(decode_max_tokens)
+    k = int(k)
+    if not 1 <= k <= 8:
+        raise ValueError(f"EXL3 scratch K must be in 1..8, got {k}")
     if hidden_size <= 0 or intermediate_size <= 0:
         raise ValueError("EXL3 scratch dimensions must be positive")
     if hidden_size % 128 or intermediate_size % 128:
@@ -113,9 +118,9 @@ def prepare_exl3_scratch(
         )
 
     trellis_shapes = (
-        (chunk_experts, hidden_size // 16, intermediate_size // 16, 16 * _EXL3_K),
-        (chunk_experts, hidden_size // 16, intermediate_size // 16, 16 * _EXL3_K),
-        (chunk_experts, intermediate_size // 16, hidden_size // 16, 16 * _EXL3_K),
+        (chunk_experts, hidden_size // 16, intermediate_size // 16, 16 * k),
+        (chunk_experts, hidden_size // 16, intermediate_size // 16, 16 * k),
+        (chunk_experts, intermediate_size // 16, hidden_size // 16, 16 * k),
     )
     reconstruct_banks = (
         torch.empty(trellis_shapes[0], dtype=torch.int16, device=device),
@@ -137,6 +142,7 @@ def prepare_exl3_scratch(
         max_top_k=_MAX_TOP_K,
         decode_max_tokens=decode_max_tokens,
         decode_top_k=chunk_experts,
+        k=k,
         gate_up=torch.empty(
             (chunk_experts, 2 * intermediate_size, hidden_size),
             dtype=torch.bfloat16,
@@ -238,6 +244,7 @@ def _validate_banks(
     hidden_size: int,
     intermediate_size: int,
     device: torch.device,
+    k: int,
 ) -> tuple[torch.Tensor, ...]:
     if len(banks) != 9:
         raise ValueError(
@@ -289,10 +296,10 @@ def _validate_banks(
     if gate_trellis.shape[1:] != (
         hidden_size // 16,
         intermediate_size // 16,
-        16 * _EXL3_K,
+        16 * k,
     ):
         raise ValueError(
-            "gate_trellis shape does not match the configured expert dimensions: "
+            f"gate_trellis shape (K={k} scratch) does not match the configured expert dimensions: "
             f"got {tuple(gate_trellis.shape)}"
         )
     if up_trellis.shape[1:] != gate_trellis.shape[1:]:
@@ -300,10 +307,10 @@ def _validate_banks(
     if down_trellis.shape[1:] != (
         intermediate_size // 16,
         hidden_size // 16,
-        16 * _EXL3_K,
+        16 * k,
     ):
         raise ValueError(
-            "down_trellis shape does not match the configured expert dimensions: "
+            f"down_trellis shape (K={k} scratch) does not match the configured expert dimensions: "
             f"got {tuple(down_trellis.shape)}"
         )
     for name, bank, width in (
@@ -459,7 +466,7 @@ def _reconstruct_decode(
             gate_trellis[local],
             gate_suh[local],
             gate_svh[local],
-            k=_EXL3_K,
+            k=scratch.k,
             codebook=_EXL3_CODEBOOK,
             out=scratch.gate_up[local, : scratch.intermediate_size, :],
             work=work_gate_up,
@@ -468,7 +475,7 @@ def _reconstruct_decode(
             up_trellis[local],
             up_suh[local],
             up_svh[local],
-            k=_EXL3_K,
+            k=scratch.k,
             codebook=_EXL3_CODEBOOK,
             out=scratch.gate_up[local, scratch.intermediate_size :, :],
             work=work_gate_up,
@@ -477,7 +484,7 @@ def _reconstruct_decode(
             down_trellis[local],
             down_suh[local],
             down_svh[local],
-            k=_EXL3_K,
+            k=scratch.k,
             codebook=_EXL3_CODEBOOK,
             out=scratch.down[local],
             work=work_down,
@@ -510,7 +517,7 @@ def _reconstruct_chunk(
             gate_trellis[slot],
             gate_suh[slot],
             gate_svh[slot],
-            k=_EXL3_K,
+            k=scratch.k,
             codebook=_EXL3_CODEBOOK,
             out=scratch.gate_up[local, :intermediate_size, :],
             work=work_gate_up,
@@ -519,7 +526,7 @@ def _reconstruct_chunk(
             up_trellis[slot],
             up_suh[slot],
             up_svh[slot],
-            k=_EXL3_K,
+            k=scratch.k,
             codebook=_EXL3_CODEBOOK,
             out=scratch.gate_up[local, intermediate_size:, :],
             work=work_gate_up,
@@ -528,7 +535,7 @@ def _reconstruct_chunk(
             down_trellis[slot],
             down_suh[slot],
             down_svh[slot],
-            k=_EXL3_K,
+            k=scratch.k,
             codebook=_EXL3_CODEBOOK,
             out=scratch.down[local],
             work=work_down,
@@ -784,6 +791,7 @@ def fused_experts_exl3(
         hidden_size=scratch.hidden_size,
         intermediate_size=scratch.intermediate_size,
         device=hidden_states.device,
+        k=scratch.k,
     )
     if expert_op not in EXL3_EXPERT_OPS:
         raise ValueError(
@@ -848,6 +856,18 @@ def fused_experts_exl3(
                 layer_id=layer_id, is_prefill=is_prefill, scratch=scratch, reason=exc
             )
             output.zero_()
+
+    if (
+        not is_prefill
+        and top_k > _MAX_RECONSTRUCT_EXPERTS
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        # Reconstruct-first decode above eight routes reads the route ids on the host, which a
+        # capture cannot do. Qwen Flash (top_k=10) captures only through the packed path.
+        raise RuntimeError(
+            f"EXL3 packed mgemm is unavailable and reconstruct-first cannot capture top_k={top_k}; "
+            "boot with --cuda-graph-max-bs 0"
+        )
 
     input_buffer = scratch.input_buffer[:rows]
     # The BF16 prompt path overwrites its input. Copying once for decode too gives both
@@ -949,7 +969,11 @@ def decode_is_graph_safe(config) -> bool:
         top_k = int(top_k)
     except (TypeError, ValueError):
         return False
-    if not 1 <= top_k <= _MAX_RECONSTRUCT_EXPERTS:
+    op = getattr(config, "exl3_expert_op", None) or DEFAULT_EXL3_EXPERT_OP
+    # The packed mgemm route list holds EXL3_MGEMM_MAX_INDICES (128) entries, so one decode
+    # row fits any top_k up to 128 (Qwen Flash routes 10). The reconstruct arena stays 8 wide.
+    limit = EXL3_MGEMM_MAX_INDICES if op == "mgemm" else _MAX_RECONSTRUCT_EXPERTS
+    if not 1 <= top_k <= limit:
         return False
 
     # This item captures only the one-row graph.  A wider requested graph would exceed the

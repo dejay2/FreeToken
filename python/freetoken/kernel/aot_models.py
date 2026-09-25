@@ -61,6 +61,9 @@ class AotModel:
     # GGUF config variants of the same model); every registry key must be
     # claimed by some entry's architecture or arch_aliases.
     arch_aliases: tuple[str, ...] = ()
+    # Routed-expert trellis K when ``expert_formats`` holds "exl3" (the checkpoint's
+    # ModelConfig.exl3_expert_k): GLM-5.3 2.05bpw is K=2.
+    exl3_expert_k: int = 2
 
 
 def fp8_block_scale_pad(rows: int, cols: int) -> int:
@@ -70,12 +73,15 @@ def fp8_block_scale_pad(rows: int, cols: int) -> int:
     return cols
 
 
-def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int) -> dict[str, int]:
+def expert_bank_row_bytes(
+    fmt: str, hidden_size: int, moe_intermediate_size: int, k: int = 2
+) -> dict[str, int]:
     """Per-expert row bytes for each offload bank a format registers.
 
     Bank names and layouts follow moe/offload_cache.py ``_BANK_SCHEMAS`` and the
     per-format loaders cited inline; every value must stay a multiple of 16 for
-    the fused multi-bank copy to engage.
+    the fused multi-bank copy to engage. ``k`` is the EXL3 routed-expert trellis K
+    (ignored by every other format).
     """
     H, I = hidden_size, moe_intermediate_size
     if fmt == "bf16":
@@ -109,17 +115,19 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
             banks["down_global"] = H * 2
         return banks
     if fmt == "exl3":
-        # models/exl3_banks.py: fixed K=2 trellis tiles plus FP16 suh/svh
-        # factors. Keep this map in the exact registration order used by the
-        # cache; at GLM H=4096/I=2048 it totals 6,328,320 bytes per expert.
+        # models/exl3_banks.py: 16*K uint16 per 16x16 trellis tile plus FP16 suh/svh
+        # factors. Keep this map in the exact registration order used by the cache; at
+        # GLM K=2 H=4096/I=2048 it totals 6,328,320 bytes per expert, at Qwen Flash K=3
+        # H=2560/I=640 1,862,400.
+        trellis = (H // 16) * (I // 16) * 16 * k * 2
         return {
-            "gate_trellis": (H // 16) * (I // 16) * 32 * 2,
+            "gate_trellis": trellis,
             "gate_suh": H * 2,
             "gate_svh": I * 2,
-            "up_trellis": (H // 16) * (I // 16) * 32 * 2,
+            "up_trellis": trellis,
             "up_suh": H * 2,
             "up_svh": I * 2,
-            "down_trellis": (I // 16) * (H // 16) * 32 * 2,
+            "down_trellis": trellis,
             "down_suh": I * 2,
             "down_svh": H * 2,
         }
@@ -426,7 +434,9 @@ def fast_index_copy_feature_sizes(model: AotModel) -> set[int]:
     for fmt in model.expert_formats:
         assert model.moe_intermediate_size is not None
         sizes.update(
-            expert_bank_row_bytes(fmt, model.hidden_size, model.moe_intermediate_size).values()
+            expert_bank_row_bytes(
+                fmt, model.hidden_size, model.moe_intermediate_size, k=model.exl3_expert_k
+            ).values()
         )
     return sizes
 

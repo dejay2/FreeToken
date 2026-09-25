@@ -348,3 +348,42 @@ def test_fused_wrapper_requires_the_route_index_limit_message():
 
     assert issubclass(Exl3MgemmLimitError, ValueError)
     assert callable(fused_experts_exl3_mgemm)
+
+
+@cuda
+def test_mgemm_k3_qwen_shape_matches_reconstruct():
+    # Qwen3.8-Flash-Next 3.05bpw routed experts: K=3, H=2560, I=640, SiLU (no clamp).
+    from freetoken.kernel.exl3 import reconstruct
+    from freetoken.kernel.exl3_mgemm import Exl3MgemmBanks, fused_experts_exl3_mgemm
+
+    dev, H, I, k, E = torch.device("cuda"), 2560, 640, 3, 4
+    g = torch.Generator().manual_seed(0)
+
+    def parts(fin, fout):
+        trellis = torch.randint(-32768, 32767, (fin // 16, fout // 16, 16 * k), generator=g,
+                                dtype=torch.int32).to(torch.int16)
+        suh = (torch.randint(0, 2, (fin,), generator=g) * 2 - 1).half()
+        svh = (torch.rand(fout, generator=g) * 0.02 + 0.01).half()
+        return trellis, suh, svh
+
+    experts = [(parts(H, I), parts(H, I), parts(I, H)) for _ in range(E)]
+    banks = []
+    for proj in range(3):
+        for comp in range(3):
+            banks.append(torch.stack([experts[e][proj][comp] for e in range(E)]).to(dev).contiguous())
+    tables = Exl3MgemmBanks.from_banks(banks)
+    assert tables.k == k
+    x = torch.randn(1, H, device=dev).bfloat16()
+    ids = torch.tensor([[0, 1, 2, 3]], device=dev, dtype=torch.int32)
+    weights = torch.full((1, 4), 0.25, device=dev)
+    got = fused_experts_exl3_mgemm(x, tables, weights, ids, activation="silu", swiglu_limit=None).float()
+
+    want = torch.zeros(1, H, device=dev)
+    for e in range(E):
+        (gt, gs, gv), (ut, us, uv), (dt, ds, dv) = [[t.to(dev) for t in p] for p in experts[e]]
+        gw = reconstruct(gt, gs, gv, k=k, codebook="mul1").float()
+        uw = reconstruct(ut, us, uv, k=k, codebook="mul1").float()
+        dw = reconstruct(dt, ds, dv, k=k, codebook="mul1").float()
+        act = torch.nn.functional.silu(x.float() @ gw.T) * (x.float() @ uw.T)
+        want += 0.25 * (act @ dw.T)
+    assert (got - want).norm() / want.norm() < 1e-2

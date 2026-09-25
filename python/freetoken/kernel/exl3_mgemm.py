@@ -1,7 +1,7 @@
 """Packed EXL3 multi-expert GEMM helpers.
 
 The pointer-table and multi-matrix call shape follow ExLlamaV3 v1.4.6.  FreeToken keeps
-GLM-5.3's nine EXL3 banks in slot order, so this module builds one device pointer table
+the nine EXL3 banks (GLM-5.3 K=2, Qwen Flash K=3) in slot order, so this module builds one device pointer table
 per bank and sends the packed trellis rows to ``exl3_mgemm`` without reconstructing them.
 The wrapper deliberately does not use ExLlamaV3's one-launch ``exl3_moe`` operation:
 GLM-5.3's clamped SwiGLU is different, so callers run gate, up, FreeToken's activation,
@@ -41,7 +41,11 @@ import torch
 # is a route-list capacity, not a size_m/token-row limit: the same kernel loops size_m in
 # 16-row pieces, and exl3_gemm_shape_compat() does not inspect size_m.
 EXL3_MGEMM_MAX_INDICES = 128
+# Default K for ``exl3_mgemm_shape_supported`` callers that do not name one (GLM-5.3 2.05bpw).
+# Bank tables record their own K: Qwen Flash 3.05bpw routed experts are K=3.
 EXL3_MGEMM_K = 2
+# The wheel's trellis codebook covers K=1..8 bits per weight.
+_EXL3_MGEMM_K_RANGE = range(1, 9)
 EXL3_MGEMM_CODEBOOK = "mul1"
 
 _PROJECTION_BANKS = {
@@ -220,6 +224,7 @@ class Exl3MgemmBanks:
 
         trellis_indices = (0, 3, 6)
         factor_indices = (1, 2, 4, 5, 7, 8)
+        found_k = []
         for index in trellis_indices:
             bank = banks[index]
             if bank.dim() != 4 or bank.dtype != torch.int16:
@@ -227,11 +232,20 @@ class Exl3MgemmBanks:
                     f"EXL3 trellis bank {index} must be rank-4 int16, got "
                     f"shape={tuple(bank.shape)} dtype={bank.dtype}"
                 )
-            if bank.shape[-1] != 16 * EXL3_MGEMM_K:
+            width = int(bank.shape[-1])
+            if width % 16 or width // 16 not in _EXL3_MGEMM_K_RANGE:
                 raise ValueError(
-                    f"EXL3 trellis bank {index} has K={bank.shape[-1] // 16}; "
-                    f"expected K={EXL3_MGEMM_K}"
+                    f"EXL3 trellis bank {index} has last dimension {width} (K={width / 16:g}); "
+                    "expected 16*K with K in 1..8"
                 )
+            found_k.append(width // 16)
+        # One K per checkpoint: the single ``k`` argument the wheel receives covers all three
+        # projections, so a mixed set would silently decode two of them with the wrong K.
+        if len(set(found_k)) != 1:
+            raise ValueError(
+                f"EXL3 mgemm needs one K for gate, up and down, got K={tuple(found_k)}"
+            )
+        k = found_k[0]
         for index in factor_indices:
             bank = banks[index]
             if bank.dim() != 2 or bank.dtype != torch.float16:
@@ -253,7 +267,7 @@ class Exl3MgemmBanks:
             ).contiguous()
             for bank in banks
         )
-        return cls(banks, ptrs, k=EXL3_MGEMM_K)
+        return cls(banks, ptrs, k=k)
 
     def projection(self, name: Literal["gate", "up", "down"]):
         try:
