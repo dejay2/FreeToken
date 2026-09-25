@@ -172,7 +172,7 @@ def _exl3_expert_k(quant: dict[str, Any]) -> int | None:
     out of ``read_model`` into ``panel._model_limit_errors``' all-models loop, breaking registry
     save/validate for every model on the page over one bad EXL3 entry).
     """
-    bits = quant.get("bits", 2)
+    bits = quant.get("bits")  # no default: an absent key is "unknown", same as an explicit null
     try:
         k = int(float(bits))
     except (TypeError, ValueError):

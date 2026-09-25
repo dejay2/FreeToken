@@ -180,6 +180,25 @@ def test_exl3_garbled_bits_gives_an_unknown_size_not_a_crash(tmp_path):
         assert "exl3_bits_error" in info.extra
 
 
+def test_exl3_missing_bits_key_gives_an_unknown_size_not_a_silent_guess():
+    """Fix round 2: quantization_config with no "bits" key at all (e.g. {"quant_method": "exl3"})
+    used to fall back to a silent K=2 default (``quant.get("bits", 2)``), contradicting the
+    round-1 fix's own docstring ("Returns None when bits is missing"). An absent key must be
+    treated the same as an explicit null."""
+    cfg = {"architectures": ["Qwen4ExpForConditionalGeneration"],
+           "quantization_config": {"quant_method": "exl3"},
+           "text_config": {"hidden_size": 2560, "moe_intermediate_size": 640, "num_experts": 512,
+                           "num_hidden_layers": 48, "num_experts_per_tok": 10}}
+    info = model_info.describe_config(cfg, "q")
+    assert info.expert_format == "exl3"
+    assert info.expert_format_label == "EXL3 (unknown bits)"
+    assert info.bytes_per_expert is None
+    assert info.bytes_per_layer is None
+    assert info.total_expert_bytes is None
+    assert "exl3_expert_k" not in info.extra
+    assert "exl3_bits_error" in info.extra
+
+
 def test_a_garbled_exl3_model_does_not_break_reading_the_others(tmp_path):
     """The shape of panel._model_limit_errors' loop: read_model() over several registered
     models, one of which has a garbled EXL3 bits value, must not raise and must still size the
