@@ -154,6 +154,67 @@ def test_crlf_and_bom_are_kept(tmp_path):
     assert raw.startswith(b"\xef\xbb\xbf") and b"\r\n" in raw and b"\n" not in raw.replace(b"\r\n", b"")
 
 
+def test_a_failed_second_write_puts_the_first_file_back(tmp_path, monkeypatch):
+    """models.json was replaced, then settings.json could not be: Pi must not be left half-changed."""
+    folder = write_pi(tmp_path / "agent")
+    original = {name: (folder / name).read_bytes() for name in ("models.json", "settings.json")}
+    real = PiSync._atomic_write.__func__
+
+    def flaky(cls, path, data):
+        if path.name == "settings.json":
+            (folder / "settings.json.tmp-freetoken").write_bytes(data)  # the temp file got written...
+            raise PermissionError(13, "Permission denied")  # ...but the replace did not
+        real(cls, path, data)
+
+    monkeypatch.setattr(PiSync, "_atomic_write", classmethod(flaky))
+    result = PiSync(folder, now=Clock()).add("small-9b", "Small", "ninfer", ENGINES)
+    assert result["status"] == "not_updated" and "Permission denied" in result["message"], result
+    assert "left as it was" in result["message"]
+    assert (folder / "models.json").read_bytes() == original["models.json"]
+    assert (folder / "settings.json").read_bytes() == original["settings.json"]
+    assert not list(folder.glob("*.tmp-freetoken"))
+
+
+def test_bytes_that_are_not_utf8_are_never_rewritten(tmp_path):
+    folder = write_pi(tmp_path / "agent")
+    path = folder / "settings.json"
+    damaged = path.read_bytes().replace(b'"dark"', b'"d\xffrk"')
+    path.write_bytes(damaged)
+    before = {p.name: p.read_bytes() for p in folder.iterdir()}
+    result = PiSync(folder, now=Clock()).add("small-9b", "Small", "ninfer", ENGINES)
+    assert result["status"] == "not_updated" and "UTF-8" in result["message"], result
+    assert {p.name: p.read_bytes() for p in folder.iterdir()} == before
+    assert b"\xef\xbf\xbd" not in path.read_bytes()
+
+
+def test_odd_rows_do_not_raise_and_the_sync_never_raises(tmp_path):
+    models = json.loads(json.dumps(MODELS))
+    models["providers"][PROVIDER]["models"].insert(0, {"id": ["not", "a", "string"], "name": "odd"})
+    models["providers"][PROVIDER]["models"].insert(0, "just a string")
+    folder = write_pi(tmp_path / "agent", models=models)
+    result = PiSync(folder, now=Clock()).add("small-9b", "Small", "ninfer", ENGINES)
+    assert result["status"] == "updated", result
+    rows = load(folder)[0]["providers"][PROVIDER]["models"]
+    assert rows[0] == "just a string" and rows[1] == {"id": ["not", "a", "string"], "name": "odd"}
+    assert rows[-1]["id"] == "small-9b" and rows[-1]["contextWindow"] == 150000  # the real neighbour still found
+
+    before = {p.name: p.read_bytes() for p in folder.iterdir()}
+    result = PiSync(folder, now=Clock()).add("tiny", "Tiny", "ninfer", None)  # a broken caller: .get on None
+    assert result["status"] == "not_updated" and "AttributeError" in result["message"], result
+    assert {p.name: p.read_bytes() for p in folder.iterdir()} == before
+
+
+def test_a_single_line_file_stays_single_line(tmp_path):
+    folder = write_pi(tmp_path / "agent")
+    (folder / "models.json").write_text(json.dumps(MODELS), encoding="utf-8")  # compact, no newline
+    (folder / "settings.json").write_text(json.dumps(SETTINGS) + "\n", encoding="utf-8")  # compact, final newline
+    assert PiSync(folder, now=Clock()).add("small-9b", "Small", "ninfer", ENGINES)["status"] == "updated"
+    models_text = (folder / "models.json").read_text(encoding="utf-8")
+    settings_text = (folder / "settings.json").read_text(encoding="utf-8")
+    assert "\n" not in models_text and json.loads(models_text)["providers"][PROVIDER]["models"][-1]["id"] == "small-9b"
+    assert settings_text.endswith("\n") and "\n" not in settings_text[:-1]
+
+
 def test_sync_off_says_so(tmp_path):
     result = PiSync(tmp_path, enabled=False).add("x", "X", "ninfer", {})
     assert result == {"status": "not_updated", "message": "Pi sync is off on this helper.", "notes": []}

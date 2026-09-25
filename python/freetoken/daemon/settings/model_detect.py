@@ -14,7 +14,7 @@ A ``.ninfer`` file is a NInfer model, and its first 8 bytes say which runtime ca
 So the header, not the file name, picks the runtime. A v3 model may be split: the entry's JSON
 directory lists its continuation files in ``files[1:]`` (named ``<entry>.part-NNNN`` by
 tools/artifact/writer.py), each starting with ``NINPRT\\0\\x03``. Only the header and the
-directory are read here, never the weights.
+directory are read here, never the weights (each listed part's first 8 bytes are checked too).
 
 A folder is a FreeToken model when its config.json names an architecture FreeToken's model
 registry serves (model_info.SUPPORTED_ARCHITECTURES, kept in step with models/register.py by
@@ -123,8 +123,15 @@ def _v3(entry: Path, directory: bytes, size: int) -> dict[str, Any]:
         part = entry.with_name(name)
         try:
             total += part.stat().st_size
+            with part.open("rb") as fh:
+                magic = fh.read(len(PART_MAGIC))
         except OSError as exc:
             raise NotAModel(f"This NInfer model is split into parts, and the part {name} is missing next to it.") from exc
+        # The directory only names the part; the part's own header proves it is one (a file of
+        # the right name from another model or a broken copy would otherwise pass as a model).
+        if magic != PART_MAGIC:
+            raise NotAModel(f"This NInfer model is split into parts, and the part {name} next to it is not a NInfer "
+                            f"part file. {NOT_SUPPORTED}")
         files.append(str(part))
     return {"version": 3, "runtime": RUNTIME_BY_VERSION[3], "files": files, "bytes": total}
 

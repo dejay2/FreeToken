@@ -90,6 +90,22 @@ def test_parts_missing_parts_and_garbage_are_not_models(tmp_path):
     assert md.detect("relative/path")["reason"] == "Use a full path, starting with / or ~/."
 
 
+def test_a_listed_part_must_start_with_the_part_magic(tmp_path):
+    entry = write_v3(tmp_path / "split.ninfer", parts=2)
+    part = tmp_path / "split.ninfer.part-0002"
+    part.write_bytes(b"not a part at all" + b"\0" * PAD)
+    found = md.detect(str(entry))
+    assert found["kind"] == "unsupported" and found["suggested"] is None
+    assert "split.ninfer.part-0002" in found["reason"] and "not a NInfer part file" in found["reason"]
+    assert "not supported by your engines" in found["reason"]
+    # A v3 header in a part's place (a copy of the entry under the part's name) is not a part either.
+    part.write_bytes(entry.read_bytes())
+    assert "not a NInfer part file" in md.detect(str(entry))["reason"]
+    # Short but right: only the first 8 bytes are read from a part.
+    part.write_bytes(md.PART_MAGIC)
+    assert md.detect(str(entry))["kind"] == "ninfer"
+
+
 def test_folders_follow_freetokens_model_registry(tmp_path):
     good = md.detect(str(write_folder(tmp_path / "Tiny-Llama")))
     assert (good["engine"], good["runtime"], good["format"]) == ("freetoken", "freetoken", "LlamaForCausalLM model folder")

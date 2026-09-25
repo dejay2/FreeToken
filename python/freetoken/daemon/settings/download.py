@@ -9,11 +9,13 @@ callbacks do not reliably cover local cache files or partial files.
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -21,8 +23,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -68,6 +70,17 @@ _NINFER_PART = re.compile(r"^(?P<entry>.+\.ninfer)\.part-\d{4}$")  # tools/artif
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _SUMS_LINE = re.compile(r"^\s*([0-9A-Fa-f]{64})\s+\*?(\S.*?)\s*$")
 _HASH_CHUNK = 8 * 1024 * 1024
+# Wizard staging folders: ``<root>/.incoming-download-<hex>``. The dot keeps them out of the
+# page's Browse list; the fixed prefix lets a later helper sweep the ones a crash left behind.
+_STAGING_PREFIX = ".incoming-"
+_STAGING_GLOB = _STAGING_PREFIX + "download-"
+# 4 MiB per read keeps a cancel within a fraction of a second even at 100 MB/s while staying
+# well under the 8 MiB hash chunk in per-call overhead.
+_STREAM_CHUNK = 4 * 1024 * 1024
+_STREAM_TIMEOUT_S = 60
+# renameat2(2) constants (linux/fs.h, fcntl.h); glibc has wrapped the call since 2.28.
+_RENAME_NOREPLACE = 1
+_AT_FDCWD = -100
 
 
 class InvalidRepository(ValueError):
@@ -84,6 +97,10 @@ class AddUnsupported(ValueError):
 
 class ChecksumMismatch(RuntimeError):
     """A downloaded file does not match the checksum the repo publishes."""
+
+
+class DownloadCancelled(Exception):
+    """Raised inside the worker when the page's Cancel arrives mid-file, mid-hash or before moving."""
 
 
 class DownloadBody(BaseModel):
@@ -120,6 +137,10 @@ class DownloadJob:
     finals: list[str] = field(default_factory=list)
     sums_name: str | None = None
     verified: list[str] = field(default_factory=list)
+    # SHA256SUMS rows read at plan time (name -> hex), and what actually checked each file:
+    # "SHA256SUMS", "published" (the Hub's LFS digest) or None (nothing could).
+    sums: dict[str, str] = field(default_factory=dict)
+    checks: dict[str, str | None] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -135,6 +156,7 @@ class DownloadJob:
             "kind": self.kind,
             "engine": self.engine,
             "verified": list(self.verified),
+            "checks": dict(self.checks),
             "resultPath": str(self.target) if self.kind == "add" and self.stage == "done" and self.target else None,
         }
 
@@ -314,12 +336,101 @@ def parse_sha256sums(text: str) -> dict[str, str]:
     return sums
 
 
-def sha256_file(path: str | os.PathLike[str]) -> str:
+def sha256_file(path: str | os.PathLike[str], cancelled: Callable[[], bool] | None = None) -> str:
+    """Hash a file; ``cancelled`` is polled once per 8 MiB so a 19 GB hash can be stopped too."""
     digest = hashlib.sha256()
     with open(path, "rb") as fh:
         while block := fh.read(_HASH_CHUNK):
+            if cancelled is not None and cancelled():
+                raise DownloadCancelled(str(path))
             digest.update(block)
     return digest.hexdigest()
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Rename ``source`` to ``destination``, refusing (FileExistsError) when the name is taken.
+
+    ``os.rename`` onto an *empty* directory silently replaces it on Linux, so an exists() check
+    followed by a rename leaves a window in which a folder created by the user is lost. Linux
+    has renameat2(RENAME_NOREPLACE), which makes the refusal atomic; it is reached through
+    ctypes because ``os`` has no wrapper. A filesystem that does not support the flag (EINVAL
+    on some FUSE and 9p mounts, ENOSYS on old kernels) falls back to the check-then-rename,
+    which is still what Windows ``os.rename`` does natively (it refuses an existing target).
+    """
+    if sys.platform.startswith("linux"):
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            renameat2 = libc.renameat2
+        except (OSError, AttributeError):
+            renameat2 = None
+        if renameat2 is not None:
+            renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+            renameat2.restype = ctypes.c_int
+            result = renameat2(_AT_FDCWD, os.fsencode(source), _AT_FDCWD, os.fsencode(destination), _RENAME_NOREPLACE)
+            if result == 0:
+                return
+            code = ctypes.get_errno()
+            if code in (errno.EEXIST, errno.ENOTEMPTY):
+                raise FileExistsError(code, os.strerror(code), str(destination))
+            if code not in (errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise OSError(code, os.strerror(code), str(source), None, str(destination))
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(destination))
+    os.rename(source, destination)
+
+
+class _DropTokenAcrossHosts(HTTPRedirectHandler):
+    """Forward a Hub redirect (to its CDN) without the bearer token, as huggingface_hub does."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102 - stdlib signature
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urlsplit(newurl).hostname != urlsplit(req.full_url).hostname:
+            new.remove_header("Authorization")
+        return new
+
+
+def _hub_file_url(repo: str, filename: str) -> str:
+    try:
+        from huggingface_hub import hf_hub_url  # honours HF_ENDPOINT; lazy like the other Hub imports
+    except ImportError:
+        return f"https://huggingface.co/{repo}/resolve/main/{quote(filename)}"
+    return hf_hub_url(repo_id=repo, filename=filename)
+
+
+def _copy_stream(response: Any, destination: Path, cancelled: Callable[[], bool]) -> None:
+    """Copy an open response to ``destination``, polling ``cancelled`` before every chunk."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with open(destination, "wb") as fh:
+        while True:
+            if cancelled():
+                raise DownloadCancelled(destination.name)
+            block = response.read(_STREAM_CHUNK)
+            if not block:
+                return
+            fh.write(block)
+
+
+def _stream_hub_file(
+    repo: str, filename: str, destination: str | os.PathLike[str], cancelled: Callable[[], bool], *,
+    opener: Callable[..., Any] | None = None,
+) -> None:
+    """The wizard's file fetch: one plain HTTP GET of the Hub's resolve URL, written in chunks.
+
+    Why not snapshot_download: it cannot be interrupted, so a single 19 GB .ninfer could only
+    be cancelled once it had finished (and a cancel that landed after the last file ended
+    "done"). Running it in a subprocess and killing it would interrupt it, but could not carry
+    the test doubles and would leave the Hub cache's partial files to clean. A streamed copy is
+    forty lines, polls the cancel flag per 4 MiB, and the wizard already checks size and sha256
+    itself and deletes the staging folder on any failure, so the Hub client's resume and retry
+    logic adds nothing here.
+    """
+    request = Request(_hub_file_url(repo, filename), headers={"User-Agent": "freetoken-settings"})
+    token = os.environ.get("HF_TOKEN")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    open_url = opener if opener is not None else build_opener(_DropTokenAcrossHosts()).open
+    with open_url(request, timeout=_STREAM_TIMEOUT_S) as response:
+        _copy_stream(response, Path(destination), cancelled)
 
 
 def _default_hf_api() -> Any:
@@ -530,12 +641,16 @@ class DownloadManager:
         pc_memory: int | Callable[[], int] | None = None,
         card_memory: int | Callable[[], int] | None = None,
         disk_free: Callable[[str | os.PathLike[str]], int] | None = None,
+        file_fetcher: Callable[..., Any] | None = None,
     ) -> None:
         self.models_dir = Path(models_dir)
         self.downloads_dir = Path(downloads_dir) if downloads_dir is not None else self.models_dir
         self._api_factory = api_factory
         self._config_fetcher = config_fetcher
         self._snapshot_downloader = snapshot_downloader or _default_snapshot_download
+        # The Add model wizard fetches one file at a time through this seam:
+        # ``fetcher(repo, filename, destination, cancelled)``; see _stream_hub_file.
+        self._file_fetcher = file_fetcher or _stream_hub_file
         # Test doubles do not have to make network calls for header metadata. The live helper,
         # which uses the default Hub API, gets a bounded Range reader unless a seam is supplied.
         self._header_fetcher = (
@@ -550,6 +665,32 @@ class DownloadManager:
         self._active_id: str | None = None
         self._partial_targets: set[str] = set()
         self._lock = threading.RLock()
+        # A helper restart mid-download leaves the worker's staging folder behind (its cleanup
+        # runs in the worker thread). No job exists yet, so every staging folder is an orphan.
+        self.sweep_staging(self.models_dir, self.downloads_dir)
+
+    def sweep_staging(self, *roots: str | os.PathLike[str]) -> list[Path]:
+        """Delete every ``.incoming-download-*`` folder under ``roots`` that no live job owns."""
+        with self._lock:
+            owned = {
+                self._target_key(job.staging)
+                for job in self._jobs.values()
+                if job.staging is not None and job.stage not in _TERMINAL_STAGES
+            }
+        removed: list[Path] = []
+        for root in {Path(root) for root in roots}:
+            try:
+                entries = list(root.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                if not entry.name.startswith(_STAGING_GLOB) or entry.is_symlink() or not entry.is_dir():
+                    continue
+                if self._target_key(entry) in owned:
+                    continue
+                shutil.rmtree(entry, ignore_errors=True)
+                removed.append(entry)
+        return removed
 
     # ---- preview and model catalogue -------------------------------------
 
@@ -642,7 +783,11 @@ class DownloadManager:
 
     def models(self) -> list[dict[str, Any]]:
         try:
-            folders = sorted((item for item in self.models_dir.iterdir() if item.is_dir()), key=lambda p: p.name.lower())
+            # Dot-named folders are the wizard's staging (and any other hidden folder), not models.
+            folders = sorted(
+                (item for item in self.models_dir.iterdir() if item.is_dir() and not item.name.startswith(".")),
+                key=lambda p: p.name.lower(),
+            )
         except (FileNotFoundError, NotADirectoryError, OSError):
             return []
         pc_bytes = _as_bytes(self._pc_memory)
@@ -713,8 +858,10 @@ class DownloadManager:
             if job is None:
                 return None
             if job.stage not in _TERMINAL_STAGES:
-                # snapshot_download cannot be interrupted mid-file.  The worker sees this flag
-                # before the next file, leaving the partial target for a later resume.
+                # Folder jobs: snapshot_download cannot be interrupted mid-file, so the worker
+                # sees this flag before the next file and leaves the partial target for a later
+                # resume.  Wizard jobs stream each file themselves and poll the flag per chunk,
+                # per hash chunk and once more before moving (see _run_add).
                 job.cancel_requested = True
             self._refresh(job)
             return job
@@ -841,9 +988,28 @@ class DownloadManager:
 
     # ---- Add model wizard (control panel Stage B) -------------------------
 
+    def _fetch_file(self, repo: str, filename: str, destination: Path, cancelled: Callable[[], bool]) -> None:
+        self._file_fetcher(repo, filename, destination, cancelled)
+
+    def _read_sums(self, repo: str, sums: RemoteFile | None) -> dict[str, str]:
+        """The repo's SHA256SUMS rows, read at plan time so each file's label says what will
+        actually check it (a file the list leaves out falls back to the Hub digest or nothing)."""
+        if sums is None:
+            return {}
+        with tempfile.TemporaryDirectory(prefix="freetoken-sums-") as temporary:
+            path = Path(temporary) / sums.name
+            self._fetch_file(repo, sums.name, path, lambda: False)
+            return parse_sha256sums(path.read_text(encoding="utf-8", errors="replace"))
+
+    @staticmethod
+    def _check_label(item: RemoteFile, sums: dict[str, str]) -> str | None:
+        if item.name in sums:
+            return "SHA256SUMS"
+        return "published" if item.sha256 else None
+
     def _plan_add(
         self, value: str, entry: str | None, folder_root: str | os.PathLike[str], ninfer_root: str | os.PathLike[str]
-    ) -> tuple[dict[str, Any], list[RemoteFile], RemoteFile | None]:
+    ) -> tuple[dict[str, Any], list[RemoteFile], RemoteFile | None, dict[str, str]]:
         repo = parse_repo(value)
         _, name = repo.split("/", 1)
         listing = [item for item in self._hub_files(repo) if _is_top_level_file(item.name)]
@@ -874,7 +1040,8 @@ class DownloadManager:
                 "This repo has no NInfer file (.ninfer) and no model folder (config.json), "
                 "so it is not supported by your engines."
             )
-        total = sum(item.size or 0 for item in fetch) + ((sums.size or 0) if sums is not None and fetch else 0)
+        rows = self._read_sums(repo, sums) if fetch else {}
+        total = sum(item.size or 0 for item in fetch)
         try:
             free = max(0, int(self._disk_free(root)))
         except (TypeError, ValueError, OSError):
@@ -891,7 +1058,7 @@ class DownloadManager:
                 {
                     "name": item.name,
                     "bytes": int(item.size or 0),
-                    "check": "SHA256SUMS" if sums is not None else ("published" if item.sha256 else None),
+                    "check": self._check_label(item, rows),
                 }
                 for item in fetch
             ],
@@ -904,7 +1071,7 @@ class DownloadManager:
             "diskFreeBytes": free,
             "diskFits": free >= total,
         }
-        return plan, fetch, sums
+        return plan, fetch, sums, rows
 
     def plan_add(
         self, value: str, entry: str | None = None, *, folder_root: str | os.PathLike[str],
@@ -917,7 +1084,7 @@ class DownloadManager:
         self, value: str, entry: str | None = None, *, folder_root: str | os.PathLike[str],
         ninfer_root: str | os.PathLike[str],
     ) -> DownloadJob:
-        plan, fetch, sums = self._plan_add(value, entry, folder_root, ninfer_root)
+        plan, fetch, sums, rows = self._plan_add(value, entry, folder_root, ninfer_root)
         if not fetch:
             raise InvalidRepository("Pick which NInfer file to download.")
         if plan["exists"]:
@@ -931,9 +1098,11 @@ class DownloadManager:
             if self._active_id is not None:
                 active = self._jobs.get(self._active_id)
                 raise DownloadConflict(f"Another model download is already {active.stage if active else 'running'}.")
+            # Orphans from a helper restart go now, while it is certain no job owns them.
+            self.sweep_staging(folder_root, ninfer_root)
             job_id = f"download-{uuid.uuid4().hex[:12]}"
             # The dot keeps the staging folder out of the page's Browse list.
-            staging = Path(plan["root"]) / f".incoming-{job_id}"
+            staging = Path(plan["root"]) / f"{_STAGING_PREFIX}{job_id}"
             job = DownloadJob(
                 job_id=job_id,
                 repo=plan["repo"],
@@ -943,9 +1112,10 @@ class DownloadManager:
                 engine=plan["engine"],
                 staging=staging,
                 target=Path(plan["target"]),
-                fetch=[*([sums] if sums is not None else []), *fetch],
+                fetch=list(fetch),
                 finals=plan["finals"],
                 sums_name=sums.name if sums is not None else None,
+                sums=dict(rows),
             )
             self._jobs[job_id] = job
             self._active_id = job_id
@@ -973,14 +1143,17 @@ class DownloadManager:
         with self._lock:
             job = self._jobs[job_id]
         self._set_stage(job_id, "downloading")
+
+        def cancelled() -> bool:
+            return self._cancelled(job_id)
+
         try:
             job.staging.mkdir(parents=True)
             for item in job.fetch:
-                if self._cancelled(job_id):
-                    self._abandon(job_id, "cancelled")
-                    return
-                self._download_one(job.repo, job.staging, item.name)
+                if cancelled():
+                    raise DownloadCancelled(item.name)
                 path = job.staging / item.name
+                self._fetch_file(job.repo, item.name, path, cancelled)
                 if not path.is_file():
                     raise RuntimeError(f"{item.name} did not arrive from Hugging Face.")
                 if item.size is not None and path.stat().st_size != item.size:
@@ -993,28 +1166,31 @@ class DownloadManager:
                 with self._lock:
                     job.files.append(item.name)
             self._set_stage(job_id, "verifying")
-            expected = {item.name: item.sha256 for item in job.fetch if item.sha256}
-            if job.sums_name:
-                # The repo's own list wins over the Hub's published LFS digests.
-                expected.update(
-                    parse_sha256sums((job.staging / job.sums_name).read_text(encoding="utf-8", errors="replace"))
-                )
+            # The repo's own list wins over the Hub's published LFS digests; a file in neither is
+            # labelled so (None) rather than claimed as checked.
+            expected: dict[str, tuple[str, str]] = {item.name: ("published", item.sha256) for item in job.fetch if item.sha256}
+            expected.update({name: ("SHA256SUMS", digest) for name, digest in job.sums.items()})
             for item in job.fetch:
-                want = expected.get(item.name)
-                if want is None or item.name == job.sums_name:
+                source, want = expected.get(item.name, (None, None))
+                with self._lock:
+                    job.checks[item.name] = source
+                if want is None:
                     continue
-                if self._cancelled(job_id):
-                    self._abandon(job_id, "cancelled")
-                    return
-                if sha256_file(job.staging / item.name) != want:
+                if sha256_file(job.staging / item.name, cancelled) != want:
                     raise ChecksumMismatch(
                         f"{item.name} does not match the checksum the repo publishes, so the download was deleted."
                     )
                 with self._lock:
                     job.verified.append(item.name)
+            # A cancel that landed after the last chunk (or during a hash-free verify) must not
+            # end "done": this is the last look before anything leaves the staging folder.
+            if cancelled():
+                raise DownloadCancelled("moving")
             self._set_stage(job_id, "moving")
             self._place(job)
             self._finish(job_id, "done")
+        except DownloadCancelled:
+            self._abandon(job_id, "cancelled")
         except Exception as exc:  # noqa: BLE001 - a failed download must not kill the helper
             self._abandon(job_id, "failed", str(exc))
 
@@ -1048,9 +1224,12 @@ class DownloadManager:
         staging, target = job.staging, job.target
         if job.engine == "freetoken":
             shutil.rmtree(staging / ".cache", ignore_errors=True)
-            if target.exists():
-                raise DownloadConflict(f"{target.name} appeared in {target.parent} while downloading; nothing was overwritten.")
-            staging.rename(target)
+            try:
+                _rename_noreplace(staging, target)
+            except FileExistsError as exc:
+                raise DownloadConflict(
+                    f"{target.name} appeared in {target.parent} while downloading; nothing was overwritten."
+                ) from exc
             return
         placed: list[Path] = []
         try:
@@ -1085,6 +1264,7 @@ def create_router(
     pc_memory: int | Callable[[], int] | None = None,
     card_memory: int | Callable[[], int] | None = None,
     disk_free: Callable[[str | os.PathLike[str]], int] | None = None,
+    file_fetcher: Callable[..., Any] | None = None,
 ) -> APIRouter:
     """Build the downloads and model-list routes for one app instance.
 
@@ -1105,6 +1285,7 @@ def create_router(
             pc_memory=pc_memory,
             card_memory=card_memory,
             disk_free=disk_free,
+            file_fetcher=file_fetcher,
         )
     downloads = APIRouter(prefix="/api/downloads", tags=["downloads"])
     models = APIRouter(tags=["models"])
@@ -1163,6 +1344,7 @@ __all__ = [
     "AddUnsupported",
     "ChecksumMismatch",
     "DownloadBody",
+    "DownloadCancelled",
     "DownloadConflict",
     "DownloadJob",
     "DownloadManager",

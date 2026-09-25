@@ -48,8 +48,11 @@ def _result(status: str, message: str, notes: list[str] | None = None) -> dict[s
     return {"status": status, "message": message, "notes": list(notes or [])}
 
 
-def _indent(text: str) -> int | str:
-    """The file's own indent: a tab, or the width of the first indented line (2 when unsure)."""
+def _indent(text: str) -> int | str | None:
+    """The file's own indent: None for a single-line (compact) file, a tab, or the width of the
+    first indented line (2 when unsure)."""
+    if "\n" not in text.rstrip("\r\n"):
+        return None
     for line in text.splitlines()[1:]:
         stripped = line.lstrip(" \t")
         if stripped and len(stripped) != len(line):
@@ -87,8 +90,10 @@ class PiSync:
         def edit(rows: list, settings: dict) -> list[str]:
             notes: list[str] = []
             if not any(isinstance(row, dict) and row.get("id") == model_id for row in rows):
-                neighbour = next((row for row in rows if isinstance(row, dict)
-                                  and engines_by_id.get(row.get("id")) == engine), None)
+                # A row whose id is not a string (a hand-edited file) is not a neighbour and
+                # must not raise (an unhashable id would in a plain dict lookup).
+                neighbour = next((row for row in rows if isinstance(row, dict) and isinstance(row.get("id"), str)
+                                  and engines_by_id.get(row["id"]) == engine), None)
                 entry: dict[str, Any] = {"id": model_id, "name": name}
                 if neighbour is not None:
                     entry.update({field: copy.deepcopy(neighbour[field]) for field in COPIED_FIELDS if field in neighbour})
@@ -131,7 +136,11 @@ class PiSync:
                 raw[path] = path.read_bytes()
         except OSError as exc:
             return _result("not_updated", f"Pi's files could not be read in {self.agent_dir} ({exc.strerror or exc}).")
-        texts = {path: data.decode("utf-8-sig", errors="replace") for path, data in raw.items()}
+        # Strict decoding: a byte that is not UTF-8 must never be written back as U+FFFD.
+        try:
+            texts = {path: data.decode("utf-8-sig") for path, data in raw.items()}
+        except UnicodeDecodeError as exc:
+            return _result("not_updated", f"One of Pi's files is not UTF-8 text ({exc.reason} at byte {exc.start}).")
         try:
             models, settings = json.loads(texts[self.models_path]), json.loads(texts[self.settings_path])
         except ValueError as exc:
@@ -141,26 +150,53 @@ class PiSync:
         if not isinstance(settings, dict) or not isinstance(provider, dict) or not isinstance(provider.get("models"), list):
             return _result("not_updated", f"Pi's models.json has no {PROVIDER} model list.")
         new_models, new_settings = copy.deepcopy(models), copy.deepcopy(settings)
-        notes = edit(new_models["providers"][PROVIDER]["models"], new_settings)
+        try:
+            notes = edit(new_models["providers"][PROVIDER]["models"], new_settings)
+        except Exception as exc:  # noqa: BLE001 - Jay's files can hold anything; the sync never raises
+            return _result("not_updated", f"Pi's files hold something unexpected ({exc.__class__.__name__}: {exc}).")
         writes = [(path, doc) for path, doc, old in ((self.models_path, new_models, models),
                                                      (self.settings_path, new_settings, settings)) if doc != old]
         if not writes:
             return _result("unchanged", "Pi already matched.", notes)
+        written: list[Path] = []
         try:
             stamp = self._now().strftime("%Y%m%d-%H%M%S-%f")
             for path in (self.models_path, self.settings_path):
                 path.with_name(f"{path.name}.bak-{stamp}").write_bytes(raw[path])
             for path, doc in writes:
                 self._atomic_write(path, _render(doc, texts[path], raw[path].startswith(codecs.BOM_UTF8)))
+                written.append(path)
             self._prune()
         except OSError as exc:
-            return _result("not_updated", f"Pi's files could not be written ({exc.strerror or exc}); "
-                                          f"backups are in {self.agent_dir}.", notes)
+            # A half-applied change (models.json new, settings.json old) would leave Pi listing
+            # a model it cannot enable; put back what this change replaced, from its own bytes.
+            restored = self._restore(raw, written)
+            state = "Pi was left as it was" if restored else f"restore it from the backups in {self.agent_dir}"
+            return _result("not_updated", f"Pi's files could not be written ({exc.strerror or exc}); {state}.", notes)
         return _result("updated", "Pi's model list was updated.", notes)
 
+    def _restore(self, raw: Mapping[Path, bytes], written: list[Path]) -> bool:
+        """Undo this change's writes (best effort) and drop any temp file; True when all undone."""
+        ok = True
+        for path in written:
+            try:
+                self._atomic_write(path, raw[path])
+            except OSError:
+                ok = False
+        for path in (self.models_path, self.settings_path):
+            try:
+                self._temp_path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        return ok
+
     @staticmethod
-    def _atomic_write(path: Path, data: bytes) -> None:
-        temporary = path.with_name(path.name + ".tmp-freetoken")
+    def _temp_path(path: Path) -> Path:
+        return path.with_name(path.name + ".tmp-freetoken")
+
+    @classmethod
+    def _atomic_write(cls, path: Path, data: bytes) -> None:
+        temporary = cls._temp_path(path)
         temporary.write_bytes(data)
         os.replace(temporary, path)
 
