@@ -524,12 +524,23 @@ def _stream_hub_file(
     logic adds nothing here.
     """
     request = Request(_hub_file_url(repo, filename), headers={"User-Agent": "freetoken-settings"})
-    token = os.environ.get("HF_TOKEN")
+    token = _hub_token()
     if token:
         request.add_header("Authorization", f"Bearer {token}")
     open_url = opener if opener is not None else build_opener(_DropTokenAcrossHosts()).open
     with open_url(request, timeout=_STREAM_TIMEOUT_S) as response:
         _copy_stream(response, Path(destination), cancelled)
+
+
+def _hub_token() -> str | None:
+    """The Hub's own token lookup (HF_TOKEN, then the `hf auth login` token file), so a gated
+    repo that snapshot_download could fetch is fetchable here too (review round 2, PR #17)."""
+    try:
+        # Lazy import: the daemon import-safety test blocks torch and its neighbours.
+        from huggingface_hub.utils import get_token
+    except ImportError:
+        return os.environ.get("HF_TOKEN") or None
+    return get_token()
 
 
 def _default_hf_api() -> Any:
@@ -769,7 +780,18 @@ class DownloadManager:
         self.sweep_staging(self.models_dir, self.downloads_dir)
 
     def sweep_staging(self, *roots: str | os.PathLike[str]) -> list[Path]:
-        """Delete every ``.incoming-download-*`` folder under ``roots`` that no live job owns."""
+        """Delete every ``.incoming-download-*`` folder under ``roots`` that no live job owns.
+
+        The folders are listed before the live jobs are read: a job is registered before its
+        worker makes its staging folder, so any folder listed here that is live is already in
+        ``owned``. Reading the jobs first let a plan_add sweep racing start_add delete the new
+        job's folder (review round 2, PR #17, when plan_add started sweeping)."""
+        listed: list[Path] = []
+        for root in {Path(root) for root in roots}:
+            try:
+                listed += list(root.iterdir())
+            except OSError:
+                continue
         with self._lock:
             owned = {
                 self._target_key(job.staging)
@@ -777,18 +799,13 @@ class DownloadManager:
                 if job.staging is not None and job.stage not in _TERMINAL_STAGES
             }
         removed: list[Path] = []
-        for root in {Path(root) for root in roots}:
-            try:
-                entries = list(root.iterdir())
-            except OSError:
+        for entry in listed:
+            if not entry.name.startswith(_STAGING_GLOB) or entry.is_symlink() or not entry.is_dir():
                 continue
-            for entry in entries:
-                if not entry.name.startswith(_STAGING_GLOB) or entry.is_symlink() or not entry.is_dir():
-                    continue
-                if self._target_key(entry) in owned:
-                    continue
-                shutil.rmtree(entry, ignore_errors=True)
-                removed.append(entry)
+            if self._target_key(entry) in owned:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            removed.append(entry)
         return removed
 
     # ---- preview and model catalogue -------------------------------------
@@ -1141,6 +1158,10 @@ class DownloadManager:
             )
         rows = self._read_sums(repo, sums) if fetch else {}
         total = sum(item.size or 0 for item in fetch)
+        # A helper restart's orphaned staging (possibly a half-fetched 19 GB file) holds drive
+        # space the plan would otherwise count as used; it goes before the free space is read,
+        # in both roots, for the plan as well as the start (review round 2, PR #17).
+        self.sweep_staging(folder_root, ninfer_root)
         try:
             free = max(0, int(self._disk_free(root)))
         except (TypeError, ValueError, OSError):
@@ -1275,7 +1296,14 @@ class DownloadManager:
                     job.checks[item.name] = source
                 if want is None:
                     continue
-                if sha256_file(job.staging / item.name, cancelled) != want:
+                digest = sha256_file(job.staging / item.name, cancelled)
+                if item.name.endswith((".safetensors", ".ninfer")) or _NINFER_PART.match(item.name):
+                    # Hashing reads the whole file back into the page cache; drop it again, as
+                    # after the write, or a 19 GB verify refills the RAM the release freed (review
+                    # round 2, PR #17). Chosen over hashing while streaming: that would move the
+                    # hash into every file_fetcher, and the repo's SHA256SUMS is only read later.
+                    release_completed_file(job.staging / item.name)
+                if digest != want:
                     raise ChecksumMismatch(
                         f"{item.name} does not match the checksum the repo publishes, so the download was deleted."
                     )

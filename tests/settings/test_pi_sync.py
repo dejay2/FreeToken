@@ -190,6 +190,26 @@ def test_a_failed_second_write_puts_the_first_file_back(tmp_path, monkeypatch):
     assert not list(folder.glob("*.tmp-freetoken*"))
 
 
+def test_rollback_leaves_a_file_another_editor_changed_and_names_it(tmp_path, monkeypatch):
+    """models.json was replaced, another editor then saved it, then settings.json failed: the
+    rollback must not overwrite the editor's save with the old bytes (review round 2, PR #17)."""
+    folder = write_pi(tmp_path / "agent")
+    real = PiSync._atomic_write.__func__
+    theirs = b'{"providers": {}, "edited": "by hand"}\n'
+
+    def flaky(cls, path, data, temps=None):
+        if path.name == "settings.json":
+            (folder / "models.json").write_bytes(theirs)  # someone saved models.json meanwhile
+            raise PermissionError(13, "Permission denied")
+        real(cls, path, data, temps)
+
+    monkeypatch.setattr(PiSync, "_atomic_write", classmethod(flaky))
+    result = PiSync(folder, now=Clock()).add("small-9b", "Small", "ninfer", ENGINES)
+    assert result["status"] == "not_updated", result
+    assert str(folder / "models.json") in result["message"] and "left as it was" not in result["message"]
+    assert (folder / "models.json").read_bytes() == theirs
+
+
 def test_bytes_that_are_not_utf8_are_never_rewritten(tmp_path):
     folder = write_pi(tmp_path / "agent")
     path = folder / "settings.json"

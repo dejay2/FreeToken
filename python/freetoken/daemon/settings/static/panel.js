@@ -212,7 +212,7 @@ function removedNote(body) {
 if (typeof module !== 'undefined') module.exports = { fmtGB, stateWord, sourceText, dialSourceFor, verdictWords, fitSummary, ramSummary, restartQuestion, nowStripHtml, modelsTableHtml, panelErrorText,
   loadQuestion, unloadQuestion, registryProblemHtml, panelSave, answerRestart, answerConfirm, startNow, loadModel, unloadModel, panel,
   idProblem, detectionText, planSummary, downloadLine, removeQuestion, removeFilesNote, removeOkLabel, ramProblem, piNote, addedNote, removedNote,
-  addState, openAdd, closeAdd, addCheckPath, addValidate, addPlan, addDownload, addCancelDownload, pollAddJob, addSave, openRemove, answerRemove };
+  addState, openAdd, closeAdd, addCheckPath, addValidate, addPlan, addPathEdited, addRepoEdited, wirePanel, addDownload, addCancelDownload, pollAddJob, addSave, openRemove, answerRemove };
 
 /* ---------- browser side: uses index.html's state, json, $, setNotice and dial renderer ---------- */
 const postJson = (url, payload) => json(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload ?? {}) });
@@ -557,6 +557,19 @@ function addValidate() {
   $('add-ram').className = ram ? 'bad' : '';
   $('add-save').disabled = addState.saving || !usable || !!problem || !!ram || !String($('add-name').value ?? '').trim();
 }
+// Typing in the path or link field makes the last answer stale: an Add or Download must never
+// act on a path or repo other than the one on screen, and a check still on its way for the
+// old text is dropped (review round 2, PR #17).
+function addPathEdited() {
+  addState.checkSeq += 1;
+  addReset();
+}
+function addRepoEdited() {
+  addState.planSeq += 1;
+  addState.plan = null;
+  $('add-download').disabled = true;
+  ['add-plan-card', 'add-entry', 'add-download-actions'].forEach((id) => { $(id).hidden = true; });
+}
 async function addPlan() {
   addReset();
   const seq = ++addState.planSeq;
@@ -821,6 +834,8 @@ function wirePanel() {
   document.querySelectorAll('[data-add-source]').forEach((button) => button.addEventListener('click', () => { addReset(); addSource(button.dataset.addSource); }));
   $('add-browse').addEventListener('click', addBrowse);
   $('add-check').addEventListener('click', () => addCheckPath($('add-path').value));
+  $('add-path').addEventListener('input', addPathEdited);
+  $('add-repo').addEventListener('input', addRepoEdited);
   $('add-path').addEventListener('keydown', (event) => { if (event.key === 'Enter') addCheckPath($('add-path').value); });
   $('add-plan').addEventListener('click', () => { $('add-entry').hidden = true; addPlan(); });
   $('add-repo').addEventListener('keydown', (event) => { if (event.key === 'Enter') { $('add-entry').hidden = true; addPlan(); } });

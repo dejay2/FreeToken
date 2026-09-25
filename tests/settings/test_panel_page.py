@@ -708,3 +708,47 @@ def test_saving_holds_the_button_and_older_answers_lose():
   assert.equal(p.addState.plan.entry, 'o/second');
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """)
+
+
+def test_editing_the_path_or_link_drops_the_old_answer():
+    """Review round 2, PR #17: after the path is edited, Add is off and the identity hidden, and a
+    check still on its way is dropped; after the link is edited, Download is off."""
+    _node(_POLL_PAGE + r"""
+const listeners = {};
+const realDollar = global.$;
+global.$ = (id) => { const node = realDollar(id); node.addEventListener = (kind, fn) => { listeners[`${id}:${kind}`] = fn; }; return node; };
+p.wirePanel();
+(async () => {
+  $('add-wizard').hidden = false;
+  await p.addCheckPath('/n/small.ninfer');
+  assert.equal($('add-save').disabled, false);
+  assert.equal($('add-step-identity').hidden, false);
+  $('add-path').value = '/n/other.ninfer'; listeners['add-path:input']();
+  assert.equal($('add-save').disabled, true);
+  assert.equal($('add-step-identity').hidden, true);
+  assert.equal(p.addState.found, null);
+  // A check sent before the edit answers after it: it must not come back.
+  let answer;
+  const realJson = global.json;
+  global.json = (url, options = {}) => url === '/api/panel/add/detect'
+    ? new Promise((resolve) => { answer = () => resolve({response: {ok: true, status: 200}, body: {kind: 'ninfer', path: '/n/small.ninfer', engineLabel: 'NInfer', format: 'NInfer v3 file', bytes: G, already: null, suggested: {id: 'small', name: 'small', ramNeedGB: 2}}}); })
+    : realJson(url, options);
+  const pending = p.addCheckPath('/n/small.ninfer'); await tick();
+  $('add-path').value = '/n/else.ninfer'; listeners['add-path:input']();
+  answer(); await pending;
+  assert.equal(p.addState.found, null);
+  assert.equal($('add-save').disabled, true);
+  assert.equal($('add-step-identity').hidden, true);
+  // The link: a ready plan, then an edit.
+  global.json = async (url) => url === '/api/panel/add/plan'
+    ? {response: {ok: true, status: 200}, body: {repo: 'o/first', kind: 'folder', name: 'x', files: [], totalBytes: G, target: '/t', diskFits: true, exists: false}}
+    : realJson(url);
+  $('add-repo').value = 'o/first'; await p.addPlan();
+  assert.equal($('add-download').disabled, false);
+  $('add-repo').value = 'o/second'; listeners['add-repo:input']();
+  assert.equal($('add-download').disabled, true);
+  assert.equal(p.addState.plan, null);
+  posts.length = 0; await p.addDownload();
+  assert.equal(posts.length, 0, 'a download must not start from the old plan');
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""")

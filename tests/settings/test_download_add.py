@@ -310,6 +310,70 @@ def test_the_streamed_copy_polls_cancel_per_chunk_and_sends_the_token_only_to_th
     assert same_host.get_header("Authorization") == "Bearer hf_secret"
 
 
+def test_streamed_fetch_uses_the_hub_login_token_not_only_hf_token(tmp_path, monkeypatch):
+    """`hf auth login` stores a token file and sets no env var; the stream must send it too
+    (review round 2, PR #17)."""
+    from huggingface_hub import constants
+
+    token_file = tmp_path / "hf-token"
+    token_file.write_text("hf_from_login\n")
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    monkeypatch.delenv("HF_OIDC_RESOURCE", raising=False)
+    monkeypatch.setattr(constants, "HF_TOKEN_PATH", str(token_file))
+    seen: list[Request] = []
+
+    class Response:
+        def read(self, size):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def opener(request, timeout):
+        seen.append(request)
+        return Response()
+
+    dl._stream_hub_file("owner/repo", "file.bin", tmp_path / "file.bin", lambda: False, opener=opener)
+    assert seen[0].get_header("Authorization") == "Bearer hf_from_login"
+
+
+def test_plan_add_sweeps_orphan_staging_in_both_roots_before_reading_free_space(tmp_path):
+    """An orphan half-download holds drive space; the plan must count it as free, not refuse
+    a download that fits once it is gone (review round 2, PR #17)."""
+    r = roots(tmp_path)
+    hub = Hub({"small.ninfer": b"x" * 100})
+    m = manager(tmp_path, hub)
+    orphans = []
+    for root in r.values():
+        orphan = root / ".incoming-download-deadbeef0000"
+        orphan.mkdir()
+        (orphan / "half.ninfer").write_bytes(b"p" * 100)
+        orphans.append(orphan)
+    m._disk_free = lambda _root: 150 - 100 * sum(o.exists() for o in orphans)  # orphans eat the drive
+    plan = m.plan_add("owner/small-repo", **r)
+    assert not any(o.exists() for o in orphans)
+    assert plan["diskFreeBytes"] == 150 and plan["diskFits"] is True
+
+
+def test_each_weight_file_is_released_again_after_its_checksum(tmp_path, monkeypatch):
+    """Hashing reads the file back into the page cache; it must be released after that too."""
+    events: list[tuple[str, str]] = []
+    real_hash = dl.sha256_file
+    monkeypatch.setattr(dl, "sha256_file", lambda path, cancelled=None: (
+        events.append(("hash", Path(path).name)), real_hash(path, cancelled))[1])
+    monkeypatch.setattr(dl, "release_completed_file", lambda path: events.append(("release", Path(path).name)))
+    hub = Hub({"small.ninfer": b"entry" * 10, "small.ninfer.part-0001": b"part" * 5})
+    m, r = manager(tmp_path, hub), roots(tmp_path)
+    assert finish(m, m.start_add("owner/small-repo", **r))["stage"] == "done"
+    for name in ("small.ninfer", "small.ninfer.part-0001"):
+        hashed = events.index(("hash", name))
+        assert ("release", name) in events[hashed + 1:], events
+
+
 def test_hashing_can_be_cancelled_too(tmp_path):
     big = tmp_path / "big.bin"
     big.write_bytes(b"x" * (dl._HASH_CHUNK + 1))

@@ -204,14 +204,21 @@ class PiSync:
                 written.append(path)
             self._prune()
         except _Changed:
-            self._restore(raw, written, temps)
+            restored, edited = self._restore(raw, rendered, written, temps)
+            if edited:
+                return _result("not_updated", self._edited_words(edited), notes)
             raise
         except OSError as exc:
             # A half-applied change (models.json new, settings.json old) would leave Pi listing
             # a model it cannot enable; put back what this change replaced, from its own bytes.
-            restored = self._restore(raw, written, temps)
-            state = "Pi was left as it was" if restored else f"restore it from the backups in {self.agent_dir}"
-            return _result("not_updated", f"Pi's files could not be written ({exc.strerror or exc}); {state}.", notes)
+            restored, edited = self._restore(raw, rendered, written, temps)
+            if edited:
+                state = self._edited_words(edited)
+            elif restored:
+                state = "Pi was left as it was."
+            else:
+                state = f"restore it from the backups in {self.agent_dir}."
+            return _result("not_updated", f"Pi's files could not be written ({exc.strerror or exc}); {state}", notes)
         return _result("updated", "Pi's model list was updated.", notes)
 
     @staticmethod
@@ -219,11 +226,24 @@ class PiSync:
         if path.read_bytes() != original:
             raise _Changed(str(path))
 
-    def _restore(self, raw: Mapping[Path, bytes], written: list[Path], temps: list[Path]) -> bool:
-        """Undo this change's writes (best effort) and drop its own temp files; True when all undone."""
-        ok = True
+    def _edited_words(self, edited: list[Path]) -> str:
+        names = " and ".join(str(path) for path in edited)
+        return (f"Pi's files were not fully updated, and {names} was changed by something else meanwhile, "
+                f"so it was left as it is; check {names} (backups are in {self.agent_dir}).")
+
+    def _restore(self, raw: Mapping[Path, bytes], rendered: Mapping[Path, bytes], written: list[Path],
+                 temps: list[Path]) -> tuple[bool, list[Path]]:
+        """Undo this change's writes (best effort) and drop its own temp files. A file is put
+        back only while it still holds exactly the bytes this change wrote: one another editor
+        changed since is theirs, and is left and named (review round 2, PR #17). Returns (all
+        undone, files left because they changed)."""
+        ok, edited = True, []
         for path in written:
             try:
+                if path.read_bytes() != rendered[path]:
+                    edited.append(path)
+                    ok = False
+                    continue
                 self._atomic_write(path, raw[path], temps)
             except OSError:
                 ok = False
@@ -232,7 +252,7 @@ class PiSync:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
-        return ok
+        return ok, edited
 
     @staticmethod
     def _temp_path(path: Path) -> Path:

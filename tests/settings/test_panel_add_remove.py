@@ -655,3 +655,23 @@ def test_a_folder_named_like_a_part_is_never_deleted(box):
     answer = remove(box, "small_9b", deleteFiles=True)
     assert answer.status_code == 409 and answer.json()["code"] == "files_unsafe", answer.text
     assert (odd / "keep.txt").is_file() and "small_9b" in ids(box)
+
+
+def test_a_symlinked_part_another_model_reads_is_never_deleted(box, tmp_path):
+    """The part is a link; the other model names the link. Checked by target only, the link
+    was deleted and the other model broken (review round 2, PR #17)."""
+    write_v3(box.ninfer / "small_9b.ninfer", parts=1)
+    part = box.ninfer / "small_9b.ninfer.part-0001"
+    store = tmp_path / "store"
+    store.mkdir()
+    part.rename(store / part.name)
+    part.symlink_to(store / part.name)
+    assert add(box, box.ninfer / "small_9b.ninfer").status_code == 200
+    write_v3(box.ninfer / "other.ninfer", part_names=["small_9b.ninfer.part-0001"])
+    doc, rev = box.store.load()
+    doc["models"].append({**find_model(doc, "twin-27b"), "id": "other", "name": "Other",
+                          "artifact": "~/ninfer-work/models/other.ninfer"})
+    box.store.save(doc, expected_revision=rev)
+    answer = remove(box, "small_9b", deleteFiles=True)
+    assert answer.status_code == 409 and answer.json()["code"] == "files_shared", answer.text
+    assert part.is_symlink() and "small_9b" in ids(box)

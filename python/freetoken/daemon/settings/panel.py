@@ -1155,7 +1155,12 @@ class PanelService:
                 raise PanelError(409, "files_unknown", f"{other['name']}'s files could not be read, so it is not "
                                                        "clear which files it uses and nothing was removed. Remove "
                                                        f"{name} without deleting files, or fix {other['name']} first.") from None
-            used += [(Path(os.path.realpath(path)), other["name"]) for path in paths]
+            # Both where each path points and the path as written (its folder resolved, the
+            # name kept): a symlinked part is checked above as the link's own place, so a
+            # target-only list missed a link another model reads (review round 2, PR #17).
+            for path in paths:
+                used.append((Path(os.path.realpath(path)), other["name"]))
+                used.append((Path(os.path.realpath(Path(path).parent)) / Path(path).name, other["name"]))
         for real in targets:
             for other_path, other_name in used:
                 if other_path == real or real in other_path.parents or other_path in real.parents:
