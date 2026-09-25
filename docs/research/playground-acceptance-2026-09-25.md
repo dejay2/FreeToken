@@ -21,3 +21,10 @@ Notes
   over ~20 s, `drop_caches` made no difference); the gate's 5-minute wait covers that.
 - FreeToken's ~11 tok/s on the first answer after a cold boot at a 5 GB cushion is an engine /
   memory observation, not a Test-tab problem; follow up separately.
+
+## Re-check after the two Codex rounds (7f161fb, llama-swap P7 + P8 rebuilt)
+
+| Check | Result |
+|---|---|
+| QUASAR vs Twin with `X-FreeToken-If-Free` chats and `?ifFree=1` loads | pass — Twin load 19.3 s; A 228.7 tok/s, 89 ms; B 142.4 tok/s, 150 ms; QUASAR back in 21.0 s (`playground-recheck.png`) |
+| Stop during "Load Fable" | pass — load ✗ "Stopped." (5.7 s), QUASAR back in 20.4 s, registry/config sha256 unchanged, no marker (`playground-stopped-recheck.png`) |
