@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import time
 from typing import (
     TYPE_CHECKING,
@@ -874,6 +875,35 @@ class Scheduler(SchedulerIOMixin):
             return 0
         return torch.cuda.memory_reserved(self.device)
 
+    def _picture_encode_stream(self):
+        """Where a picture encode runs: the engine stream for an EXL3 tower, unchanged else.
+
+        An EXL3 tower's linears are ``Exl3Linear`` ops. Encoding on ``self.stream`` (the
+        overlap loop's scheduling stream) while the previous batch still runs on
+        ``engine.stream`` would put ExLlamaV3 kernels on two streams at once: they share the
+        wheel's per-device split-K lock / Blackwell barrier buffer (a device deadlock, see
+        kernel/exl3_launch.py) and the dense EXL3 fp16 workspace x16/xh/y16 (a data race).
+        The launch choke point can order eager EXL3 launches but not a CUDA graph REPLAY on the
+        engine stream, and not the workspace copies around each launch, so the encode moves
+        onto the engine stream after the scheduling stream's queued work (hang investigation
+        2026-09-25, H-D). The caller's device synchronise already waits for the in-flight batch,
+        so this costs only the overlap of the encode with that batch.
+
+        bf16 towers (NVFP4 daily) keep today's stream: nothing of theirs shares EXL3 state."""
+        vision_config = getattr(self.config.model_config, "vision_config", None)
+        engine_stream = getattr(self.engine, "stream", None)
+        if not getattr(vision_config, "exl3", False) or engine_stream is None:
+            return contextlib.nullcontext()
+        from freetoken.kernel import exl3_launch
+
+        current = torch.cuda.current_stream(self.device)
+        if current != engine_stream:
+            engine_stream.wait_stream(current)
+        stack = contextlib.ExitStack()
+        stack.enter_context(torch.cuda.stream(engine_stream))
+        stack.enter_context(exl3_launch.scope("picture"))
+        return stack
+
     @torch.inference_mode()
     def _prepare_multimodal_request(self, msg: UserMsg) -> None:
         """Encode one tokenizer-prepared still picture and derive Qwen rotary positions."""
@@ -917,7 +947,8 @@ class Scheduler(SchedulerIOMixin):
             try:
                 # The model owns placement: layer-stream keeps these transport tensors on
                 # CPU, while the backward-compatible GPU path moves them inside encode_images.
-                features = model.encode_images(pixels, grid)
+                with self._picture_encode_stream():
+                    features = model.encode_images(pixels, grid)
                 if features.device.type == "cuda":
                     torch.cuda.synchronize(features.device)
             finally:
