@@ -434,6 +434,13 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self._install_model_weights(config)
+        # Dense EXL3 linears share one fixed fp16 workspace. Allocated here, after the weights
+        # (it sizes itself from the built Exl3Linear tree) and before the post-weights free
+        # snapshot below, so the MoE cache and KV budgets see it as spent and every CUDA graph
+        # captured later binds its fixed addresses. No-op for every other checkpoint.
+        from freetoken.kernel.exl3_linear import prepare_exl3_dense_workspace
+
+        prepare_exl3_dense_workspace(self.model, self.device)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
 

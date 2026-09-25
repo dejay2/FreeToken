@@ -114,6 +114,48 @@ _FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
     ), 16),
 }
 
+# EXL3 checkpoints (turboderp 3.05bpw_h5_ng5) store every quantized linear as four components.
+_EXL3_COMPONENT_SUFFIXES = (".trellis", ".suh", ".svh", ".mul1")
+# Checkpoint part -> nested module path inside the Exl3ColMerged that replaces a bf16 fusion:
+# trellis tensors cannot be concatenated, so each part keeps its own tensors under the merged op.
+_EXL3_NESTED = {
+    ".self_attn.q_proj.": ".self_attn.qkv_proj.q_proj.",
+    ".self_attn.k_proj.": ".self_attn.qkv_proj.k_proj.",
+    ".self_attn.v_proj.": ".self_attn.qkv_proj.v_proj.",
+    ".linear_attn.in_proj_qkv.": ".linear_attn.in_proj_qkvz.in_proj_qkv.",
+    ".linear_attn.in_proj_z.": ".linear_attn.in_proj_qkvz.in_proj_z.",
+    ".mlp.shared_expert.gate_proj.": ".mlp.shared_expert.gate_up_proj.gate_proj.",
+    ".mlp.shared_expert.up_proj.": ".mlp.shared_expert.gate_up_proj.up_proj.",
+}
+# bf16 fusions that still apply to an EXL3 checkpoint: HC as today, and GDN b|a (fp16 in the
+# checkpoint) now that qkv|z are packed separately.
+_EXL3_FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
+    key: value for key, value in _FUSIONS.items() if "hyper_connection" in key
+}
+_EXL3_FUSIONS[".linear_attn.in_proj_ba.weight"] = (
+    (".linear_attn.in_proj_b.weight", ".linear_attn.in_proj_a.weight"), 0)
+
+
+def is_exl3_checkpoint(model_path: str) -> bool:
+    """True when the checkpoint's ``config.json`` declares ``quant_method: exl3``."""
+    folder = download_hf_weight(model_path)
+    try:
+        with open(os.path.join(folder, "config.json"), encoding="utf-8") as fh:
+            quant = json.load(fh).get("quantization_config") or {}
+    except FileNotFoundError:
+        return False
+    return str(quant.get("quant_method") or "").lower() == "exl3"
+
+
+def _exl3_rename(name: str) -> str:
+    """Nest an EXL3 component of a fused projection's part under its merged module."""
+    if not name.endswith(_EXL3_COMPONENT_SUFFIXES):
+        return name
+    for part, nested in _EXL3_NESTED.items():
+        if part in name:
+            return name.replace(part, nested, 1)
+    return name
+
 
 def _rename(raw_name: str, *, include_vision: bool = False) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
@@ -137,10 +179,13 @@ def _rename(raw_name: str, *, include_vision: bool = False) -> str | None:
 
 
 def _try_fuse(
-    name: str, tensor: torch.Tensor, buf: dict[str, dict[int, torch.Tensor]]
+    name: str,
+    tensor: torch.Tensor,
+    buf: dict[str, dict[int, torch.Tensor]],
+    fusions: dict[str, tuple[tuple[str, ...], int]] = _FUSIONS,
 ) -> tuple[str, torch.Tensor] | tuple[()] | None:
     """Buffer a fusion part; return the merged ``(name, tensor)`` once all parts arrive, ``()`` while incomplete, ``None`` if ``name`` is not a fusion part."""
-    for fused_suffix, (parts, pad_to) in _FUSIONS.items():
+    for fused_suffix, (parts, pad_to) in fusions.items():
         for idx, part in enumerate(parts):
             if not name.endswith(part):
                 continue
@@ -178,6 +223,10 @@ def iter_weights(
 
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the
     routed experts are NVFP4 and always come from :func:`load_nvfp4_expert_sources`.
+
+    EXL3 checkpoints (``quant_method: exl3``): the packed ``.trellis/.suh/.svh/.mul1``
+    components pass through unfused, the parts of a bf16 fusion nested under the merged op
+    (:func:`_exl3_rename`); only the HC and GDN ``b|a`` fusions remain (``_EXL3_FUSIONS``).
     """
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
@@ -185,16 +234,20 @@ def iter_weights(
         return
 
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
+    exl3 = is_exl3_checkpoint(model_path)
+    fusions = _EXL3_FUSIONS if exl3 else _FUSIONS
     include_vision = include_vision and vision_load_enabled()
     stream_vision = include_vision and vision_execution_mode() == "layer-stream"
     # ``mmap``: install the picture tensors as zero-copy views over a read-only mapping
     # of their shard extent instead of reading 856 MiB into process RAM. ``None`` means
     # today's resident behaviour -- either the flag says ``ram`` or the mapping was refused.
-    mapped_vision = (
-        open_mmap_vision_weights(model_path)
-        if stream_vision and vision_weights_backing() == "mmap"
-        else None
-    )
+    want_mapped = stream_vision and vision_weights_backing() == "mmap"
+    if want_mapped and exl3:
+        # The mapped view assumes the tower is one contiguous bf16 extent (see
+        # open_mmap_vision_weights); an EXL3 tower interleaves packed int16/fp16 components.
+        logger.info("EXL3 checkpoint: picture weights served from RAM (mmap needs one bf16 extent)")
+        want_mapped = False
+    mapped_vision = open_mmap_vision_weights(model_path) if want_mapped else None
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -221,6 +274,8 @@ def iter_weights(
                 name = _rename(raw_name, include_vision=include_vision)
                 if name is None:
                     continue
+                if exl3:
+                    name = _exl3_rename(name)
                 if mapped_vision is not None and name.startswith("visual."):
                     tensor = mapped_vision.tensor(name)
                 else:
@@ -231,7 +286,7 @@ def iter_weights(
 
                     require_dense_vision_weight(name, tensor)
                 yielded = True
-                fused = _try_fuse(name, tensor, fuse_buf)
+                fused = _try_fuse(name, tensor, fuse_buf, fusions)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
                         yield fused
