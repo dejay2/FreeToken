@@ -29,6 +29,8 @@ from freetoken.message import (
     CacheRebuildReply,
     CacheResidencyMsg,
     CacheResidencyReply,
+    CacheSleepMsg,
+    CacheSleepReply,
     CacheStepMsg,
     CacheStepReply,
     KVDynamicStatusReply,
@@ -62,7 +64,7 @@ from pydantic import BaseModel
 from .args import ServerArgs
 from .anthropic_api import register_anthropic_routes
 from .accounting import AdmissionClosedError, register_accounting_routes
-from .control_api import register_control_routes
+from .control_api import public_state, register_control_routes
 from .openai_api import register_openai_routes
 from .prefix_api import register_prefix_routes
 from .recent_prompts import register_recent_prompt_routes
@@ -93,6 +95,11 @@ logger = init_logger(__name__, "FrontendAPI")
 # operation, and is never subject to this clock. Slightly slow to catch a real wedge beats
 # ever declaring a healthy server dead (it takes the server down until a ten-minute reboot).
 MAINTENANCE_STUCK_S = 600.0
+# How long a chat (or POST /v1/wake) waits for a sleeping engine to wake. The design estimate is
+# 10-33 s (docs/superpowers/specs/2026-09-25-freetoken-sleep-design.md section 2.4); 300 s covers
+# a slow SSD and matches the helper's wait for a whole Stop, and is still well under llama-swap's
+# healthCheckTimeout of 600 s.
+WAKE_WAIT_S = 300.0
 # The event-loop task that applies the limit when nobody polls /health or /v1/cache/status.
 MAINTENANCE_WATCH_INTERVAL_S = 5.0
 
@@ -391,6 +398,13 @@ class FrontendManager:
     _frontend_warm_started: bool = False
     # Event set when not rebuilding; cleared when rebuilding starts
     rebuild_done: asyncio.Event = field(default_factory=asyncio.Event)
+    # Sleep (docs/superpowers/specs/2026-09-25-freetoken-sleep-design.md): True while the engine
+    # has given the card back. Kept apart from maintenance_state so every existing gate keeps its
+    # meaning; control_api.public_state reports "sleeping" when this is set and the engine is
+    # otherwise serving. Only a CacheSleepReply changes it.
+    asleep: bool = False
+    sleep_info: Dict[str, Any] = field(default_factory=dict)
+    _wake_task: Any = None
     _residency_cache: Dict[str, Any] | None = None
     _residency_time: float = 0.0
 
@@ -467,6 +481,28 @@ class FrontendManager:
             )
         return self._allocate_user()
 
+    async def ensure_awake(self, timeout: float = WAKE_WAIT_S) -> str | None:
+        """Wake a sleeping engine for a chat. None once awake, else the 503 reason. Concurrent
+        callers share one wake task, so ten chats arriving together send one wake."""
+        if not self.asleep:
+            return None
+        task = self._wake_task
+        if task is None or task.done():
+            task = self._wake_task = asyncio.ensure_future(dispatch_sleep(self, action="wake", timeout=timeout))
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except asyncio.TimeoutError:
+            return f"server unavailable: waking up took longer than {int(timeout)} s"
+        if result.get("status") == "ok" and not self.asleep:
+            return None
+        return f"server is asleep and could not wake: {result.get('error') or result.get('status')}"
+
+    async def _wake_and_allocate(self, timeout: float) -> int:
+        reason = await self.ensure_awake(max(timeout, WAKE_WAIT_S))
+        if reason is not None:
+            raise AdmissionClosedError(reason)
+        return await self.new_user_async(timeout)
+
     async def wait_until_serving(self, timeout: float = 120.0) -> str | None:
         """The adapters' front-door gate. ``None`` when the engine is serving (after waiting out
         a runtime rebuild, up to ``timeout``); otherwise the 503 reason.
@@ -480,6 +516,12 @@ class FrontendManager:
                 await asyncio.wait_for(self.rebuild_done.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 return f"server unavailable: cache rebuild timed out after {timeout}s"
+        if self.maintenance_state == "serving" and self.asleep:
+            # A chat to a sleeping model wakes it (design section 2.5); a refused wake (a game
+            # holds the card) is the 503 reason, in words Jay can act on.
+            reason = await self.ensure_awake(max(timeout, WAKE_WAIT_S))
+            if reason is not None:
+                return reason
         if self.maintenance_state == "loading":
             return "model is still loading"
         if self.maintenance_state == "failed":
@@ -495,6 +537,8 @@ class FrontendManager:
             )
         if self.maintenance_state == "rebuilding":
             return self._wait_rebuild_and_allocate(timeout=timeout)
+        if self.asleep:
+            return self._wake_and_allocate(timeout)
         return _AwaitableInt(self._allocate_user())
 
     async def new_user_async(self, timeout: float = 120.0) -> int:
@@ -530,6 +574,9 @@ class FrontendManager:
                 continue
             if isinstance(msg, CacheStepReply):
                 self._resolve_step(msg)
+                continue
+            if isinstance(msg, CacheSleepReply):
+                self._resolve_sleep(msg)
                 continue
             if isinstance(msg, CacheResidencyReply):
                 self._resolve_residency(msg)
@@ -627,6 +674,28 @@ class FrontendManager:
                 self.last_rebuild = {**(self.last_rebuild or {}), "moe_cache_size": msg.moe_cache_size}
             self._residency_cache = None
             self._residency_time = 0.0
+        _close_maintenance(self, msg.request_id, failed=(msg.status == "failed"))
+
+    def _resolve_sleep(self, msg: CacheSleepReply) -> None:
+        """A sleep or wake reply (API-dispatched or the scheduler's own auto-wake). The asleep
+        flag follows the scheduler's report of the engine's state after the operation, set
+        BEFORE the gate reopens so a waiter released by it sees the right side of sleep."""
+        if msg.status != "failed":
+            self.asleep = bool(msg.asleep)
+            if msg.status == "ok" and msg.action == "sleep":
+                self.sleep_info = {"since": time.time(), "released_bytes": msg.released_bytes,
+                                   "vram_free_bytes": msg.vram_free_bytes, "sleep_s": msg.elapsed_s}
+            elif msg.status == "ok" and msg.action == "wake":
+                self.sleep_info = {"woke_at": time.time(), "last_wake_s": msg.elapsed_s}
+        fut = self.rebuild_futures.pop(msg.request_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result({
+                "status": msg.status, "action": msg.action, "asleep": bool(msg.asleep),
+                "released_bytes": msg.released_bytes, "vram_free_bytes": msg.vram_free_bytes,
+                "elapsed_s": msg.elapsed_s, "error": msg.error,
+            })
+        if not _reply_matches_open_operation(self, msg.request_id):
+            return
         _close_maintenance(self, msg.request_id, failed=(msg.status == "failed"))
 
     def _note_progress(self, msg: CacheProgressReply) -> None:
@@ -1224,6 +1293,55 @@ async def cache_step(req: CacheStepRequest):
     return JSONResponse(result, status_code=200 if result.get("status") == "ok" else 503)
 
 
+async def dispatch_sleep(state: FrontendManager, *, action: str, timeout: float = WAKE_WAIT_S) -> Dict[str, Any]:
+    """Send a sleep or wake to the scheduler under the maintenance gate and await the reply
+    (the same shape as dispatch_step: requests wait while it runs)."""
+    request_id = str(uuid.uuid4())
+    fut = asyncio.get_running_loop().create_future()
+    state.rebuild_futures[request_id] = fut
+    _open_maintenance(state, request_id, action)
+    try:
+        await state.send_one(CacheSleepMsg(request_id=request_id, action=action))
+    except Exception as e:  # noqa: BLE001
+        state.rebuild_futures.pop(request_id, None)
+        _abort_maintenance(state, request_id)
+        return {"status": "failed", "error": f"failed to dispatch {action}: {e!r}"}
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        # As dispatch_rebuild: the gate stays shut until the reply lands.
+        state.rebuild_futures.pop(request_id, None)
+        return {"status": "timeout", "request_id": request_id}
+
+
+@app.post("/v1/sleep")
+async def sleep_route(timeout: float = 120.0):
+    """Give the graphics card back and keep the model in PC memory (design section 3.2)."""
+    state = get_global_state()
+    if state.maintenance_state in ("loading", "failed"):
+        return JSONResponse({"status": state.maintenance_state, "error": f"engine is {state.maintenance_state}"},
+                            status_code=503)
+    if state.maintenance_state in ("rebuilding", "stopping"):
+        return JSONResponse({"status": "busy", "error": f"engine is {state.maintenance_state}; try again"},
+                            status_code=409)
+    if state.asleep:
+        return {"status": "ok", "asleep": True, "note": "already asleep", **state.sleep_info}
+    result = await dispatch_sleep(state, action="sleep", timeout=timeout)
+    code = {"ok": 200, "busy": 409, "timeout": 504}.get(result.get("status"), 503)
+    return JSONResponse(result, status_code=code)
+
+
+@app.post("/v1/wake")
+async def wake_route(timeout: float = WAKE_WAIT_S):
+    """Wake a sleeping engine (a chat does this by itself); waits out a running operation."""
+    state = get_global_state()
+    was_asleep = state.asleep
+    reason = await state.wait_until_serving(timeout)
+    if reason is None:
+        return {"status": "ok", "asleep": False, "woke": was_asleep, **state.sleep_info}
+    return JSONResponse({"status": "rejected", "asleep": state.asleep, "error": reason}, status_code=503)
+
+
 @app.get("/v1/cache/residency")
 async def cache_residency(timeout: float = 10.0):
     """Report current layer residency, cache sizes, and model-derived ``layer_bytes``."""
@@ -1494,9 +1612,10 @@ async def cache_status():
     inference = check_inference() if callable(check_inference) else None
     return {
         "instance_id": getattr(state, "instance_id", None),
-        "state": state.maintenance_state,
+        "state": public_state(state),
         "inference": inference,
         "maintenance": maintenance,
+        "sleep": {"asleep": bool(getattr(state, "asleep", False)), **(getattr(state, "sleep_info", None) or {})},
         "kv_dynamic": getattr(state, "kv_dynamic_status", None),
         "last_rebuild": state.last_rebuild,
         "geometry": cache_geometry(state),
