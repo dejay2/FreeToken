@@ -32,6 +32,7 @@ llama-swap in engines/llama-swap; the shapes they read are pinned there:
 
 from __future__ import annotations
 
+import copy
 import datetime as _dt
 import http.client
 import json
@@ -42,9 +43,14 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any, Callable, Iterator
 
-from .switcher import DEFAULT_URL
+from .panel import PanelError
+from .playground_speed import AnswerTracker, answer_stats
+from .registry import RegistryCorrupt, RegistryError, RegistryMissing, find_model
+from .swap_config import SwitcherRefused
+from .switcher import DEFAULT_URL, LOADED_STATES, SwitcherError, is_down
 
 # Plan guesses, measured on the RTX 5090 box: a FreeToken boot of Qwen3.8 Flash takes about
 # 2.5 min, an NInfer 27B about 20 s (own switcher part 1 acceptance, 2026-09-24).
@@ -238,3 +244,235 @@ class SwitcherProbe:
         if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
             return None
         return parse_go_time(rows[0].get("timestamp"))
+
+
+# ---- the runner: plan part (Task 4). The run, put-back, stop and recover part follows. ----
+
+ACTIVE = ("running", "stopping", "restoring")
+SAMPLING = (("temperature", "Creativity (temperature)", 0.0, 2.0, False),
+            ("top_p", "Top-p", 0.0, 1.0, False),
+            ("top_k", "Top-k", 0, 200, True))
+STOPPED = "Stopped."
+YIELDED = "Another app asked for a different model, so the test stopped to let it through."
+
+
+class PlaygroundError(RuntimeError):
+    def __init__(self, status: int, code: str, message: str, extra: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.status, self.payload = status, {"code": code, "message": message, **(extra or {})}
+
+
+class _Halt(Exception):
+    """Ends a test early; kind becomes the job's status: failed, stopped or yielded."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind, self.message = kind, message
+
+
+def _thread(fn: Callable[..., Any], *args: Any) -> None:
+    threading.Thread(target=fn, args=args, name="playground-test", daemon=True).start()
+
+
+def _now_iso() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _header(row: dict[str, Any], name: str) -> str:
+    headers = row.get("req_headers") if isinstance(row.get("req_headers"), dict) else {}
+    for key, value in headers.items():
+        if str(key).lower() == name.lower():
+            return str(value)
+    return ""
+
+
+def _seconds(ms: int) -> str:
+    if ms < 60_000:
+        return f"{ms / 1000:.1f} s"
+    total = round(ms / 1000)
+    return f"{total // 60} min {total % 60} s"
+
+
+class PlaygroundRunner:
+    """One test at a time; the job dict is what GET /api/playground/runs/current returns."""
+
+    def __init__(self, panel: Any, *, chat: Any = None, probe: Any = None,
+                 spawn: Callable[..., None] | None = None, clock: Callable[[], float] = time.monotonic,
+                 wall: Callable[[], float] = time.time) -> None:
+        self.panel, self.switcher = panel, panel.switcher
+        self.chat = chat if chat is not None else SwitcherChat()
+        self.probe = probe if probe is not None else SwitcherProbe()
+        self._spawn = spawn or _thread
+        self._clock, self._wall = clock, wall
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self.job: dict[str, Any] | None = None
+        self._session = ""
+        self._loading: str | None = None
+        self._ours: str | None = None  # the model this test loaded last
+        self._own_last: dict[str, float] = {}
+        self._aliases: dict[str, set[str]] = {}
+        self._labels: dict[str, str] = {}
+
+    # ---- reading ----
+    def _doc(self) -> dict[str, Any]:
+        try:
+            doc, _ = self.panel.store.load()
+        except RegistryMissing:
+            raise PlaygroundError(409, "registry_missing",
+                                  "The control panel has no model list yet. Copy today's settings first.") from None
+        except RegistryCorrupt as exc:
+            raise PlaygroundError(409, "registry_corrupt", exc.message) from None
+        self._aliases = {m["id"]: {m["id"], *(m.get("aliases") or [])} for m in doc["models"]}
+        self._labels = {m["id"]: m["name"] for m in doc["models"]}
+        return doc
+
+    def _name(self, model_id: str | None) -> str:
+        return self._labels.get(model_id or "", model_id or "")
+
+    def _others_using(self, model_id: str) -> bool | None:
+        """True when another app has a request in flight on model_id (by id or alias); None
+        when llama-swap cannot tell. The test's own requests carry its session header."""
+        rows = self.probe.inflight()
+        if rows is None:
+            return None
+        names = self._aliases.get(model_id, {model_id})
+        return any(str(row.get("model")) in names
+                   and not (self._session and _header(row, SESSION_HEADER) == self._session) for row in rows)
+
+    def _card(self) -> str | None:
+        running = self.switcher.running()
+        if running is None:
+            raise PlaygroundError(503, "switcher_unknown", "Can't tell which model is loaded right now. Try again in a moment.")
+        if is_down(running):
+            raise PlaygroundError(503, "switcher_down", "The model switcher is not running.")
+        if any(state not in ("ready", "stopped", "shutdown") for state in running.values()):
+            raise PlaygroundError(409, "loading", "A model is loading or unloading right now. Try again when it has finished.")
+        ready = sorted(model for model, state in running.items() if state == "ready")
+        return ready[0] if ready else None
+
+    # ---- the request ----
+    def _request(self, body: dict[str, Any], doc: dict[str, Any]) -> dict[str, Any]:
+        prompt = str(body.get("prompt") or "").strip()
+        if not prompt:
+            raise PlaygroundError(422, "prompt", "Type a prompt first.")
+        if len(prompt) > MAX_PROMPT_CHARS:
+            raise PlaygroundError(422, "prompt", f"The prompt is too long: at most {MAX_PROMPT_CHARS:,} characters.")
+        system = str(body.get("system") or "").strip()
+        if len(system) > MAX_SYSTEM_CHARS:
+            raise PlaygroundError(422, "system", f"The system message is too long: at most {MAX_SYSTEM_CHARS:,} characters.")
+        raw = body.get("sides")
+        if not isinstance(raw, list) or not 1 <= len(raw) <= 2:
+            raise PlaygroundError(422, "sides", "Pick one or two setups.")
+        sides = [self._side(key, item if isinstance(item, dict) else {}, doc) for key, item in zip("AB", raw)]
+        return {"prompt": prompt, "system": system, "sides": sides,
+                "warmup": bool(body.get("warmup", True)), "putBack": bool(body.get("putBack", True))}
+
+    def _side(self, key: str, item: dict[str, Any], doc: dict[str, Any]) -> dict[str, Any]:
+        model_id = str(item.get("model") or "")
+        try:
+            model = find_model(doc, model_id)
+        except KeyError:
+            raise PlaygroundError(422, "model", f"Setup {key}: pick a model.") from None
+        preset = item.get("preset") or None
+        if preset is not None and preset not in (model.get("presets") or {}):
+            raise PlaygroundError(422, "preset", f"Setup {key}: the preset “{preset}” no longer exists.")
+        sampling: dict[str, Any] = {}
+        for name, label, low, high, whole in SAMPLING:
+            value = item.get(name)
+            if value is None or value == "":
+                continue
+            try:
+                number = int(value) if whole else float(value)
+            except (TypeError, ValueError):
+                raise PlaygroundError(422, name, f"Setup {key}: {label} must be a number.") from None
+            if isinstance(value, bool) or not low <= number <= high:
+                raise PlaygroundError(422, name, f"Setup {key}: {label} must be between {low:g} and {high:g}.")
+            sampling[name] = number
+        try:
+            tokens = int(item.get("maxTokens", DEFAULT_ANSWER_TOKENS))
+        except (TypeError, ValueError):
+            tokens = 0
+        if not 1 <= tokens <= MAX_ANSWER_TOKENS:
+            raise PlaygroundError(422, "maxTokens",
+                                  f"Setup {key}: Longest answer must be between 1 and {MAX_ANSWER_TOKENS:,} tokens.")
+        sampling["max_tokens"] = tokens
+        return {"key": key, "model": model_id, "name": model["name"], "engine": model["engine"], "preset": preset,
+                "runPreset": self.panel.test_preset_key(model_id, preset),
+                "settingsLabel": f"preset “{preset}”" if preset else "Saved settings",
+                "sampling": sampling, "answer": "", "reasoning": "", "stats": None, "loadMs": None, "error": None}
+
+    # ---- the plan ----
+    def _steps(self, sides: list[dict[str, Any]], before: str | None, held: bool, warmup: bool, put_back: bool,
+               engines: dict[str, str]) -> list[dict[str, Any]]:
+        """The steps the job walks. A setup already on the card on the right settings is not
+        reloaded; a model on "old settings until the next load" (held) always is."""
+        steps: list[dict[str, Any]] = []
+        current: tuple[str | None, str | None] = (before, "(held)" if held else None)
+
+        def add(kind: str, side: str | None, model: str | None, preset: str | None, label: str, guess: int) -> None:
+            steps.append({"kind": kind, "side": side, "model": model, "preset": preset, "label": label,
+                          "guessS": guess, "state": "waiting", "ms": None, "detail": ""})
+
+        for side in sides:
+            key, model, preset = side["key"], side["model"], side["runPreset"]
+            if current != (model, preset):
+                if current[0] is not None:
+                    add("unload", key, current[0], None, f"Put away {self._name(current[0])}",
+                        UNLOAD_GUESS_S[engines[current[0]]])
+                words = f"preset “{preset}”" if preset else "saved settings"
+                add("settings", key, model, preset, f"Use {words} for {side['name']}", 0)
+                add("load", key, model, preset, f"Load {side['name']}", LOAD_GUESS_S[side["engine"]])
+                current = (model, preset)
+            if warmup:
+                add("warmup", key, model, preset, f"Warm up {side['name']} (not counted)", 5)
+            add("answer", key, model, preset, f"Answer with setup {key}", 30)
+        guess = 0
+        if current != (before, None):
+            if current[0] is not None and (put_back or current[1] is not None or before is None):
+                guess += UNLOAD_GUESS_S[engines[current[0]]]
+            if put_back and before is not None:
+                guess += LOAD_GUESS_S[engines[before]]
+        label = f"Put things back: {self._name(before)} on its saved settings" if before and put_back else "Put things back"
+        add("restore", None, before, None, label, guess)
+        return steps
+
+    def plan(self, body: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if self.job is not None and self.job["status"] in ACTIVE:
+                raise PlaygroundError(409, "test_running", "A test is already running.")
+        doc = self._doc()
+        request = self._request(body, doc)
+        before = self._card()
+        held = before is not None and before in self.panel.held_models()
+        engines = {m["id"]: m["engine"] for m in doc["models"]}
+        if before is not None:
+            busy = self._others_using(before)
+            if busy is None:
+                raise PlaygroundError(503, "switcher_unknown",
+                                      "Can't tell whether the loaded model is busy. Try again in a moment.")
+            if busy:
+                raise PlaygroundError(409, "in_use",
+                                      f"{self._name(before)} is answering something right now. Try again when it's done.")
+        steps = self._steps(request["sides"], before, held, request["warmup"], request["putBack"], engines)
+        warnings: list[str] = []
+        if before is not None and any(step["kind"] == "unload" and step["model"] == before for step in steps):
+            used, own = self.probe.last_used(before), self._own_last.get(before)
+            # The test's own requests show up in the activity list too; they end before own.
+            if used is not None and (own is None or used > own + 2) and self._wall() - used < RECENT_USE_S:
+                seconds = max(1, round(self._wall() - used))
+                warnings.append(f"{self._name(before)} was used {seconds} seconds ago. The test will put it away.")
+        return {**request, "before": before, "held": held, "steps": steps,
+                "estimateS": sum(step["guessS"] for step in steps), "warnings": warnings}
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            if self.job is None:
+                return {"status": "idle"}
+            out = copy.deepcopy(self.job)
+            now = self._clock()
+        for step in out["steps"]:
+            started = step.pop("_t0", None)
+            if step["state"] == "running" and started is not None:
+                step["elapsedMs"] = max(0, round((now - started) * 1000))
+        return out
