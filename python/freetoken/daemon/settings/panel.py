@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import errno
 import json
+import logging
 import math
 import os
 import shutil
@@ -70,8 +72,16 @@ from .registry_import import ImportRefused, import_live
 from .swap_config import HEADER, SwitcherRefused, config_sha256, extract_model_blocks, profile_id, render_config
 from .switcher import LOADED_STATES, SwitcherError, is_down
 
+logger = logging.getLogger("freetoken.daemon.settings.panel")
+
 GIB = 1024 ** 3
 PROFILE_NOTE = "Control panel settings for this model"
+# A download's staging folder (download.py places files as .incoming-<id> beside the target and
+# renames at the end): a half-written file there must not be added.
+STAGING_PREFIX = ".incoming-"
+STAGING_MESSAGE = ("That is inside a download's staging folder, so it may be half-written. Wait for the "
+                   "download to finish, then add the finished file or folder.")
+NOT_FOUND_MESSAGE = "That model is no longer in the list. Reload the page."
 IMPORT_UNKNOWN_MESSAGE = ("Can't tell whether a model is loaded right now, so the import would risk "
                           "restarting it. Try again in a moment.")
 REWRITE_UNKNOWN_MESSAGE = ("Can't tell whether a model is loaded right now, so this could restart it. "
@@ -205,6 +215,36 @@ def default_add_roots() -> dict[str, Path]:
     home = Path.home()
     return {"folder": Path(os.environ.get("FREETOKEN_MODELS_DIR") or home / "models"),
             "ninfer": Path(os.environ.get("FREETOKEN_NINFER_MODELS_DIR") or home / "ninfer-work" / "models")}
+
+
+def _in_staging(path: str) -> bool:
+    text = str(path or "").strip().strip('"').strip("'")
+    if not text:
+        return False
+    return any(part.startswith(STAGING_PREFIX) for part in Path(os.path.abspath(os.path.expanduser(text))).parts)
+
+
+def _is_network_error(exc: BaseException) -> bool:
+    """Hub, HTTP and socket errors, told apart from a local OSError without importing the
+    Hub: ConnectionError and TimeoutError are OSError subclasses, so they go first."""
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    for klass in type(exc).__mro__:
+        module = klass.__module__ or ""
+        if module.split(".")[0] in ("huggingface_hub", "requests", "urllib3", "urllib", "http", "socket", "ssl"):
+            return True
+    return False
+
+
+def _after_save(step: str, fn: Callable[[], dict[str, Any]], fallback: Mapping[str, Any],
+                words: str) -> dict[str, Any]:
+    """Run one step that follows a completed add/remove. The list change already happened,
+    so a failure here is reported in the response, never raised into a 500 (review round)."""
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001 - reported, the add/remove itself succeeded
+        logger.exception("%s failed after the list was saved", step)
+        return {**fallback, "message": f"{words} ({exc.__class__.__name__}: {exc})."}
 
 
 def _home_path(path: str) -> str:
@@ -341,7 +381,11 @@ class PanelService:
 
     # ---- the one save path ----
     def _save(self, mutate: Callable[[dict], dict], revision: str | None, when_loaded: str | None,
-              extra: Callable[[dict, dict], dict] | None = None) -> dict[str, Any]:
+              extra: Callable[[dict, dict], dict] | None = None,
+              before_commit: Callable[[], None] | None = None) -> dict[str, Any]:
+        """``before_commit`` runs after every check (registry, model limits, --check-config)
+        and right before the registry is written: remove_model puts a loaded model away there,
+        so a remove that the checks refuse never unloads it first (review round)."""
         if when_loaded not in (None, "restart", "next-time"):
             raise RegistryValidationError([{"field": "whenLoaded", "message": "Choose restart or next-time."}])
         with self._lock:
@@ -392,6 +436,8 @@ class PanelService:
             new_text = render_config(proposed, holds)
             staged = self.writer.check(new_text) if new_text != old_text else None
             try:
+                if before_commit is not None:
+                    before_commit()
                 self._unload_for_restart(proposed, restarting)
                 new_revision = self.store.save(proposed, expected_revision=current_revision)
             except BaseException:
@@ -917,6 +963,10 @@ class PanelService:
 
     def detect_path(self, path: str) -> dict[str, Any]:
         doc, _ = self.store.load()
+        if _in_staging(path):
+            found = detect("", taken=())  # the unsupported shape, with the reason swapped in
+            found.update(path=str(path).strip(), reason=STAGING_MESSAGE, already=None)
+            return found
         found = detect(path, taken=self._taken(doc))
         found["already"] = self._already(doc, found["path"]) if found["kind"] != "unsupported" else None
         return found
@@ -933,8 +983,19 @@ class PanelService:
             raise PanelError(422, "bad_link", str(exc)) from exc
         except DownloadConflict as exc:
             raise PanelError(409, "download_conflict", str(exc)) from exc
-        except Exception as exc:  # noqa: BLE001 - the Hub's own errors (no such repo, no network), in plain words
-            raise PanelError(502, "hub_error", f"Couldn't read that repo from Hugging Face: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - told apart below; nothing here may escape as a bare 500
+            if _is_network_error(exc):
+                # The Hub's own errors (no such repo, gated, no network), in plain words.
+                raise PanelError(502, "hub_error", f"Couldn't read that repo from Hugging Face: {exc}") from exc
+            if isinstance(exc, OSError):
+                # A local file problem is not the Hub's fault: a full disk is 507, the rest 500.
+                full = exc.errno in (errno.ENOSPC, errno.EDQUOT)
+                where = self.add_roots["folder"]
+                raise PanelError(507 if full else 500, "write_failed",
+                                 f"Couldn't write to {where}: {exc.strerror or exc}.") from exc
+            logger.exception("the download planner failed (%s)", method)
+            raise PanelError(500, "add_failed", "Something went wrong preparing that download. "
+                                                "Check the helper log for the details.") from exc
 
     def plan_download(self, link: str, entry: str | None = None) -> dict[str, Any]:
         return self._hub("plan_add", link, entry)
@@ -959,6 +1020,8 @@ class PanelService:
             doc, current_revision = self.store.load()
             if revision != current_revision:
                 raise StaleRevision("The model list was changed somewhere else.")
+            if _in_staging(path):
+                raise PanelError(422, "not_supported", STAGING_MESSAGE)
             found = detect(path, taken=self._taken(doc))
             if found["kind"] == "unsupported":
                 raise PanelError(422, "not_supported", found["reason"])
@@ -995,9 +1058,13 @@ class PanelService:
 
             result = self._save(mutate, current_revision, None)
             engines = {m["id"]: m["engine"] for m in doc["models"]}
-            result.update(status="added", id=model_id, name=name, adjusted=adjusted,
-                          pi=self.pi.add(model_id, name, entry["engine"], engines))
-            return result
+            result.update(status="added", id=model_id, name=name, adjusted=adjusted)
+        # Pi's files live on /mnt/c, which is slow: written after the lock is released, from
+        # values captured inside it, so other panel requests are not held up (review round).
+        result["pi"] = _after_save("Pi add", lambda: self.pi.add(model_id, name, entry["engine"], engines),
+                                   {"status": "not_updated", "notes": []},
+                                   "The model was added, but Pi's list could not be updated")
+        return result
 
     def _check_deletable(self, doc: Mapping[str, Any], model: Mapping[str, Any], files: list[str]) -> None:
         """Runs before anything changes. Only the model's own files: a NInfer entry or part, or
@@ -1031,11 +1098,16 @@ class PanelService:
 
     @staticmethod
     def _delete_files(files: list[str]) -> dict[str, Any]:
-        gone, failed = [], []
+        """A symlinked entry or folder loses only the link: the files it points to may be
+        another copy's, or on a drive the panel was never asked to touch (review round)."""
+        gone, links, failed = [], [], []
         for item in files:
             path = Path(item)
             try:
-                if path.is_symlink() or path.is_file():
+                if path.is_symlink():
+                    path.unlink()
+                    links.append(str(path))
+                elif path.is_file():
                     path.unlink()
                 elif path.is_dir():
                     shutil.rmtree(path)
@@ -1043,46 +1115,95 @@ class PanelService:
             except OSError as exc:
                 failed.append(f"{path} ({exc.strerror or exc})")
         if failed:
-            return {"deleted": False, "paths": gone,
+            return {"deleted": False, "paths": gone, "links": links,
                     "message": "The model was removed, but some of its files could not be deleted: " + "; ".join(failed) + "."}
-        return {"deleted": True, "paths": gone, "message": "Its files were deleted."}
+        if links:
+            kept = ", ".join(links)
+            if len(links) == len(gone):
+                message = f"{kept}: the link was removed; the files it points to were kept."
+            else:
+                message = f"Its files were deleted. {kept}: the link was removed; the files it points to were kept."
+            return {"deleted": True, "paths": gone, "links": links, "message": message}
+        return {"deleted": True, "paths": gone, "links": links, "message": "Its files were deleted."}
 
     def _drop_profile(self, model: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Runs after the list is saved: nothing here may raise, so each step reports instead
+        (a bad profiles file, or a boot file the helper cannot read when it moves back)."""
         if model["engine"] != "freetoken":
             return None
         try:
             result = self.profiles.delete(profile_id(model["id"]))
         except ProfileError as exc:
             return {"deleted": False, "message": f"Its FreeToken settings profile could not be deleted: {exc}"}
+        except Exception as exc:  # noqa: BLE001 - the model is already off the list
+            logger.exception("profile delete failed after the list was saved")
+            return {"deleted": False, "message": "Its FreeToken settings profile could not be deleted "
+                                                 f"({exc.__class__.__name__}: {exc})."}
+        out = {"deleted": bool(result.get("deleted"))}
         if result.get("deleted") and result.get("activeProfileId") and result.get("bootFilePath") and self.profile_deleted:
-            self.profile_deleted(result)
-        return {"deleted": bool(result.get("deleted"))}
+            try:
+                self.profile_deleted(result)
+            except Exception as exc:  # noqa: BLE001 - the profile is gone; the helper stays on its current boot file
+                logger.exception("moving the helper off the deleted profile failed")
+                out["message"] = ("Its profile was deleted, but the helper could not move back to the default "
+                                  f"boot file ({exc.__class__.__name__}: {exc}). Pick a profile on the Server tab.")
+        return out
 
     def remove_model(self, model_id: str, delete_files: bool, revision: str | None) -> dict[str, Any]:
         with self._lock:
             doc, current_revision = self.store.load()
             if revision != current_revision:
                 raise StaleRevision("The model list was changed somewhere else.")
-            model = find_model(doc, model_id)
+            try:
+                model = find_model(doc, model_id)
+            except KeyError:
+                raise PanelError(404, "not_found", NOT_FOUND_MESSAGE) from None
+            name = model["name"]
             files = model_files(model["engine"], model["artifact"]) if delete_files else []
             if delete_files:
                 self._check_deletable(doc, model, files)
             known, _down = self._ask()
             if known is None:
-                raise PanelError(503, "switcher_unknown", f"Can't tell whether {model['name']} is loaded right now, "
+                raise PanelError(503, "switcher_unknown", f"Can't tell whether {name} is loaded right now, "
                                                           "so it was not removed. Try again in a moment.")
-            if model_id in known and not self.switcher.unload(model_id):
-                raise PanelError(503, "unload_failed", f"Couldn't put {model['name']} away, so nothing was removed. "
-                                                       "Try again in a moment.")
+            unloaded = False
+
+            def put_away() -> None:
+                # Runs inside _save once every check has passed, so a remove the checks refuse
+                # (a limit, --check-config) never pulls the model out first (review round).
+                nonlocal unloaded
+                if model_id in known:
+                    if not self.switcher.unload(model_id):
+                        raise PanelError(503, "unload_failed", f"Couldn't put {name} away, so nothing was removed. "
+                                                               "Try again in a moment.")
+                    unloaded = True
 
             def mutate(proposed: dict) -> dict:
                 proposed["models"] = [m for m in proposed["models"] if m["id"] != model_id]
                 return proposed
 
-            result = self._save(mutate, current_revision, None)
-            result.update(status="removed", id=model_id, name=model["name"], profile=self._drop_profile(model),
-                          files=self._delete_files(files) if delete_files else None, pi=self.pi.remove(model_id))
-            return result
+            try:
+                result = self._save(mutate, current_revision, None, before_commit=put_away)
+            except PanelError:
+                raise
+            except Exception as exc:
+                if not unloaded:
+                    raise
+                logger.exception("the list could not be saved after %s was put away", model_id)
+                raise PanelError(500, "remove_failed", f"{name} was put away but not removed ({exc}). "
+                                                       "It is still in the list; try again in a moment.") from exc
+            result.update(status="removed", id=model_id, name=name)
+            result["profile"] = _after_save("profile delete", lambda: self._drop_profile(model),
+                                            {"deleted": False},
+                                            "Its FreeToken settings profile could not be deleted")
+            result["files"] = _after_save("file delete", lambda: self._delete_files(files),
+                                          {"deleted": False, "paths": [], "links": []},
+                                          "The model was removed, but its files could not be deleted") if delete_files else None
+        # Pi (slow /mnt/c) after the lock is released, like add_model.
+        result["pi"] = _after_save("Pi remove", lambda: self.pi.remove(model_id),
+                                   {"status": "not_updated", "notes": []},
+                                   "The model was removed, but Pi's list could not be updated")
+        return result
 
     # ---- holds and start-up ----
     def release_finished_holds(self) -> list[str]:

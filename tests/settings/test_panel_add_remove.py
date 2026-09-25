@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from freetoken.daemon.settings.app import create_app
-from freetoken.daemon.settings.boot_parser import BootFile
+from freetoken.daemon.settings.boot_parser import BootFile, BootParseError
 from freetoken.daemon.settings.download import DownloadManager
 from freetoken.daemon.settings.panel import PanelService
 from freetoken.daemon.settings.pi_sync import PROVIDER, PiSync
@@ -53,7 +54,7 @@ def box(tmp_path, monkeypatch):
     pi_dir = write_pi(tmp_path / "pi")
     hub = Hub({})
     downloads = DownloadManager(models, api_factory=hub, config_fetcher=lambda _: hub.config or {},
-                                snapshot_downloader=hub.snapshot, pc_memory=64 * GIB, card_memory=32 * GIB,
+                                file_fetcher=hub.fetch, pc_memory=64 * GIB, card_memory=32 * GIB,
                                 disk_free=lambda _: 10 ** 12)
     service = PanelService(
         store=store, writer=writer, switcher=switcher, profiles=profiles,
@@ -323,3 +324,193 @@ def test_link_errors_are_plain(box):
     answer = box.client.post("/api/panel/add/plan", json={"link": "owner/nothing"})
     assert answer.status_code == 422 and "not supported by your engines" in answer.json()["message"]
     assert box.client.get("/api/panel/add/downloads/nope").status_code == 404
+
+
+# ---- review round: steps after the save, symlinks, staging folders, order of checks ----
+def lock_free_probe(box, calls):
+    """A Pi stand-in whose add/remove report whether the panel lock was free at the time.
+    Only another thread can tell: an RLock re-enters for the thread that holds it."""
+    def probe(*_args, **_kwargs):
+        seen = []
+
+        def look():
+            got = box.service._lock.acquire(blocking=False)
+            if got:
+                box.service._lock.release()
+            seen.append(got)
+        worker = threading.Thread(target=look)
+        worker.start()
+        worker.join(2)
+        calls.append(seen[0])
+        return {"status": "updated", "message": "", "notes": []}
+    return SimpleNamespace(add=probe, remove=probe)
+
+
+def test_pi_add_raising_does_not_undo_the_add(box, monkeypatch):
+    def boom(*_a, **_k):
+        raise TypeError("Pi's models.json holds a list where a dict was expected")
+    monkeypatch.setattr(box.service.pi, "add", boom)
+    write_v2(box.ninfer / "small_9b.ninfer")
+    answer = add(box, box.ninfer / "small_9b.ninfer")
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["status"] == "added" and "small_9b" in ids(box)
+    assert answer.json()["pi"]["status"] == "not_updated" and "Pi" in answer.json()["pi"]["message"]
+
+
+def test_pi_remove_raising_does_not_undo_the_remove(box, monkeypatch):
+    def boom(*_a, **_k):
+        raise OSError(5, "Input/output error")
+    monkeypatch.setattr(box.service.pi, "remove", boom)
+    answer = remove(box, "quasar-27b")
+    assert answer.status_code == 200, answer.text
+    assert "quasar-27b" not in ids(box)
+    assert answer.json()["pi"]["status"] == "not_updated" and "Input/output error" in answer.json()["pi"]["message"]
+
+
+def test_profile_delete_raising_does_not_undo_the_remove(box, monkeypatch):
+    box.service._ensure_profiles(box.store.load()[0])
+
+    def boom(*_a, **_k):
+        raise OSError(13, "Permission denied")
+    monkeypatch.setattr(box.profiles, "delete", boom)
+    answer = remove(box, "qwen3.8-flash")
+    assert answer.status_code == 200, answer.text
+    assert "qwen3.8-flash" not in ids(box)
+    profile = answer.json()["profile"]
+    assert profile["deleted"] is False and "Permission denied" in profile["message"]
+
+
+def test_a_failing_boot_switch_after_the_profile_delete_is_reported_not_raised(box):
+    box.service._ensure_profiles(box.store.load()[0])
+    assert box.client.post("/api/profiles/model-qwen3.8-flash/activate").status_code == 200
+
+    def boom(_result):
+        raise BootParseError("boot-2020.ps1: no launcher line")
+    box.service.profile_deleted = boom
+    answer = remove(box, "qwen3.8-flash")
+    assert answer.status_code == 200, answer.text
+    assert "qwen3.8-flash" not in ids(box) and box.profiles.get("model-qwen3.8-flash") is None
+    profile = answer.json()["profile"]
+    assert profile["deleted"] is True and "no launcher line" in profile["message"]
+
+
+def test_deleting_a_symlinked_model_removes_only_the_link(box, tmp_path):
+    store = tmp_path / "store"
+    store.mkdir()
+    write_v2(store / "small_9b.ninfer")
+    link = box.ninfer / "small_9b.ninfer"
+    link.symlink_to(store / "small_9b.ninfer")
+    assert add(box, link).status_code == 200
+    answer = remove(box, "small_9b", deleteFiles=True)
+    assert answer.status_code == 200, answer.text
+    assert not link.is_symlink() and (store / "small_9b.ninfer").is_file()
+    files = answer.json()["files"]
+    assert files["deleted"] is True and "the link was removed; the files it points to were kept" in files["message"]
+    assert "were deleted" not in files["message"]
+
+
+def test_a_symlinked_folder_model_keeps_its_target(box, tmp_path):
+    target = write_folder(tmp_path / "store" / "Tiny-Llama", max_position_embeddings=8192)
+    link = box.models / "Tiny-Llama"
+    link.symlink_to(target)
+    assert add(box, link, id="tiny-llama", name="Tiny Llama", ramNeedGB=2).status_code == 200
+    answer = remove(box, "tiny-llama", deleteFiles=True)
+    assert answer.status_code == 200, answer.text
+    assert not link.exists() and not link.is_symlink() and (target / "config.json").is_file()
+    assert "the link was removed" in answer.json()["files"]["message"]
+
+
+def test_a_download_staging_folder_is_refused(box):
+    staging = box.ninfer / ".incoming-abc123"
+    staging.mkdir()
+    write_v2(staging / "small_9b.ninfer")
+    found = box.client.post("/api/panel/add/detect", json={"path": str(staging / "small_9b.ninfer")}).json()
+    assert found["kind"] == "unsupported" and "download" in found["reason"] and found["already"] is None
+    answer = add(box, staging / "small_9b.ninfer")
+    assert answer.status_code == 422 and answer.json()["code"] == "not_supported"
+    assert "download" in answer.json()["message"] and "small_9b" not in ids(box)
+
+
+def test_a_remove_the_switcher_would_refuse_unloads_nothing(box):
+    box.switcher.states = {"quasar-27b": "ready"}
+    box.service.writer._runner = checker(ok=False)
+    before, text = box.store.load()[1], box.cfg.read_text()
+    answer = remove(box, "quasar-27b")
+    assert answer.status_code == 422 and answer.json()["code"] == "switcher_refused"
+    assert box.switcher.calls == [], "the model must not be put away before the checks pass"
+    assert box.store.load()[1] == before and box.cfg.read_text() == text and "quasar-27b" in pi_ids(box)
+
+
+def test_a_failure_after_the_unload_says_the_model_was_put_away(box, monkeypatch):
+    box.switcher.states = {"quasar-27b": "ready"}
+
+    def boom(*_a, **_k):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(box.store, "save", boom)
+    answer = remove(box, "quasar-27b")
+    assert answer.status_code == 500, answer.text
+    assert box.switcher.calls == [("unload", "quasar-27b")]
+    message = answer.json()["message"]
+    assert "put away" in message and "not removed" in message and "No space left" in message
+    assert "quasar-27b" in ids(box)
+
+
+def test_hub_errors_are_told_apart(box, monkeypatch):
+    def raising(exc):
+        def model_info(*_a, **_k):
+            raise exc
+        return model_info
+    monkeypatch.setattr(box.hub, "model_info", raising(OSError(28, "No space left on device")))
+    answer = box.client.post("/api/panel/add/plan", json={"link": "owner/small-9b"})
+    assert answer.status_code == 507, answer.text
+    assert answer.json()["message"].startswith(f"Couldn't write to {box.models}") and "Hugging Face" not in answer.json()["message"]
+    monkeypatch.setattr(box.hub, "model_info", raising(OSError(13, "Permission denied")))
+    answer = box.client.post("/api/panel/add/plan", json={"link": "owner/small-9b"})
+    assert answer.status_code == 500 and "Permission denied" in answer.json()["message"]
+    monkeypatch.setattr(box.hub, "model_info", raising(RuntimeError("a bug in the planner")))
+    answer = box.client.post("/api/panel/add/plan", json={"link": "owner/small-9b"})
+    assert answer.status_code == 500 and answer.json()["code"] == "add_failed"
+    assert "Hugging Face" not in answer.json()["message"] and "a bug in the planner" not in answer.json()["message"]
+    monkeypatch.setattr(box.hub, "model_info", raising(ConnectionError("Name or service not known")))
+    answer = box.client.post("/api/panel/add/plan", json={"link": "owner/small-9b"})
+    assert answer.status_code == 502 and answer.json()["code"] == "hub_error" and "Hugging Face" in answer.json()["message"]
+
+
+def test_removing_an_unknown_model_says_reload(box):
+    answer = remove(box, "gone")
+    assert answer.status_code == 404 and answer.json()["code"] == "not_found"
+    assert answer.json()["message"] == "That model is no longer in the list. Reload the page."
+
+
+def test_pi_is_called_after_the_lock_is_released(box):
+    calls = []
+    box.service.pi = lock_free_probe(box, calls)
+    write_v2(box.ninfer / "small_9b.ninfer")
+    assert add(box, box.ninfer / "small_9b.ninfer").status_code == 200
+    assert remove(box, "small_9b").status_code == 200
+    assert calls == [True, True], "Pi (a slow /mnt/c write) must run outside the panel lock"
+
+
+@pytest.mark.parametrize("artifact", ["/", "/home", "~/.."])
+def test_paths_above_home_are_never_deleted(box, artifact):
+    doc, rev = box.store.load()
+    find_model(doc, "qwen3.8-flash")["artifact"] = artifact
+    box.store.save(doc, expected_revision=rev)
+    answer = remove(box, "qwen3.8-flash", deleteFiles=True)
+    assert answer.status_code == 409 and answer.json()["code"] == "files_unsafe", answer.text
+    assert "qwen3.8-flash" in ids(box) and box.home.is_dir() and box.ninfer.is_dir()
+
+
+def test_a_removed_model_leaves_no_hold_behind_while_the_switcher_is_up(box):
+    box.switcher.states = {"quasar-27b": "ready"}
+    view = box.client.get("/api/panel/views/model/quasar-27b").json()
+    settings = {k: v for k, v in view["settings"].items() if not k.startswith("model.")}
+    settings["draft-tokens"] = 5
+    held = box.client.put("/api/panel/models/quasar-27b", json={
+        "revision": view["revision"], "settings": settings, "identity": {}, "activePreset": None, "whenLoaded": "next-time"})
+    assert held.json()["held"] == ["quasar-27b"] and "quasar-27b" in json.loads(box.service.holds_path.read_text())
+    answer = remove(box, "quasar-27b")
+    assert answer.status_code == 200, answer.text
+    assert box.switcher.calls == [("unload", "quasar-27b")]
+    assert "quasar-27b" not in json.loads(box.service.holds_path.read_text())
+    assert "quasar-27b" not in extract_model_blocks(box.cfg.read_text()) and answer.json()["held"] == []
