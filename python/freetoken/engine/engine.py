@@ -664,6 +664,36 @@ class Engine:
             # ladder's replay rungs (which need the verify warm-ups' stash to have run).
             self._capture_spec_graphs_at_boot()
 
+    # ---- sleep (engine/sleep.py; docs/superpowers/specs/2026-09-25-freetoken-sleep-design.md) ----
+    # A CLASS default like _gpu_owned_layer_ids: Engine.__new__ stubs in the tests read it.
+    # None means awake; this is the one source of truth the scheduler reads.
+    sleep_snapshot = None
+
+    def sleep_preflight(self) -> None:
+        from .sleep import check_can_sleep
+
+        check_can_sleep(self)
+
+    # inference_mode like rebuild_runtime_cache: the pools, banks and graphs these re-make are
+    # the same tensors, and the scheduler's forwards run under it.
+    @torch.inference_mode()
+    def sleep(self) -> dict:
+        from .sleep import sleep_engine
+
+        return sleep_engine(self)
+
+    @torch.inference_mode()
+    def wake(self) -> dict:
+        from .sleep import wake_engine
+
+        return wake_engine(self)
+
+    @torch.inference_mode()
+    def asleep_rebuild(self, **kwargs) -> None:
+        from .sleep import asleep_rebuild
+
+        asleep_rebuild(self, **kwargs)
+
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
