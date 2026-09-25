@@ -37,7 +37,7 @@ Every changed spot carries a `// FreeToken patch Pn:` comment.
 
 | Patch | What | Files |
 |---|---|---|
-| P4 | clampParams filter: clamp numeric params into [min,max]; config load refuses entries it would drop | internal/config/{filters.go,load.go}, internal/server/filters.go, config-schema.json |
+| P4 | clampParams filter: clamp numeric params into [min,max]; config load refuses entries it would drop | internal/config/{filters.go,load.go,peer.go}, internal/server/filters.go, config-schema.json |
 | P1 | latest wins: a new pick cancels a colliding not-ready swap (409 model_superseded) | internal/config/config.go, internal/router/scheduler/{scheduler.go,fifo.go}, internal/router/base.go, internal/process/process_command.go, internal/swaputil/superseded.go, config-schema.json |
 | P2 | memory gate: wait for Windows free RAM - ramNeedGB >= floorGB before loading (503 not_enough_memory); optional `memoryGate.helperURL` bypass when the settings helper runs a FreeToken llama-swap did not start; probe cmd has WaitDelay; probe failure logs Warn, a cancelled probe returns ctx.Err() | internal/memgate/*, internal/config/{config.go,model_config.go,load.go}, internal/router/{base.go,reconfigure.go}, config-schema.json |
 | P5 | selective reload, part 1: the group router reconfigures in place (`PrepareReconfigure` -> `ReconfigPlan.Commit/Abort`); unchanged loaded models keep their process and in-flight requests, changed and removed models are stopped through `OnUnload`; each process gets its own child context of procCtx; swaps work from the table captured at `StartSwap`; matrix router has no planner factory and keeps upstream's full rebuild | internal/router/{reconfigure.go,base.go,group.go}, internal/router/scheduler/{scheduler.go,fifo.go} |
