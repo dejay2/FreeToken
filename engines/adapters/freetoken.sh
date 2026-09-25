@@ -146,7 +146,9 @@ if [ -n "$PROFILE" ]; then
   profile_state=$(push_profile) || exit 1
 fi
 adopt=0
-if [ "$state" = serving ] && [ "$job_now" = - ] && ! other_model_loaded; then
+# A sleeping server (it gave the card back, the model is still loaded) counts as running: the
+# first chat wakes it. Rebooting it would throw away the fast wake.
+if { [ "$state" = serving ] || [ "$state" = sleeping ]; } && [ "$job_now" = - ] && ! other_model_loaded; then
   # A running server is kept only if it runs this folder, on this model's profile, with the
   # settings the panel has now; anything else reboots so the new settings take effect.
   if [ -z "$PROFILE" ] || { [ "$(active_profile)" = "$PROFILE" ] && [ "$profile_state" = same ]; }; then
@@ -196,7 +198,7 @@ while true; do
   else
     gone=0
   fi
-  if [ "$state" = serving ] && other_model_loaded; then
+  if { [ "$state" = serving ] || [ "$state" = sleeping ]; } && other_model_loaded; then
     log "the settings page switched to another model; releasing $MODEL_PATH"
     exit 0
   fi
