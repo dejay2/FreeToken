@@ -69,6 +69,9 @@ DEFAULT_ANSWER_TOKENS = 512
 MAX_ANSWER_TOKENS = 4_096
 MAX_TEXT_CHARS = 60_000
 SESSION_HEADER = "X-Session-ID"
+# FreeToken llama-swap patch P8 (round 2): a chat with this header is refused at admission
+# (409 code busy) instead of superseding (P1) another app's load of a different model.
+IF_FREE_HEADER = "X-FreeToken-If-Free"
 SESSION_PREFIX = "ft-test-"
 WARMUP_MESSAGES = [{"role": "user", "content": "Reply with the single word OK."}]
 WARMUP_TOKENS = 8
@@ -151,7 +154,7 @@ class SwitcherChat:
                     return
                 conn.request("POST", "/v1/chat/completions", body=json.dumps(body).encode("utf-8"),
                              headers={"Content-Type": "application/json", "Accept": "text/event-stream",
-                                      SESSION_HEADER: session})
+                                      SESSION_HEADER: session, IF_FREE_HEADER: "1"})
                 response = conn.getresponse()
             except OSError as exc:
                 if self._aborted:
@@ -281,7 +284,8 @@ class SwitcherProbe:
 
         cancel_load() from another thread shuts this request's socket down: llama-swap then
         drops only this request's claim on the load (OnCancel). The load itself goes on if
-        another app joined it; otherwise nobody holds it and P7's if-idle unload stops it."""
+        another app joined it; otherwise llama-swap aborts it (P8 round 2, a wait in the memory
+        gate included), and put-back's P7 if-idle unload makes sure of it on an older build."""
         parts = urllib.parse.urlsplit(self.base_url)
         path = f"/api/models/load/{urllib.parse.quote(model_id, safe='')}?ifFree=1"
         with self._load_lock:
@@ -422,6 +426,11 @@ class PlaygroundRunner:
         # and left the card empty), so the re-checks before a load skip these unless another
         # app has a request in flight on them.
         self._started: set[str] = set()
+        # Models whose load this test asked for and that never reported ready (stopped, cut
+        # short, refused). One stopped while it waited in llama-swap's memory gate has no
+        # process yet, so it is absent from /running; put-back still cancels it (P7 if-idle
+        # unload) so no orphaned load refuses the put-back load or boots later.
+        self._unfinished: set[str] = set()
         self._own_last: dict[str, float] = {}
         self._aliases: dict[str, set[str]] = {}
         self._labels: dict[str, str] = {}
@@ -670,6 +679,7 @@ class PlaygroundRunner:
             self._session = SESSION_PREFIX + uuid.uuid4().hex[:10]
             self._ours = None
             self._started = set()
+            self._unfinished = set()
             job = {**plan, "id": self._session[len(SESSION_PREFIX):], "status": "running",
                    "startedAt": _now_iso(), "finishedAt": None, "message": "", "restore": ""}
             self.job = job
@@ -781,19 +791,14 @@ class PlaygroundRunner:
             self._answer(job, side, warmup=kind == "warmup")
 
     def _load(self, side: dict[str, Any], model: str) -> None:
-        known, other = self._other_on_card(None)
-        if not known:
-            raise _Halt("failed", f"Can't tell which model is loaded right now, so {side['name']} was not loaded.")
-        if other is not None:
-            raise _Halt("yielded", f"Another app started using {self._name(other)}, so the test stopped to let it through.")
-        with self._lock:
-            self._loading = model
-            self._started.add(model)
-            stopping = self._stop.is_set()
-        if stopping:
+        try:
+            self._preflight(side, model)
+        except _Halt:
+            # These exits never reach the load's finally below, and a load that never ran
+            # still shows as one that did not load, never as "already loaded".
             with self._lock:
-                self._loading = None
-            raise _Halt("stopped", STOPPED)
+                side["loadFailed"] = True
+            raise
         started = self._clock()
         try:
             # P8 if-free load: never supersedes another app's load, one waiting in the memory
@@ -801,6 +806,8 @@ class PlaygroundRunner:
             self.probe.load_if_free(model, self._session)
         except SwitcherError as exc:
             if self._stop.is_set():
+                # Stop cancelled the request, not necessarily the load: put-back cancels that.
+                self._unfinished.add(model)
                 raise _Halt("stopped", STOPPED) from None
             if exc.code == "model_superseded":
                 raise _Halt("yielded", YIELDED) from None
@@ -826,6 +833,21 @@ class PlaygroundRunner:
             # put-back says so.
             if self._put_away(model) == "unloaded":
                 self._ours = None
+            raise _Halt("stopped", STOPPED)
+
+    def _preflight(self, side: dict[str, Any], model: str) -> None:
+        known, other = self._other_on_card(None)
+        if not known:
+            raise _Halt("failed", f"Can't tell which model is loaded right now, so {side['name']} was not loaded.")
+        if other is not None:
+            raise _Halt("yielded", f"Another app started using {self._name(other)}, so the test stopped to let it through.")
+        with self._lock:
+            self._loading = model
+            self._started.add(model)
+            stopping = self._stop.is_set()
+        if stopping:
+            with self._lock:
+                self._loading = None
             raise _Halt("stopped", STOPPED)
 
     def _answer(self, job: dict[str, Any], side: dict[str, Any], *, warmup: bool) -> None:
@@ -855,6 +877,8 @@ class PlaygroundRunner:
                 raise _Halt("stopped", STOPPED) from None
             if exc.code == "model_superseded":
                 raise _Halt("yielded", YIELDED) from None
+            if exc.code == "busy":  # P8 if-free chat: another app is loading or using a model
+                raise _Halt("yielded", NOT_FREE) from None
             raise _Halt("failed", f"{side['name']} could not answer: {exc.message}") from None
         finally:
             tracker.ended = self._clock()
@@ -944,6 +968,21 @@ class PlaygroundRunner:
                     self.panel.note_test_leftover(model, test["preset"])
                     words.append(f"{self._name(model)} is still on test settings because an app is using it. "
                                  "It goes back to its saved settings at its next load.")
+            # A load of ours that never finished and has no process (stopped while it waited
+            # in the memory gate) is invisible to /running above: cancel it too, if no other
+            # app's request joined it, so it neither refuses the put-back load nor boots later.
+            for model in sorted(self._unfinished - set(loaded)):
+                result = self._put_away(model)
+                for _ in range(CUT_SHORT_RETRIES):
+                    if result != "busy":
+                        break
+                    self._sleep(0.5)
+                    result = self._put_away(model)
+                if result == "unloaded":
+                    gone.add(model)
+                    self._unfinished.discard(model)
+                elif result != "busy":  # busy: another app joined that load, so it stays
+                    words.append(f"Couldn't check that the stopped load of {self._name(model)} was cancelled.")
             text = self.panel.set_test_settings(None, None)
             if not self.panel.wait_for_switcher(text):
                 words.append("The switcher hasn't picked up the saved settings yet, so nothing was loaded again. "
@@ -1011,7 +1050,7 @@ class PlaygroundRunner:
         and the next helper start tries again."""
         marker = self.panel.read_test_marker()
         if marker is None:
-            return "none"
+            return self._recover_leftover()
         try:
             self._doc()
         except PlaygroundError:
@@ -1034,6 +1073,28 @@ class PlaygroundRunner:
             self.panel.note_test_leftover(model, preset)
             raise
         return result
+
+    def _recover_leftover(self) -> str:
+        """No test was running, but an earlier one may have left its model on test settings
+        (the note is kept on disk, panel.test_leftover). Put it away when nobody uses it, so
+        its next load is on saved settings; forget the note once the model is seen unloaded;
+        otherwise keep it, so the Right-now strip and the next plan still know."""
+        leftover = self.panel.test_leftover
+        if leftover is None:
+            return "none"
+        try:
+            self._doc()
+        except PlaygroundError:
+            pass
+        model = str(leftover.get("model") or "")
+        running = self.switcher.running()
+        if running is None or is_down(running):
+            return "unknown"
+        if running.get(model) not in LOADED_STATES:
+            self.panel.test_leftover = None
+            return "gone"
+        # _put_away clears the note when the model is unloaded.
+        return "unloaded" if self._put_away(model) == "unloaded" else "left"
 
     # ---- the page's pick lists ----
     def options(self) -> dict[str, Any]:

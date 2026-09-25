@@ -44,7 +44,7 @@ Every changed spot carries a `// FreeToken patch Pn:` comment.
 | P5 | selective reload, part 2: a config reload reconfigures the local router in place (unchanged entries keep their process and requests; changed/removed ones are stopped via OnUnload; matrix or router-kind changes rebuild as upstream) through `server.Rebuild`; the retired Server shuts down everything but the kept router (`ShutdownExceptLocal`); a stale plan is refused (`ErrStaleReconfigure`); reloads coalesce instead of being dropped; `--check-config` (= `-validate`); `GET /api/config/hash` | llama-swap.go, freetoken_reload.go, internal/router/{base.go,reconfigure.go}, internal/server/{server.go,freetoken_api.go} |
 | P6 | `POST /api/models/load/{model}`: load through the scheduler (P1/P2 apply), answer when ready or failed (200 `{"model","state":"ready"}`, 409 model_superseded, 503 not_enough_memory, 404 unknown or not local) | internal/router/load.go, internal/server/{server.go,freetoken_api.go} |
 | P7 | unload only if idle: `POST /api/models/unload/{model}?ifIdle=1` stops the model only when the scheduler holds no request for it (in flight, queued, waiting on a swap, or a swap to it running), else 409 code `busy` and nothing stops; the check and the stop run in one run-loop step, atomic with admission; a request still before the run loop is not seen (it reloads the model after the stop instead of being killed); a router without the check answers 501; plain unload unchanged | internal/router/{unload_idle.go,base.go}, internal/router/scheduler/fifo.go, internal/server/apigroup.go |
-| P8 | `POST /api/models/load/{model}?ifFree=1`: load only when nothing else is on the card or on its way there; refused at admission on the run loop (409 code `busy`, nothing admitted or cancelled) when another model is running, being swapped in (a swap parked in the memory gate counts, though it has no process state yet), queued or holding requests; the target itself does not count; a router without it answers 501. P7's `Busy` no longer counts a swap whose waiters have all gone (a P6 load whose caller cancelled), so an if-idle unload can stop it | internal/router/load.go, internal/router/scheduler/{scheduler.go,fifo.go,if_free.go}, internal/server/freetoken_api.go |
+| P8 | `POST /api/models/load/{model}?ifFree=1`: load only when nothing else is on the card or on its way there; refused at admission on the run loop (409 code `busy`, nothing admitted or cancelled) when another model is running, being swapped in (a swap parked in the memory gate counts, though it has no process state yet), queued or holding requests; the target itself does not count; a router without it answers 501. P7's `Busy` no longer counts a swap whose waiters have all gone (a P6 load whose caller cancelled), so an if-idle unload can stop it. Round 2: a P6 load's cancel aborts its swap (gate wait included) and stops its process when no other waiter is left (`HandlerReq.AbortSwapIfLast`); a chat request with header `X-FreeToken-If-Free: 1` gets the same if-free admission (409 `busy` instead of superseding); the header is removed before the request reaches the engine | internal/router/{load.go,base.go}, internal/router/scheduler/{scheduler.go,fifo.go,if_free.go}, internal/server/freetoken_api.go |
 
 Notes (final review fixes, 2026-09-24):
 
@@ -164,3 +164,19 @@ Notes (P7, 2026-09-25):
   killed. `FIFO.Busy` counts `inFlight`, `reserved` and `active`; the unload request carries
   `ifIdle` and the run loop checks it just before `OnUnload`. Covered by
   internal/router/unload_idle_test.go and internal/server/freetoken_unload_idle_test.go.
+
+Notes (P8 round 2, 2026-09-25, Codex review of PR #18):
+
+- P8: the Test tab's Stop cancels its own if-free load. A load parked in the memory gate has no
+  process state, so it is absent from /running; upstream `OnCancel` removed the waiter but kept
+  the swap, which then refused every later if-free load (the Test tab's own put-back) and booted
+  its model whenever room appeared. `FIFO.OnCancel` now aborts a swap left with no waiters when
+  the cancelled request was a load (`AbortSwapIfLast`, set only by `baseRouter.load`): the swap
+  is removed from `active`, `CancelSwap` ends the gate wait or `EnsureReady`, and the process is
+  stopped (blocking, as `supersede` does). A chat request keeps upstream's behaviour (the swap
+  completes on its own). Covered by TestLoad_CancelledWhileGatedIsAborted and
+  TestLoad_CancelKeepsASwapAnotherRequestJoined (internal/router/if_free_round2_test.go).
+- P8: the Test tab's warm-up and measured chats went through ordinary routing and could
+  supersede (P1) another app's load. `ServeHTTP` now reads `X-FreeToken-If-Free: 1` into
+  `HandlerReq.IfFree`, so the refusal is decided on the run loop at admission exactly as for
+  `?ifFree=1`. Covered by TestChatIfFree_* in the same file.

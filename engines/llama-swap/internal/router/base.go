@@ -617,7 +617,12 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		Admit:      make(chan error, 1),
 		Respond:    make(chan scheduler.HandlerResp),
 		PositionCh: make(chan int, 1),
+		// FreeToken patch P8 (round 2): a chat request can ask for the
+		// if-free admission a load gets with ?ifFree=1. The header is
+		// llama-swap's own and is not passed on to the engine.
+		IfFree: req.Header.Get(scheduler.IfFreeHeader) == "1",
 	}
+	req.Header.Del(scheduler.IfFreeHeader) // FreeToken patch P8 (round 2)
 
 	select {
 	case b.handlerCh <- hr:

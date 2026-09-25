@@ -9,6 +9,12 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
+// IfFreeHeader on a chat request asks for the same non-preempting admission
+// as ?ifFree=1 on a load (FreeToken patch P8, round 2): 409 code "busy" instead
+// of superseding when another model is running, loading, waiting in the memory
+// gate, queued or holding requests. The value must be "1".
+const IfFreeHeader = "X-FreeToken-If-Free"
+
 // NotFreeError refuses an if-free request because another model is running,
 // loading, waiting in the memory gate, queued or answering (409, code "busy").
 // Nothing was admitted and nothing was cancelled.

@@ -198,8 +198,10 @@ def test_stop_during_load_cancels_it_and_puts_back(tmp_path, monkeypatch):
     job = start(env, {"prompt": "Hi", "sides": [{"model": "fable-27b", "preset": "Three"}, {"model": "quasar-27b"}]})
     assert job["status"] == "stopped" and job["message"] == "Stopped."
     # PR #18 review: Stop cancels only the test's own load request, never a plain unload.
+    # Round 2: put-back then cancels the stopped load itself with P7's if-idle unload (the
+    # fake records it as "unload"), since one waiting in the memory gate is not in /running.
     assert env.switcher.calls == [("unload", "quasar-27b"), ("load", "fable-27b"),
-                                  ("cancel", "fable-27b"), ("load", "quasar-27b")]
+                                  ("cancel", "fable-27b"), ("unload", "fable-27b"), ("load", "quasar-27b")]
     states = [(step["kind"], step["state"]) for step in job["steps"]]
     assert states[:3] == [("unload", "done"), ("settings", "done"), ("load", "failed")]
     assert all(state == "skipped" for kind, state in states[3:-1]) and states[-1] == ("restore", "done")
@@ -315,7 +317,8 @@ def test_helper_restart_leaves_a_busy_test_model_and_says_so(tmp_path, monkeypat
     assert service.held_models() == ["quasar-27b"]
     assert "--draft-tokens 3" in extract_model_blocks(env.cfg.read_text())["quasar-27b"]
     assert service.now()["testLeftover"]["preset"] == "Fast"
-    assert runner.recover() == "none"
+    # Round 2: the leftover note is kept on disk, so the next start still finds it.
+    assert runner.recover() == "left" and ("unload", "quasar-27b") not in env.switcher.calls
 
 
 def test_start_refused_as_test_running_when_the_panel_is_already_testing(tmp_path, monkeypatch):

@@ -99,6 +99,12 @@ RESTART_PENDING_MESSAGE = ("The control panel is restarting a model with its new
                            "Try again when it has finished.")
 PANEL_BUSY_MESSAGE = "The control panel is loading or unloading a model right now. Try again when it has finished."
 TEST_MARKER = "playground-test.json"
+# A model an earlier test left on test settings (its put-away was refused because an app was
+# using it). Kept on disk until the model is seen unloaded, so a helper restart in between
+# still knows it runs test settings (PR #18 review round 2).
+TEST_LEFTOVER = "playground-leftover.json"
+RECOVERING_MESSAGE = ("The settings page is finishing an earlier test after a restart. "
+                      "Try again in a moment.")
 
 IDENTITY_GROUP = "This model"
 IDENTITY_DIALS: tuple[Dial, ...] = (
@@ -351,8 +357,12 @@ class PanelService:
         self._restarts_pending = 0
         self._actions = 0
         self.test_settings: dict[str, Any] | None = None
-        self.test_leftover: dict[str, Any] | None = None
         self.test_marker_path = self.holds_path.with_name(TEST_MARKER)
+        self.test_leftover_path = self.holds_path.with_name(TEST_LEFTOVER)
+        self._test_leftover: dict[str, Any] | None = self._read_test_leftover()
+        # Helper start-up recovery (server.start_panel) holds the test guard: a test or a panel
+        # action started mid-recovery would race its put-away and its switcher-file rewrite.
+        self.recovering = False
 
     # ---- small helpers ----
     def _ask(self) -> tuple[list[str] | None, bool]:
@@ -1355,6 +1365,16 @@ class PanelService:
     def _guard_test(self) -> None:
         if self.test_running:
             raise PanelError(409, "test_running", TEST_RUNNING_MESSAGE)
+        if self.recovering:
+            raise PanelError(409, "busy", RECOVERING_MESSAGE)
+
+    def begin_recovery(self) -> None:
+        with self._lock:
+            self.recovering = True
+
+    def end_recovery(self) -> None:
+        with self._lock:
+            self.recovering = False
 
     def begin_test(self) -> None:
         with self._lock:
@@ -1445,6 +1465,35 @@ class PanelService:
 
     def note_test_leftover(self, model_id: str, preset: str | None) -> None:
         self.test_leftover = {"model": model_id, "preset": preset}
+
+    @property
+    def test_leftover(self) -> dict[str, Any] | None:
+        return self._test_leftover
+
+    @test_leftover.setter
+    def test_leftover(self, value: dict[str, Any] | None) -> None:
+        """Kept in memory and on disk: cleared only once the model is seen unloaded (now(),
+        playground._put_away), so a helper restart in between still knows about it."""
+        self._test_leftover = value
+        try:
+            if value is None:
+                self.test_leftover_path.unlink(missing_ok=True)
+            else:
+                self.test_leftover_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self.test_leftover_path.with_name(self.test_leftover_path.name + ".tmp")
+                temporary.write_text(json.dumps({**value, "at": _now_iso()}) + "\n", encoding="utf-8")
+                os.replace(temporary, self.test_leftover_path)
+        except OSError:
+            logger.exception("The Test tab's leftover note could not be saved")
+
+    def _read_test_leftover(self) -> dict[str, Any] | None:
+        try:
+            data = json.loads(self.test_leftover_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict) or not data.get("model"):
+            return None
+        return {"model": str(data["model"]), "preset": data.get("preset")}
 
     def wait_for_switcher(self, text: str, stop: threading.Event | None = None) -> bool:
         """True once the switcher reports text's hash (P5); False after restart_wait_s, or as

@@ -223,7 +223,8 @@ func (s *FIFO) supersede(target string, evict []string) bool {
 
 // OnCancel removes a request whose client has disconnected from the queue and
 // from every in-flight swap's waiters. If the request was the sole waiter of an
-// active swap, the swap goroutine is left to complete on its own — OnSwapDone
+// active swap, the swap goroutine is left to complete on its own (FreeToken
+// patch P8 round 2: unless the request was a load, see below) — OnSwapDone
 // will find no waiters and simply clean up. This prevents drainQueue from ever
 // starting a model load for a caller that is no longer there.
 func (s *FIFO) OnCancel(req HandlerReq) {
@@ -244,17 +245,42 @@ func (s *FIFO) OnCancel(req HandlerReq) {
 	}
 
 	// Prune from any active swap's waiters.
-	for _, sw := range s.active {
+	var abandoned []string
+	for id, sw := range s.active {
 		filtered := sw.waiters[:0]
+		pruned := false
 		for _, w := range sw.waiters {
 			if w.Respond == req.Respond {
-				removed = true
+				removed, pruned = true, true
 				s.release(w.Model)
 				continue
 			}
 			filtered = append(filtered, w)
 		}
 		sw.waiters = filtered
+		// FreeToken patch P8 (round 2): a load (P6) whose caller cancelled
+		// and that nobody else joined is aborted, not left to complete. A
+		// swap parked in the memory gate has no process state, so nothing
+		// (not /running, not an if-idle unload by a caller that only reads
+		// /running) would ever find it, and it booted its model whenever room
+		// appeared, beside whatever had been loaded meanwhile.
+		if pruned && req.AbortSwapIfLast && len(filtered) == 0 {
+			abandoned = append(abandoned, id)
+		}
+	}
+	if len(abandoned) > 0 {
+		sort.Strings(abandoned)
+		for _, id := range abandoned {
+			delete(s.active, id)
+			s.effects.CancelSwap(id)
+			s.logger.Infof("%s: load of %s cancelled by its only caller; swap aborted", s.name, id)
+		}
+		// A process the swap had already started is stopped (blocking, as
+		// supersede does), so nothing half-loaded is left behind.
+		for _, id := range abandoned {
+			s.effects.StopProcesses(s.effects.UnloadTimeout(id), []string{id})
+		}
+		defer s.drainQueue()
 	}
 
 	if removed {

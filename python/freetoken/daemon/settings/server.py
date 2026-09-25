@@ -42,6 +42,25 @@ def start_panel(app) -> None:
     as a leftover so the strip says it may still sit on test settings (the marker stays, so
     the next helper start tries again)."""
     panel = app.state.panel
+    _recovering(panel, True)
+    try:
+        _start_panel(app, panel)
+    finally:
+        _recovering(panel, False)
+
+
+def _recovering(panel: Any, on: bool) -> None:
+    """Hold (or lift) the panel's test guard for start-up recovery: a Test-tab test or a
+    panel load/unload that started mid-recovery would race its put-away and its switcher-file
+    rewrite (PR #18 review round 2); they get 409 busy meanwhile. The adapter's lifecycle
+    routes (/api/server/stop and the rest, app.py) never take this guard, so freetoken.sh's
+    unload still reaches them while recovery puts a FreeToken model away."""
+    method = getattr(panel, "begin_recovery" if on else "end_recovery", None)
+    if method is not None:
+        method()
+
+
+def _start_panel(app: Any, panel: Any) -> None:
     try:
         app.state.playground.recover()
     except Exception:  # noqa: BLE001
@@ -75,13 +94,19 @@ def start_panel_when_listening(app: Any, port: int, *, accepts: Callable[[int], 
     #18 review). uvicorn's lifespan startup also runs before it binds, so the wait is on the
     port itself. stop ends the wait when the helper exits without ever listening."""
     stop = stop or threading.Event()
+    # The guard goes up now, before uvicorn listens: a test started in the gap between the
+    # port opening and this thread noticing it would otherwise slip in ahead of recovery.
+    _recovering(app.state.panel, True)
 
     def run() -> None:
-        while not accepts(port):
-            if stop.is_set():
-                return
-            sleep(0.2)
-        start_panel(app)
+        try:
+            while not accepts(port):
+                if stop.is_set():
+                    return
+                sleep(0.2)
+            start_panel(app)
+        finally:
+            _recovering(app.state.panel, False)
 
     thread = threading.Thread(target=run, name="panel-start", daemon=True)
     thread.start()

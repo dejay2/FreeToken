@@ -54,6 +54,9 @@ func (b *baseRouter) load(ctx context.Context, modelID string, ifFree bool) erro
 		Respond:    make(chan scheduler.HandlerResp),
 		PositionCh: make(chan int, 1),
 		IfFree:     ifFree, // FreeToken patch P8
+		// FreeToken patch P8 (round 2): a cancelled load nobody else joined
+		// never boots later (it may be parked in the memory gate).
+		AbortSwapIfLast: true,
 	}
 	shutdownErr := fmt.Errorf("%s is shutting down", b.name)
 	select {
