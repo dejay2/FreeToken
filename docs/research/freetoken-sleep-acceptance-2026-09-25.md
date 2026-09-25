@@ -34,3 +34,11 @@ One FreeToken boot. Screenshots: `img/sleep-*.png`. Bench JSON: `sleep-bench-mtp
 | Fault watch | PASS | no `nvlddmkm` events in the System log over the last 4 hours |
 
 MTP-on round (plan step 6) skipped: the box's daily shape is MTP off.
+
+## Final re-check after the two Codex rounds (c3ef327, boot 2)
+
+| Check | Result |
+|---|---|
+| Boot | 115 s |
+| Bench, 2 cycles | PASS — sleep 0.92-1.05 s, wake 8.14-8.54 s (13.5x faster than the boot), chat to a sleeping model 12.6-12.8 s, card asleep 7.23-7.26 GiB, identical output (`sleep-bench-final-2026-09-25.json`) |
+| Card busy (25 GB held by another process) | PASS — "…the graphics card has 1.5 GB free and waking needs 22.9 GB; close the game or program using it…" (nvidia-smi: 1,520 MiB free — the NVML reading now matches); after the hog exited a chat woke the model and answered "7" |
