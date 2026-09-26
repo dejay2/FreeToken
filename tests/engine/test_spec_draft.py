@@ -1188,3 +1188,61 @@ def test_a_prefix_hit_on_a_picture_request_keeps_the_old_not_ready_behaviour():
     req.cached_len = 69
     head.observe_forward(batch, _capture(5), torch.tensor(7))
     assert head.is_ready(req) is False
+
+
+# ------------------------------------------------------------------ the private context's width
+
+
+def test_a_request_that_outgrows_the_private_context_stops_speculating_instead_of_crashing():
+    # 2026-09-26: a fresh 127k-token prompt ran the head past its boot-sized page table and
+    # the empty page-table slice killed the scheduler. Width here is PAGES * PAGE_SIZE = 256.
+    head = _head(depth=3)
+    first, _ = _prefill_batch(200, chunked=True)
+    head.observe_forward(first, _capture(200), torch.tensor(7))
+    assert head.committed_len == 199
+    calls = list(head.staged_model.calls)
+
+    second, req = _prefill_batch(60)
+    head.observe_forward(second, _capture(60), torch.tensor(7))
+    assert head.staged_model.calls == calls  # nothing written past the table
+    req.cached_len = 260
+    assert head.is_ready(req) is False
+
+    decode, req = _decode_batch(cached_len=260)
+    head.observe_forward(decode, _capture(1), torch.tensor(9))
+    assert head._buffered == [] and head.is_ready(req) is False
+
+    # the next request starts clean
+    fresh, req = _prefill_batch(5, uid=2)
+    head.observe_forward(fresh, _capture(5), torch.tensor(7))
+    req.cached_len = 5
+    assert head.committed_len == 5 and head.is_ready(req) is True
+
+
+def test_the_private_context_is_sized_for_the_dynamic_pool_ceiling_not_its_floor():
+    from freetoken.engine.spec_draft import _draft_context_tokens
+
+    def engine(max_seq_len, **config):
+        cfg = SimpleNamespace(max_seq_len=262144, kv_dynamic=False, kv_ceiling_tokens=None)
+        cfg.__dict__.update(config)
+        return SimpleNamespace(max_seq_len=max_seq_len, config=cfg)
+
+    assert _draft_context_tokens(engine(32768, kv_dynamic=True, kv_ceiling_tokens=262208)) == 262144
+    assert _draft_context_tokens(engine(32768, kv_dynamic=True, kv_ceiling_tokens=131136)) == 131136
+    assert _draft_context_tokens(engine(100000)) == 100000
+
+
+def test_buffered_decode_rows_that_would_outgrow_the_context_are_refused_before_a_proposal():
+    head = _head(depth=3)
+    first, _ = _prefill_batch(252)
+    head.observe_forward(first, _capture(252), torch.tensor(7))
+    assert head.committed_len == 252  # 252 + depth 3 = 255 of 256
+    decode, req = _decode_batch(cached_len=252)
+    head.observe_forward(decode, _capture(1), torch.tensor(9))
+    req.cached_len = 253
+    assert head._buffered_rows == 1 and head.is_ready(req) is True  # 253 + 3 fits exactly
+    decode, req = _decode_batch(cached_len=253)
+    head.observe_forward(decode, _capture(1), torch.tensor(10))
+    req.cached_len = 254
+    # a second buffered row would leave no room for the proposal's recursive rows
+    assert head._buffered == [] and head.is_ready(req) is False
