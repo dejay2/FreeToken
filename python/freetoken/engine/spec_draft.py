@@ -1177,6 +1177,15 @@ class SpecDraftHead:
         if paired_hidden.shape[0] == 0:
             return
         if batch.is_decode:
+            if (
+                self.committed_len + self._buffered_rows + int(paired_hidden.shape[0]) + self.depth
+                > self.page_table.shape[1]
+            ):
+                # caught here, not at the flush: ``is_ready`` counts buffered rows as consumed,
+                # so a flush that overflowed inside ``propose`` would raise instead of falling
+                # back to plain decode (review, 2026-09-26)
+                self._give_up_request(int(paired_hidden.shape[0]))
+                return
             # A plain decode step's pair is BUFFERED, not committed. Committing it costs a
             # whole eager draft forward per fallback token, and during an adaptive cooldown
             # nothing reads the result before the buffer is flushed anyway.
