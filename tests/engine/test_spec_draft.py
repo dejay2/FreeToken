@@ -1141,3 +1141,50 @@ def test_the_drafts_filter_is_the_one_the_server_would_have_prepared(
         logits, temperature=drafted[0], top_k=drafted[1], top_p=drafted[2]
     )
     assert torch.equal(actual, expected)
+
+
+def test_a_prefix_cache_hit_starts_the_context_at_the_uncached_tail():
+    """The engine observes a prompt after ``complete_one``: ``cached_len`` already includes the
+    forwarded rows, and a prefix hit forwards only the tail. The head cannot see the cached
+    rows' hidden states, so it starts its own context there instead of never becoming ready
+    (2026-09-26: repeated prompts decoded at plain speed for the whole request)."""
+    head = _head()
+    batch, req = _prefill_batch(5)
+    req.cached_len = 69  # 64 cached + the 5 forwarded rows
+    head.observe_forward(batch, _capture(5), torch.tensor(7))
+    assert head.committed_len == 5
+    assert head.is_ready(req) is True
+    req.cached_len = 70
+    assert head.is_ready(req) is False
+    # the offset is per request
+    second, req2 = _prefill_batch(3, uid=2)
+    req2.cached_len = 3
+    head.observe_forward(second, _capture(3), torch.tensor(7))
+    assert head.is_ready(req2) is True
+
+
+def test_a_prefix_hit_on_an_mrope_text_batch_drops_the_targets_coordinates():
+    """An mrope model gives every batch rope coordinates, text included; after a prefix hit
+    they are the TARGET's positions, not the head's, so the head derives its own."""
+    head = _head()
+    rope = torch.arange(64, 69, dtype=torch.int64).expand(3, -1).contiguous()
+    batch, req = _prefill_batch(5, rope=rope)
+    req.cached_len = 69
+    head.observe_forward(batch, _capture(5), torch.tensor(7))
+    assert head.is_ready(req) is True
+    assert head._pending_rope is None
+    decode, dreq = _decode_batch(cached_len=69, rope=torch.full((3, 1), 69, dtype=torch.int64))
+    head.observe_forward(decode, _capture(1), torch.tensor(8))
+    assert all(rope is None for _, _, rope in head._buffered)
+    dreq.cached_len = 70
+    assert head.is_ready(dreq) is True
+
+
+def test_a_prefix_hit_on_a_picture_request_keeps_the_old_not_ready_behaviour():
+    head = _head()
+    rope = torch.arange(64, 69, dtype=torch.int64).expand(3, -1).contiguous()
+    batch, req = _prefill_batch(5, rope=rope)
+    req.mrope_position_ids = rope
+    req.cached_len = 69
+    head.observe_forward(batch, _capture(5), torch.tensor(7))
+    assert head.is_ready(req) is False

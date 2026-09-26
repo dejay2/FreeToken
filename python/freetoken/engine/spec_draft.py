@@ -121,16 +121,26 @@ def resolve_spec_expert_placement(
     checkpoint -- the placement that shipped, unchanged.
 
     An EXL3 checkpoint (target ``expert_quant == "exl3"``) has no bf16 MTP banks to read: its
-    head's routed experts ship packed, so the placement is ``exl3`` and an explicit other
-    format is refused rather than silently ignored.
+    head's routed experts ship packed, so the placement is always ``exl3``. A ``bf16`` or
+    ``nvfp4`` name is logged and ignored rather than refused: the settings helper's service
+    unit sets ``nvfp4`` for every model it boots (the NVFP4 checkpoint's private MTP banks), and
+    on 2026-09-26 that refusal was the whole reason MTP would not start on the EXL3 copy from
+    the control panel. Anything else is still a typo and is refused.
     """
     env = os.environ if environ is None else environ
     if getattr(model_config, "expert_quant", None) == "exl3":
         named = (env.get(_EXPERT_FORMAT_ENV, "") or "").strip().lower()
-        if named not in ("", "exl3"):
+        if named in ("bf16", "nvfp4"):
+            logger.warning(
+                "%s=%s ignored: this EXL3 checkpoint's MTP experts are EXL3 and are read "
+                "from the checkpoint itself",
+                _EXPERT_FORMAT_ENV,
+                named,
+            )
+        elif named not in ("", "exl3"):
             raise ValueError(
-                "this EXL3 checkpoint's MTP experts are EXL3; unset "
-                f"{_EXPERT_FORMAT_ENV} (the placement is exl3; got {named!r})"
+                f"{_EXPERT_FORMAT_ENV} must be bf16, nvfp4 or exl3, got {named!r} "
+                "(an EXL3 checkpoint always places its MTP experts as exl3)"
             )
         return "exl3", None
     placement = (env.get(_EXPERT_FORMAT_ENV, "") or "bf16").strip().lower() or "bf16"
@@ -358,6 +368,7 @@ class SpecDraftHead:
 
         self._uid: int | None = None
         self.committed_len = 0
+        self._context_offset = 0
         self._pending_hidden: torch.Tensor | None = None
         self._pending_rope: torch.Tensor | None = None
         self._sample: torch.Tensor | None = None
@@ -1051,6 +1062,7 @@ class SpecDraftHead:
         """
         self._uid = int(uid)
         self.committed_len = 0
+        self._context_offset = 0
         self._pending_hidden = None
         self._pending_rope = None
         self._sample = None
@@ -1078,7 +1090,8 @@ class SpecDraftHead:
             self._uid == req.uid
             and (self._sample is not None or bool(self._buffered))
             and self._pending_hidden is None
-            and self.committed_len + self._buffered_rows == req.cached_len
+            and self._context_offset + self.committed_len + self._buffered_rows
+            == req.cached_len
         )
 
     # ---------------------------------------------------------------- the engine capture seam
@@ -1098,6 +1111,25 @@ class SpecDraftHead:
         if self._uid != req.uid:
             self.reset_request(req.uid)
         _, hidden, embeds = capture
+        text_only = getattr(req, "mrope_position_ids", None) is None
+        if (
+            batch.is_prefill
+            and text_only
+            and self.committed_len == 0
+            and self._context_offset == 0
+            and self._pending_hidden is None
+            and not self._buffered
+        ):
+            # A prompt that hit the prefix cache forwards only its uncached tail, so the head
+            # never sees the cached rows' target hidden states and could never catch up with
+            # ``cached_len`` -- every step of the request fell back to plain decode. Measured
+            # 2026-09-26 on the EXL3 copy: a repeated 81-token prompt (64 cached) decoded at
+            # 60 tok/s against 96-101 cold, and Pi re-sends the whole chat on every turn. The
+            # head starts its context at the tail instead: the draft attends a shorter history,
+            # while the target hidden rows it pairs with still carry the whole prompt.
+            # ``complete_one`` already ran, so ``cached_len`` includes this forward's rows.
+            # Picture requests (real mrope coordinates) keep the old not-ready behaviour.
+            self._context_offset = max(0, int(req.cached_len) - int(hidden.shape[0]))
         chunked = type(req).__name__ == "ChunkedReq"
         next_embedding = None
         if not chunked:
@@ -1107,6 +1139,12 @@ class SpecDraftHead:
         had_pending = self._pending_hidden is not None
         pending_rope = self._pending_rope
         rope = None if batch.rope_positions is None else batch.rope_positions
+        if self._context_offset and text_only:
+            # An mrope model hands text batches plain ``arange`` coordinates at the TARGET's
+            # positions; the offset head's rows sit at ``committed_len``, so it derives its own
+            # (exactly what a text proposal already does -- ``rope=None`` when the request has
+            # no ``mrope_position_ids``). Rotary is relative, so the shift changes nothing.
+            rope = None
         paired_hidden, paired_embeds, self._pending_hidden = build_shifted_pairs(
             self._pending_hidden, hidden, embeds, next_embedding=next_embedding
         )
