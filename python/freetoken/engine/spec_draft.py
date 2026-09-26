@@ -91,6 +91,20 @@ logger = init_logger(__name__)
 # The GPU expert runner's per-call row cap; priming chunks are split to it.
 _MAX_DRAFT_ROWS = 128
 
+
+def _draft_context_tokens(engine) -> int:
+    """How many positions the head's private context must hold: the longest request the
+    target can ever admit. ``engine.max_seq_len`` alone is the KV pool's size at boot, and a
+    dynamic pool boots at its floor (32,768 on the serving box) then grows to its ceiling
+    without rebuilding the head. Sized at the ceiling the NVFP4 head measured 2.56 GiB against
+    2.17 GiB (2026-09-07), inside the 2.25 GiB + 0.75 GiB post-cache reserve."""
+    tokens = int(engine.max_seq_len)
+    config = getattr(engine, "config", None)
+    ceiling = getattr(config, "kv_ceiling_tokens", None)
+    if getattr(config, "kv_dynamic", False) and ceiling:
+        tokens = max(tokens, min(int(config.max_seq_len), int(ceiling)))
+    return tokens
+
 _EXPERT_FORMAT_ENV = "FREETOKEN_MTP_SPEC_EXPERT_FORMAT"
 _NVFP4_MANIFEST_ENV = "FREETOKEN_MTP_SPEC_NVFP4_MANIFEST"
 _CONF_LOG_ENV = "FREETOKEN_MTP_SPEC_CONF_LOG"
@@ -299,6 +313,8 @@ class SpecDraftHead:
     _graph_buffers_ready = False
     _graph_disabled_reason: str | None = None
     _device_base_offset: int | None = None
+    #: set when a request outgrew the head's private context; cleared by ``reset_request``
+    _overflowed = False
     #: the MTP head is one QSA layer, so its block-selection capture has exactly one slot
     _graph_qsa_slot = 0
 
@@ -359,7 +375,7 @@ class SpecDraftHead:
         self.num_pages = (
             num_pages
             if num_pages is not None
-            else -(-int(engine.max_seq_len) // page_size) + 1
+            else -(-_draft_context_tokens(engine) // page_size) + 1
         )
         with torch.device("meta"), torch_dtype(torch.bfloat16):
             self.model = Qwen4ExpMTPModel(self.mtp_config)
@@ -1061,6 +1077,7 @@ class SpecDraftHead:
         known starting point.
         """
         self._uid = int(uid)
+        self._overflowed = False
         self.committed_len = 0
         self._context_offset = 0
         self._pending_hidden = None
@@ -1088,6 +1105,7 @@ class SpecDraftHead:
         """
         return (
             self._uid == req.uid
+            and not self._overflowed
             and (self._sample is not None or bool(self._buffered))
             and self._pending_hidden is None
             and self._context_offset + self.committed_len + self._buffered_rows
@@ -1110,6 +1128,8 @@ class SpecDraftHead:
         req = batch.reqs[0]
         if self._uid != req.uid:
             self.reset_request(req.uid)
+        if self._overflowed:
+            return
         _, hidden, embeds = capture
         text_only = getattr(req, "mrope_position_ids", None) is None
         if (
@@ -1252,6 +1272,12 @@ class SpecDraftHead:
 
     def _commit_pairs(self, hidden, embeds, rope, *, probe=None) -> None:
         rows = int(hidden.shape[0])
+        if self._overflowed:
+            return
+        # ``propose`` then writes up to ``depth`` recursive rows past the committed ones
+        if self.committed_len + rows + self.depth > self.page_table.shape[1]:
+            self._give_up_request(rows)
+            return
         if self._commit_graphable(rows):
             self._ensure_graph_buffers()
             if hidden.dtype is not self._commit_in_hidden.dtype or (
@@ -1267,6 +1293,29 @@ class SpecDraftHead:
                 probe and probe.mark("tail.commit.replay")
                 return
         self._commit_pairs_eager(hidden, embeds, rope)
+
+    def _give_up_request(self, rows: int) -> None:
+        """Stop speculating for the rest of this request; it decodes plainly from here.
+
+        The private page table is sized once, at boot. Before this guard a request past its
+        width killed the scheduler: 2026-09-26, a fresh 127k-token prompt on the EXL3 copy
+        with the dynamic KV pool sized the head at the 32,768-token floor, and the fourth 8k
+        prefill chunk hit ``out_loc.copy_`` with an empty page-table slice. Sizing now follows
+        the pool's ceiling (``_draft_context_tokens``); this is the net for whatever still
+        outgrows it.
+        """
+        logger.warning(
+            "MTP draft head: request %s needs %d rows past %d of %d private positions; "
+            "speculation off for the rest of this request",
+            self._uid, rows + self.depth, self.committed_len, int(self.page_table.shape[1]),
+        )
+        self._overflowed = True
+        self._pending_hidden = None
+        self._pending_rope = None
+        self._sample = None
+        self._recursive = None
+        self._saved_blocks = None
+        self._buffered = []
 
     def _commit_pairs_eager(self, hidden, embeds, rope) -> None:
         capture: dict[int, torch.Tensor] = {}
