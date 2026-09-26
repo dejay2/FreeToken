@@ -384,13 +384,14 @@ DIALS: tuple[Dial, ...] = (
     Dial(
         "MoECacheHeadroomBytes", "number", -1, "bytes", "Free VRAM cushion that expert slot cache must leave untouched (-1 = default 1.5 GiB).",
         "Memory & experts", minimum=-1, maximum=34359738368, engine_mapping="--moe-cache-headroom-bytes <N>",
-        plain="MoE cache headroom", blurb="GPU memory the expert cache must leave unused.", slider=(0, 8, 0.25), display_unit="GiB", display_factor=GIB,
+        plain="MoE cache headroom", blurb="GPU memory the expert cache must leave unused.", slider=(0, 16, 0.25), display_unit="GiB", display_factor=GIB,
         auto_value=-1, auto_label="Automatic (1.5 GiB)", advanced=True, effects=("vram:up", "speed:mixed"),
         info=(
             "Card memory that must stay free after everything is loaded. Automatic keeps 1.5 GiB, the "
             "least any healthy start-up on this PC measured; a run that left only 0.55 GiB free answered "
             "at half speed. If the expert slot count does not leave this much, the server refuses to "
-            "start and names the largest count that fits."
+            "start and names the largest count that fits. The slider tops out at 16 GiB, half the "
+            "5090, for keeping room free for games or a second program; the number box takes up to 32."
         ),
     ),
     Dial(
