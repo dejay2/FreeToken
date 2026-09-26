@@ -1163,10 +1163,28 @@ def test_a_prefix_cache_hit_starts_the_context_at_the_uncached_tail():
     assert head.is_ready(req2) is True
 
 
+def test_a_prefix_hit_on_an_mrope_text_batch_drops_the_targets_coordinates():
+    """An mrope model gives every batch rope coordinates, text included; after a prefix hit
+    they are the TARGET's positions, not the head's, so the head derives its own."""
+    head = _head()
+    rope = torch.arange(64, 69, dtype=torch.int64).expand(3, -1).contiguous()
+    batch, req = _prefill_batch(5, rope=rope)
+    req.cached_len = 69
+    head.observe_forward(batch, _capture(5), torch.tensor(7))
+    assert head.is_ready(req) is True
+    assert head._pending_rope is None
+    decode, dreq = _decode_batch(cached_len=69, rope=torch.full((3, 1), 69, dtype=torch.int64))
+    head.observe_forward(decode, _capture(1), torch.tensor(8))
+    assert all(rope is None for _, _, rope in head._buffered)
+    dreq.cached_len = 70
+    assert head.is_ready(dreq) is True
+
+
 def test_a_prefix_hit_on_a_picture_request_keeps_the_old_not_ready_behaviour():
     head = _head()
     rope = torch.arange(64, 69, dtype=torch.int64).expand(3, -1).contiguous()
     batch, req = _prefill_batch(5, rope=rope)
+    req.mrope_position_ids = rope
     req.cached_len = 69
     head.observe_forward(batch, _capture(5), torch.tensor(7))
     assert head.is_ready(req) is False

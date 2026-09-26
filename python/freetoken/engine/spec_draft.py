@@ -1111,9 +1111,10 @@ class SpecDraftHead:
         if self._uid != req.uid:
             self.reset_request(req.uid)
         _, hidden, embeds = capture
+        text_only = getattr(req, "mrope_position_ids", None) is None
         if (
             batch.is_prefill
-            and batch.rope_positions is None
+            and text_only
             and self.committed_len == 0
             and self._context_offset == 0
             and self._pending_hidden is None
@@ -1124,11 +1125,10 @@ class SpecDraftHead:
             # ``cached_len`` -- every step of the request fell back to plain decode. Measured
             # 2026-09-26 on the EXL3 copy: a repeated 81-token prompt (64 cached) decoded at
             # 60 tok/s against 96-101 cold, and Pi re-sends the whole chat on every turn. The
-            # head's positions are its own (text rope is derived from ``committed_len``), so it
-            # starts its context at the tail: the draft attends a shorter history, while the
-            # target hidden rows it pairs with still carry the whole prompt. Picture requests
-            # (explicit mrope positions) keep the old not-ready behaviour.
+            # head starts its context at the tail instead: the draft attends a shorter history,
+            # while the target hidden rows it pairs with still carry the whole prompt.
             # ``complete_one`` already ran, so ``cached_len`` includes this forward's rows.
+            # Picture requests (real mrope coordinates) keep the old not-ready behaviour.
             self._context_offset = max(0, int(req.cached_len) - int(hidden.shape[0]))
         chunked = type(req).__name__ == "ChunkedReq"
         next_embedding = None
@@ -1139,6 +1139,12 @@ class SpecDraftHead:
         had_pending = self._pending_hidden is not None
         pending_rope = self._pending_rope
         rope = None if batch.rope_positions is None else batch.rope_positions
+        if self._context_offset and text_only:
+            # An mrope model hands text batches plain ``arange`` coordinates at the TARGET's
+            # positions; the offset head's rows sit at ``committed_len``, so it derives its own
+            # (exactly what a text proposal already does -- ``rope=None`` when the request has
+            # no ``mrope_position_ids``). Rotary is relative, so the shift changes nothing.
+            rope = None
         paired_hidden, paired_embeds, self._pending_hidden = build_shifted_pairs(
             self._pending_hidden, hidden, embeds, next_embedding=next_embedding
         )
