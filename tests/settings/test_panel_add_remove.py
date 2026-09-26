@@ -165,6 +165,21 @@ def test_a_small_freetoken_model_gets_the_defaults_fitted_to_it(box):
     assert box.profiles.get("model-tiny-llama")["settings"]["ModelPath"] == str(folder)
 
 
+def test_pi_neighbour_is_found_under_a_registry_alias(box):
+    # Jay's Pi file lists the FreeToken models by their aliases (Qwen3.8-Flash-Next-NVFP4), not
+    # the registry ids; the EXL3 copy added on 2026-09-25 matched nothing, got FALLBACK with no
+    # thinkingLevelMap, and Pi's "off" then sent no reasoning_effort, so the model kept thinking.
+    doc = json.loads((box.pi / "models.json").read_text())
+    rows = doc["providers"][PROVIDER]["models"]
+    next(r for r in rows if r["id"] == "qwen3.8-flash")["id"] = "Qwen3.8-Flash-Next-NVFP4"
+    (box.pi / "models.json").write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    folder = write_folder(box.models / "Tiny-Llama", max_position_embeddings=8192)
+    answer = add(box, folder, id="tiny-llama", name="Tiny Llama (FreeToken)", ramNeedGB=2)
+    assert answer.status_code == 200, answer.text
+    pi_entry = json.loads((box.pi / "models.json").read_text())["providers"][PROVIDER]["models"][-1]
+    assert pi_entry["id"] == "tiny-llama" and pi_entry["thinkingLevelMap"]["off"] == "none"
+
+
 def test_pi_out_of_reach_still_adds_and_says_so(box):
     for path in box.pi.iterdir():
         path.unlink()

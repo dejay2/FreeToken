@@ -1322,7 +1322,10 @@ class PanelService:
                 return proposed
 
             result = self._save(mutate, current_revision, None)
-            engines = {m["id"]: m["engine"] for m in doc["models"]}
+            # Aliases too: Jay's Pi file lists the FreeToken models by alias
+            # (Qwen3.8-Flash-Next-NVFP4), so ids alone found no neighbour and the EXL3 copy got
+            # FALLBACK with no thinkingLevelMap (Pi's "off" then left thinking on, 2026-09-26).
+            engines = {name: m["engine"] for m in doc["models"] for name in [m["id"], *(m.get("aliases") or [])]}
             result.update(status="added", id=model_id, name=name, adjusted=adjusted)
             pi = self._queue_pi(lambda: _after_save(
                 "Pi add", lambda: self.pi.add(model_id, name, entry["engine"], engines),
