@@ -368,6 +368,7 @@ class SpecDraftHead:
 
         self._uid: int | None = None
         self.committed_len = 0
+        self._context_offset = 0
         self._pending_hidden: torch.Tensor | None = None
         self._pending_rope: torch.Tensor | None = None
         self._sample: torch.Tensor | None = None
@@ -1061,6 +1062,7 @@ class SpecDraftHead:
         """
         self._uid = int(uid)
         self.committed_len = 0
+        self._context_offset = 0
         self._pending_hidden = None
         self._pending_rope = None
         self._sample = None
@@ -1088,7 +1090,8 @@ class SpecDraftHead:
             self._uid == req.uid
             and (self._sample is not None or bool(self._buffered))
             and self._pending_hidden is None
-            and self.committed_len + self._buffered_rows == req.cached_len
+            and self._context_offset + self.committed_len + self._buffered_rows
+            == req.cached_len
         )
 
     # ---------------------------------------------------------------- the engine capture seam
@@ -1108,6 +1111,25 @@ class SpecDraftHead:
         if self._uid != req.uid:
             self.reset_request(req.uid)
         _, hidden, embeds = capture
+        if (
+            batch.is_prefill
+            and batch.rope_positions is None
+            and self.committed_len == 0
+            and self._context_offset == 0
+            and self._pending_hidden is None
+            and not self._buffered
+        ):
+            # A prompt that hit the prefix cache forwards only its uncached tail, so the head
+            # never sees the cached rows' target hidden states and could never catch up with
+            # ``cached_len`` -- every step of the request fell back to plain decode. Measured
+            # 2026-09-26 on the EXL3 copy: a repeated 81-token prompt (64 cached) decoded at
+            # 60 tok/s against 96-101 cold, and Pi re-sends the whole chat on every turn. The
+            # head's positions are its own (text rope is derived from ``committed_len``), so it
+            # starts its context at the tail: the draft attends a shorter history, while the
+            # target hidden rows it pairs with still carry the whole prompt. Picture requests
+            # (explicit mrope positions) keep the old not-ready behaviour.
+            # ``complete_one`` already ran, so ``cached_len`` includes this forward's rows.
+            self._context_offset = max(0, int(req.cached_len) - int(hidden.shape[0]))
         chunked = type(req).__name__ == "ChunkedReq"
         next_embedding = None
         if not chunked:
