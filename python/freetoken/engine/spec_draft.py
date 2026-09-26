@@ -121,16 +121,26 @@ def resolve_spec_expert_placement(
     checkpoint -- the placement that shipped, unchanged.
 
     An EXL3 checkpoint (target ``expert_quant == "exl3"``) has no bf16 MTP banks to read: its
-    head's routed experts ship packed, so the placement is ``exl3`` and an explicit other
-    format is refused rather than silently ignored.
+    head's routed experts ship packed, so the placement is always ``exl3``. A ``bf16`` or
+    ``nvfp4`` name is logged and ignored rather than refused: the settings helper's service
+    unit sets ``nvfp4`` for every model it boots (the NVFP4 checkpoint's private MTP banks), and
+    on 2026-09-26 that refusal was the whole reason MTP would not start on the EXL3 copy from
+    the control panel. Anything else is still a typo and is refused.
     """
     env = os.environ if environ is None else environ
     if getattr(model_config, "expert_quant", None) == "exl3":
         named = (env.get(_EXPERT_FORMAT_ENV, "") or "").strip().lower()
-        if named not in ("", "exl3"):
+        if named in ("bf16", "nvfp4"):
+            logger.warning(
+                "%s=%s ignored: this EXL3 checkpoint's MTP experts are EXL3 and are read "
+                "from the checkpoint itself",
+                _EXPERT_FORMAT_ENV,
+                named,
+            )
+        elif named not in ("", "exl3"):
             raise ValueError(
-                "this EXL3 checkpoint's MTP experts are EXL3; unset "
-                f"{_EXPERT_FORMAT_ENV} (the placement is exl3; got {named!r})"
+                f"{_EXPERT_FORMAT_ENV} must be bf16, nvfp4 or exl3, got {named!r} "
+                "(an EXL3 checkpoint always places its MTP experts as exl3)"
             )
         return "exl3", None
     placement = (env.get(_EXPERT_FORMAT_ENV, "") or "bf16").strip().lower() or "bf16"

@@ -133,8 +133,13 @@ def test_placement_is_exl3_for_exl3_checkpoints():
     from freetoken.engine.spec_draft import resolve_spec_expert_placement
     cfg = SimpleNamespace(expert_quant="exl3", linear_storage="exl3")
     assert resolve_spec_expert_placement({}, model_config=cfg) == ("exl3", None)
+    # The helper's service unit sets nvfp4 for every model (the NVFP4 copy's private banks);
+    # an EXL3 boot must not trip on it.
+    for named in ("nvfp4", "bf16", "EXL3"):
+        env = {"FREETOKEN_MTP_SPEC_EXPERT_FORMAT": named}
+        assert resolve_spec_expert_placement(env, model_config=cfg) == ("exl3", None)
     with pytest.raises(ValueError, match="exl3"):
-        resolve_spec_expert_placement({"FREETOKEN_MTP_SPEC_EXPERT_FORMAT": "nvfp4"}, model_config=cfg)
+        resolve_spec_expert_placement({"FREETOKEN_MTP_SPEC_EXPERT_FORMAT": "nvfp5"}, model_config=cfg)
 
 
 def test_exl3_runner_type_and_bank_loader_are_wired():
