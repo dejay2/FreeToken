@@ -16,7 +16,7 @@ from typing import (
 
 import torch
 from freetoken import diag
-from freetoken.attention.linear import build_fla_metadata
+from freetoken.attention.linear import build_fla_metadata, check_linear_slots
 from freetoken.core import Batch, Req, SpecInflight
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
@@ -2286,6 +2286,7 @@ class Scheduler(SchedulerIOMixin):
                     pool = self.engine.linear_state_pool
                     slots = [r.linear_slot_idx if r.linear_slot_idx is not None
                              else pool.padding_slot for r in batch.padded_reqs]
+                    check_linear_slots("decode", batch.padded_reqs, slots, pool)
                     batch.linear_table_idx = torch.tensor(
                         slots, dtype=torch.int32, device="cpu", pin_memory=True
                     ).to(self.device, non_blocking=True)
@@ -2402,6 +2403,7 @@ class Scheduler(SchedulerIOMixin):
         if self.engine.linear_state_pool is not None:
             pool = self.engine.linear_state_pool
             slot = req.linear_slot_idx if req.linear_slot_idx is not None else pool.padding_slot
+            check_linear_slots("speculative step", [req], [slot], pool)
             batch.linear_table_idx = torch.tensor(
                 [slot], dtype=torch.int32, device=self.device
             )
