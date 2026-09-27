@@ -48,6 +48,41 @@ class FLAMetadata:
     track_boundary_row: torch.Tensor | None = None  # [nt] int64 forward-local row of the track boundary; states with their own left context (qwen4_exp PLE) derive their windows from it
 
 
+def check_linear_slots(kind: str, reqs, slots, pool=None) -> None:
+    """Refuse a linear-state slot id outside the pool before it reaches a device kernel.
+
+    Tripwire, not a fix. 2026-09-27 01:58 the serving box (EXL3 copy, MTP on, dynamic KV pool
+    capped at 119,488 tokens, hours of 110k-token turns) died on a device-side
+    ``index_copy_(): index out of bounds`` in a 2-byte copy of exactly 92,160 elements -- one
+    slot of the PLE conv state ([10240, 9] bf16) -- at a prefill chunk boundary. The dump
+    names only the kernel, so which owner handed out the bad id is unknown, and the same
+    sequence replayed by hand did not reproduce it. Checked here on host ints, before the
+    H2D copy, the next occurrence raises with the request and the pool's free list instead.
+    """
+    if pool is None:
+        from freetoken import core
+
+        ctx = core._GLOBAL_CTX
+        pool = getattr(ctx, "linear_state_pool", None) if ctx is not None else None
+    if pool is None:
+        return
+    n = int(pool.num_slots)
+    bad = [(r, int(s)) for r, s in zip(reqs, slots) if not 0 <= int(s) < n]
+    if not bad:
+        return
+    details = "; ".join(
+        f"uid={getattr(r, 'uid', None)} slot={s} linear_slot_idx={getattr(r, 'linear_slot_idx', None)} "
+        f"ping_pong={getattr(r, 'mamba_ping_pong', None)} table_idx={getattr(r, 'table_idx', None)} "
+        f"cached_len={getattr(r, 'cached_len', None)} extend_len={getattr(r, 'extend_len', None)}"
+        for r, s in bad
+    )
+    raise RuntimeError(
+        f"linear-state slot out of range ({kind}): pool has {n} slots; {details}; "
+        f"free={sorted(getattr(pool, '_free_slots', []))} "
+        f"reserved={sorted(getattr(pool, '_reserved_slots', []))}"
+    )
+
+
 def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     """Build the per-forward GDN metadata. Uses pinned host staging + non_blocking H2D
     (the input_ids/attn-metadata pattern), so the copies overlap the forward instead of
@@ -77,7 +112,9 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     # prefill: cumsum of query (extend) lengths, per-request slot + continuation flags.
     lens = [r.extend_len for r in reqs]
     cu_host = torch.tensor([0, *lens], dtype=torch.int64, **pin).cumsum_(0)
-    idx_host = torch.tensor([gdn_slot(r) for r in reqs], dtype=torch.int32, **pin)
+    live_slots = [gdn_slot(r) for r in reqs]
+    check_linear_slots("prefill live", reqs, live_slots)
+    idx_host = torch.tensor(live_slots, dtype=torch.int32, **pin)
     has_init_host = torch.tensor([r.cached_len > 0 for r in reqs], dtype=torch.bool, **pin)
     fresh = [gdn_slot(r) for r in reqs if r.cached_len == 0]
     fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
@@ -115,6 +152,7 @@ def _build_track_metadata(reqs, cu_host, device, pin):
     )
     boh = prepare_chunk_offsets(cu_host, CHUNK_SIZE).tolist()
     dst, h_row, conv_src, boundary_rows = [], [], [], []
+    tracked = []
     for i, r in enumerate(reqs):
         if r.mamba_ping_pong is None:
             continue
@@ -126,6 +164,7 @@ def _build_track_metadata(reqs, cu_host, device, pin):
         off = int(cu_host[i])
         boundary = r.cached_len + c * CHUNK_SIZE
         dst.append(r.mamba_ping_pong[r.mamba_next_track_idx])
+        tracked.append(r)
         h_row.append(boh[i] + c)
         conv_src.append([off + c * CHUNK_SIZE - km1 + j for j in range(km1)])
         boundary_rows.append(off + c * CHUNK_SIZE)
@@ -133,6 +172,7 @@ def _build_track_metadata(reqs, cu_host, device, pin):
         r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
     if not dst:
         return empty
+    check_linear_slots("track snapshot", tracked, dst)
     to = lambda xs, **kw: torch.tensor(xs, **pin, **kw).to(device, non_blocking=True)
     return dict(
         track_dst=to(dst, dtype=torch.int64),
